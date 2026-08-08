@@ -36,7 +36,7 @@ ol_device_mesh     = { path = "../ol_device_mesh" }
 ol_confidential    = { path = "../ol_confidential" }
 rand               = "0.8"
 rand_chacha        = "0.3"
-x25519-dalek       = { version = "2.0", features = ["static_secrets"] }
+x25519-dalek       = { version = "3.0", features = ["static_secrets"] }
 
 [profile.release]
 debug = 1

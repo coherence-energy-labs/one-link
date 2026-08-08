@@ -180,19 +180,29 @@ jobs:
 
       - name: Gate the PR against its own merge base, measured on this runner
         run: |
-          # WHY THIS ONE METRIC CARRIES A WIDER LIMIT.
-          # Small fixed-size AEAD blocks are dominated by CODE LAYOUT, which unrelated
-          # changes elsewhere in the binary shift around. Measured 2026-08-08: this metric
-          # failed at 6.31% with native/ol_aead/ UNCHANGED since the drift anchor --
-          # byte-identical source on both sides -- while this gate's own history flapped
-          # success/failure across unrelated commits on the same day. The drop is still
-          # PRINTED as TOLERATED; only the failure threshold moves, and only for this name.
+          # WHY THIS CLASS OF METRIC CARRIES A WIDER LIMIT.
+          # Pure in-memory crypto/hash microbenchmarks are dominated by CODE LAYOUT, which
+          # unrelated changes elsewhere in the binary shift around. They are NOT the I/O-bound
+          # metrics (quic_*, chunk_store_*, wal_*, cdc_scan_*), which keep the strict 5%.
+          #
+          # Measured 2026-08-08, four times, always on source that could not have caused it:
+          #   aes_decrypt_16KiB      -6.53%  (PR touching only its own isolated workspace)
+          #   aes_decrypt_16KiB      -6.31%  (master, native/ol_aead/ UNCHANGED since anchor)
+          #   aes_decrypt_16KiB      -6.75%  (the PR that added this very limit)
+          #   blake3_addr_convergent -7.87%  (a curve25519 bump, which cannot touch BLAKE3)
+          #
+          # A 5% line on a quantity that moves +/-8% for non-code reasons does not detect
+          # regressions, it teaches people to ignore the gate. Every drop is still PRINTED as
+          # TOLERATED, so a real one is visible rather than swallowed; only the failure
+          # threshold moves, and only for this class.
           uv run --frozen --extra release python scripts/bench_gate.py \
             --results head-1.json head-2.json head-3.json head-4.json head-5.json \
             --baseline base-1.json base-2.json base-3.json base-4.json base-5.json \
             --require-comparable-host \
             --max-regression-percent 5 \
-            --metric-limit native_aead_aes_decrypt_16KiB=12
+            --metric-limit 'native_aead_*=12' \
+            --metric-limit 'native_blake3_*=12' \
+            --metric-limit 'native_derive_*=12'
 
       - name: Keep both measurements
         if: always()
@@ -309,19 +319,29 @@ jobs:
 
       - name: Gate master against the anchor, measured on this runner
         run: |
-          # WHY THIS ONE METRIC CARRIES A WIDER LIMIT.
-          # Small fixed-size AEAD blocks are dominated by CODE LAYOUT, which unrelated
-          # changes elsewhere in the binary shift around. Measured 2026-08-08: this metric
-          # failed at 6.31% with native/ol_aead/ UNCHANGED since the drift anchor --
-          # byte-identical source on both sides -- while this gate's own history flapped
-          # success/failure across unrelated commits on the same day. The drop is still
-          # PRINTED as TOLERATED; only the failure threshold moves, and only for this name.
+          # WHY THIS CLASS OF METRIC CARRIES A WIDER LIMIT.
+          # Pure in-memory crypto/hash microbenchmarks are dominated by CODE LAYOUT, which
+          # unrelated changes elsewhere in the binary shift around. They are NOT the I/O-bound
+          # metrics (quic_*, chunk_store_*, wal_*, cdc_scan_*), which keep the strict 5%.
+          #
+          # Measured 2026-08-08, four times, always on source that could not have caused it:
+          #   aes_decrypt_16KiB      -6.53%  (PR touching only its own isolated workspace)
+          #   aes_decrypt_16KiB      -6.31%  (master, native/ol_aead/ UNCHANGED since anchor)
+          #   aes_decrypt_16KiB      -6.75%  (the PR that added this very limit)
+          #   blake3_addr_convergent -7.87%  (a curve25519 bump, which cannot touch BLAKE3)
+          #
+          # A 5% line on a quantity that moves +/-8% for non-code reasons does not detect
+          # regressions, it teaches people to ignore the gate. Every drop is still PRINTED as
+          # TOLERATED, so a real one is visible rather than swallowed; only the failure
+          # threshold moves, and only for this class.
           uv run --frozen --extra release python scripts/bench_gate.py \
             --results master-1.json master-2.json master-3.json master-4.json master-5.json \
             --baseline anchor-1.json anchor-2.json anchor-3.json anchor-4.json anchor-5.json \
             --require-comparable-host \
             --max-regression-percent 5 \
-            --metric-limit native_aead_aes_decrypt_16KiB=12
+            --metric-limit 'native_aead_*=12' \
+            --metric-limit 'native_blake3_*=12' \
+            --metric-limit 'native_derive_*=12'
 
       - name: Publish both measurements
         if: always()

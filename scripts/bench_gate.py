@@ -29,6 +29,7 @@ metric is taken across repetitions.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import sys
 from pathlib import Path
@@ -167,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
         "--metric-limit",
         action="append",
         default=[],
-        metavar="NAME=PERCENT",
+        metavar="NAME_OR_GLOB=PERCENT",
         help=(
             "Per-metric tolerance override, repeatable. For metrics whose measured spread is "
             "dominated by something other than the code under test -- see the block-collection "
@@ -249,6 +250,18 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError:
             raise SystemExit(f"--metric-limit percent is not a number: {spec!r}") from None
 
+    def limit_for(metric: str) -> float:
+        """Exact name first, then glob. Patterns exist because the layout-sensitive metrics are a
+        CLASS, not a list: naming them one at a time is how you discover the next one in CI."""
+        if metric in metric_limits:
+            return metric_limits[metric]
+        # Most specific pattern wins, so a tighter rule can carve an exception out of a broad one
+        # rather than being silently overridden by whichever happened to be declared first.
+        matches = [(pat, lim) for pat, lim in metric_limits.items() if fnmatch.fnmatchcase(metric, pat)]
+        if not matches:
+            return threshold
+        return max(matches, key=lambda kv: len(kv[0]))[1]
+
     failures: list[str] = []
 
     for name, base_bps in baseline.items():
@@ -297,7 +310,7 @@ def main(argv: list[str] | None = None) -> int:
         #
         # So: keep 5% where it means something, and give the layout-sensitive metrics their own
         # limit rather than loosening the gate globally or deleting it.
-        limit = metric_limits.get(name, threshold)
+        limit = limit_for(name)
         if ratio < (1.0 - limit) and separated:
             regress_pct = (1.0 - ratio) * 100.0
             failures.append(

@@ -520,3 +520,54 @@ def test_a_malformed_per_metric_limit_is_REFUSED_not_ignored(tmp_path: Path, spe
     out = run_gate_with(head, base, "--metric-limit", spec)
     assert out.returncode != 0
     assert "--metric-limit" in (out.stdout + out.stderr)
+
+
+def test_a_glob_limit_covers_the_CLASS_but_not_the_io_metrics(tmp_path: Path) -> None:
+    """Naming metrics one at a time is how you find the next one in CI.
+
+    A limit was set on `native_aead_aes_decrypt_16KiB`; the very next PR failed on
+    `native_blake3_addr_convergent_64KiB` -- a curve25519 bump, which cannot touch BLAKE3. The
+    layout-sensitive metrics are a CLASS (pure in-memory crypto/hash), and the I/O-bound ones
+    (quic_*, chunk_store_*, wal_*, cdc_scan_*) must KEEP the strict limit.
+    """
+    host = {"platform": "Linux-6.17.0-azure-x86_64", "python": "3.12.13", "cpu_count": 4}
+    metrics = {
+        "native_aead_aes_decrypt_16KiB": 3_800_000_000.0,
+        "native_blake3_addr_convergent_64KiB": 4_490_000_000.0,
+        "native_quic_round_trip_16KiB_x200": 500_000_000.0,
+    }
+    base = write(tmp_path, "base.json", payload(host, metrics))
+
+    def head_with(drops: dict[str, float]) -> Path:
+        hot = {k: v * (1.0 - drops.get(k, 0.0) / 100.0) for k, v in metrics.items()}
+        return write(tmp_path, "head.json", payload(host, hot))
+
+    glob = ["--metric-limit", "native_aead_*=12",
+            "--metric-limit", "native_blake3_*=12"]
+
+    # Both crypto metrics drop 8% -> tolerated by the class limit, and REPORTED.
+    out = run_gate_with(head_with({"native_aead_aes_decrypt_16KiB": 8.0,
+                                   "native_blake3_addr_convergent_64KiB": 8.0}), base, *glob)
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert out.stdout.count("TOLERATED") == 2
+
+    # The I/O metric drops the same 8% -> STILL FAILS. The glob must not reach it.
+    out = run_gate_with(head_with({"native_quic_round_trip_16KiB_x200": 8.0}), base, *glob)
+    assert out.returncode != 0
+    assert "native_quic_round_trip_16KiB_x200" in (out.stdout + out.stderr)
+
+
+def test_a_more_specific_pattern_beats_a_broader_one(tmp_path: Path) -> None:
+    """So a tighter rule can carve an exception out of a class instead of being silently
+    overridden by whichever pattern happened to be declared first."""
+    host = {"platform": "Linux-6.17.0-azure-x86_64", "python": "3.12.13", "cpu_count": 4}
+    metrics = {"native_aead_aes_decrypt_16KiB": 3_800_000_000.0}
+    base = write(tmp_path, "base.json", payload(host, metrics))
+    head = write(tmp_path, "head.json",
+                 payload(host, {k: v * 0.92 for k, v in metrics.items()}))  # 8% drop
+
+    # Broad class allows 12%, but the specific name is held to 6% -> must FAIL.
+    out = run_gate_with(head, base,
+                        "--metric-limit", "native_aead_*=12",
+                        "--metric-limit", "native_aead_aes_decrypt_16KiB=6")
+    assert out.returncode != 0, out.stdout + out.stderr

@@ -12,7 +12,7 @@ crate-type = ["lib"]
 
 [dependencies]
 thiserror = { workspace = true }
-lz4_flex  = { version = "0.11", default-features = false, features = ["std"] }
+lz4_flex  = { version = "0.14", default-features = false, features = ["std"] }
 zstd      = { version = "0.13", default-features = false }
 
 [dev-dependencies]

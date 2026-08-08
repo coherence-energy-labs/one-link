@@ -29,7 +29,7 @@ subtle        = { workspace = true }
 # Layer 7 self-onion uses the shipped `ol_onion::sphinx` machinery
 # over Ristretto255 hops. We pin the same `curve25519-dalek`
 # version that `ol_onion` uses so types interop directly.
-curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
+curve25519-dalek = { version = "5", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
 ol_onion         = { path = "../ol_onion" }
 # Layer 10 duress envelope uses Argon2id to derive AEAD keys from
 # short user-entered codes (the user types a 4-8 char duress code

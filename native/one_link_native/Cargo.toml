@@ -47,7 +47,7 @@ ol_selector       = { path = "../ol_selector" }
 ol_radio_batcher  = { path = "../ol_radio_batcher" }
 ol_compress       = { path = "../ol_compress" }
 ol_fuse           = { path = "../ol_fuse" }
-curve25519-dalek  = { version = "4", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
+curve25519-dalek  = { version = "5", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
 ml-kem            = "0.2"
 hybrid-array      = "0.2"
 ed25519-dalek   = { workspace = true }

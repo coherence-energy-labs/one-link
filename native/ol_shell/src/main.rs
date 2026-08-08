@@ -195,6 +195,17 @@ fn main() {
     let event_loop = EventLoop::new();
     let mut builder_w = WindowBuilder::new()
         .with_title("One Link")
+        // NO OS TITLE BAR. The interface already HAS one -- `header.top` carries the logo, the
+        // pane tabs, the identity chip and the settings gear. A native caption strip above that is
+        // a second, worse header: different font, different colours, a generic chrome rectangle
+        // sitting on top of a designed dark UI. Every desktop app people compare this to (the
+        // editor, the chat clients) draws its own.
+        //
+        // The window controls and the drag region are INJECTED INTO the app's existing header by
+        // `SHELL_CHROME_JS` below, so nothing moves and `index.html` is untouched -- which matters
+        // twice over: the browser fallback keeps the layout it has always had, and the UI hash this
+        // shell pins stays a pure function of the shipped interface.
+        .with_decorations(false)
         .with_min_inner_size(LogicalSize::new(420.0, 480.0));
     if let [w, h, x, y] = geometry[..] {
         builder_w = builder_w
@@ -209,10 +220,33 @@ fn main() {
         Ok(w) => w,
         Err(e) => fail(&format!("could not create a window: {e}")),
     };
+    // Shared because the chrome's IPC handler and the event loop both need it: the buttons in the
+    // header are the ONLY way to minimise, maximise or close a window with no OS caption strip.
+    let window = std::rc::Rc::new(window);
+    let chrome_window = std::rc::Rc::clone(&window);
 
     let nav_origin = origin.clone();
     let mut builder = WebViewBuilder::new()
         .with_url(&url)
+        // The window has no OS decorations, so the interface draws them. See SHELL_CHROME_JS.
+        .with_initialization_script(SHELL_CHROME_JS)
+        // The ONLY messages this window accepts. An explicit match rather than anything
+        // dispatch-like: this handler is reachable from page script, so it must be able to do
+        // exactly four things and nothing that takes an argument.
+        .with_ipc_handler(move |req| {
+            match req.body().as_str() {
+                "drag" => {
+                    let _ = chrome_window.drag_window();
+                }
+                "minimize" => chrome_window.set_minimized(true),
+                "maximize" => chrome_window.set_maximized(!chrome_window.is_maximized()),
+                "close" => {
+                    // Same exit the close button always had. The daemon is not ours to stop.
+                    std::process::exit(0);
+                }
+                _ => {}
+            }
+        })
         // NO DEVTOOLS IN A SHIPPED WINDOW. Explicit rather than relying on the default: this window
         // holds an authenticated session, and an inspector is a console into it.
         .with_devtools(false)
@@ -270,6 +304,129 @@ fn main() {
         }
     });
 }
+
+/// The window chrome, drawn by the INTERFACE instead of the OS.
+///
+/// Injected rather than written into `index.html` on purpose. The same page is served to a browser
+/// when the shell is unavailable, and a browser tab must not grow minimise/maximise/close buttons
+/// that do nothing. Keeping it here means the fallback is untouched, and the UI hash this binary
+/// pins stays a pure function of the shipped interface rather than of who is rendering it.
+///
+/// Everything is scoped under `html.ol-shell`, which only ever exists inside this window.
+const SHELL_CHROME_JS: &str = r#"
+(function () {
+  /* NOT captured at load time. An initialization script runs at DOCUMENT-START, where
+     `document.documentElement` is still NULL -- reading `.classList` off it threw on the very
+     first statement, killing the whole IIFE before it could register DOMContentLoaded, the
+     observer, or the emergency fallback. The window came up with no title bar and no buttons.
+     Everything below therefore reads the root lazily and tolerates it being absent. */
+  var root = function () { return document.documentElement; };
+  var send = function (m) { try { window.ipc.postMessage(m); } catch (e) {} };
+  var INTERACTIVE =
+    'button,a,input,select,textarea,label,[role="button"],[role="tab"],[contenteditable]';
+
+  function paint() {
+    var HTML = root();
+    if (!HTML || HTML.classList.contains('ol-shell')) { return !!HTML; }
+    var header = document.querySelector('header.top');
+    if (!header || !document.head) { return false; }
+    HTML.classList.add('ol-shell');
+
+    /* Styled from the interface's OWN tokens -- 32px, radius 8, --text-dim, hover --bg-2 -- so
+       these read as three more of the app's icon buttons rather than as bolted-on chrome. */
+    var style = document.createElement('style');
+    style.textContent = [
+      'html.ol-shell header.top{-webkit-user-select:none;user-select:none;}',
+      'html.ol-shell .ol-winctl{display:flex;align-items:center;gap:2px;margin-left:10px;',
+        'padding-left:10px;border-left:1px solid var(--line,rgba(255,255,255,.08));}',
+      'html.ol-shell .ol-winctl button{width:32px;height:32px;border-radius:8px;border:0;',
+        'background:transparent;color:var(--text-dim,#8b90a0);display:grid;place-items:center;',
+        'padding:0;cursor:default;transition:background .12s,color .12s;}',
+      'html.ol-shell .ol-winctl button:hover{background:var(--bg-2,rgba(255,255,255,.07));',
+        'color:var(--text,#e8eaf0);}',
+      'html.ol-shell .ol-winctl button:focus-visible{outline:2px solid var(--accent,#7c5cff);',
+        'outline-offset:-2px;}',
+      /* Close is the destructive one, so it is the one that goes red -- the convention people
+         already have in their hands from every other window on the machine. */
+      'html.ol-shell .ol-winctl .ol-close:hover{background:#e5484d;color:#fff;}',
+      'html.ol-shell .ol-winctl svg{width:11px;height:11px;display:block;}'
+    ].join('');
+    document.head.appendChild(style);
+
+    /* DRAG. The header IS the title bar, so a press on empty header space moves the window --
+       except on anything interactive, or the tabs, hamburger and gear would become drag handles
+       and stop responding. `closest` walks up, so an icon inside a button still counts as the
+       button. Left button only: right-click must still reach a context menu. */
+    header.addEventListener('mousedown', function (ev) {
+      if (ev.button !== 0) { return; }
+      if (ev.target.closest && ev.target.closest(INTERACTIVE)) { return; }
+      send('drag');
+    });
+    header.addEventListener('dblclick', function (ev) {
+      if (ev.target.closest && ev.target.closest(INTERACTIVE)) { return; }
+      send('maximize');
+    });
+
+    var svg = function (d) {
+      return '<svg viewBox="0 0 11 11" aria-hidden="true" fill="none" stroke="currentColor"'
+           + ' stroke-width="1.15" stroke-linecap="round">' + d + '</svg>';
+    };
+    var ctl = document.createElement('div');
+    ctl.className = 'ol-winctl';
+    ctl.innerHTML =
+        '<button type="button" class="ol-min" title="Minimise" aria-label="Minimise">'
+      +   svg('<path d="M1 5.5h9"/>') + '</button>'
+      + '<button type="button" class="ol-max" title="Maximise" aria-label="Maximise">'
+      +   svg('<rect x="1" y="1" width="9" height="9" rx="1.5"/>') + '</button>'
+      + '<button type="button" class="ol-close" title="Close" aria-label="Close">'
+      +   svg('<path d="M1.4 1.4l8.2 8.2M9.6 1.4l-8.2 8.2"/>') + '</button>';
+    header.appendChild(ctl);
+
+    ctl.querySelector('.ol-min').addEventListener('click', function () { send('minimize'); });
+    ctl.querySelector('.ol-max').addEventListener('click', function () { send('maximize'); });
+    ctl.querySelector('.ol-close').addEventListener('click', function () { send('close'); });
+    return true;
+  }
+
+  /* WHY THIS IS NOT JUST `paint()`.
+     An initialization script runs at DOCUMENT-START: there is no <body> yet, let alone
+     `header.top`. The first version of this called querySelector immediately, found nothing, and
+     silently produced a window with no title bar AND no buttons -- draggable by nothing, closable
+     only by Alt+F4. So: try now (for a re-navigation into an already-built page), then on
+     DOMContentLoaded, and keep an observer running in case the header is rendered later. */
+  if (!paint()) {
+    document.addEventListener('DOMContentLoaded', paint);
+    var obs = new MutationObserver(function () { if (paint()) { obs.disconnect(); } });
+    obs.observe(document, { childList: true, subtree: true });
+    /* A LAST RESORT that must never be needed, but must exist: if no header has appeared after
+       ten seconds, this is not the app, and a frameless window with no way out is not shippable.
+       Float the same controls so the window can always be moved and closed. */
+    setTimeout(function () {
+      var HTML = root();
+      if (!HTML || HTML.classList.contains('ol-shell')) { return; }
+      obs.disconnect();
+      var bar = document.createElement('div');
+      bar.setAttribute('data-ol-fallback-titlebar', '');
+      bar.style.cssText = 'position:fixed;top:0;left:0;right:0;height:34px;z-index:2147483647;'
+        + 'display:flex;justify-content:flex-end;align-items:center;gap:2px;padding-right:6px;'
+        + 'background:rgba(12,14,20,.96);color:#e8eaf0;-webkit-user-select:none;user-select:none;';
+      bar.addEventListener('mousedown', function (ev) {
+        if (ev.button === 0 && !(ev.target.closest && ev.target.closest('button'))) { send('drag'); }
+      });
+      var mk = function (label, msg) {
+        var b = document.createElement('button');
+        b.type = 'button'; b.textContent = label; b.setAttribute('aria-label', msg);
+        b.style.cssText = 'width:32px;height:26px;border:0;border-radius:6px;background:transparent;'
+          + 'color:inherit;cursor:default;font:13px system-ui;';
+        b.addEventListener('click', function () { send(msg); });
+        bar.appendChild(b);
+      };
+      mk('\u2014', 'minimize'); mk('\u25a1', 'maximize'); mk('\u2715', 'close');
+      (document.body || HTML).appendChild(bar);
+    }, 10000);
+  }
+})();
+"#;
 
 /// Refuse to render an interface that is not the one this binary was built against, or a
 /// certified surface that does not verify.

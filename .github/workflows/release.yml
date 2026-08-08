@@ -721,7 +721,17 @@ jobs:
         shell: bash
         env:
           SOURCE_DATE_EPOCH: ${{ needs.build.outputs.source_date_epoch }}
-        run: uv run --no-sync python scripts/build_binary.py
+        # `--gui` IS THE END-USER BUILD, and its absence here shipped the developer one.
+        #
+        # Without it `build_binary.py` picks `--console`, whose own help says "debugging only; end
+        # users want --gui". On Windows that makes the launcher a CONSOLE-SUBSYSTEM binary, so
+        # double-clicking One Link pops a black terminal beside the app that no other desktop
+        # program shows. On macOS it also skips `BUNDLE()`, shipping `dist/one-link/` -- a
+        # UNIX-executable folder Finder will not double-click -- instead of `one-link.app`.
+        #
+        # The ROLLING channel (`auto_build.yml`) has always passed `--gui`. Only the STABLE
+        # release omitted it, so the artifact users are pointed at was the worse of the two.
+        run: uv run --no-sync python scripts/build_binary.py --gui
 
       - name: validate stable packaged-artifact contract
         shell: bash

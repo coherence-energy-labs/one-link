@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import http.server
+import os
 import queue
 import subprocess
 import sys
@@ -54,6 +55,12 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 
 
 def shell_binary() -> Path | None:
+    # `OL_SHELL_BIN` lets you smoke a build that is not in the default target dir -- e.g. a second
+    # `CARGO_TARGET_DIR` used because the normal binary is locked by a running window.
+    override = os.environ.get("OL_SHELL_BIN", "").strip()
+    if override:
+        cand = Path(override)
+        return cand if cand.is_file() else None
     base = REPO / "native" / "ol_shell" / "target" / "release"
     for name in ("ol_shell.exe", "ol_shell"):
         candidate = base / name

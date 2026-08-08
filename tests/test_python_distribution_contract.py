@@ -64,7 +64,13 @@ def _stage_distribution_source(destination: Path) -> None:
 
 
 def test_stable_distribution_contract_exactly_matches_source_tree() -> None:
-    # 205: one_link.env_bounds added 2026-08-05 -- the single validated parser
+    # 207: one_link.group_invite added 2026-08-07 -- the CONSUMER the group-invite mint never
+    # had. The daemon signed `one-link://group-invite/<token>` in two places and peer.html
+    # offered a Copy invite button, while `protocol_handler` answered "unsupported one-link
+    # route" to the app's OWN URL -- nothing decoded that token on any surface. It is a stable
+    # runtime module because the deep-link handler imports it: a frozen build without it would
+    # accept the link and then fail to verify anything behind it.
+    # (206 before it: one_link.env_bounds added 2026-08-05 -- the single validated parser
     # for numeric environment overrides. It exists because nine constants in
     # daemon.py and server.py used bare int(os.environ.get(...)), so
     # ONE_LINK_MAX_PEERS=abc raised at IMPORT and the daemon could not start,
@@ -72,7 +78,7 @@ def test_stable_distribution_contract_exactly_matches_source_tree() -> None:
     # to zero. It is imported at module scope by both, so a frozen build
     # missing it would fail before logging exists.
     # (204 before it: bounded_resolver, 2026-07-30.)
-    assert len(build_identity.EXPECTED_STABLE_RUNTIME_MODULES) == 206
+    assert len(build_identity.EXPECTED_STABLE_RUNTIME_MODULES) == 207
     assert build_identity.EXPECTED_STABLE_RUNTIME_MODULES == tuple(
         sorted(set(build_identity.EXPECTED_STABLE_RUNTIME_MODULES))
     )
@@ -126,7 +132,13 @@ def test_distribution_source_contract_hashes_every_packaged_python_file() -> Non
         if "__pycache__" not in path.parts
     }
     packaged_python = {name for name in contract.payload_hashes if name.endswith(".py")}
-    # 222 / 245: data/certified/unread_badge.json added 2026-08-07 -- the FIFTH certified
+    # 223 / 246: group_invite.py added 2026-08-07 -- the CONSUMER the group-invite mint never
+    # had. The daemon signed `one-link://group-invite/<token>` in two places and peer.html
+    # offered a Copy invite button, while the deep-link handler answered "unsupported one-link
+    # route" to the app's own URL: nothing anywhere decoded that token, on phone or desktop.
+    # Verifies the signature, and RECOMPUTES the issuer fingerprint from the key -- without that
+    # binding an attacker mints a validly-signed invite carrying a trusted contact's fingerprint.
+    # (222 / 245 before it: data/certified/unread_badge.json, 2026-08-07 -- the FIFTH certified
     # surface and where design §11.1 model (b) reaches a pixel: what an unread count is
     # ALLOWED TO SAY, proven over every integer.
     # (222 / 244: data/certified/origin_fence.json -- the THIRD certified
@@ -139,9 +151,9 @@ def test_distribution_source_contract_hashes_every_packaged_python_file() -> Non
     # (222 / 242 before it: certified_surface.py + data/certified/peer_row.json, the
     # peer row's proven layout table, laws discharged over every integer input.)
     # (221 / 240 before it: env_bounds.py, 2026-08-05. 220 / 239: bounded_resolver.py.)
-    assert len(source_python) == 222
+    assert len(source_python) == 223
     assert packaged_python == source_python
-    assert len(contract.payload_hashes) == 245
+    assert len(contract.payload_hashes) == 246
 
 
 def test_developer_only_modules_are_not_stable_distribution_requirements() -> None:

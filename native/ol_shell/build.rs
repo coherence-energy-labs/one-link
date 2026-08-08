@@ -41,6 +41,20 @@ fn main() {
         }
     }
 
+    // THE PIN IS PER-BUILD, NOT PER-CONTENT -- and that is fine, but know it before chasing it.
+    //
+    // `index.html` has no `eol` rule in .gitattributes (only `*.sh` does), so it checks out CRLF on
+    // Windows and LF elsewhere. The same commit therefore pins two different digests: measured,
+    // 2e004e22... on Windows and e79ebe40... on the macOS runner, and the LF-normalised bytes hash
+    // to exactly the latter. So this is line endings, not a corrupted or substituted interface.
+    //
+    // It is SAFE because the hash is computed from the very bytes the build then packages: each
+    // bundle verifies the file it shipped with. It would only bite if a shell built on one platform
+    // were paired with an interface checked out on another, which the build never does.
+    //
+    // NOT "fixed" by adding `*.html text eol=lf`: that renormalises a 43,765-line file across every
+    // checkout, and the churn is a worse trade than a documented, self-consistent pin. Revisit if
+    // cross-platform byte-identical bundles ever become a requirement.
     let ui = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../src/one_link/web/index.html");
 
     // Rebuild whenever the UI changes: a stale pin would refuse the very interface that shipped

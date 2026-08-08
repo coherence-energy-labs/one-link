@@ -41,10 +41,12 @@ A non-technical user may close the dialog thinking it's malware.
   good. Audit found this is in place.
 - **Add a 30-second screenshot walkthrough** of the
   click-through. Visual > text for non-technical users.
-- **First-launch in-app banner** that closes the loop: "Glad
-  you got past the SmartScreen warning. Here's why we don't
-  pay Microsoft to remove it. (Read more)" — turn the
-  friction into a moment of trust-building.
+- ~~**First-launch in-app banner**~~ **SHIPPED (v0.21.x, verified 2026-08-07).**
+  `index.html` carries `install-warning-banner` + its "read more" modal, with
+  exactly this framing. It fires once per device (`one_link.install_warning_seen`),
+  is dismissable, silently skips when `localStorage` is unavailable, and
+  deliberately never competes with the key-rotation banner, which is urgent.
+  What remains of this item is the **website** screenshot walkthrough below.
 - **`one-link verify-this-install` command** ships as a fail-closed complete
   package inventory. It requires an independently authenticated expected
   rollup for comparison; `--inventory-only` is explicitly non-verifying.
@@ -91,9 +93,32 @@ real install path on the website.
 
 ---
 
-### 4. Website meta-vs-reality mismatch (P0)
+### 4. Website meta-vs-reality mismatch — ~~P0~~ **RESOLVED (re-audited 2026-08-07)**
 
-**Today:** Homepage meta description claims "Works on Windows,
+> **This is no longer a blocker, and the table below is a historical record.**
+> Re-checked against the live site and the published releases rather than against
+> this document, because a stale P0 costs attention every time someone reads it.
+>
+> | 2026-05-25 finding | 2026-08-07 reality |
+> |---|---|
+> | meta claims "Windows, macOS, Linux, Android, iOS" | no platform overclaim; copy leads on privacy |
+> | Schema.org `operatingSystem` lists Android + iOS | `"Windows, macOS, Linux"` |
+> | download page says only Windows + Linux ship | no such mismatch on the page |
+> | "Last reviewed 2026-05-19" visible mid-page | not present |
+>
+> **And "macOS" is now TRUE, not aspirational:** `v0.21.0` publishes
+> `one-link-macos-arm64.zip` with a Sigstore bundle, beside Linux (x86_64 + arm64)
+> and Windows (x86_64 + arm64). The site's claim matches what a user can download.
+>
+> The site paths in the table are also gone — it was restructured into
+> `content/` + `dist/` with six locales (de/es/fr/it/pt + en), which is why a
+> find/replace against `/index.html` would have found nothing.
+>
+> **Only residual, minor:** user-facing copy on the builders and security pages
+> still pins "lands v0.22". Accurate today (current release is 0.21.0) but it goes
+> stale by itself; "coming in the next release" would not.
+
+**Today (2026-05-25, historical):** Homepage meta description claims "Works on Windows,
 macOS, Linux, Android, iOS" but the download page (correctly)
 says "Windows + Linux ship today." First-impression damage
 for users searching from a Mac.
@@ -180,13 +205,71 @@ consultancy.
 
 ---
 
-### 9. Phone group invite acceptance
+### 9. Group invite acceptance — **SCOPE WAS UNDERSTATED (re-audited 2026-08-07)**
 
-**Today:** Last Phase B gap per ROADMAP. Phone can see groups,
-send/edit/react/delete in groups, manage members, copy invites,
-leave — but cannot ACCEPT an invite link directly on the phone.
+**What this entry said:** the phone can copy invites but cannot ACCEPT an invite link
+directly on the phone — implying the desktop can, and that this is a phone-UI gap of
+~1-2 hours.
 
-**Our fix:** code. Bounded ~1-2 hours of in-repo work.
+**What the code actually shows:** *nothing on any surface can redeem a group invite.*
+The link is **mint-only**.
+
+- It is generated in two places — `server.py:25168` (desktop API) and `server.py:7996`
+  (the phone bridge) — as a signed, offline-verifiable
+  `one-link://group-invite/<token>`, and `peer.html` offers a **Copy invite** button.
+- `protocol_handler.peer_path_for_deep_link` accepts exactly **one** route,
+  `self-mesh/enroll`. `one-link://group-invite/...` raises
+  `unsupported one-link route: group-invite/...`.
+- Nothing anywhere decodes that token, verifies its `signature_hex`, checks
+  `expires_ms`, or turns it into a join request. `grep` for `one_link_group_invite`
+  returns two hits, both minting it.
+
+So a user can copy an invite and send it, and the person who receives it has no path
+that consumes it — on the phone **or** the desktop.
+
+**Why this is bigger than "~1-2 hours of UI".** The mint deliberately does not grant
+membership: *"the token lets a paired device prove which group it is asking to join. A
+group admin still signs the ADD_MEMBER event, preserving the group authority model
+instead of turning links into ambient access."* Redemption therefore needs a
+**join-request protocol** — verify the issuer's signature and expiry, present the group
+to the invitee, carry a request to an admin, and have the admin sign `ADD_MEMBER` — and
+that touches the group authority model directly. Building it hastily is how a link
+becomes ambient access, which is the exact thing the design refuses.
+
+**Our fix:** still code, and still ours — but scoped as a protocol increment with its
+own threat review, not a button on a phone screen.
+
+#### Landed 2026-08-07 — the verification half
+
+`src/one_link/group_invite.py` is the consumer that never existed, and the deep-link
+handler now accepts the URL the app has been minting all along:
+
+- `verify_group_invite(token)` → `VerifiedInvite` **or raises**. There is deliberately no
+  "probably fine" return value for a UI to render optimistically.
+- **The binding that matters:** a signature made with the key named *inside* the token
+  proves only that the token is self-consistent — anyone can mint that. The fingerprint
+  is recomputed from the public key and required to match, which is what stops an
+  attacker presenting a trusted contact's fingerprint over their own key. **Calibrated:**
+  with that one check removed, the forged invite verifies clean and exactly one test
+  catches it.
+- Also refused: edited payloads, smuggled fields, expired invites, invites issued in the
+  future (a clock wrong enough to fake `issued_ms` can fake `expires_ms`), wrong token
+  types, future versions, bad key lengths, oversized tokens, and `True` where an integer
+  belongs. 20 tests, written forgery-first.
+- `one-link://group-invite/<token>` now routes to `/peer?group_invite=…` instead of
+  `unsupported one-link route`.
+
+#### What is still missing — the authority half
+
+Verification produces an **introduction**, not membership, and must never be made to
+produce membership. Still to build:
+
+1. a **join-request** carried from the invitee to a group admin,
+2. the admin's approve/decline surface, signing the existing `ADD_MEMBER` event,
+3. the invitee-facing screen that shows the verified group, issuer and expiry.
+
+**Do not read the Copy invite button — or `verify_group_invite` — as evidence a person
+can join a group from a link yet.** The token is now trustworthy; nothing yet acts on it.
 
 ---
 

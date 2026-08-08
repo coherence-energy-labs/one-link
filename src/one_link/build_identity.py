@@ -396,6 +396,7 @@ EXPECTED_STABLE_RUNTIME_MODULES: tuple[str, ...] = (
     "one_link.fountain_native",
     "one_link.frame_provenance",
     "one_link.fuse_native",
+    "one_link.group_invite",
     "one_link.groups",
     "one_link.groups_crypto",
     "one_link.handoff_orchestrator",

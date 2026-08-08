@@ -417,6 +417,14 @@ def test_fabric_plan_stays_fast_with_many_remembered_routes():
     # had been failing on every pull request's Linux suite for exactly that reason -- red on work
     # that could not possibly have caused it, which is how a gate stops being read at all.
     #
+    # WHERE THE 680 ms CAME FROM, measured rather than shrugged at. The old assertion timed the
+    # FIRST plan() in the process, which pays one-time lazy initialisation, inside a suite that had
+    # already run ~9,400 tests. On this machine: first call 157 ms, warmed calls 7.7 ms, and a
+    # single gen2 gc.collect() over a suite-sized heap 228 ms. One-time warm-up plus a GC pause
+    # landing inside the measured window, on a runner several times slower, is the whole gap.
+    # Neither number is the planner's steady-state cost, which is what the test claims to police.
+    # Best-of-k below excludes both, so the ratio compares like with like.
+    #
     # The property the name promises is that planning stays fast AS REMEMBERED ROUTES GROW. That
     # is about growth, and growth is measurable on any machine: compare the same planner against
     # 4x the routes, in this process, under this load. Linear is ~4x, quadratic ~16x. A ceiling of

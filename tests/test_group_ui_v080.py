@@ -680,3 +680,31 @@ def test_index_html_has_groups_surface():
         ".group-sender",
     ]:
         assert needle in text, f"index.html missing {needle!r}"
+
+
+def test_the_group_invite_LINK_now_HAS_a_consumer():
+    """This test used to assert the opposite, and inverting it was the point.
+
+    The daemon minted `one-link://group-invite/<token>` for a long time while
+    `peer_path_for_deep_link` answered "unsupported one-link route" -- a signed, copyable,
+    shareable link with no consumer on ANY surface. That gap was pinned here deliberately so it
+    could not be mistaken for a working feature, with a note that the pin would flip when
+    redemption landed. It landed; this is the flip.
+
+    Verification itself lives in `test_group_invite_verification.py`, forgery-first. What this
+    asserts is narrower and is the regression that started it: the app ACCEPTS the URL it MINTS.
+    """
+    from one_link.protocol_handler import peer_path_for_deep_link
+
+    # The route that was already wired, as a control: without it this test would also pass
+    # against a handler that had started accepting everything.
+    assert peer_path_for_deep_link(
+        "one-link://self-mesh/enroll?token=" + "a" * 32
+    ).startswith("/peer?")
+
+    path = peer_path_for_deep_link("one-link://group-invite/" + "b" * 40)
+    assert path.startswith("/peer?") and "group_invite=" in path
+
+    # ...and a malformed token is still refused AT THE DOOR, before any decoder sees it.
+    with pytest.raises(ValueError, match="group invite token is malformed"):
+        peer_path_for_deep_link("one-link://group-invite/short!!")

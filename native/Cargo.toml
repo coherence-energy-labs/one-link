@@ -119,7 +119,7 @@ bloomfilter       = "3.0"
 # matching rustls + rcgen versions for self-signed identity-bound TLS.
 quinn             = { version = "0.11.9", default-features = false, features = ["rustls-aws-lc-rs", "runtime-tokio"] }
 rustls            = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rcgen             = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rcgen             = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 ring              = "0.17"
 tokio             = { version = "1.41", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
 ed25519-dalek     = { version = "2.1", features = ["rand_core", "pkcs8", "pem"] }

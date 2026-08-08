@@ -22,7 +22,7 @@ curve25519-dalek = { version = "4", default-features = false, features = ["alloc
 # shared secret so a quantum-equipped passive recorder can't decrypt
 # historical traffic.
 ml-kem           = "0.2"
-hybrid-array     = "0.2"
+hybrid-array     = "0.4"
 aead             = { workspace = true }
 rand_core        = { workspace = true }
 zeroize          = { workspace = true }

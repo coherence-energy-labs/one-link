@@ -16,7 +16,7 @@ ml-kem        = "0.2"
 # Match the hybrid-array version ml-kem 0.2 uses. Required because we
 # need to construct `Array<u8, N>` instances directly to call ml-kem's
 # `KeyEncode::from_bytes` (which takes a typed Array, not a slice).
-hybrid-array  = "0.2"
+hybrid-array  = "0.4"
 x25519-dalek  = { version = "2.0", features = ["static_secrets"] }
 rand_core     = { workspace = true }
 zeroize       = { workspace = true }

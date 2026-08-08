@@ -49,7 +49,7 @@ ol_compress       = { path = "../ol_compress" }
 ol_fuse           = { path = "../ol_fuse" }
 curve25519-dalek  = { version = "4", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
 ml-kem            = "0.2"
-hybrid-array      = "0.2"
+hybrid-array      = "0.4"
 ed25519-dalek   = { workspace = true }
 x25519-dalek    = { version = "2.0", features = ["static_secrets"] }
 # rand 0.8 pairs with rand_core 0.6 which ml-kem 0.2 and x25519-dalek

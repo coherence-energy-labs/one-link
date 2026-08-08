@@ -19,7 +19,7 @@ rand_core     = { workspace = true }
 chacha20poly1305 = { workspace = true }
 # Deterministic CSPRNG used to expand the sealed seed into an
 # ol_pqsig HybridSigningKey inside sealed-sign / verifying_key.
-rand_chacha   = "0.3"
+rand_chacha   = "0.9"
 # Cross-platform ECDSA-P256 verification — Windows TPM produces
 # raw r||s signatures over the curve, but peers on macOS / Linux
 # need to verify them. Verify-only is cheap; signing on the TPM
@@ -64,7 +64,7 @@ features = [
 proptest      = { workspace = true }
 criterion     = { workspace = true }
 rand          = "0.8"
-rand_chacha   = "0.3"
+rand_chacha   = "0.9"
 hex           = { workspace = true }
 
 [[bench]]

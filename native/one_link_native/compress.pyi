@@ -23,3 +23,11 @@ def onemem_encode_many(
     precompressed: bool = ...,
     compress: bool = ...,
 ) -> list[bytes]: ...
+def onemem_sha256_slices(source: bytes, bounds: list[tuple[int, int]]) -> list[bytes]: ...
+def onemem_encode_slices(
+    source: bytes,
+    bounds: list[tuple[int, int]],
+    algorithm: str,
+    precompressed: bool = ...,
+    compress: bool = ...,
+) -> list[bytes]: ...

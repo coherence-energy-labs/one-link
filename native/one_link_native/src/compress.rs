@@ -163,7 +163,74 @@ pub(crate) fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     m.add_class::<PyCompressor>()?;
     m.add_function(wrap_pyfunction!(onemem_sha256_many, m)?)?;
     m.add_function(wrap_pyfunction!(onemem_encode_many, m)?)?;
+    m.add_function(wrap_pyfunction!(onemem_sha256_slices, m)?)?;
+    m.add_function(wrap_pyfunction!(onemem_encode_slices, m)?)?;
     Ok(())
+}
+
+/// Borrow ``source`` (must be ``bytes``: immutable, so safe to read detached)
+/// and validate every ``(start, end)`` range against it.
+fn source_and_bounds(
+    source: &Bound<'_, PyAny>,
+    bounds: &[(usize, usize)],
+) -> PyResult<PyBackedBytes> {
+    let bytes = source
+        .cast::<PyBytes>()
+        .map_err(|_| PyValueError::new_err("ONE Memory slice batches borrow a bytes source"))?;
+    let backed = PyBackedBytes::from(bytes.to_owned());
+    if let Some(&(s, e)) = bounds.iter().find(|&&(s, e)| s > e || e > backed.len()) {
+        return Err(PyValueError::new_err(format!(
+            "slice ({s}, {e}) is outside a source of {} bytes",
+            backed.len()
+        )));
+    }
+    Ok(backed)
+}
+
+/// SHA-256 of ``source[start:end]`` for each bound, zero-copy and in parallel.
+///
+/// ONE Memory measured copying each chunk out of its blob at 0.5 ms/MiB --
+/// a third of ingest -- before any hashing began.
+#[pyfunction]
+fn onemem_sha256_slices<'py>(
+    py: Python<'py>,
+    source: &Bound<'py, PyAny>,
+    bounds: Vec<(usize, usize)>,
+) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+    let backed = source_and_bounds(source, &bounds)?;
+    let digests = py.detach(move || {
+        let refs: Vec<&[u8]> = bounds.iter().map(|&(s, e)| &backed[s..e]).collect();
+        ol_compress::onemem::sha256_many(&refs)
+    });
+    Ok(digests.iter().map(|d| PyBytes::new(py, d)).collect())
+}
+
+/// ``onemem_encode_many`` over ``source[start:end]`` slices, zero-copy.
+#[pyfunction]
+#[pyo3(signature = (source, bounds, algorithm, precompressed = false, compress = true))]
+fn onemem_encode_slices<'py>(
+    py: Python<'py>,
+    source: &Bound<'py, PyAny>,
+    bounds: Vec<(usize, usize)>,
+    algorithm: &str,
+    precompressed: bool,
+    compress: bool,
+) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+    let mode = ol_compress::onemem::Mode::parse(algorithm).ok_or_else(|| {
+        PyValueError::new_err(format!("algorithm {algorithm:?} is not on the native path"))
+    })?;
+    let backed = source_and_bounds(source, &bounds)?;
+    let encoded = py.detach(move || {
+        let refs: Vec<&[u8]> = bounds.iter().map(|&(s, e)| &backed[s..e]).collect();
+        ol_compress::onemem::encode_many(&refs, mode, precompressed, compress)
+    });
+    encoded
+        .into_iter()
+        .map(|r| {
+            r.map(|bytes| PyBytes::new(py, &bytes))
+                .map_err(|err| compress_err_to_py(&err))
+        })
+        .collect()
 }
 
 fn backed(chunks: &Bound<'_, PyAny>) -> PyResult<Vec<PyBackedBytes>> {

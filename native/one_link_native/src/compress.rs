@@ -5,10 +5,30 @@
 //! between lz4 / zstd / none and `compress` + `decompress` for the
 //! round-trip.
 
+use crate::chunk::contiguous_buffer_snapshot;
 use ol_compress::{Algorithm, CompressError, Dispatcher, EventKind, PreCompressed};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyBytes;
+
+/// Run a codec call with the interpreter detached, so N Python threads
+/// compress or decompress on N cores (it held the GIL before: 8 threads ran at
+/// 1.0x of one). ``bytes`` are borrowed zero-copy (immutable); any other
+/// buffer is snapshotted first, because a second thread could mutate it.
+fn detached<T: Send>(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    work: impl Fn(&[u8]) -> T + Send + Sync,
+) -> PyResult<T> {
+    if let Ok(bytes) = obj.cast::<PyBytes>() {
+        let immutable = PyBackedBytes::from(bytes.to_owned());
+        Ok(py.detach(move || work(&immutable)))
+    } else {
+        let owned = contiguous_buffer_snapshot(py, obj)?;
+        Ok(py.detach(move || work(&owned)))
+    }
+}
 
 /// Python-visible dispatcher. Stateless; one instance for the daemon.
 #[pyclass(
@@ -51,17 +71,18 @@ impl PyCompressor {
 
     /// Compress `bytes` using `algo` ("none" | "lz4" | "`zstd_balanced`"
     /// | "`zstd_aggressive`"). Returns the tag-prefixed compressed bytes.
+    ///
+    /// Releases the GIL while compressing.
     #[pyo3(signature = (algo, payload))]
     fn compress<'py>(
         &self,
         py: Python<'py>,
         algo: &str,
-        payload: &[u8],
+        payload: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let a = parse_algo(algo)?;
-        let out = self
-            .inner
-            .compress(a, payload)
+        let inner = self.inner;
+        let out = detached(py, payload, move |bytes| inner.compress(a, bytes))?
             .map_err(|err| compress_err_to_py(&err))?;
         Ok(PyBytes::new(py, &out))
     }
@@ -69,16 +90,17 @@ impl PyCompressor {
     /// Decompress a tag-prefixed payload. `max_size` is a defensive
     /// upper bound on the decompressed length — protects against
     /// decompression-bomb payloads.
+    ///
+    /// Releases the GIL while decompressing.
     #[pyo3(signature = (payload, max_size))]
     fn decompress<'py>(
         &self,
         py: Python<'py>,
-        payload: &[u8],
+        payload: &Bound<'py, PyAny>,
         max_size: usize,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let out = self
-            .inner
-            .decompress(payload, max_size)
+        let inner = self.inner;
+        let out = detached(py, payload, move |bytes| inner.decompress(bytes, max_size))?
             .map_err(|err| compress_err_to_py(&err))?;
         Ok(PyBytes::new(py, &out))
     }

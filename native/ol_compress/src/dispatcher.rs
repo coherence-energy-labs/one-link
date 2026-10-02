@@ -1,7 +1,70 @@
 //! The `Dispatcher` pick/compress/decompress surface.
 
 use crate::error::CompressError;
+use std::cell::RefCell;
 use std::io::{Cursor, Read};
+
+thread_local! {
+    // One reusable zstd context per thread and level. `encode_all` built and
+    // freed a full context (~1 MiB of match tables) for EVERY call: on 64 KiB
+    // chunks that was ~40% of the codec time (ONE Memory, KITTI LiDAR: 111
+    // MiB/s per 64 KiB call vs 188 MiB/s per 1 MiB call, same bytes, same
+    // level). Contexts carry parameters only -- each call is one independent,
+    // complete frame, so reuse cannot leak history between payloads.
+    static ZSTD_ENCODERS: RefCell<[Option<zstd::bulk::Compressor<'static>>; 2]> =
+        const { RefCell::new([None, None]) };
+    static ZSTD_DECODER: RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+        const { RefCell::new(None) };
+}
+
+fn zstd_encode(bytes: &[u8], slot: usize, level: i32) -> Result<Vec<u8>, CompressError> {
+    ZSTD_ENCODERS.with(|cell| {
+        let mut encoders = cell.borrow_mut();
+        let encoder = match &mut encoders[slot] {
+            Some(encoder) => encoder,
+            empty => empty.insert(zstd::bulk::Compressor::new(level)?),
+        };
+        // Frames now declare their content size, which lets `decompress`
+        // reject an oversized frame before decoding and size its buffer once.
+        Ok(encoder.compress(bytes)?)
+    })
+}
+
+/// One-shot decode for a single frame that declares its size; `None` means
+/// "not this shape" (no declared size, or several concatenated frames) and
+/// the caller takes the streaming path.
+fn zstd_decode_declared(body: &[u8], max: usize) -> Result<Option<Vec<u8>>, CompressError> {
+    let Ok(Some(declared)) = zstd::zstd_safe::get_frame_content_size(body) else {
+        return Ok(None);
+    };
+    let declared = usize::try_from(declared).unwrap_or(usize::MAX);
+    // The bomb check happens on the header, before any decoding or allocation.
+    ensure_output_bound(declared, max)?;
+    if zstd::zstd_safe::find_frame_compressed_size(body) != Ok(body.len()) {
+        return Ok(None);
+    }
+    ZSTD_DECODER.with(|cell| {
+        let mut decoder = cell.borrow_mut();
+        let decoder = match &mut *decoder {
+            Some(decoder) => decoder,
+            empty => {
+                let mut fresh = zstd::bulk::Decompressor::new()?;
+                fresh.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(
+                    ZSTD_MAX_WINDOW_LOG,
+                ))?;
+                empty.insert(fresh)
+            }
+        };
+        let out = decoder.decompress(body, declared)?;
+        if out.len() != declared {
+            return Err(CompressError::Zstd(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "zstd frame produced fewer bytes than it declared",
+            )));
+        }
+        Ok(Some(out))
+    })
+}
 
 /// Absolute per-call plaintext ceiling.
 ///
@@ -162,12 +225,10 @@ impl Dispatcher {
                 out.extend_from_slice(&payload);
             }
             Algorithm::ZstdBalanced => {
-                let payload = zstd::stream::encode_all(bytes, 3)?;
-                out.extend_from_slice(&payload);
+                out.extend_from_slice(&zstd_encode(bytes, 0, 3)?);
             }
             Algorithm::ZstdAggressive => {
-                let payload = zstd::stream::encode_all(bytes, 9)?;
-                out.extend_from_slice(&payload);
+                out.extend_from_slice(&zstd_encode(bytes, 1, 9)?);
             }
         }
         Ok(out)
@@ -213,6 +274,11 @@ impl Dispatcher {
                 Ok(out)
             }
             Algorithm::ZstdBalanced | Algorithm::ZstdAggressive => {
+                if let Some(out) = zstd_decode_declared(body, effective_max)? {
+                    return Ok(out);
+                }
+                // Frames without a declared size (written before contexts were
+                // reused) or concatenated frames: bounded streaming decode.
                 let mut decoder = zstd::stream::read::Decoder::new(Cursor::new(body))?;
                 decoder.window_log_max(ZSTD_MAX_WINDOW_LOG)?;
 
@@ -480,6 +546,126 @@ mod tests {
             Algorithm::ZstdAggressive,
         ] {
             assert_eq!(Algorithm::from_tag(algo.tag()).unwrap(), algo);
+        }
+    }
+
+    // ───── reused zstd contexts ─────────────────────────────────────
+
+    fn lidar_like(n: usize, seed: u32) -> Vec<u8> {
+        // Float-ish structured bytes: compressible, but not trivially.
+        (0..n as u32)
+            .flat_map(|i| {
+                (i.wrapping_mul(2_654_435_761) ^ seed)
+                    .rotate_left(i % 13)
+                    .to_le_bytes()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn frames_written_before_context_reuse_still_decode() {
+        // `encode_all` frames carry no content size: they must take the
+        // streaming path and decode exactly as before (stored data compat).
+        let d = dispatcher();
+        let input = lidar_like(50_000, 7);
+        for (algo, level) in [(Algorithm::ZstdBalanced, 3), (Algorithm::ZstdAggressive, 9)] {
+            let mut legacy = vec![algo.tag()];
+            legacy.extend_from_slice(&zstd::stream::encode_all(&input[..], level).unwrap());
+            assert_eq!(
+                zstd::zstd_safe::get_frame_content_size(&legacy[1..]).unwrap(),
+                None,
+                "the legacy frame must lack a declared size for this test to bite"
+            );
+            assert_eq!(d.decompress(&legacy, input.len()).unwrap(), input);
+        }
+    }
+
+    #[test]
+    fn new_frames_declare_their_size_and_round_trip() {
+        let d = dispatcher();
+        for n in [0, 1, 4096, 65_536, 300_001] {
+            let input = lidar_like(n / 4 + 1, 3);
+            let c = d.compress(Algorithm::ZstdBalanced, &input).unwrap();
+            assert_eq!(
+                zstd::zstd_safe::get_frame_content_size(&c[1..]).unwrap(),
+                Some(input.len() as u64)
+            );
+            assert_eq!(d.decompress(&c, input.len()).unwrap(), input);
+        }
+    }
+
+    #[test]
+    fn declared_size_bomb_is_rejected_from_the_header() {
+        // The one-shot path reports the DECLARED size (the streaming path can
+        // only report max+1): proof the check ran before any decoding.
+        let d = dispatcher();
+        let c = d
+            .compress(Algorithm::ZstdBalanced, &vec![7u8; 100_000])
+            .unwrap();
+        assert!(matches!(
+            d.decompress(&c, 1_000),
+            Err(CompressError::OutputTooLarge {
+                decompressed: 100_000,
+                max: 1_000
+            })
+        ));
+    }
+
+    #[test]
+    fn concatenated_frames_still_decode_through_the_streaming_path() {
+        let d = dispatcher();
+        let a = lidar_like(1_000, 1);
+        let b = lidar_like(2_000, 2);
+        let mut payload = d.compress(Algorithm::ZstdBalanced, &a).unwrap();
+        payload.extend_from_slice(&d.compress(Algorithm::ZstdBalanced, &b).unwrap()[1..]);
+        let mut both = a.clone();
+        both.extend_from_slice(&b);
+        assert_eq!(d.decompress(&payload, both.len()).unwrap(), both);
+        assert!(d.decompress(&payload, both.len() - 1).is_err());
+    }
+
+    #[test]
+    fn reused_context_is_deterministic_and_leaks_nothing_between_calls() {
+        let d = dispatcher();
+        let a = lidar_like(20_000, 11);
+        let b = lidar_like(20_000, 12);
+        let first = d.compress(Algorithm::ZstdBalanced, &a).unwrap();
+        let _ = d.compress(Algorithm::ZstdBalanced, &b).unwrap();
+        let _ = d.compress(Algorithm::ZstdAggressive, &b).unwrap();
+        let again = d.compress(Algorithm::ZstdBalanced, &a).unwrap();
+        assert_eq!(
+            first, again,
+            "a frame must not depend on what the context saw before"
+        );
+        let fresh = zstd::bulk::compress(&a, 3).unwrap();
+        assert_eq!(
+            &first[1..],
+            &fresh[..],
+            "reuse must equal a fresh one-shot context"
+        );
+    }
+
+    #[test]
+    fn contexts_are_per_thread_and_correct_under_concurrency() {
+        let handles: Vec<_> = (0..8u32)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    let d = Dispatcher::new();
+                    for i in 0..50u32 {
+                        let input = lidar_like(4_096 + (i as usize) * 97, t * 1_000 + i);
+                        let algo = if i % 2 == 0 {
+                            Algorithm::ZstdBalanced
+                        } else {
+                            Algorithm::ZstdAggressive
+                        };
+                        let c = d.compress(algo, &input).unwrap();
+                        assert_eq!(d.decompress(&c, input.len()).unwrap(), input);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
         }
     }
 }

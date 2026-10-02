@@ -26,7 +26,7 @@ thiserror     = { workspace = true }
 # rand 0.8 pairs with rand_core 0.6, which ml-kem 0.2 and x25519-dalek
 # 2.0 both use. The workspace's rand = 0.9 is a different RngCore trait
 # version, so use a dedicated 0.8 here for test ergonomics.
-rand          = "0.8"
+rand          = "0.10"
 hex           = { workspace = true }
 proptest      = { workspace = true }
 criterion     = { workspace = true }

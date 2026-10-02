@@ -22,7 +22,7 @@ subtle        = { workspace = true }
 [dev-dependencies]
 proptest          = { workspace = true }
 criterion         = { workspace = true }
-rand              = "0.8"
+rand              = "0.10"
 hex               = { workspace = true }
 ol_proximity_pair = { path = "../ol_proximity_pair" }
 

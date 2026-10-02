@@ -111,7 +111,7 @@ fs2               = "0.4"
 # Temp file utilities for tests.
 tempfile          = "3.27"
 # Quickcheck-style randomized fuzzing of WAL replay.
-rand              = "0.9"
+rand              = "0.10"
 # Bloom filter for chunk-presence front in the LSM index per ADR-0003.
 # bloomfilter is a small, well-audited crate; deterministic seeded hashes.
 bloomfilter       = "3.0"

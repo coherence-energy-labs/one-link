@@ -46,12 +46,16 @@ pub mod cdc;
 pub mod error;
 pub mod format_aware;
 pub mod frame;
+pub mod pcdc;
 
 pub use blake3_wrap::{
     chunk_address_convergent, chunk_address_raw, derive_aead_key, derive_ratchet_key_id,
     derive_stripe_seed, DerivationContext,
 };
-pub use cdc::{scan_to_vec, scan_to_vec_parallel, Boundary, CdcParams, ChunkScanner};
+pub use cdc::{
+    scan_to_vec, scan_to_vec_parallel, scan_to_vec_parallel_with_params, Boundary, CdcParams,
+    ChunkScanner,
+};
 pub use error::ChunkError;
 pub use format_aware::{
     detect_format, scan_format_aware, zip_lfh_offsets, ContainerFormat, FormatAwareChunkSet,

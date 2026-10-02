@@ -14,6 +14,8 @@ crate-type = ["lib"]
 thiserror = { workspace = true }
 lz4_flex  = { version = "0.14", default-features = false, features = ["std"] }
 zstd      = { version = "0.13", default-features = false }
+sha2      = "0.10"
+rayon     = "1.10"
 
 [dev-dependencies]
 proptest  = { workspace = true }

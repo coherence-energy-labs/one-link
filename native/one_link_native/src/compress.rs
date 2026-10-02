@@ -5,10 +5,30 @@
 //! between lz4 / zstd / none and `compress` + `decompress` for the
 //! round-trip.
 
+use crate::chunk::contiguous_buffer_snapshot;
 use ol_compress::{Algorithm, CompressError, Dispatcher, EventKind, PreCompressed};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyBytes;
+
+/// Run a codec call with the interpreter detached, so N Python threads
+/// compress or decompress on N cores (it held the GIL before: 8 threads ran at
+/// 1.0x of one). ``bytes`` are borrowed zero-copy (immutable); any other
+/// buffer is snapshotted first, because a second thread could mutate it.
+fn detached<T: Send>(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    work: impl Fn(&[u8]) -> T + Send + Sync,
+) -> PyResult<T> {
+    if let Ok(bytes) = obj.cast::<PyBytes>() {
+        let immutable = PyBackedBytes::from(bytes.to_owned());
+        Ok(py.detach(move || work(&immutable)))
+    } else {
+        let owned = contiguous_buffer_snapshot(py, obj)?;
+        Ok(py.detach(move || work(&owned)))
+    }
+}
 
 /// Python-visible dispatcher. Stateless; one instance for the daemon.
 #[pyclass(
@@ -51,17 +71,18 @@ impl PyCompressor {
 
     /// Compress `bytes` using `algo` ("none" | "lz4" | "`zstd_balanced`"
     /// | "`zstd_aggressive`"). Returns the tag-prefixed compressed bytes.
+    ///
+    /// Releases the GIL while compressing.
     #[pyo3(signature = (algo, payload))]
     fn compress<'py>(
         &self,
         py: Python<'py>,
         algo: &str,
-        payload: &[u8],
+        payload: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let a = parse_algo(algo)?;
-        let out = self
-            .inner
-            .compress(a, payload)
+        let inner = self.inner;
+        let out = detached(py, payload, move |bytes| inner.compress(a, bytes))?
             .map_err(|err| compress_err_to_py(&err))?;
         Ok(PyBytes::new(py, &out))
     }
@@ -69,16 +90,17 @@ impl PyCompressor {
     /// Decompress a tag-prefixed payload. `max_size` is a defensive
     /// upper bound on the decompressed length — protects against
     /// decompression-bomb payloads.
+    ///
+    /// Releases the GIL while decompressing.
     #[pyo3(signature = (payload, max_size))]
     fn decompress<'py>(
         &self,
         py: Python<'py>,
-        payload: &[u8],
+        payload: &Bound<'py, PyAny>,
         max_size: usize,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let out = self
-            .inner
-            .decompress(payload, max_size)
+        let inner = self.inner;
+        let out = detached(py, payload, move |bytes| inner.decompress(bytes, max_size))?
             .map_err(|err| compress_err_to_py(&err))?;
         Ok(PyBytes::new(py, &out))
     }
@@ -139,5 +161,182 @@ pub(crate) fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
         ol_compress::MAX_COMPRESSED_PAYLOAD_BYTES,
     )?;
     m.add_class::<PyCompressor>()?;
+    m.add_function(wrap_pyfunction!(onemem_sha256_many, m)?)?;
+    m.add_function(wrap_pyfunction!(onemem_encode_many, m)?)?;
+    m.add_function(wrap_pyfunction!(onemem_sha256_slices, m)?)?;
+    m.add_function(wrap_pyfunction!(onemem_encode_slices, m)?)?;
+    m.add_function(wrap_pyfunction!(onemem_decode_many, m)?)?;
+    m.add_function(wrap_pyfunction!(onemem_grid_decode, m)?)?;
     Ok(())
+}
+
+/// Decode one grid payload (either inner coder) to exactly ``plain_size``
+/// bytes; ``ValueError`` if it is malformed or does not decode. ONE Memory's
+/// own chunk decoder calls this for the native-only range-coded grid codec.
+#[pyfunction]
+fn onemem_grid_decode<'py>(
+    py: Python<'py>,
+    payload: &Bound<'py, PyAny>,
+    plain_size: usize,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let out = detached(py, payload, move |bytes| {
+        ol_compress::onemem::grid_decode(bytes, plain_size)
+    })?
+    .map_err(|err| compress_err_to_py(&err))?;
+    Ok(PyBytes::new(py, &out))
+}
+
+/// Decode and SHA-256-verify ONE Memory chunks in parallel, interpreter
+/// detached. Entry ``i`` is the plaintext, or ``None`` when chunk ``i`` is not
+/// this path's to serve (encrypted, zlib, malformed, or failing verification):
+/// the caller's own decoder then handles it and owns the error semantics.
+#[pyfunction]
+fn onemem_decode_many<'py>(
+    py: Python<'py>,
+    encoded: &Bound<'py, PyAny>,
+    digests: Vec<Vec<u8>>,
+) -> PyResult<Vec<Option<Bound<'py, PyBytes>>>> {
+    let owned = backed(encoded)?;
+    if owned.len() != digests.len() {
+        return Err(PyValueError::new_err("one digest per encoded chunk"));
+    }
+    let expected: Vec<[u8; 32]> = digests
+        .into_iter()
+        .map(|d| {
+            <[u8; 32]>::try_from(d.as_slice())
+                .map_err(|_| PyValueError::new_err("digests are 32-byte SHA-256 values"))
+        })
+        .collect::<PyResult<_>>()?;
+    let plain = py.detach(move || {
+        let refs: Vec<&[u8]> = owned.iter().map(|c| &c[..]).collect();
+        ol_compress::onemem::decode_many(&refs, &expected)
+    });
+    Ok(plain
+        .into_iter()
+        .map(|p| p.map(|bytes| PyBytes::new(py, &bytes)))
+        .collect())
+}
+
+/// Borrow ``source`` (must be ``bytes``: immutable, so safe to read detached)
+/// and validate every ``(start, end)`` range against it.
+fn source_and_bounds(
+    source: &Bound<'_, PyAny>,
+    bounds: &[(usize, usize)],
+) -> PyResult<PyBackedBytes> {
+    let bytes = source
+        .cast::<PyBytes>()
+        .map_err(|_| PyValueError::new_err("ONE Memory slice batches borrow a bytes source"))?;
+    let backed = PyBackedBytes::from(bytes.to_owned());
+    if let Some(&(s, e)) = bounds.iter().find(|&&(s, e)| s > e || e > backed.len()) {
+        return Err(PyValueError::new_err(format!(
+            "slice ({s}, {e}) is outside a source of {} bytes",
+            backed.len()
+        )));
+    }
+    Ok(backed)
+}
+
+/// SHA-256 of ``source[start:end]`` for each bound, zero-copy and in parallel.
+///
+/// ONE Memory measured copying each chunk out of its blob at 0.5 ms/MiB --
+/// a third of ingest -- before any hashing began.
+#[pyfunction]
+fn onemem_sha256_slices<'py>(
+    py: Python<'py>,
+    source: &Bound<'py, PyAny>,
+    bounds: Vec<(usize, usize)>,
+) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+    let backed = source_and_bounds(source, &bounds)?;
+    let digests = py.detach(move || {
+        let refs: Vec<&[u8]> = bounds.iter().map(|&(s, e)| &backed[s..e]).collect();
+        ol_compress::onemem::sha256_many(&refs)
+    });
+    Ok(digests.iter().map(|d| PyBytes::new(py, d)).collect())
+}
+
+/// ``onemem_encode_many`` over ``source[start:end]`` slices, zero-copy.
+#[pyfunction]
+#[pyo3(signature = (source, bounds, algorithm, precompressed = false, compress = true))]
+fn onemem_encode_slices<'py>(
+    py: Python<'py>,
+    source: &Bound<'py, PyAny>,
+    bounds: Vec<(usize, usize)>,
+    algorithm: &str,
+    precompressed: bool,
+    compress: bool,
+) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+    let mode = ol_compress::onemem::Mode::parse(algorithm).ok_or_else(|| {
+        PyValueError::new_err(format!("algorithm {algorithm:?} is not on the native path"))
+    })?;
+    let backed = source_and_bounds(source, &bounds)?;
+    let encoded = py.detach(move || {
+        let refs: Vec<&[u8]> = bounds.iter().map(|&(s, e)| &backed[s..e]).collect();
+        ol_compress::onemem::encode_many(&refs, mode, precompressed, compress)
+    });
+    encoded
+        .into_iter()
+        .map(|r| {
+            r.map(|bytes| PyBytes::new(py, &bytes))
+                .map_err(|err| compress_err_to_py(&err))
+        })
+        .collect()
+}
+
+fn backed(chunks: &Bound<'_, PyAny>) -> PyResult<Vec<PyBackedBytes>> {
+    chunks
+        .try_iter()?
+        .map(|item| {
+            let item = item?;
+            item.cast::<PyBytes>()
+                .map(|b| PyBackedBytes::from(b.to_owned()))
+                .map_err(|_| PyValueError::new_err("ONE Memory batches take bytes chunks"))
+        })
+        .collect()
+}
+
+/// SHA-256 of every chunk, in parallel with the interpreter detached.
+///
+/// ONE Memory's ingest identities: one call per window of chunks.
+#[pyfunction]
+fn onemem_sha256_many<'py>(
+    py: Python<'py>,
+    chunks: &Bound<'py, PyAny>,
+) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+    let owned = backed(chunks)?;
+    let digests = py.detach(move || {
+        let refs: Vec<&[u8]> = owned.iter().map(|c| &c[..]).collect();
+        ol_compress::onemem::sha256_many(&refs)
+    });
+    Ok(digests.iter().map(|d| PyBytes::new(py, d)).collect())
+}
+
+/// Encode chunks in ONE Memory's V2 format (unencrypted), in parallel with the
+/// interpreter detached; byte-identical to ``one_storage.codec.encode_chunk``.
+///
+/// ``algorithm``: one of `auto`, `auto_fast`, `none`, `lz4`, `zstd_balanced`,
+/// `zstd_aggressive`.
+#[pyfunction]
+#[pyo3(signature = (chunks, algorithm, precompressed = false, compress = true))]
+fn onemem_encode_many<'py>(
+    py: Python<'py>,
+    chunks: &Bound<'py, PyAny>,
+    algorithm: &str,
+    precompressed: bool,
+    compress: bool,
+) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+    let mode = ol_compress::onemem::Mode::parse(algorithm).ok_or_else(|| {
+        PyValueError::new_err(format!("algorithm {algorithm:?} is not on the native path"))
+    })?;
+    let owned = backed(chunks)?;
+    let encoded = py.detach(move || {
+        let refs: Vec<&[u8]> = owned.iter().map(|c| &c[..]).collect();
+        ol_compress::onemem::encode_many(&refs, mode, precompressed, compress)
+    });
+    encoded
+        .into_iter()
+        .map(|r| {
+            r.map(|bytes| PyBytes::new(py, &bytes))
+                .map_err(|err| compress_err_to_py(&err))
+        })
+        .collect()
 }

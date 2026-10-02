@@ -1332,6 +1332,8 @@ version = "0.22.1"
 dependencies = [
  "lz4_flex",
  "proptest",
+ "rayon",
+ "sha2",
  "thiserror 2.0.19",
  "zstd",
 ]

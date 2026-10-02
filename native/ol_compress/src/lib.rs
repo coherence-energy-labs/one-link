@@ -35,6 +35,7 @@
 
 pub mod dispatcher;
 pub mod error;
+pub mod onemem;
 
 pub use dispatcher::{
     Algorithm, Dispatcher, EventKind, PreCompressed, MAX_COMPRESSED_PAYLOAD_BYTES,

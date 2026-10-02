@@ -161,5 +161,66 @@ pub(crate) fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
         ol_compress::MAX_COMPRESSED_PAYLOAD_BYTES,
     )?;
     m.add_class::<PyCompressor>()?;
+    m.add_function(wrap_pyfunction!(onemem_sha256_many, m)?)?;
+    m.add_function(wrap_pyfunction!(onemem_encode_many, m)?)?;
     Ok(())
+}
+
+fn backed(chunks: &Bound<'_, PyAny>) -> PyResult<Vec<PyBackedBytes>> {
+    chunks
+        .try_iter()?
+        .map(|item| {
+            let item = item?;
+            item.cast::<PyBytes>()
+                .map(|b| PyBackedBytes::from(b.to_owned()))
+                .map_err(|_| PyValueError::new_err("ONE Memory batches take bytes chunks"))
+        })
+        .collect()
+}
+
+/// SHA-256 of every chunk, in parallel with the interpreter detached.
+///
+/// ONE Memory's ingest identities: one call per window of chunks.
+#[pyfunction]
+fn onemem_sha256_many<'py>(
+    py: Python<'py>,
+    chunks: &Bound<'py, PyAny>,
+) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+    let owned = backed(chunks)?;
+    let digests = py.detach(move || {
+        let refs: Vec<&[u8]> = owned.iter().map(|c| &c[..]).collect();
+        ol_compress::onemem::sha256_many(&refs)
+    });
+    Ok(digests.iter().map(|d| PyBytes::new(py, d)).collect())
+}
+
+/// Encode chunks in ONE Memory's V2 format (unencrypted), in parallel with the
+/// interpreter detached; byte-identical to ``one_storage.codec.encode_chunk``.
+///
+/// ``algorithm``: one of `auto`, `auto_fast`, `none`, `lz4`, `zstd_balanced`,
+/// `zstd_aggressive`.
+#[pyfunction]
+#[pyo3(signature = (chunks, algorithm, precompressed = false, compress = true))]
+fn onemem_encode_many<'py>(
+    py: Python<'py>,
+    chunks: &Bound<'py, PyAny>,
+    algorithm: &str,
+    precompressed: bool,
+    compress: bool,
+) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+    let mode = ol_compress::onemem::Mode::parse(algorithm).ok_or_else(|| {
+        PyValueError::new_err(format!("algorithm {algorithm:?} is not on the native path"))
+    })?;
+    let owned = backed(chunks)?;
+    let encoded = py.detach(move || {
+        let refs: Vec<&[u8]> = owned.iter().map(|c| &c[..]).collect();
+        ol_compress::onemem::encode_many(&refs, mode, precompressed, compress)
+    });
+    encoded
+        .into_iter()
+        .map(|r| {
+            r.map(|bytes| PyBytes::new(py, &bytes))
+                .map_err(|err| compress_err_to_py(&err))
+        })
+        .collect()
 }

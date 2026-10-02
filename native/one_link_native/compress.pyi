@@ -1,5 +1,6 @@
 """Types for :mod:`one_link_native.compress`."""
 
+from collections.abc import Iterable
 from typing import final
 from typing_extensions import Buffer
 
@@ -14,3 +15,11 @@ class Compressor:
     def compress(self, algo: str, payload: Buffer) -> bytes: ...
     def decompress(self, payload: Buffer, max_size: int) -> bytes: ...
     def __repr__(self) -> str: ...
+
+def onemem_sha256_many(chunks: Iterable[bytes]) -> list[bytes]: ...
+def onemem_encode_many(
+    chunks: Iterable[bytes],
+    algorithm: str,
+    precompressed: bool = ...,
+    compress: bool = ...,
+) -> list[bytes]: ...

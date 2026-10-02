@@ -52,6 +52,9 @@ pub enum ContainerFormat {
     /// are the highest-priority cuts so re-encoded video preserves
     /// GOP-aligned chunks.
     H264AnnexB,
+    /// MCAP robotics log container. Top-level record starts are forced
+    /// cuts, preserving chunk/index boundaries across local revisions.
+    Mcap,
 }
 
 /// ZIP local-file-header signature (`PK\x03\x04`).
@@ -59,6 +62,9 @@ pub const ZIP_LFH_MAGIC: [u8; 4] = [0x50, 0x4B, 0x03, 0x04];
 
 /// ZIP local-file-header fixed-prefix length (signature + 26 fixed bytes).
 pub const ZIP_LFH_FIXED_LEN: usize = 30;
+
+/// MCAP v0 leading/trailing magic.
+pub const MCAP_MAGIC: [u8; 8] = [0x89, b'M', b'C', b'A', b'P', b'0', b'\r', b'\n'];
 
 /// Detect a container format from leading bytes + an optional file
 /// extension hint.
@@ -70,6 +76,9 @@ pub const ZIP_LFH_FIXED_LEN: usize = 30;
 pub fn detect_format(leading: &[u8], path_extension: Option<&str>) -> Option<ContainerFormat> {
     if leading.starts_with(&ZIP_LFH_MAGIC) {
         return Some(ContainerFormat::Zip);
+    }
+    if leading.starts_with(&MCAP_MAGIC) {
+        return Some(ContainerFormat::Mcap);
     }
     // ISO BMFF top-level boxes start with a 4-byte big-endian size
     // followed by a 4-byte ASCII type. The first box in a valid file
@@ -262,6 +271,56 @@ pub fn wav_data_offset(buffer: &[u8]) -> Option<usize> {
     None
 }
 
+/// Walk an MCAP v0 buffer and return structurally validated top-level
+/// record start offsets.
+///
+/// MCAP records are framed as `[opcode:u8][content_len:u64 LE][content]`
+/// after the 8-byte magic. A crashed/in-progress recording may not yet
+/// have trailing magic; in that case every complete prefix record is
+/// still usable as a conservative structural boundary.
+#[must_use]
+pub fn mcap_record_offsets(buffer: &[u8]) -> Vec<usize> {
+    const RECORD_HEADER: usize = 9;
+    if buffer.len() < MCAP_MAGIC.len() + RECORD_HEADER
+        || !buffer.starts_with(&MCAP_MAGIC)
+        || buffer[MCAP_MAGIC.len()] != 0x01
+    {
+        return Vec::new();
+    }
+
+    let data_end = if buffer.ends_with(&MCAP_MAGIC) && buffer.len() >= 2 * MCAP_MAGIC.len() {
+        buffer.len() - MCAP_MAGIC.len()
+    } else {
+        buffer.len()
+    };
+    let mut offsets = Vec::new();
+    let mut pos = MCAP_MAGIC.len();
+
+    while pos + RECORD_HEADER <= data_end {
+        let opcode = buffer[pos];
+        if opcode == 0 {
+            break;
+        }
+        let mut raw_len = [0u8; 8];
+        raw_len.copy_from_slice(&buffer[pos + 1..pos + RECORD_HEADER]);
+        let Ok(content_len) = usize::try_from(u64::from_le_bytes(raw_len)) else {
+            break;
+        };
+        let Some(next) = pos
+            .checked_add(RECORD_HEADER)
+            .and_then(|value| value.checked_add(content_len))
+        else {
+            break;
+        };
+        if next > data_end {
+            break;
+        }
+        offsets.push(pos);
+        pos = next;
+    }
+    offsets
+}
+
 /// Walk `buffer` and collect ZIP local-file-header offsets that pass the
 /// sanity check. Returns a sorted, deduplicated, monotonic list of
 /// forced-cut offsets.
@@ -367,6 +426,12 @@ pub fn scan_format_aware(
             // still hit the same IDR boundaries downstream, so dedup
             // recovers everything past the edit.
             h264_keyframe_offsets(buffer)
+        }
+        Some(ContainerFormat::Mcap) => {
+            // Keep MCAP record framing visible to the content-addressed
+            // layer. Large Chunk/Index records then remain independently
+            // reusable and seekable across local log revisions.
+            mcap_record_offsets(buffer)
         }
         None => Vec::new(),
     };
@@ -514,6 +579,29 @@ mod tests {
         buf
     }
 
+    fn push_mcap_record(buf: &mut Vec<u8>, opcode: u8, size: usize, fill: u8) {
+        buf.push(opcode);
+        buf.extend_from_slice(
+            &u64::try_from(size)
+                .expect("test MCAP record size fits u64")
+                .to_le_bytes(),
+        );
+        buf.extend(std::iter::repeat_n(fill, size));
+    }
+
+    fn make_dummy_mcap(record_size: usize, records: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MCAP_MAGIC);
+        push_mcap_record(&mut buf, 0x01, 16, 0x11); // Header
+        for i in 0..records {
+            let fill = u8::try_from(i).unwrap_or(0).wrapping_add(0x20);
+            push_mcap_record(&mut buf, 0x06, record_size, fill); // Chunk
+        }
+        push_mcap_record(&mut buf, 0x02, 20, 0x22); // Footer
+        buf.extend_from_slice(&MCAP_MAGIC);
+        buf
+    }
+
     #[test]
     fn detect_zip_from_magic() {
         let buf = make_dummy_zip(1, 100);
@@ -544,6 +632,45 @@ mod tests {
         buf[8..12].copy_from_slice(b"WAVE");
         assert_eq!(detect_format(&buf, None), Some(ContainerFormat::Wav));
         assert_eq!(detect_format(&buf, Some("wav")), Some(ContainerFormat::Wav));
+    }
+
+    #[test]
+    fn detect_mcap_from_magic() {
+        let buf = make_dummy_mcap(16 * 1024, 2);
+        assert_eq!(detect_format(&buf, None), Some(ContainerFormat::Mcap));
+        assert_eq!(
+            detect_format(&buf, Some("mcap")),
+            Some(ContainerFormat::Mcap)
+        );
+    }
+
+    #[test]
+    fn mcap_record_offsets_follow_record_framing() {
+        let buf = make_dummy_mcap(16 * 1024, 3);
+        let offsets = mcap_record_offsets(&buf);
+        assert_eq!(offsets.len(), 5); // header + 3 chunks + footer
+        assert_eq!(offsets[0], MCAP_MAGIC.len());
+        for pair in offsets.windows(2) {
+            assert!(pair[1] > pair[0]);
+        }
+        assert_eq!(&buf[offsets[1]..offsets[1] + 1], &[0x06]);
+    }
+
+    #[test]
+    fn mcap_format_aware_scan_forces_large_record_starts() {
+        let buf = make_dummy_mcap(32 * 1024, 4);
+        let records = mcap_record_offsets(&buf);
+        let scanned =
+            scan_format_aware(&buf, Some(ContainerFormat::Mcap), CdcParams::default()).unwrap();
+        let accepted_record_starts: Vec<usize> = records
+            .into_iter()
+            .filter(|offset| *offset >= CdcParams::default().min_size as usize)
+            .collect();
+        assert!(scanned.format_forced_count() >= 3);
+        assert!(accepted_record_starts
+            .iter()
+            .skip(1)
+            .any(|offset| scanned.boundaries.iter().any(|b| b.start == *offset)));
     }
 
     #[test]

@@ -196,25 +196,35 @@ const PARALLEL_HASH_MIN_BYTES: usize = 1024 * 1024;
 /// path.
 #[must_use]
 pub fn scan_to_vec_parallel(buffer: &[u8]) -> Vec<Boundary> {
+    scan_to_vec_parallel_with_params(buffer, CdcParams::default())
+        .expect("default CdcParams are always valid")
+}
+
+/// Parameterized parallel scanner used by workload-aware callers.
+///
+/// The caller chooses the `FastCDC` profile, while boundary determinism and
+/// parallel BLAKE3 addressing remain identical to the default scanner.
+pub fn scan_to_vec_parallel_with_params(
+    buffer: &[u8],
+    params: CdcParams,
+) -> Result<Vec<Boundary>, ChunkError> {
+    params.validate()?;
     if buffer.len() < PARALLEL_HASH_MIN_BYTES {
-        return scan_to_vec(buffer);
+        return Ok(ChunkScanner::with_params(buffer, params)?.collect());
     }
-    // Pass 1: discover ranges sequentially.
-    let params = CdcParams::default();
     let ranges: Vec<(usize, usize)> =
         fastcdc::v2020::FastCDC::new(buffer, params.min_size, params.avg_size, params.max_size)
             .map(|c| (c.offset, c.offset + c.length))
             .collect();
 
-    // Pass 2: hash each range in parallel.
-    ranges
+    Ok(ranges
         .par_iter()
         .map(|&(start, end)| Boundary {
             start,
             end,
             raw_address: blake3_wrap::chunk_address_raw(&buffer[start..end]),
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]

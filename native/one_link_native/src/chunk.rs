@@ -9,14 +9,18 @@
 //! - Errors map to `one_link_native.OlChunkError` (subclass of `OlError`).
 
 use ol_chunk::{
-    blake3_wrap, frame_count_for_plaintext, scan_to_vec_parallel, AEAD_FRAME_PLAINTEXT_LEN,
-    AEAD_TAG_LEN,
+    blake3_wrap, frame_count_for_plaintext, scan_format_aware, scan_to_vec_parallel,
+    scan_to_vec_parallel_with_params, CdcParams, ChunkScanner, ContainerFormat,
+    AEAD_FRAME_PLAINTEXT_LEN, AEAD_TAG_LEN,
 };
 use pyo3::buffer::PyBuffer;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyOSError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyBytes;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 /// Python-visible boundary record. Wraps `(start, end, blake3_hash)`.
 #[pyclass(
@@ -64,6 +68,65 @@ impl PyBoundary {
             self.end - self.start,
             self.raw_address_hex(),
         )
+    }
+}
+
+/// Python-visible format-aware boundary record.
+#[pyclass(
+    from_py_object,
+    name = "FormatBoundary",
+    frozen,
+    module = "one_link_native.chunk"
+)]
+#[derive(Debug, Clone)]
+pub struct PyFormatBoundary {
+    #[pyo3(get)]
+    start: usize,
+    #[pyo3(get)]
+    end: usize,
+    #[pyo3(get)]
+    format_forced: bool,
+    raw_address: [u8; 32],
+}
+
+#[pymethods]
+impl PyFormatBoundary {
+    #[getter]
+    fn length(&self) -> usize {
+        self.end - self.start
+    }
+
+    #[getter]
+    fn raw_address<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.raw_address)
+    }
+
+    fn raw_address_hex(&self) -> String {
+        hex_lower(&self.raw_address)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "FormatBoundary(start={}, end={}, forced={}, raw={})",
+            self.start,
+            self.end,
+            self.format_forced,
+            self.raw_address_hex(),
+        )
+    }
+}
+
+fn parse_container_format(value: &str) -> PyResult<Option<ContainerFormat>> {
+    match value.to_ascii_lowercase().as_str() {
+        "" | "auto" | "none" => Ok(None),
+        "zip" => Ok(Some(ContainerFormat::Zip)),
+        "mp4" | "mov" | "m4v" => Ok(Some(ContainerFormat::Mp4)),
+        "wav" => Ok(Some(ContainerFormat::Wav)),
+        "h264" | "h264annexb" | "annexb" => Ok(Some(ContainerFormat::H264AnnexB)),
+        "mcap" => Ok(Some(ContainerFormat::Mcap)),
+        other => Err(PyValueError::new_err(format!(
+            "unsupported format-aware chunking format: {other}"
+        ))),
     }
 }
 
@@ -128,6 +191,231 @@ pub fn cdc_iter(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<PyBoundaryIt
     })
 }
 
+/// Scan a contiguous byte buffer with caller-selected `FastCDC` sizing.
+///
+/// Sizes are validated by `ol_chunk` (positive min < avg < max, max <= 16 MiB).
+/// This exists so ONE Memory can benchmark workload-specific profiles rather
+/// than assuming one chunk size is optimal for maps, point clouds and media.
+#[pyfunction]
+pub fn cdc_iter_params(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    min_size: u32,
+    avg_size: u32,
+    max_size: u32,
+) -> PyResult<PyBoundaryIterator> {
+    let params = CdcParams {
+        min_size,
+        avg_size,
+        max_size,
+    };
+    params
+        .validate()
+        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+    let scan = move |bytes: &[u8]| -> PyResult<Vec<PyBoundary>> {
+        Ok(scan_to_vec_parallel_with_params(bytes, params)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?
+            .into_iter()
+            .map(|b| PyBoundary {
+                start: b.start,
+                end: b.end,
+                raw_address: b.raw_address,
+            })
+            .collect())
+    };
+    let boundaries = if let Ok(bytes) = obj.cast::<PyBytes>() {
+        let immutable = PyBackedBytes::from(bytes.to_owned());
+        py.detach(move || scan(&immutable))?
+    } else {
+        let owned = contiguous_buffer_snapshot(py, obj)?;
+        py.detach(move || scan(&owned))?
+    };
+    Ok(PyBoundaryIterator {
+        boundaries: boundaries.into_iter(),
+    })
+}
+
+fn scan_file_boundaries_with_params(
+    path: &Path,
+    params: CdcParams,
+) -> std::io::Result<Vec<PyBoundary>> {
+    params
+        .validate()
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string()))?;
+    let mut file = File::open(path)?;
+    let max_size = params.max_size as usize;
+    let mut buffer: Vec<u8> = Vec::with_capacity(max_size * 2);
+    let mut start = 0usize;
+    let mut base_offset = 0usize;
+    let mut eof = false;
+    let mut boundaries = Vec::new();
+
+    loop {
+        // Compact only occasionally. This keeps peak memory bounded to about
+        // 2 * max_size while avoiding a memmove for every average-size chunk.
+        if start >= max_size {
+            let remaining = buffer.len() - start;
+            buffer.copy_within(start.., 0);
+            buffer.truncate(remaining);
+            start = 0;
+        }
+
+        while buffer.len() - start < max_size && !eof {
+            let available = buffer.len() - start;
+            let wanted = max_size - available;
+            let old_len = buffer.len();
+            buffer.resize(old_len + wanted, 0);
+            let read = file.read(&mut buffer[old_len..])?;
+            buffer.truncate(old_len + read);
+            if read == 0 {
+                eof = true;
+            }
+        }
+
+        let window = &buffer[start..];
+        if window.is_empty() {
+            break;
+        }
+        let Some(boundary) = ChunkScanner::with_params(window, params)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string()))?
+            .next()
+        else {
+            break;
+        };
+        let length = boundary.end;
+        let end = base_offset
+            .checked_add(length)
+            .ok_or_else(|| std::io::Error::other("file offset overflow"))?;
+        boundaries.push(PyBoundary {
+            start: base_offset,
+            end,
+            raw_address: boundary.raw_address,
+        });
+        start += length;
+        base_offset = end;
+    }
+
+    Ok(boundaries)
+}
+
+fn scan_file_boundaries(path: &Path) -> std::io::Result<Vec<PyBoundary>> {
+    scan_file_boundaries_with_params(path, CdcParams::default())
+}
+
+/// Scan a file with bounded memory instead of materializing its complete bytes.
+///
+/// The scanner retains at most roughly two `FastCDC` maximum chunks (~512 KiB)
+/// plus the boundary vector. Output is byte-for-byte equivalent to `cdc_iter` on
+/// the same immutable file, while avoiding file-size-proportional RAM use.
+#[pyfunction]
+pub fn cdc_file(py: Python<'_>, path: &str) -> PyResult<Vec<PyBoundary>> {
+    let owned = PathBuf::from(path);
+    py.detach(move || scan_file_boundaries(&owned))
+        .map_err(|err| PyOSError::new_err(format!("failed to scan file {path}: {err}")))
+}
+
+/// Parameterized bounded-memory file scanner for workload-aware ONE Memory profiles.
+#[pyfunction]
+pub fn cdc_file_params(
+    py: Python<'_>,
+    path: &str,
+    min_size: u32,
+    avg_size: u32,
+    max_size: u32,
+) -> PyResult<Vec<PyBoundary>> {
+    let params = CdcParams {
+        min_size,
+        avg_size,
+        max_size,
+    };
+    params
+        .validate()
+        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+    let owned = PathBuf::from(path);
+    py.detach(move || scan_file_boundaries_with_params(&owned, params))
+        .map_err(|err| PyOSError::new_err(format!("failed to scan file {path}: {err}")))
+}
+
+/// Run the native format-aware chunker with default ADR-0001 CDC parameters.
+///
+/// `format_name` accepts: zip, mp4/mov/m4v, wav, h264/annexb, or none.
+/// The returned records include whether their starting boundary was forced
+/// by container structure rather than natural CDC.
+#[pyfunction]
+pub fn format_aware_boundaries(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    format_name: &str,
+) -> PyResult<Vec<PyFormatBoundary>> {
+    let format = parse_container_format(format_name)?;
+    let build = |bytes: &[u8]| -> PyResult<Vec<PyFormatBoundary>> {
+        let set = scan_format_aware(bytes, format, CdcParams::default())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        Ok(set
+            .boundaries
+            .into_iter()
+            .zip(set.format_aware)
+            .map(|(b, forced)| PyFormatBoundary {
+                start: b.start,
+                end: b.end,
+                format_forced: forced,
+                raw_address: b.raw_address,
+            })
+            .collect())
+    };
+
+    if let Ok(bytes) = obj.cast::<PyBytes>() {
+        let immutable = PyBackedBytes::from(bytes.to_owned());
+        py.detach(move || build(&immutable))
+    } else {
+        let owned = contiguous_buffer_snapshot(py, obj)?;
+        py.detach(move || build(&owned))
+    }
+}
+
+/// Format-aware scan with caller-selected `FastCDC` sizing.
+#[pyfunction]
+pub fn format_aware_boundaries_params(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    format_name: &str,
+    min_size: u32,
+    avg_size: u32,
+    max_size: u32,
+) -> PyResult<Vec<PyFormatBoundary>> {
+    let format = parse_container_format(format_name)?;
+    let params = CdcParams {
+        min_size,
+        avg_size,
+        max_size,
+    };
+    params
+        .validate()
+        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+    let build = move |bytes: &[u8]| -> PyResult<Vec<PyFormatBoundary>> {
+        let set = scan_format_aware(bytes, format, params)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        Ok(set
+            .boundaries
+            .into_iter()
+            .zip(set.format_aware)
+            .map(|(b, forced)| PyFormatBoundary {
+                start: b.start,
+                end: b.end,
+                format_forced: forced,
+                raw_address: b.raw_address,
+            })
+            .collect())
+    };
+    if let Ok(bytes) = obj.cast::<PyBytes>() {
+        let immutable = PyBackedBytes::from(bytes.to_owned());
+        py.detach(move || build(&immutable))
+    } else {
+        let owned = contiguous_buffer_snapshot(py, obj)?;
+        py.detach(move || build(&owned))
+    }
+}
+
 /// Compute the raw BLAKE3-256 chunk address for a buffer.
 ///
 /// Equivalent to `blake3.hash(buf).digest()` but exposed via the engine's
@@ -166,7 +454,10 @@ pub fn chunk_address_convergent<'py>(
     Ok(PyBytes::new(py, &addr))
 }
 
-fn contiguous_buffer_snapshot(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+pub(crate) fn contiguous_buffer_snapshot(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+) -> PyResult<Vec<u8>> {
     let buf = PyBuffer::<u8>::get(obj)?;
     if !buf.is_c_contiguous() {
         return Err(PyValueError::new_err(
@@ -286,10 +577,16 @@ pub(crate) fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
 
     // Types.
     m.add_class::<PyBoundary>()?;
+    m.add_class::<PyFormatBoundary>()?;
     m.add_class::<PyBoundaryIterator>()?;
 
     // Functions.
     m.add_function(wrap_pyfunction!(cdc_iter, m)?)?;
+    m.add_function(wrap_pyfunction!(cdc_iter_params, m)?)?;
+    m.add_function(wrap_pyfunction!(cdc_file, m)?)?;
+    m.add_function(wrap_pyfunction!(cdc_file_params, m)?)?;
+    m.add_function(wrap_pyfunction!(format_aware_boundaries, m)?)?;
+    m.add_function(wrap_pyfunction!(format_aware_boundaries_params, m)?)?;
     m.add_function(wrap_pyfunction!(chunk_address_raw, m)?)?;
     m.add_function(wrap_pyfunction!(chunk_address_convergent, m)?)?;
     m.add_function(wrap_pyfunction!(derive_aead_key, m)?)?;

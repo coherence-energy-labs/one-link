@@ -25,6 +25,13 @@ use std::{array, hint::black_box, time::Instant};
 
 use ol_threshold_recovery::gf256::gf_mul;
 
+// The workspace's wall-clock gate convention (test_support/timing_gate.rs):
+// enforced under OL_TIMING_GATES=1 (the strict CI step, a quiet machine);
+// a warning in the per-PR matrix, where runner noise alone pushed this gate
+// to 5.17% on macOS with no code change (One Link PR #72).
+#[path = "../../test_support/timing_gate.rs"]
+mod timing_gate;
+
 const BUCKETS: usize = 16;
 const MEASURED_ROUNDS: usize = 64;
 const WARMUP_ROUNDS: usize = 4;
@@ -185,7 +192,7 @@ fn gf_mul_constant_time_across_operand_buckets() {
     // This peak-to-peak bound is stricter than the old five-percent relative
     // standard-deviation bound: no pair of representative bucket costs may
     // differ by five percent, while isolated wall-clock outliers are ignored.
-    assert!(
+    timing_gate!(
         spread < MAX_PAIRWISE_MEDIAN_SPREAD,
         "gf_mul representative operand-bucket costs differ by {:.2}% (limit {:.2}%): fastest {:?}, slowest {:?}",
         spread * 100.0,

@@ -212,10 +212,9 @@ pub fn scan_to_vec_parallel_with_params(
     if buffer.len() < PARALLEL_HASH_MIN_BYTES {
         return Ok(ChunkScanner::with_params(buffer, params)?.collect());
     }
-    let ranges: Vec<(usize, usize)> =
-        fastcdc::v2020::FastCDC::new(buffer, params.min_size, params.avg_size, params.max_size)
-            .map(|c| (c.offset, c.offset + c.length))
-            .collect();
+    // Boundaries from the parallel two-phase scanner (crate::pcdc): identical
+    // to fastcdc::v2020::FastCDC, proven by pcdc's differential tests.
+    let ranges = crate::pcdc::chunk_ranges(buffer, params);
 
     Ok(ranges
         .par_iter()

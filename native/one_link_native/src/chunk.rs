@@ -10,8 +10,8 @@
 
 use ol_chunk::{
     blake3_wrap, frame_count_for_plaintext, scan_format_aware, scan_to_vec_parallel,
-    scan_to_vec_parallel_with_params, CdcParams, ChunkScanner, ContainerFormat,
-    AEAD_FRAME_PLAINTEXT_LEN, AEAD_TAG_LEN,
+    scan_to_vec_parallel_with_params, CdcParams, ContainerFormat, AEAD_FRAME_PLAINTEXT_LEN,
+    AEAD_TAG_LEN,
 };
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyOSError, PyValueError};
@@ -21,6 +21,9 @@ use pyo3::types::PyBytes;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+
+/// Bytes the streaming file scanner holds at once (bounded; never file-sized).
+const FILE_SCAN_WINDOW: usize = 32 << 20;
 
 /// Python-visible boundary record. Wraps `(start, end, blake3_hash)`.
 #[pyclass(
@@ -244,55 +247,59 @@ fn scan_file_boundaries_with_params(
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string()))?;
     let mut file = File::open(path)?;
     let max_size = params.max_size as usize;
-    let mut buffer: Vec<u8> = Vec::with_capacity(max_size * 2);
-    let mut start = 0usize;
+    // A bounded window (never file-sized): each is scanned by the parallel
+    // two-phase FastCDC (ol_chunk::pcdc) and addressed in parallel. A chunk is
+    // accepted only once its cut has seen max_size bytes (or EOF), exactly the
+    // bytes the serial scanner would have seen, so boundaries are unchanged.
+    // Sized to the file when it is small: a fixed 32 MiB window was allocated
+    // and zero-filled for every ~2 MB sensor file, halving ingest.
+    let file_len = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+    let mut window_cap = FILE_SCAN_WINDOW.max(4 * max_size).min(file_len.max(1));
+    let mut buffer: Vec<u8> = Vec::with_capacity(window_cap);
     let mut base_offset = 0usize;
     let mut eof = false;
     let mut boundaries = Vec::new();
 
     loop {
-        // Compact only occasionally. This keeps peak memory bounded to about
-        // 2 * max_size while avoiding a memmove for every average-size chunk.
-        if start >= max_size {
-            let remaining = buffer.len() - start;
-            buffer.copy_within(start.., 0);
-            buffer.truncate(remaining);
-            start = 0;
+        while buffer.len() < window_cap && !eof {
+            // Appends into spare capacity: no zero-fill before the read.
+            let wanted = (window_cap - buffer.len()) as u64;
+            let read = (&mut file).take(wanted).read_to_end(&mut buffer)?;
+            eof = read == 0;
         }
-
-        while buffer.len() - start < max_size && !eof {
-            let available = buffer.len() - start;
-            let wanted = max_size - available;
-            let old_len = buffer.len();
-            buffer.resize(old_len + wanted, 0);
-            let read = file.read(&mut buffer[old_len..])?;
-            buffer.truncate(old_len + read);
-            if read == 0 {
-                eof = true;
+        if buffer.is_empty() {
+            break;
+        }
+        let ranges: Vec<(usize, usize)> = ol_chunk::pcdc::chunk_ranges(&buffer, params)
+            .into_iter()
+            .take_while(|&(s, _)| eof || s + max_size <= buffer.len())
+            .collect();
+        let consumed = ranges.last().map_or(0, |&(_, e)| e);
+        if consumed == 0 {
+            if eof {
+                return Err(std::io::Error::other("file scan made no progress"));
             }
+            // A window that fits the file exactly fills before EOF is seen, so
+            // its last chunk cannot be final yet: grow the window and read on.
+            window_cap = window_cap.saturating_mul(2).max(4 * max_size);
+            continue;
         }
-
-        let window = &buffer[start..];
-        if window.is_empty() {
+        for b in ol_chunk::pcdc::address_ranges(&buffer, &ranges) {
+            let start = base_offset
+                .checked_add(b.start)
+                .ok_or_else(|| std::io::Error::other("file offset overflow"))?;
+            boundaries.push(PyBoundary {
+                start,
+                end: start + (b.end - b.start),
+                raw_address: b.raw_address,
+            });
+        }
+        base_offset += consumed;
+        buffer.copy_within(consumed.., 0);
+        buffer.truncate(buffer.len() - consumed);
+        if eof && buffer.is_empty() {
             break;
         }
-        let Some(boundary) = ChunkScanner::with_params(window, params)
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string()))?
-            .next()
-        else {
-            break;
-        };
-        let length = boundary.end;
-        let end = base_offset
-            .checked_add(length)
-            .ok_or_else(|| std::io::Error::other("file offset overflow"))?;
-        boundaries.push(PyBoundary {
-            start: base_offset,
-            end,
-            raw_address: boundary.raw_address,
-        });
-        start += length;
-        base_offset = end;
     }
 
     Ok(boundaries)

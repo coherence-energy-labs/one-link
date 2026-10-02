@@ -143,6 +143,52 @@ pub fn encode_chunk(
     Ok(frame(CODEC_NONE, n, plaintext))
 }
 
+/// Decode one V2 chunk (unencrypted, One Link codecs) and verify its SHA-256.
+///
+/// `None` means "not this path": an encrypted chunk, a zlib codec, a
+/// malformed header, a failed decode or a digest mismatch. The caller then
+/// runs ONE Memory's Python decoder, which owns the error semantics (it
+/// raises, and marks the chunk CORRUPT only for bytes that fail verification).
+#[must_use]
+pub fn decode_chunk(encoded: &[u8], expected: &[u8; 32]) -> Option<Vec<u8>> {
+    if encoded.len() < 16 || &encoded[..5] != MAGIC_V2 {
+        return None;
+    }
+    let flags = encoded[5];
+    let codec = encoded[6];
+    let plain_size = usize::try_from(u64::from_be_bytes(encoded[7..15].try_into().ok()?)).ok()?;
+    if flags & !FLAG_COMPRESSED != 0 || encoded[15] != 0 {
+        return None; // encrypted (or unknown flags): the Python path
+    }
+    if (flags & FLAG_COMPRESSED != 0) != (codec != CODEC_NONE) {
+        return None;
+    }
+    let payload = &encoded[16..];
+    let d = Dispatcher::new();
+    let plain = match codec {
+        CODEC_NONE => payload.to_vec(),
+        CODEC_LZ4 | CODEC_ZSTD_BALANCED | CODEC_ZSTD_AGGRESSIVE => {
+            d.decompress(payload, plain_size).ok()?
+        }
+        CODEC_GRID_ZSTD | CODEC_GRID_LZ4 => grid_decode(payload, plain_size).ok()?,
+        _ => return None, // zlib family: the Python path
+    };
+    if plain.len() != plain_size || sha256(&plain) != *expected {
+        return None;
+    }
+    Some(plain)
+}
+
+/// [`decode_chunk`] over many chunks, in parallel.
+#[must_use]
+pub fn decode_many(chunks: &[&[u8]], expected: &[[u8; 32]]) -> Vec<Option<Vec<u8>>> {
+    chunks
+        .par_iter()
+        .zip(expected.par_iter())
+        .map(|(c, e)| decode_chunk(c, e))
+        .collect()
+}
+
 fn frame(codec: u8, plain_size: usize, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(16 + payload.len());
     out.extend_from_slice(MAGIC_V2);
@@ -650,6 +696,48 @@ mod tests {
             }
         }
         assert!(grid_decode(&payload, data.len() + 4).is_err());
+    }
+
+    #[test]
+    fn decode_inverts_every_encoding_and_refuses_what_it_does_not_own() {
+        let mut x: u64 = 0x1234_5678_9ABC_DEF1;
+        let random: Vec<u8> = (0..20_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x.to_le_bytes()[0]
+            })
+            .collect();
+        let inputs = [lidar(3000, 2), b"telemetry,ok,12.5\n".repeat(900), random];
+        for data in &inputs {
+            let digest = sha256(data);
+            for mode in [
+                Mode::Auto,
+                Mode::AutoFast,
+                Mode::None,
+                Mode::Lz4,
+                Mode::ZstdBalanced,
+            ] {
+                let enc = encode_chunk(data, mode, false, true).unwrap();
+                assert_eq!(decode_chunk(&enc, &digest).as_deref(), Some(&data[..]));
+                // a wrong expected digest is never served
+                assert_eq!(decode_chunk(&enc, &[0u8; 32]), None);
+                // a flipped payload byte is never served
+                let mut bad = enc.clone();
+                let last = bad.len() - 1;
+                bad[last] ^= 0x40;
+                assert_eq!(decode_chunk(&bad, &digest), None);
+            }
+            // encrypted and zlib chunks belong to the Python path
+            let mut enc = encode_chunk(data, Mode::None, false, true).unwrap();
+            enc[5] |= 0x02;
+            assert_eq!(decode_chunk(&enc, &digest), None);
+            let mut zl = encode_chunk(data, Mode::None, false, true).unwrap();
+            zl[5] |= FLAG_COMPRESSED;
+            zl[6] = 1;
+            assert_eq!(decode_chunk(&zl, &digest), None);
+        }
     }
 
     #[test]

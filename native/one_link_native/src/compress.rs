@@ -165,7 +165,39 @@ pub(crate) fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     m.add_function(wrap_pyfunction!(onemem_encode_many, m)?)?;
     m.add_function(wrap_pyfunction!(onemem_sha256_slices, m)?)?;
     m.add_function(wrap_pyfunction!(onemem_encode_slices, m)?)?;
+    m.add_function(wrap_pyfunction!(onemem_decode_many, m)?)?;
     Ok(())
+}
+
+/// Decode and SHA-256-verify ONE Memory chunks in parallel, interpreter
+/// detached. Entry ``i`` is the plaintext, or ``None`` when chunk ``i`` is not
+/// this path's to serve (encrypted, zlib, malformed, or failing verification):
+/// the caller's own decoder then handles it and owns the error semantics.
+#[pyfunction]
+fn onemem_decode_many<'py>(
+    py: Python<'py>,
+    encoded: &Bound<'py, PyAny>,
+    digests: Vec<Vec<u8>>,
+) -> PyResult<Vec<Option<Bound<'py, PyBytes>>>> {
+    let owned = backed(encoded)?;
+    if owned.len() != digests.len() {
+        return Err(PyValueError::new_err("one digest per encoded chunk"));
+    }
+    let expected: Vec<[u8; 32]> = digests
+        .into_iter()
+        .map(|d| {
+            <[u8; 32]>::try_from(d.as_slice())
+                .map_err(|_| PyValueError::new_err("digests are 32-byte SHA-256 values"))
+        })
+        .collect::<PyResult<_>>()?;
+    let plain = py.detach(move || {
+        let refs: Vec<&[u8]> = owned.iter().map(|c| &c[..]).collect();
+        ol_compress::onemem::decode_many(&refs, &expected)
+    });
+    Ok(plain
+        .into_iter()
+        .map(|p| p.map(|bytes| PyBytes::new(py, &bytes)))
+        .collect())
 }
 
 /// Borrow ``source`` (must be ``bytes``: immutable, so safe to read detached)

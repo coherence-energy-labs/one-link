@@ -166,7 +166,24 @@ pub(crate) fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     m.add_function(wrap_pyfunction!(onemem_sha256_slices, m)?)?;
     m.add_function(wrap_pyfunction!(onemem_encode_slices, m)?)?;
     m.add_function(wrap_pyfunction!(onemem_decode_many, m)?)?;
+    m.add_function(wrap_pyfunction!(onemem_grid_decode, m)?)?;
     Ok(())
+}
+
+/// Decode one grid payload (either inner coder) to exactly ``plain_size``
+/// bytes; ``ValueError`` if it is malformed or does not decode. ONE Memory's
+/// own chunk decoder calls this for the native-only range-coded grid codec.
+#[pyfunction]
+fn onemem_grid_decode<'py>(
+    py: Python<'py>,
+    payload: &Bound<'py, PyAny>,
+    plain_size: usize,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let out = detached(py, payload, move |bytes| {
+        ol_compress::onemem::grid_decode(bytes, plain_size)
+    })?
+    .map_err(|err| compress_err_to_py(&err))?;
+    Ok(PyBytes::new(py, &out))
 }
 
 /// Decode and SHA-256-verify ONE Memory chunks in parallel, interpreter

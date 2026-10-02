@@ -12,7 +12,7 @@ crate-type = ["lib"]
 
 [dependencies]
 blake3        = { workspace = true }
-ml-kem        = "0.2"
+ml-kem        = "0.3"
 # Match the hybrid-array version ml-kem 0.2 uses. Required because we
 # need to construct `Array<u8, N>` instances directly to call ml-kem's
 # `KeyEncode::from_bytes` (which takes a typed Array, not a slice).

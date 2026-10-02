@@ -553,7 +553,7 @@ mod tests {
 
     fn lidar_like(n: usize, seed: u32) -> Vec<u8> {
         // Float-ish structured bytes: compressible, but not trivially.
-        (0..n as u32)
+        (0..u32::try_from(n).expect("test sizes fit u32"))
             .flat_map(|i| {
                 (i.wrapping_mul(2_654_435_761) ^ seed)
                     .rotate_left(i % 13)

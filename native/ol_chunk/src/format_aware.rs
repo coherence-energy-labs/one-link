@@ -653,7 +653,7 @@ mod tests {
         for pair in offsets.windows(2) {
             assert!(pair[1] > pair[0]);
         }
-        assert_eq!(&buf[offsets[1]..offsets[1] + 1], &[0x06]);
+        assert_eq!(&buf[offsets[1]..=offsets[1]], &[0x06]);
     }
 
     #[test]

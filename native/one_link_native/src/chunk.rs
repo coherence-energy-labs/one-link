@@ -19,11 +19,7 @@ use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyBytes;
 use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-
-/// Bytes the streaming file scanner holds at once (bounded; never file-sized).
-const FILE_SCAN_WINDOW: usize = 32 << 20;
 
 /// Python-visible boundary record. Wraps `(start, end, blake3_hash)`.
 #[pyclass(
@@ -245,64 +241,101 @@ fn scan_file_boundaries_with_params(
     params
         .validate()
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string()))?;
-    let mut file = File::open(path)?;
-    let max_size = params.max_size as usize;
-    // A bounded window (never file-sized): each is scanned by the parallel
-    // two-phase FastCDC (ol_chunk::pcdc) and addressed in parallel. A chunk is
-    // accepted only once its cut has seen max_size bytes (or EOF), exactly the
-    // bytes the serial scanner would have seen, so boundaries are unchanged.
-    // Sized to the file when it is small: a fixed 32 MiB window was allocated
-    // and zero-filled for every ~2 MB sensor file, halving ingest.
+    // Bounded windows, each scanned by the parallel two-phase FastCDC and
+    // addressed in parallel, boundaries equal to the in-memory scanner's
+    // (ol_chunk::stream::scan_stream, shared with format_aware_file).
+    let file = File::open(path)?;
     let file_len = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
-    let mut window_cap = FILE_SCAN_WINDOW.max(4 * max_size).min(file_len.max(1));
-    let mut buffer: Vec<u8> = Vec::with_capacity(window_cap);
-    let mut base_offset = 0usize;
-    let mut eof = false;
-    let mut boundaries = Vec::new();
+    Ok(ol_chunk::stream::scan_stream(file, file_len, params)?
+        .into_iter()
+        .map(|b| PyBoundary {
+            start: b.start,
+            end: b.end,
+            raw_address: b.raw_address,
+        })
+        .collect())
+}
 
-    loop {
-        while buffer.len() < window_cap && !eof {
-            // Appends into spare capacity: no zero-fill before the read.
-            let wanted = (window_cap - buffer.len()) as u64;
-            let read = (&mut file).take(wanted).read_to_end(&mut buffer)?;
-            eof = read == 0;
-        }
-        if buffer.is_empty() {
-            break;
-        }
-        let ranges: Vec<(usize, usize)> = ol_chunk::pcdc::chunk_ranges(&buffer, params)
-            .into_iter()
-            .take_while(|&(s, _)| eof || s + max_size <= buffer.len())
-            .collect();
-        let consumed = ranges.last().map_or(0, |&(_, e)| e);
-        if consumed == 0 {
-            if eof {
-                return Err(std::io::Error::other("file scan made no progress"));
-            }
-            // A window that fits the file exactly fills before EOF is seen, so
-            // its last chunk cannot be final yet: grow the window and read on.
-            window_cap = window_cap.saturating_mul(2).max(4 * max_size);
-            continue;
-        }
-        for b in ol_chunk::pcdc::address_ranges(&buffer, &ranges) {
-            let start = base_offset
-                .checked_add(b.start)
-                .ok_or_else(|| std::io::Error::other("file offset overflow"))?;
-            boundaries.push(PyBoundary {
-                start,
-                end: start + (b.end - b.start),
-                raw_address: b.raw_address,
-            });
-        }
-        base_offset += consumed;
-        buffer.copy_within(consumed.., 0);
-        buffer.truncate(buffer.len() - consumed);
-        if eof && buffer.is_empty() {
-            break;
-        }
-    }
+/// Bytes a format-aware file scan may hold whole for formats whose cuts need
+/// a byte scan (ZIP, H.264); record-framed formats never need it.
+const FORMAT_AWARE_IN_MEMORY_LIMIT: usize = 256 << 20;
 
-    Ok(boundaries)
+fn scan_format_aware_path(
+    path: &Path,
+    format: Option<ContainerFormat>,
+    params: CdcParams,
+) -> PyResult<Vec<PyFormatBoundary>> {
+    let open = || -> std::io::Result<(File, usize)> {
+        let file = File::open(path)?;
+        let len = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+        Ok((file, len))
+    };
+    let (mut file, len) = open()
+        .map_err(|err| PyOSError::new_err(format!("failed to open {}: {err}", path.display())))?;
+    let set = ol_chunk::stream::scan_format_aware_seekable(
+        &mut file,
+        len,
+        format,
+        params,
+        FORMAT_AWARE_IN_MEMORY_LIMIT,
+    )
+    .map_err(|err| match err {
+        ol_chunk::stream::StreamScanError::Io(io) => {
+            PyOSError::new_err(format!("failed to scan {}: {io}", path.display()))
+        }
+        other => PyValueError::new_err(other.to_string()),
+    })?;
+    Ok(set
+        .boundaries
+        .into_iter()
+        .zip(set.format_aware)
+        .map(|(b, forced)| PyFormatBoundary {
+            start: b.start,
+            end: b.end,
+            format_forced: forced,
+            raw_address: b.raw_address,
+        })
+        .collect())
+}
+
+/// [`format_aware_boundaries`] of a file, with bounded memory: record-framed
+/// containers (MCAP, MP4/MOV, WAV) are walked by their record headers and
+/// chunked range by range, so a multi-GB robot log never has to fit in RAM.
+/// Equal to `format_aware_boundaries(open(path).read(), format_name)`.
+/// ZIP and H.264 need a byte scan: up to 256 MiB they are read whole; above
+/// that `ValueError` (the caller falls back to plain `cdc_file`).
+#[pyfunction]
+pub fn format_aware_file(
+    py: Python<'_>,
+    path: &str,
+    format_name: &str,
+) -> PyResult<Vec<PyFormatBoundary>> {
+    let format = parse_container_format(format_name)?;
+    let owned = PathBuf::from(path);
+    py.detach(move || scan_format_aware_path(&owned, format, CdcParams::default()))
+}
+
+/// [`format_aware_file`] with caller-selected `FastCDC` sizing.
+#[pyfunction]
+pub fn format_aware_file_params(
+    py: Python<'_>,
+    path: &str,
+    format_name: &str,
+    min_size: u32,
+    avg_size: u32,
+    max_size: u32,
+) -> PyResult<Vec<PyFormatBoundary>> {
+    let format = parse_container_format(format_name)?;
+    let params = CdcParams {
+        min_size,
+        avg_size,
+        max_size,
+    };
+    params
+        .validate()
+        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+    let owned = PathBuf::from(path);
+    py.detach(move || scan_format_aware_path(&owned, format, params))
 }
 
 fn scan_file_boundaries(path: &Path) -> std::io::Result<Vec<PyBoundary>> {
@@ -594,6 +627,8 @@ pub(crate) fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     m.add_function(wrap_pyfunction!(cdc_file_params, m)?)?;
     m.add_function(wrap_pyfunction!(format_aware_boundaries, m)?)?;
     m.add_function(wrap_pyfunction!(format_aware_boundaries_params, m)?)?;
+    m.add_function(wrap_pyfunction!(format_aware_file, m)?)?;
+    m.add_function(wrap_pyfunction!(format_aware_file_params, m)?)?;
     m.add_function(wrap_pyfunction!(chunk_address_raw, m)?)?;
     m.add_function(wrap_pyfunction!(chunk_address_convergent, m)?)?;
     m.add_function(wrap_pyfunction!(derive_aead_key, m)?)?;

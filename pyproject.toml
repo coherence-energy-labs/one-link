@@ -181,7 +181,7 @@ security = [
   "pip-audit>=2.7",
   "bandit>=1.7",
   "cyclonedx-bom>=4.4",
-  "uv>=0.12.1,<0.13",
+  "uv>=0.12.1,<0.14",
   "zizmor>=1.27,<2",
 ]
 

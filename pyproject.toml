@@ -115,7 +115,7 @@ dev = [
   "PyYAML>=6.0.3,<7",
   # Distribution-contract tests build from an isolated source snapshot using
   # the reviewed backend rather than resolving mutable build tools at runtime.
-  "setuptools>=83,<84",
+  "setuptools>=83,<85",
   "wheel>=0.47,<0.48",
   # v0.21.x property-based testing for invariants that span
   # huge input spaces (e.g. 'every BIP-39 seed round-trips';
@@ -167,7 +167,7 @@ release = [
   "build>=1.5,<2",
   "maturin>=1.14.1,<2",
   "pyinstaller>=6.21,<7",
-  "setuptools>=83,<84",
+  "setuptools>=83,<85",
   "sigstore>=4.5.0,<5",
   "wheel>=0.47,<0.48",
 ]
@@ -207,7 +207,7 @@ release-tools = [
   # Parse wheel/sdist filenames and normalize the PEP 440 project version in
   # the independent distribution contract gate.
   "packaging>=26.2,<27",
-  "setuptools>=83,<84",
+  "setuptools>=83,<85",
   "sigstore>=4.5.0,<5",
   "wheel>=0.47,<0.48",
 ]
@@ -216,7 +216,7 @@ release-tools = [
 one-link = "one_link.cli:main"
 
 [build-system]
-requires = ["setuptools>=83,<84", "wheel>=0.47,<0.48"]
+requires = ["setuptools>=83,<85", "wheel>=0.47,<0.48"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]

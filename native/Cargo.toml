@@ -92,7 +92,7 @@ memchr       = "2.7"
 # cryptographic collision resistance.
 xxhash-rust  = { version = "0.8", features = ["xxh3"] }
 # Content-defined chunking (FastCDC/Gear-256 per ADR-0001).
-fastcdc      = "3.1"
+fastcdc      = "4.0"
 # AEAD primitives. RustCrypto suite is the standard well-audited choice;
 # AES-256-GCM uses aesni hardware accel on x86 (AVX2 + AES-NI), NEON on ARM.
 # ChaCha20-Poly1305 fallback runs on every architecture in constant time.

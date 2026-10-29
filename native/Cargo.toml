@@ -122,7 +122,7 @@ rustls            = { version = "0.23", default-features = false, features = ["r
 rcgen             = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 ring              = "0.17"
 tokio             = { version = "1.41", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
-ed25519-dalek     = { version = "2.1", features = ["rand_core", "pkcs8", "pem"] }
+ed25519-dalek     = { version = "3.0", features = ["rand_core", "pkcs8", "pem"] }
 x509-parser       = "0.16"
 # rand 0.8 for ed25519-dalek compatibility (it pins rand_core 0.6 which
 # matches rand 0.8). Workspace already has rand 0.9 for tests; we keep

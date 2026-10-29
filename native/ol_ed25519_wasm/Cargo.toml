@@ -9,7 +9,7 @@ description = "Integrity-pinned Ed25519 WebAssembly fallback for One Link browse
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["alloc", "fast", "zeroize"] }
+ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["alloc", "fast", "zeroize"] }
 zeroize = { workspace = true }
 
 [lints]

@@ -1,0 +1,552 @@
+{
+  "schema": 1,
+  "template": "index.template.html",
+  "groups": [
+    {
+      "name": "owner",
+      "modules": [
+        {
+          "path": "main/platform.js",
+          "kind": "feature",
+          "responsibility": "Form factor detection and browser boot policy"
+        },
+        {
+          "path": "services/formatting.js",
+          "kind": "service",
+          "responsibility": "DOM/text formatting with live settings access",
+          "factory": "createOwnerFormatting"
+        },
+        {
+          "path": "main/formatting.js",
+          "kind": "feature",
+          "responsibility": "Formatting service bindings"
+        },
+        {
+          "path": "services/owner_state.js",
+          "kind": "service",
+          "responsibility": "Fresh owner state per page instance; owns maps and mutable collections",
+          "factory": "createOwnerState"
+        },
+        {
+          "path": "main/state.js",
+          "kind": "feature",
+          "responsibility": "Owner state and message media constants"
+        },
+        {
+          "path": "main/peer_status.js",
+          "kind": "feature",
+          "responsibility": "Peer reachability, latency and conversation status"
+        },
+        {
+          "path": "main/provenance.js",
+          "kind": "feature",
+          "responsibility": "Media provenance indicator rendering"
+        },
+        {
+          "path": "main/api_errors.js",
+          "kind": "feature",
+          "responsibility": "Server error translation for the owner client"
+        },
+        {
+          "path": "main/session.js",
+          "kind": "feature",
+          "responsibility": "Owner bearer lifecycle and session recovery"
+        },
+        {
+          "path": "services/api_client.js",
+          "kind": "service",
+          "responsibility": "HTTP coalescing and stable file intents; owns private in-flight caches",
+          "factory": "createOwnerApiClient"
+        },
+        {
+          "path": "main/api.js",
+          "kind": "feature",
+          "responsibility": "HTTP and idempotent file upload service binding"
+        },
+        {
+          "path": "main/render_queue.js",
+          "kind": "feature",
+          "responsibility": "Error presentation and coalesced render scheduling"
+        },
+        {
+          "path": "main/notifications_permission.js",
+          "kind": "feature",
+          "responsibility": "Clipboard and notification permission helpers"
+        },
+        {
+          "path": "main/updates.js",
+          "kind": "feature",
+          "responsibility": "Authenticated update plan, install and rotation banners"
+        },
+        {
+          "path": "main/appearance.js",
+          "kind": "feature",
+          "responsibility": "Notification preferences and appearance settings"
+        },
+        {
+          "path": "main/notifications.js",
+          "kind": "feature",
+          "responsibility": "Notification sound, call ringing, unread and presence"
+        },
+        {
+          "path": "main/first_pair.js",
+          "kind": "feature",
+          "responsibility": "First pairing guidance and shared empty/toast surfaces"
+        },
+        {
+          "path": "main/file_offers.js",
+          "kind": "feature",
+          "responsibility": "Accept-first file offer prompts and reconciliation"
+        },
+        {
+          "path": "main/attention.js",
+          "kind": "feature",
+          "responsibility": "Attention center presentation and actions"
+        },
+        {
+          "path": "main/peers.js",
+          "kind": "feature",
+          "responsibility": "Paired peer list rendering and actions"
+        },
+        {
+          "path": "main/discovery.js",
+          "kind": "feature",
+          "responsibility": "Discovery, invite creation and trust actions"
+        },
+        {
+          "path": "main/rich_text_files.js",
+          "kind": "feature",
+          "responsibility": "Inline text, local outbound file access and lightbox"
+        },
+        {
+          "path": "main/previews.js",
+          "kind": "feature",
+          "responsibility": "Typed file preview renderers"
+        },
+        {
+          "path": "main/transfer_facts.js",
+          "kind": "feature",
+          "responsibility": "Transfer indexes, rates, status and diagnostic rendering"
+        },
+        {
+          "path": "main/device_mesh.js",
+          "kind": "feature",
+          "responsibility": "Fabric truth and personal device mesh rendering"
+        },
+        {
+          "path": "main/health.js",
+          "kind": "feature",
+          "responsibility": "One Health guidance, rendering and actions"
+        },
+        {
+          "path": "main/mesh_actions.js",
+          "kind": "feature",
+          "responsibility": "Personal device mesh operations"
+        },
+        {
+          "path": "main/courier.js",
+          "kind": "feature",
+          "responsibility": "No-router and removable courier workflows"
+        },
+        {
+          "path": "main/transfer_header.js",
+          "kind": "feature",
+          "responsibility": "Aggregate transfer progress and header presentation"
+        },
+        {
+          "path": "main/messages.js",
+          "kind": "feature",
+          "responsibility": "Message render scheduling, scrolling and message list"
+        },
+        {
+          "path": "main/message_actions.js",
+          "kind": "feature",
+          "responsibility": "Call log bubbles, replies, reactions, pins and drafts"
+        },
+        {
+          "path": "main/files.js",
+          "kind": "feature",
+          "responsibility": "Received/sent file panel"
+        },
+        {
+          "path": "main/groups.js",
+          "kind": "feature",
+          "responsibility": "Group conversation, membership and shared chat preferences"
+        },
+        {
+          "path": "main/folders.js",
+          "kind": "feature",
+          "responsibility": "Folder offers, browsing, previews and file history"
+        },
+        {
+          "path": "main/folder_send.js",
+          "kind": "feature",
+          "responsibility": "Folder send confirmation, progress and settings"
+        },
+        {
+          "path": "main/folder_conflicts.js",
+          "kind": "feature",
+          "responsibility": "Folder conflict review and resolution"
+        },
+        {
+          "path": "main/nearby.js",
+          "kind": "feature",
+          "responsibility": "Activity overview and nearby peer discovery"
+        },
+        {
+          "path": "main/status.js",
+          "kind": "feature",
+          "responsibility": "Status/fabric refresh and route bootstrap import/export"
+        },
+        {
+          "path": "main/activity.js",
+          "kind": "feature",
+          "responsibility": "Activity feed folding, filtering and rendering"
+        },
+        {
+          "path": "main/transfers.js",
+          "kind": "feature",
+          "responsibility": "Transfer polling, grouping and transfer panel"
+        },
+        {
+          "path": "main/outbox.js",
+          "kind": "feature",
+          "responsibility": "Service worker authority, durable outbox and send retry"
+        },
+        {
+          "path": "main/navigation_prediction.js",
+          "kind": "feature",
+          "responsibility": "Local frame measurements and predictive navigation"
+        },
+        {
+          "path": "main/selection.js",
+          "kind": "feature",
+          "responsibility": "Peer selection, identity-change and conversation trust"
+        },
+        {
+          "path": "main/device_drawer.js",
+          "kind": "feature",
+          "responsibility": "Per-device controls, capabilities and trust history"
+        },
+        {
+          "path": "main/chat_appearance.js",
+          "kind": "feature",
+          "responsibility": "Conversation export, wallpaper, gallery and expiration"
+        },
+        {
+          "path": "main/mobile.js",
+          "kind": "feature",
+          "responsibility": "Responsive gestures, viewport and capability controls"
+        },
+        {
+          "path": "main/version.js",
+          "kind": "feature",
+          "responsibility": "First-send celebration, release notes and version drift"
+        },
+        {
+          "path": "main/bootstrap.js",
+          "kind": "feature",
+          "responsibility": "Initial snapshots, peer refresh and history"
+        },
+        {
+          "path": "main/live_refresh.js",
+          "kind": "feature",
+          "responsibility": "Live update and reconnection controller"
+        },
+        {
+          "path": "main/events.js",
+          "kind": "feature",
+          "responsibility": "Owner WebSocket event routing and state reconciliation"
+        },
+        {
+          "path": "main/composer_staging.js",
+          "kind": "feature",
+          "responsibility": "Composer state, file staging and metadata stripping"
+        },
+        {
+          "path": "main/image_editor.js",
+          "kind": "feature",
+          "responsibility": "Staged image editing and rename"
+        },
+        {
+          "path": "main/message_selection.js",
+          "kind": "feature",
+          "responsibility": "Multi-select actions and forwarding"
+        },
+        {
+          "path": "main/composer_send.js",
+          "kind": "feature",
+          "responsibility": "Slash commands, message action sheet and send intent"
+        },
+        {
+          "path": "main/attachments.js",
+          "kind": "feature",
+          "responsibility": "File/folder attachment selection and camera capture"
+        },
+        {
+          "path": "main/onboarding.js",
+          "kind": "feature",
+          "responsibility": "One Setup onboarding state and invite flow"
+        },
+        {
+          "path": "main/recovery_shell.js",
+          "kind": "feature",
+          "responsibility": "Recovery wizard lifecycle, focus and status"
+        },
+        {
+          "path": "main/recovery_phrase.js",
+          "kind": "feature",
+          "responsibility": "Recovery phrase presentation and verification"
+        },
+        {
+          "path": "main/recovery_social.js",
+          "kind": "feature",
+          "responsibility": "Guardian selection and social recovery setup"
+        },
+        {
+          "path": "main/recovery_backup.js",
+          "kind": "feature",
+          "responsibility": "Recovery bundle testing and export"
+        },
+        {
+          "path": "main/recovery_shares.js",
+          "kind": "feature",
+          "responsibility": "Held recovery share management"
+        },
+        {
+          "path": "main/recovery_rotation.js",
+          "kind": "feature",
+          "responsibility": "Identity rotation and pending phrase workflow"
+        },
+        {
+          "path": "main/recovery_restore.js",
+          "kind": "feature",
+          "responsibility": "Recovery restore preflight and submit"
+        },
+        {
+          "path": "main/onboarding_actions.js",
+          "kind": "feature",
+          "responsibility": "Setup review, confirmation and test deliveries"
+        },
+        {
+          "path": "main/command_palette.js",
+          "kind": "feature",
+          "responsibility": "Global command palette and result navigation"
+        },
+        {
+          "path": "main/voice.js",
+          "kind": "feature",
+          "responsibility": "Voice recording, preview and send intents"
+        },
+        {
+          "path": "main/upload_paste.js",
+          "kind": "feature",
+          "responsibility": "File uploads, paste handling and drag/drop collection"
+        },
+        {
+          "path": "main/search.js",
+          "kind": "feature",
+          "responsibility": "Conversation search and jump-to-date"
+        },
+        {
+          "path": "main/invite_bindings.js",
+          "kind": "feature",
+          "responsibility": "Discovery and invite surface event bindings"
+        },
+        {
+          "path": "main/diagnostics.js",
+          "kind": "feature",
+          "responsibility": "Sidebar, diagnostic exports, capability truth and doctor"
+        },
+        {
+          "path": "main/installation.js",
+          "kind": "feature",
+          "responsibility": "Browser PWA install affordance"
+        },
+        {
+          "path": "main/folder_bindings.js",
+          "kind": "feature",
+          "responsibility": "Debug pane and folder management event bindings"
+        },
+        {
+          "path": "main/pairing.js",
+          "kind": "feature",
+          "responsibility": "SAS pairing modal, verification and flow lifecycle"
+        },
+        {
+          "path": "main/settings_shell.js",
+          "kind": "feature",
+          "responsibility": "Settings navigation, dirty-state and search"
+        },
+        {
+          "path": "main/settings_storage.js",
+          "kind": "feature",
+          "responsibility": "Storage usage, local traces and profile presentation"
+        },
+        {
+          "path": "main/settings_privacy.js",
+          "kind": "feature",
+          "responsibility": "Blocked devices, UI sessions, privacy and audit views"
+        },
+        {
+          "path": "main/settings_network.js",
+          "kind": "feature",
+          "responsibility": "Settings overview, network status and export"
+        },
+        {
+          "path": "main/settings_devices.js",
+          "kind": "feature",
+          "responsibility": "Device health and management in settings"
+        },
+        {
+          "path": "main/settings_pairing.js",
+          "kind": "feature",
+          "responsibility": "Update preference and settings device QR lifecycle"
+        },
+        {
+          "path": "main/settings_save.js",
+          "kind": "feature",
+          "responsibility": "Settings control bindings and persistence"
+        },
+        {
+          "path": "main/lifecycle.js",
+          "kind": "feature",
+          "responsibility": "Global shortcuts, startup and deep-link handling"
+        }
+      ]
+    },
+    {
+      "name": "calls",
+      "modules": [
+        {
+          "path": "calls/entry.js",
+          "kind": "feature",
+          "responsibility": "Call closure guard and DOM selector"
+        },
+        {
+          "path": "services/call_state.js",
+          "kind": "service",
+          "responsibility": "Fresh call lifecycle, signaling and telemetry state",
+          "factory": "createCallState"
+        },
+        {
+          "path": "calls/state.js",
+          "kind": "feature",
+          "responsibility": "Call state construction and diagnostics exposure"
+        },
+        {
+          "path": "calls/api.js",
+          "kind": "feature",
+          "responsibility": "Call API and automatic trace capture"
+        },
+        {
+          "path": "services/media_state.js",
+          "kind": "service",
+          "responsibility": "Fresh media and route state; capture resources owned by call lifecycle",
+          "factory": "createCallMediaState"
+        },
+        {
+          "path": "calls/capture.js",
+          "kind": "feature",
+          "responsibility": "Media state, capture constraints, ICE config and media surfaces"
+        },
+        {
+          "path": "services/call_health.js",
+          "kind": "service",
+          "responsibility": "Media health classification, hysteresis and adaptive video decisions",
+          "factory": "createCallHealth"
+        },
+        {
+          "path": "calls/health.js",
+          "kind": "feature",
+          "responsibility": "Call health/adaptation service binding"
+        },
+        {
+          "path": "calls/controls.js",
+          "kind": "feature",
+          "responsibility": "Transceivers, devices, screen share, captions and layouts"
+        },
+        {
+          "path": "calls/cleanup.js",
+          "kind": "feature",
+          "responsibility": "Call media shutdown and timer cleanup"
+        },
+        {
+          "path": "calls/attestation.js",
+          "kind": "feature",
+          "responsibility": "Media attestation and bounded capsule capture"
+        },
+        {
+          "path": "calls/ice.js",
+          "kind": "feature",
+          "responsibility": "Candidate normalization and RTCPeerConnection setup"
+        },
+        {
+          "path": "calls/negotiation.js",
+          "kind": "feature",
+          "responsibility": "Local SDP offer/answer and staged media repair"
+        },
+        {
+          "path": "calls/recovery.js",
+          "kind": "feature",
+          "responsibility": "Backend path recommendation, recovery intent and authority"
+        },
+        {
+          "path": "calls/remote_signaling.js",
+          "kind": "feature",
+          "responsibility": "Remote SDP role handling, collision and ICE application"
+        },
+        {
+          "path": "calls/presentation.js",
+          "kind": "feature",
+          "responsibility": "Mute/quality/history/settings presentation"
+        },
+        {
+          "path": "calls/privacy_panel.js",
+          "kind": "feature",
+          "responsibility": "Shared privacy panel rendering and actions"
+        },
+        {
+          "path": "calls/modal_layer.js",
+          "kind": "feature",
+          "responsibility": "Delegated modal close and Escape handling"
+        },
+        {
+          "path": "calls/start.js",
+          "kind": "feature",
+          "responsibility": "Public outbound call entry and acceptance setup"
+        },
+        {
+          "path": "calls/surfaces.js",
+          "kind": "feature",
+          "responsibility": "Outgoing/incoming/active call surfaces and event rail"
+        },
+        {
+          "path": "calls/telemetry.js",
+          "kind": "feature",
+          "responsibility": "Call metrics, adaptation and watchdog scheduling"
+        },
+        {
+          "path": "calls/reconciliation.js",
+          "kind": "feature",
+          "responsibility": "Inbound acceptance, rejoin and snapshot reconciliation"
+        },
+        {
+          "path": "calls/buttons.js",
+          "kind": "feature",
+          "responsibility": "Call action and SAS button wiring"
+        },
+        {
+          "path": "calls/events.js",
+          "kind": "feature",
+          "responsibility": "Call file intents, WebSocket call events and history bubbles"
+        },
+        {
+          "path": "calls/polling.js",
+          "kind": "feature",
+          "responsibility": "Adaptive backfill reconciliation and page lifecycle"
+        }
+      ]
+    }
+  ]
+}

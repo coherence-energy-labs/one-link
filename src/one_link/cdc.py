@@ -9,7 +9,7 @@ can exchange "which chunks do you already have?" before sending bytes.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO, Iterable
 
@@ -48,6 +48,8 @@ class FileIndex:
     blob_hash: str
     size: int
     chunks: tuple[Chunk, ...]
+    # Execution provenance is not part of the content/resume identity.
+    engine: str = field(default="unspecified", compare=False)
 
 
 @dataclass(frozen=True)
@@ -120,14 +122,10 @@ def chunk_bytes(data: bytes) -> tuple[Chunk, ...]:
 def index_path(path: Path, *, read_size: int = 1024 * 1024) -> FileIndex:
     """Hash and CDC-index a file in one streaming pass.
 
-    Memory stays bounded by MAX_CHUNK_BYTES plus the rolling window. This is
-    the path used by live transfer, so very large files do not need a full
-    in-memory copy just to build the dedup offer.
+    Payload buffering is bounded by the read window and chunk state; returned
+    chunk metadata grows with the number of chunks. Live transfer uses the
+    same scanner through ``index_file`` on its identity-bound descriptor.
     """
-
-    native = _index_path_native(path, read_size=read_size)
-    if native is not None:
-        return native
 
     with open(path, "rb") as handle:
         return index_file(
@@ -143,13 +141,22 @@ def index_file(
     size: int,
     read_size: int = 1024 * 1024,
 ) -> FileIndex:
-    """Hash and CDC-index one already-open, identity-bound file handle."""
+    """Hash and CDC-index one already-open, identity-bound file handle.
+
+    Native and Python engines use identical Gear parameters and boundaries.
+    The native path consumes this descriptor directly; it never reopens its
+    pathname or substitutes a different chunking algorithm.
+    """
 
     if read_size <= 0:
         raise ValueError("read_size must be positive")
     expected_size = int(size)
     if expected_size < 0:
         raise ValueError("size must be non-negative")
+
+    native = _index_file_native(handle, size=expected_size, read_size=read_size)
+    if native is not None:
+        return native
 
     chunks: list[Chunk] = []
     file_hasher = blake3.blake3()
@@ -199,6 +206,7 @@ def index_file(
         blob_hash=file_hasher.hexdigest(),
         size=expected_size,
         chunks=tuple(chunks),
+        engine="python-gear",
     )
 
 
@@ -307,6 +315,7 @@ def fixed_index_file(
         blob_hash=file_hasher.hexdigest(),
         size=expected_size,
         chunks=tuple(chunks),
+        engine="python-fixed",
     )
 
 
@@ -371,75 +380,85 @@ def _chunk_bytes_native(data: bytes) -> tuple[Chunk, ...] | None:
 
 
 def _index_path_native(path: Path, *, read_size: int) -> FileIndex | None:
+    """Compatibility wrapper; file identity and length come from one open."""
+    if read_size <= 0:
+        return None
+    with open(path, "rb") as handle:
+        return _index_file_native(
+            handle, size=int(os.fstat(handle.fileno()).st_size), read_size=read_size,
+        )
+
+
+def _index_file_native(
+    handle: BinaryIO, *, size: int, read_size: int,
+) -> FileIndex | None:
+    """Stream the verified C scanner over an already-open descriptor.
+
+    Only unavailable acceleration selects Python. Once scanning starts, IO or
+    contract errors propagate rather than being hidden by a second scan.
+    Rolling state and the chunk hasher span read boundaries without retaining
+    or rescanning a pending chunk. Memory is O(read_size + output chunks).
+    """
     try:
         from .native_cdc import get_native_cdc_scanner
-
         scanner = get_native_cdc_scanner()
-        if scanner is None:
-            return None
-        if read_size <= 0:
-            return None
-
-        chunks: list[Chunk] = []
-        file_hasher = blake3.blake3()
-        chunk_hasher = blake3.blake3()
-        buf = bytearray(read_size)
-        absolute = 0
-        chunk_start = 0
-        rolling = 0
-        chunk_len = 0
-
-        with open(path, "rb") as f:
-            while True:
-                n = f.readinto(buf)
-                if not n:
-                    break
-                view = memoryview(buf)[:n]
-                file_hasher.update(view)
-                cuts, rolling, chunk_len = scanner.scan(
-                    buf,
-                    length=n,
-                    initial_rolling=rolling,
-                    initial_chunk_len=chunk_len,
-                    min_chunk=MIN_CHUNK_BYTES,
-                    max_chunk=MAX_CHUNK_BYTES,
-                    boundary_mask=_BOUNDARY_MASK,
-                )
-
-                segment_start = 0
-                for cut in cuts:
-                    if cut < segment_start or cut > n:
-                        raise RuntimeError(f"native CDC returned invalid cut {cut}")
-                    chunk_hasher.update(view[segment_start:cut])
-                    end = absolute + cut
-                    chunks.append(
-                        Chunk(
-                            index=len(chunks),
-                            start=chunk_start,
-                            end=end,
-                            hash=chunk_hasher.hexdigest(),
-                        )
-                    )
-                    chunk_start = end
-                    chunk_hasher = blake3.blake3()
-                    segment_start = cut
-                if segment_start < n:
-                    chunk_hasher.update(view[segment_start:n])
-                absolute += n
-
-        if chunk_len or not chunks:
+    except (ImportError, OSError, RuntimeError):
+        return None
+    if scanner is None:
+        return None
+    chunks: list[Chunk] = []
+    file_hasher = blake3.blake3()
+    chunk_hasher = blake3.blake3()
+    buf = bytearray(read_size)
+    absolute = 0
+    chunk_start = 0
+    rolling = 0
+    chunk_len = 0
+    handle.seek(0)
+    while True:
+        n = handle.readinto(buf)
+        if n is None or n < 0 or n > len(buf):
+            raise OSError("invalid read length while building CDC index")
+        if not n:
+            break
+        if absolute + n > size:
+            raise OSError("file size changed while building CDC index")
+        view = memoryview(buf)[:n]
+        file_hasher.update(view)
+        cuts, rolling, chunk_len = scanner.scan(
+            buf, length=n, initial_rolling=rolling, initial_chunk_len=chunk_len,
+            min_chunk=MIN_CHUNK_BYTES, max_chunk=MAX_CHUNK_BYTES,
+            boundary_mask=_BOUNDARY_MASK,
+        )
+        segment_start = 0
+        for cut in cuts:
+            if cut <= segment_start or cut > n:
+                raise RuntimeError(f"native CDC returned invalid cut {cut}")
+            chunk_hasher.update(view[segment_start:cut])
+            end = absolute + cut
             chunks.append(
                 Chunk(
-                    index=len(chunks),
-                    start=chunk_start,
-                    end=absolute,
+                    index=len(chunks), start=chunk_start, end=end,
                     hash=chunk_hasher.hexdigest(),
                 )
             )
-        return FileIndex(
-            blob_hash=file_hasher.hexdigest(),
-            size=path.stat().st_size,
-            chunks=tuple(chunks),
+            chunk_start = end
+            chunk_hasher = blake3.blake3()
+            segment_start = cut
+        if segment_start < n:
+            chunk_hasher.update(view[segment_start:n])
+        absolute += n
+    if absolute != size:
+        raise OSError("file size changed while building CDC index")
+    if chunk_len or not chunks:
+        chunks.append(
+            Chunk(
+                index=len(chunks), start=chunk_start, end=absolute,
+                hash=chunk_hasher.hexdigest(),
+            )
         )
-    except Exception:
-        return None
+    handle.seek(0)
+    return FileIndex(
+        blob_hash=file_hasher.hexdigest(), size=absolute, chunks=tuple(chunks),
+        engine="native-c-gear",
+    )

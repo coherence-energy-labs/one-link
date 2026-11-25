@@ -493,9 +493,19 @@ def _stage_recovered_authority(
     overwrite_files: bool = True,
 ) -> dict[str, Any]:
     """Publish protected recovery inputs, with the intent marker last."""
-    from one_link import master_seed
+    from one_link import lockbox, master_seed
 
     root = Path(data_dir)
+    # A recovery staged on top of an unfinished data-key migration could never
+    # replay (the migration journal blocks every key operation) and would in
+    # turn block the migration (it refuses while recovery is pending).
+    unfinished = lockbox.data_key_migration_in_progress(root)
+    if unfinished is not None:
+        raise RecoveryTransactionError(
+            "a data-key migration is unfinished on this installation; run "
+            f"`{lockbox.MIGRATION_COMMANDS[unfinished]}` to finish it before "
+            "staging a recovery or rotation"
+        )
     candidate = bytes(seed)
     if len(candidate) != master_seed.SEED_LEN_BYTES:
         raise ValueError(f"seed must be {master_seed.SEED_LEN_BYTES} bytes")
@@ -2407,3 +2417,593 @@ def reset_all_recovery_state(state) -> None:
     ):
         with contextlib.suppress(Exception):
             state.delete_setting(key)
+
+
+# ── data-key migration: `one-link recovery set-passphrase` / remove ───
+#
+# Moves an installation's application data key between silent mode (the DEK
+# is derive_drk(seed)) and passphrase mode (a fresh random DEK in the
+# dual-slot envelope), in ONE offline, crash-replayable transaction:
+#
+#   1. the daemon instance lock (refuses while a daemon runs) and, for the
+#      whole transaction, the envelope lock (a concurrent `backup export`
+#      waits, boundedly, instead of archiving a half-migrated install);
+#   2. a durable intent journal; while it exists every other envelope
+#      transaction -- boot, export, recovery -- refuses;
+#   3. preflight: every DEK_PROTECTED_ARTIFACTS envelope and every data-key
+#      KEY_PROTECTED_FIELDS value must authenticate under the current key or
+#      the target key, or nothing is changed;
+#   4. carry the files, then the fields (one SQLite transaction), then the
+#      SQLCipher database key, each classifying by decryption and doing only
+#      what is still missing;
+#   5. verify everything under the target key, THEN publish it (set: rename
+#      the staged envelope live; remove: rename the envelope out of service);
+#   6. verify again through the readers the daemon uses (acquire_lockbox,
+#      inspect_derived_authority) and only then delete the old authority and
+#      the journal.
+#
+# Mnemonic semantics: the master seed and identity never change, so the
+# 24-word phrase is unchanged.  In passphrase mode the envelope's seed slot
+# opens the DEK, so the phrase plus a backup bundle (which carries the
+# envelope and salt) still recovers everything without the passphrase; the
+# phrase alone recovers identity and the silent DRK, exactly as before.
+
+DATA_KEY_MIGRATION_INTENT_VERSION = 1
+MIGRATION_FAULT_POINTS = {
+    "set_passphrase": (
+        "intent_written", "staged", "files_carried", "fields_carried",
+        "database_rekeyed", "published", "verified",
+    ),
+    "remove_passphrase": (
+        "intent_written", "files_carried", "fields_carried",
+        "database_rekeyed", "retired", "verified", "discarded",
+    ),
+}
+
+
+class DataKeyMigrationError(RecoveryTransactionError):
+    """A data-key migration refused, or found the installation inconsistent."""
+
+
+@contextlib.contextmanager
+def daemon_instance_lock(data_dir: Path):
+    """Hold the daemon's own singleton lock for an offline transaction.
+
+    The daemon's lock implementation is reused exactly as ``run()`` reuses it
+    for its bootstrap, so a daemon cannot start mid-transaction and this
+    refuses (after the daemon's own short hand-off wait) while one runs.
+    """
+    from one_link import paths
+    from one_link.daemon import Daemon
+
+    if Path(data_dir).resolve() != paths.data_dir().resolve():
+        raise DataKeyMigrationError(
+            "the data-key migration runs only on this ONE_LINK_HOME's data directory"
+        )
+    owner = object.__new__(Daemon)
+    owner._lock_file = None
+    try:
+        owner._acquire_instance_lock()
+    except RuntimeError as exc:
+        raise DataKeyMigrationError(
+            f"stop One Link first: {exc}; the data key cannot change under a running daemon"
+        ) from exc
+    try:
+        yield
+    finally:
+        owner._release_instance_lock()
+
+
+@contextlib.contextmanager
+def _passphrase_environment(value: Optional[str]):
+    """Scope ONE_LINK_PASSPHRASE for readers that consult it (keychain, LockBox)."""
+    from one_link import lockbox
+
+    name = lockbox.PASSPHRASE_ENV
+    previous = os.environ.get(name)
+    if value:
+        os.environ[name] = value
+    else:
+        os.environ.pop(name, None)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
+
+
+def _stored_database_key(root: Path) -> Optional[str]:
+    """The keychain/local state-database key, ignoring ONE_LINK_PASSPHRASE."""
+    from one_link import keychain
+
+    with _passphrase_environment(None):
+        return keychain._configured_passphrase_at(root)
+
+
+def _migration_intent_path(root: Path) -> Path:
+    from one_link import lockbox
+
+    return root / lockbox.MIGRATION_INTENT_FILENAME
+
+
+def _write_migration_intent(root: Path, kind: str) -> None:
+    payload = json.dumps(
+        {
+            "version": DATA_KEY_MIGRATION_INTENT_VERSION,
+            "kind": kind,
+            "started_ms": int(time.time() * 1000),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    _atomic_small_private_file(
+        _migration_intent_path(root), payload, label="data-key migration intent",
+    )
+
+
+def _rekey_state_database(
+    db_path: Path, *, source_keys: list[Optional[str]], target_key: Optional[str],
+) -> str:
+    """Move the SQLCipher key of an offline state.db; classify by opening it.
+
+    ``current`` (target opens it), ``rekeyed``, ``plaintext`` (no SQLCipher
+    key to move: whoever opens it next encrypts it under the key it holds),
+    or ``absent``.  Never guesses: a database that opens under neither key
+    refuses.
+    """
+    from one_link import state_encryption
+
+    kind = state_encryption.detect_db_state(db_path)
+    if kind in ("missing", "empty"):
+        return "absent"
+    if kind == "plaintext":
+        return "plaintext"
+    if target_key and state_encryption.database_accepts_passphrase(db_path, target_key):
+        return "current"
+    if not target_key:
+        raise DataKeyMigrationError(
+            "state.db is encrypted but no target database key is available "
+            "(at-rest key management is disabled or has no usable store)"
+        )
+    for source in source_keys:
+        if source and state_encryption.database_accepts_passphrase(db_path, source):
+            state_encryption.replace_encrypted_database_key_atomic(
+                db_path=db_path,
+                source_passphrase=source,
+                destination_passphrase=target_key,
+            )
+            if not state_encryption.database_accepts_passphrase(db_path, target_key):
+                raise DataKeyMigrationError(
+                    "state.db does not open under its new key after re-keying"
+                )
+            return "rekeyed"
+    raise DataKeyMigrationError(
+        "state.db opens with neither the current nor the target database key"
+    )
+
+
+def _verify_under(
+    root: Path, *, data_key: bytes, seed: bytes, database_keys: list[Optional[str]],
+) -> None:
+    """Fail loudly unless every artifact and field opens under ``data_key``."""
+    from one_link import lockbox
+    from one_link import state as state_module
+
+    unopenable = lockbox.dek_artifacts_unopenable_by(root, lockbox.LockBox(data_key))
+    if unopenable:
+        raise DataKeyMigrationError(
+            "verification failed: these artifacts do not open under the new "
+            f"data key: {', '.join(a.relpath for a in unopenable)}"
+        )
+    report = state_module.rekey_offline_state_fields(
+        root / state_module.DB_FILE,
+        database_keys=database_keys,
+        previous_data_key=data_key,
+        target_data_key=data_key,
+        seed=seed,
+        dry_run=True,
+    )
+    bad = {
+        name: counts for name, counts in report.items()
+        if counts["unopenable"] or counts["rekeyed"]
+    }
+    if bad:
+        raise DataKeyMigrationError(
+            f"verification failed: state.db fields do not open under the new data key: {bad}"
+        )
+
+
+def _preflight(
+    root: Path,
+    *,
+    current_key: bytes,
+    target_key: Optional[bytes],
+    seed: bytes,
+    database_keys: list[Optional[str]],
+) -> None:
+    """Refuse before changing anything unless all data opens under a held key.
+
+    ``target_key`` is ``None`` before the target exists (a first run of
+    set-passphrase); on a replay, values already carried open under it.
+    """
+    from one_link import lockbox
+    from one_link import state as state_module
+
+    held = [current_key] + ([target_key] if target_key is not None else [])
+    unopenable = lockbox.dek_artifacts_unopenable_by_any(root, held)
+    if unopenable:
+        raise DataKeyMigrationError(
+            "refusing to migrate: these artifacts open under neither the "
+            "current nor the target data key (the installation is already "
+            f"inconsistent): {', '.join(a.relpath for a in unopenable)}"
+        )
+    report = state_module.rekey_offline_state_fields(
+        root / state_module.DB_FILE,
+        database_keys=database_keys,
+        previous_data_key=current_key,
+        target_data_key=target_key if target_key is not None else current_key,
+        seed=seed,
+        dry_run=True,
+    )
+    bad = sorted(name for name, counts in report.items() if counts["unopenable"])
+    if bad:
+        raise DataKeyMigrationError(
+            "refusing to migrate: state.db fields open under neither the "
+            f"current nor the target data key: {', '.join(bad)}"
+        )
+
+
+def _converged_evidence(root: Path, *, id_path: Path, seed: bytes) -> dict[str, Any]:
+    from one_link import master_seed
+
+    return master_seed.inspect_derived_authority(root, identity_path=id_path, seed=seed)
+
+
+def _require_converged(root: Path, *, id_path: Path, seed: bytes, passphrase: Optional[str]) -> None:
+    """Final proof, under the environment the daemon of the new mode runs with."""
+    with _passphrase_environment(passphrase):
+        evidence = _converged_evidence(root, id_path=id_path, seed=seed)
+    if evidence != {"identity": True, "data_root": True}:
+        raise DataKeyMigrationError(f"verification failed: authority evidence {evidence}")
+
+
+def _probe_same_key(box: Any, data_key: bytes, *, what: str) -> None:
+    from one_link import lockbox
+
+    if not lockbox.holds_data_key(box, data_key):
+        raise DataKeyMigrationError(
+            f"verification failed: {what} does not hand out the migrated data key"
+        )
+
+
+def set_data_key_passphrase(
+    *,
+    data_dir: Path,
+    passphrase: str,
+    identity_path: Optional[Path] = None,
+    _fault: Optional[Any] = None,
+) -> dict[str, Any]:
+    """Silent -> passphrase mode, in one offline crash-replayable transaction.
+
+    Afterwards the passphrase is also the state database's SQLCipher key, so
+    One Link must be started with ONE_LINK_PASSPHRASE set.  Re-running after
+    any interruption finishes the same migration; a different passphrase on
+    replay refuses.  Already in passphrase mode with this passphrase: a
+    verified no-op.
+    """
+    return _migrate_data_key(
+        kind="set_passphrase",
+        data_dir=Path(data_dir),
+        passphrase=passphrase,
+        identity_path=identity_path,
+        fault=_fault,
+    )
+
+
+def remove_data_key_passphrase(
+    *,
+    data_dir: Path,
+    passphrase: str,
+    identity_path: Optional[Path] = None,
+    _fault: Optional[Any] = None,
+) -> dict[str, Any]:
+    """Passphrase -> silent mode, authorized by the passphrase being removed.
+
+    The data key becomes derive_drk(seed) and the database key a stored
+    keychain/local key again (minted if none exists), so One Link must then
+    be started WITHOUT ONE_LINK_PASSPHRASE.
+    """
+    return _migrate_data_key(
+        kind="remove_passphrase",
+        data_dir=Path(data_dir),
+        passphrase=passphrase,
+        identity_path=identity_path,
+        fault=_fault,
+    )
+
+
+def _migrate_data_key(
+    *,
+    kind: str,
+    data_dir: Path,
+    passphrase: str,
+    identity_path: Optional[Path],
+    fault: Optional[Any],
+) -> dict[str, Any]:
+    from one_link import lockbox, master_seed, paths
+    from one_link import state as state_module
+
+    if not isinstance(passphrase, str) or not passphrase:
+        raise ValueError("passphrase must be a non-empty string")
+    step = fault if callable(fault) else (lambda _point: None)
+    root = Path(data_dir)
+    id_path = Path(identity_path) if identity_path is not None else paths.key_path()
+    db_path = root / state_module.DB_FILE
+    with daemon_instance_lock(root):
+        if has_pending_recovery(root):
+            raise DataKeyMigrationError(
+                "a recovery transaction is pending; start One Link once to "
+                "complete it before changing the data key"
+            )
+        seed = master_seed.load_seed(root)
+        if seed is None:
+            raise DataKeyMigrationError(
+                "this installation has no recovery seed: run `one-link backup "
+                "init` and start One Link once, then retry"
+            )
+        silent_key = master_seed.derive_drk(seed)
+        with lockbox._envelope_mutation_lock(
+            root, purpose=lockbox.MIGRATION_COMMANDS[kind], migration=True,
+        ):
+            in_progress = lockbox.data_key_migration_in_progress(root)
+            if in_progress is not None and in_progress != kind:
+                raise DataKeyMigrationError(
+                    f"an unfinished {in_progress.replace('_', '-')} migration "
+                    f"must be finished first: run `{lockbox.MIGRATION_COMMANDS[in_progress]}`"
+                )
+            if in_progress is None:
+                # Judged as the daemon of the mode the install is ACTUALLY in
+                # (a live envelope means passphrase mode): a passphrase in this
+                # process's environment says nothing about a silent install.
+                current_mode_passphrase = (
+                    passphrase if lockbox._load_envelope(root) is not None else None
+                )
+                with _passphrase_environment(current_mode_passphrase):
+                    evidence = _converged_evidence(root, id_path=id_path, seed=seed)
+                # The one unconverged state this command repairs: seeded legacy
+                # passphrase rows whose envelope was never published (the
+                # bootstrap refuses them; set-passphrase publishes it).
+                legacy_unmigrated = (
+                    kind == "set_passphrase"
+                    and evidence == {"identity": True, "data_root": False}
+                    and lockbox.requires_legacy_passphrase_recovery(root)
+                )
+                if evidence != {"identity": True, "data_root": True} and not legacy_unmigrated:
+                    raise DataKeyMigrationError(
+                        f"installation authority is not converged ({evidence}); "
+                        "start One Link once (or complete recovery) first"
+                    )
+            if kind == "set_passphrase":
+                return _set_passphrase_steps(
+                    root, db_path=db_path, seed=seed, silent_key=silent_key,
+                    passphrase=passphrase, resumed=in_progress is not None,
+                    id_path=id_path, step=step,
+                )
+            return _remove_passphrase_steps(
+                root, db_path=db_path, seed=seed, silent_key=silent_key,
+                passphrase=passphrase, resumed=in_progress is not None,
+                id_path=id_path, step=step,
+            )
+
+
+def _set_passphrase_steps(
+    root: Path,
+    *,
+    db_path: Path,
+    seed: bytes,
+    silent_key: bytes,
+    passphrase: str,
+    resumed: bool,
+    id_path: Path,
+    step: Any,
+) -> dict[str, Any]:
+    from one_link import lockbox
+    from one_link import state as state_module
+
+    stored_key = _stored_database_key(root)
+    database_keys: list[Optional[str]] = [stored_key, passphrase]
+    live = lockbox._load_envelope(root)
+    if not resumed:
+        if live is not None:
+            # Already passphrase mode: verified no-op (wrong passphrase raises).
+            lockbox.open_live_passphrase_envelope(root, passphrase=passphrase, seed=seed)
+            return {"changed": False, "mode": "passphrase"}
+        if artifact_exists(root / lockbox.SALT_FILENAME, label="lockbox KDF salt"):
+            # Seeded legacy passphrase rows: their data key IS scrypt(passphrase,
+            # salt).  Publish its dual-slot envelope byte-preservingly (the
+            # mint guard proves, by the whole-file witnesses, that this salt's
+            # key protects the data) instead of re-keying anything.
+            with _passphrase_environment(passphrase):
+                lockbox.ensure_recovery_envelope_for_backup(root, seed=seed)
+                legacy_key = lockbox.open_live_passphrase_envelope(
+                    root, passphrase=passphrase, seed=seed,
+                )
+                if legacy_key is None:
+                    raise DataKeyMigrationError(
+                        "the legacy passphrase envelope was not published"
+                    )
+                _probe_same_key(
+                    lockbox.acquire_lockbox(root), legacy_key, what="acquire_lockbox",
+                )
+            _verify_under(root, data_key=legacy_key, seed=seed, database_keys=[passphrase])
+            _require_converged(root, id_path=id_path, seed=seed, passphrase=passphrase)
+            return {"changed": True, "mode": "passphrase", "legacy_envelope": True}
+        _preflight(
+            root, current_key=silent_key, target_key=None, seed=seed,
+            database_keys=database_keys,
+        )
+        _write_migration_intent(root, "set_passphrase")
+        step("intent_written")
+    if live is not None:
+        # Interrupted after publication: the live envelope holds the target.
+        published = lockbox.open_live_passphrase_envelope(
+            root, passphrase=passphrase, seed=seed,
+        )
+        if published is None:  # pragma: no cover - live was loaded above
+            raise DataKeyMigrationError("the published envelope disappeared")
+        target = published
+    else:
+        target = lockbox.stage_passphrase_envelope(root, passphrase=passphrase, seed=seed)
+        step("staged")
+    if resumed:
+        _preflight(
+            root, current_key=silent_key, target_key=target, seed=seed,
+            database_keys=database_keys,
+        )
+    carried = lockbox.carry_dek_protected_envelopes(
+        root, previous_key=silent_key, target_key=target,
+    )
+    if carried["retired"] or carried["unopenable"]:  # preflight proved otherwise
+        raise DataKeyMigrationError(f"artifacts could not be carried: {carried}")
+    step("files_carried")
+    fields = state_module.rekey_offline_state_fields(
+        db_path,
+        database_keys=database_keys,
+        previous_data_key=silent_key,
+        target_data_key=target,
+        seed=seed,
+    )
+    step("fields_carried")
+    database = _rekey_state_database(
+        db_path, source_keys=[stored_key], target_key=passphrase,
+    )
+    step("database_rekeyed")
+    _verify_under(root, data_key=target, seed=seed, database_keys=[passphrase])
+    lockbox.publish_staged_passphrase_envelope(
+        root, passphrase=passphrase, seed=seed, expected_dek=target,
+    )
+    step("published")
+    # Again, through the readers the daemon uses, the way it will use them.
+    with _passphrase_environment(passphrase):
+        _probe_same_key(lockbox.acquire_lockbox(root), target, what="acquire_lockbox")
+    _verify_under(root, data_key=target, seed=seed, database_keys=[passphrase])
+    _require_converged(root, id_path=id_path, seed=seed, passphrase=passphrase)
+    if lockbox.recovery_envelope_matches_seed(root, seed) is not True:
+        raise DataKeyMigrationError(
+            "verification failed: the paper phrase does not open the new envelope"
+        )
+    step("verified")
+    _durable_unlink(_migration_intent_path(root), label="data-key migration intent")
+    return {
+        "changed": True,
+        "mode": "passphrase",
+        "artifacts": carried,
+        "fields": fields,
+        "database": database,
+    }
+
+
+def _remove_passphrase_steps(
+    root: Path,
+    *,
+    db_path: Path,
+    seed: bytes,
+    silent_key: bytes,
+    passphrase: str,
+    resumed: bool,
+    id_path: Path,
+    step: Any,
+) -> dict[str, Any]:
+    from one_link import keychain, lockbox, state_encryption
+    from one_link import state as state_module
+
+    stored_key = _stored_database_key(root)
+    database_keys: list[Optional[str]] = [passphrase, stored_key]
+    live = lockbox._load_envelope(root)
+    if not resumed and live is None:
+        if artifact_exists(root / lockbox.SALT_FILENAME, label="lockbox KDF salt"):
+            raise DataKeyMigrationError(
+                "a legacy passphrase salt exists without its recovery envelope; "
+                "run `one-link recovery set-passphrase` with that passphrase "
+                "first, then remove it"
+            )
+        return {"changed": False, "mode": "silent"}
+    # The passphrase being removed authorizes the removal: a wrong one raises.
+    previous = lockbox.open_live_passphrase_envelope(root, passphrase=passphrase, seed=seed)
+    if not resumed:
+        if previous is None:  # pragma: no cover - live was loaded above
+            raise DataKeyMigrationError("the live envelope disappeared")
+        _preflight(
+            root, current_key=previous, target_key=None, seed=seed,
+            database_keys=database_keys,
+        )
+        _write_migration_intent(root, "remove_passphrase")
+        step("intent_written")
+    carried: dict[str, list[str]] = {"carried": [], "retired": [], "unopenable": []}
+    fields: dict[str, dict[str, int]] = {}
+    if previous is not None:
+        # Before retirement: the envelope still holds the key being left.
+        # After it, everything was verified under the silent key already.
+        if resumed:
+            _preflight(
+                root, current_key=previous, target_key=silent_key, seed=seed,
+                database_keys=database_keys,
+            )
+        carried = lockbox.carry_dek_protected_envelopes(
+            root, previous_key=previous, target_key=silent_key,
+        )
+        if carried["retired"] or carried["unopenable"]:
+            raise DataKeyMigrationError(f"artifacts could not be carried: {carried}")
+        step("files_carried")
+        fields = state_module.rekey_offline_state_fields(
+            db_path,
+            database_keys=database_keys,
+            previous_data_key=previous,
+            target_data_key=silent_key,
+            seed=seed,
+        )
+        step("fields_carried")
+    target_db_key = stored_key
+    if state_encryption.detect_db_state(db_path) == "encrypted" and target_db_key is None:
+        if keychain._disabled():
+            raise DataKeyMigrationError(
+                "state.db is encrypted under the passphrase and at-rest key "
+                "management is disabled, so there is no stored key to move it to"
+            )
+        # Mint the stored database key exactly once: a replay reads it back.
+        with _passphrase_environment(None):
+            target_db_key = keychain._publish_recovered_passphrase(
+                root, secrets.token_urlsafe(32),
+            )
+    database = _rekey_state_database(
+        db_path, source_keys=[passphrase], target_key=target_db_key,
+    )
+    step("database_rekeyed")
+    _verify_under(root, data_key=silent_key, seed=seed, database_keys=[target_db_key])
+    if previous is not None:
+        lockbox.retire_passphrase_envelope(
+            root, passphrase=passphrase, seed=seed, expected_dek=previous,
+        )
+    step("retired")
+    with _passphrase_environment(None):
+        _probe_same_key(lockbox.acquire_lockbox(root), silent_key, what="acquire_lockbox")
+    if database in ("current", "rekeyed") and _stored_database_key(root) != target_db_key:
+        raise DataKeyMigrationError(
+            "verification failed: the stored database key is not the one "
+            "state.db was moved to"
+        )
+    _verify_under(root, data_key=silent_key, seed=seed, database_keys=[target_db_key])
+    _require_converged(root, id_path=id_path, seed=seed, passphrase=None)
+    step("verified")
+    lockbox.discard_retired_passphrase_authority(root)
+    step("discarded")
+    _durable_unlink(_migration_intent_path(root), label="data-key migration intent")
+    return {
+        "changed": True,
+        "mode": "silent",
+        "artifacts": carried,
+        "fields": fields,
+        "database": database,
+    }

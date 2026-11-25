@@ -1314,6 +1314,98 @@ def recovery_restore(portable_shares: tuple[str, ...], force: bool) -> None:
         )
 
 
+def _data_key_passphrase(*, confirm: bool) -> str:
+    """ONE_LINK_PASSPHRASE if set, otherwise a hidden prompt.
+
+    Never a command-line argument (argv is visible to every local process and
+    lands in shell history) and never logged or echoed.
+    """
+    import os
+
+    from one_link import lockbox
+
+    value = os.environ.get(lockbox.PASSPHRASE_ENV, "")
+    if value:
+        return value
+    value = click.prompt(
+        "passphrase",
+        hide_input=True,
+        confirmation_prompt=confirm,
+        prompt_suffix="> ",
+    )
+    if not value:
+        raise click.ClickException("an empty passphrase protects nothing")
+    return value
+
+
+@recovery.command("set-passphrase")
+def recovery_set_passphrase() -> None:
+    """Protect this install's data with a passphrase (One Link must be stopped).
+
+    Re-wraps every protected file and database field from the silent data key
+    to a new passphrase-protected data key, and moves the state database onto
+    the passphrase, in one transaction that survives a crash: if it is
+    interrupted, run this command again with the same passphrase to finish.
+
+    The passphrase is read from ONE_LINK_PASSPHRASE, or prompted for (twice).
+    Afterwards always start One Link with ONE_LINK_PASSPHRASE set.
+
+    Your 24-word phrase does not change. With a backup bundle exported after
+    this, the phrase alone still recovers everything; the passphrase is not
+    needed for recovery.
+    """
+    from one_link import recovery_api
+    from one_link.key_material import KeyMaterialError
+    from one_link.paths import data_dir
+
+    passphrase = _data_key_passphrase(confirm=True)
+    try:
+        report = recovery_api.set_data_key_passphrase(
+            data_dir=data_dir(), passphrase=passphrase,
+        )
+    except (ValueError, KeyMaterialError, recovery_api.RecoveryTransactionError) as exc:
+        raise click.ClickException(f"set-passphrase did not complete: {exc}") from exc
+    if not report["changed"]:
+        click.echo("This install is already protected by that passphrase; nothing changed.")
+        return
+    click.echo(
+        "The data key is now protected by your passphrase and every protected\n"
+        "file and field was re-wrapped and verified. Start One Link with\n"
+        "ONE_LINK_PASSPHRASE set from now on, and export a fresh backup."
+    )
+
+
+@recovery.command("remove-passphrase")
+def recovery_remove_passphrase() -> None:
+    """Return this install to the silent data key (One Link must be stopped).
+
+    The passphrase being removed must be supplied (ONE_LINK_PASSPHRASE or a
+    prompt); a wrong one changes nothing. Every protected file and field is
+    re-wrapped to the seed-derived data key and the state database moves to
+    a stored key, in one crash-replayable transaction. Afterwards start One
+    Link WITHOUT ONE_LINK_PASSPHRASE.
+    """
+    from one_link import recovery_api
+    from one_link.key_material import KeyMaterialError
+    from one_link.paths import data_dir
+
+    passphrase = _data_key_passphrase(confirm=False)
+    try:
+        report = recovery_api.remove_data_key_passphrase(
+            data_dir=data_dir(), passphrase=passphrase,
+        )
+    except (ValueError, KeyMaterialError, recovery_api.RecoveryTransactionError) as exc:
+        raise click.ClickException(f"remove-passphrase did not complete: {exc}") from exc
+    if not report["changed"]:
+        click.echo("This install has no passphrase; nothing changed.")
+        return
+    click.echo(
+        "The passphrase was removed: every protected file and field was\n"
+        "re-wrapped to the silent data key and verified. Start One Link\n"
+        "without ONE_LINK_PASSPHRASE from now on, and export a fresh backup."
+    )
+
+
 @recovery.command("test-shares")
 @click.argument("portable_shares", nargs=-1)
 def recovery_test_shares(portable_shares: tuple[str, ...]) -> None:

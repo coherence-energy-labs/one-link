@@ -57,15 +57,18 @@ Backward compatibility:
 """
 from __future__ import annotations
 
+import errno
+import json
 import os
 import secrets
 import hashlib
 import sys
+import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -457,12 +460,99 @@ def _load_envelope(data_dir: Path) -> Optional[_DekEnvelope]:
     return None if payload is None else _DekEnvelope.decode(payload)
 
 
-@contextmanager
-def _envelope_mutation_lock(data_dir: Path):
-    """Serialize first migration and passphrase/seed-slot rewraps."""
+# ─── the envelope transaction lock ──────────────────────────────────
+#
+# Real concurrent holders exist: `one-link backup export` runs beside a live
+# daemon without the instance lock and holds this lock for the whole export;
+# the daemon takes it at every seeded boot and from worker threads (TLS
+# authority minting, the in-daemon export API); a data-key migration holds it
+# for its whole transaction.  So a waiter waits -- bounded, with backoff --
+# and on timeout names the holder, recorded in the lock file after byte 0
+# (the byte Windows locks).  Within one process the lock is re-entrant per
+# thread and threads wait for each other: two handles conflict exactly like
+# two processes do (Windows byte-range locks and POSIX flock are per handle).
 
-    root = Path(data_dir)
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+LOCK_WAIT_TIMEOUT_S = 30.0
+_LOCK_BACKOFF_START_S = 0.01
+_LOCK_BACKOFF_MAX_S = 0.25
+_LOCK_HOLDER_MAX_BYTES = 512
+_LOCK_CONTENTION_ERRNOS = frozenset(
+    code
+    for code in (
+        getattr(errno, "EACCES", None),
+        getattr(errno, "EAGAIN", None),
+        getattr(errno, "EWOULDBLOCK", None),
+        getattr(errno, "EDEADLK", None),
+        getattr(errno, "EDEADLOCK", None),
+    )
+    if code is not None
+)
+
+# A data-key migration (`one-link recovery set-passphrase` / remove-passphrase)
+# journals itself here.  While it exists every other envelope transaction
+# refuses: between carrying the data and publishing the new key, neither key
+# alone describes the install.
+MIGRATION_INTENT_FILENAME = "lockbox.data-key-migration-v1.json"
+STAGED_ENVELOPE_FILENAME = DEK_ENVELOPE_FILENAME + ".staged"
+STAGED_SALT_FILENAME = "lockbox.salt.staged"
+RETIRED_ENVELOPE_FILENAME = DEK_ENVELOPE_FILENAME + ".retired"
+RETIRED_SALT_FILENAME = "lockbox.salt.retired"
+MIGRATION_COMMANDS = {
+    "set_passphrase": "one-link recovery set-passphrase",
+    "remove_passphrase": "one-link recovery remove-passphrase",
+}
+
+
+@dataclass
+class _ProcessEnvelopeLock:
+    rlock: Any
+    depth: int = 0
+    purpose: str = ""
+
+
+_PROCESS_ENVELOPE_LOCKS: dict[str, _ProcessEnvelopeLock] = {}
+_PROCESS_ENVELOPE_LOCKS_GUARD = threading.Lock()
+
+
+def _process_envelope_lock(root: Path) -> _ProcessEnvelopeLock:
+    key = os.path.normcase(os.path.abspath(str(root)))
+    with _PROCESS_ENVELOPE_LOCKS_GUARD:
+        held = _PROCESS_ENVELOPE_LOCKS.get(key)
+        if held is None:
+            held = _ProcessEnvelopeLock(rlock=threading.RLock())
+            _PROCESS_ENVELOPE_LOCKS[key] = held
+        return held
+
+
+def _lock_holder_hint(fd: int) -> str:
+    """`` (held by <purpose>, pid <n>)`` if the holder recorded itself."""
+    try:
+        os.lseek(fd, 1, os.SEEK_SET)
+        record = json.loads(os.read(fd, _LOCK_HOLDER_MAX_BYTES).decode("utf-8"))
+        purpose = str(record["purpose"])[:120]
+        pid = int(record["pid"])
+    except (OSError, ValueError, KeyError, TypeError, UnicodeDecodeError):
+        return " (holder not recorded)"
+    return f" (held by {purpose}, pid {pid})"
+
+
+def _record_lock_holder(fd: int, purpose: str) -> None:
+    record = json.dumps(
+        {"pid": os.getpid(), "purpose": purpose, "since_ms": int(time.time() * 1000)},
+        separators=(",", ":"),
+    ).encode("utf-8")[:_LOCK_HOLDER_MAX_BYTES]
+    try:
+        os.lseek(fd, 1, os.SEEK_SET)
+        os.write(fd, record)
+        os.ftruncate(fd, 1 + len(record))
+    except OSError:
+        # The record only improves a waiter's error message.
+        pass
+
+
+def _acquire_envelope_file_lock(
+    root: Path, *, purpose: str, deadline: float, timeout_s: float,
+) -> int:
     path = root / DEK_ENVELOPE_LOCK_FILENAME
     flags = os.O_RDWR | os.O_CREAT | int(getattr(os, "O_BINARY", 0))
     flags |= int(getattr(os, "O_CLOEXEC", 0))
@@ -473,49 +563,153 @@ def _envelope_mutation_lock(data_dir: Path):
         raise KeyMaterialPersistenceError(
             "cannot open lockbox DEK envelope lock"
         ) from exc
-    locked = False
     try:
-        if sys.platform == "win32":
-            import msvcrt
-
-            if os.fstat(fd).st_size == 0:
-                os.write(fd, b"\x00")
-                os.fsync(fd)
-            os.lseek(fd, 0, os.SEEK_SET)
-            try:
-                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-            except OSError as exc:
-                raise KeyMaterialPersistenceError(
-                    "another lockbox DEK envelope transaction is in progress"
-                ) from exc
-        else:
-            import fcntl
-
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as exc:
-                raise KeyMaterialPersistenceError(
-                    "another lockbox DEK envelope transaction is in progress"
-                ) from exc
-        locked = True
-        if sys.platform != "win32":
-            os.chmod(path, 0o600)
-        yield
-    finally:
-        if locked:
+        if os.fstat(fd).st_size == 0:
+            # Byte 0 is the locked byte on Windows; the holder record follows.
+            os.write(fd, b"\x00")
+            os.fsync(fd)
+        delay = _LOCK_BACKOFF_START_S
+        while True:
             try:
                 if sys.platform == "win32":
                     import msvcrt
 
                     os.lseek(fd, 0, os.SEEK_SET)
-                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
                 else:
                     import fcntl
 
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in _LOCK_CONTENTION_ERRNOS:
+                    raise KeyMaterialPersistenceError(
+                        f"cannot lock the lockbox DEK envelope: {exc}"
+                    ) from exc
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise KeyMaterialPersistenceError(
+                        "another lockbox DEK envelope transaction is in "
+                        f"progress{_lock_holder_hint(fd)}; gave up after "
+                        f"{timeout_s:.0f}s"
+                    ) from exc
+                time.sleep(min(delay, remaining))
+                delay = min(delay * 2, _LOCK_BACKOFF_MAX_S)
+        if sys.platform != "win32":
+            os.chmod(path, 0o600)
+        _record_lock_holder(fd, purpose)
+        return fd
+    except BaseException:
         os.close(fd)
+        raise
+
+
+def _release_envelope_file_lock(fd: int) -> None:
+    try:
+        with suppress(OSError):
+            os.ftruncate(fd, 1)
+        if sys.platform == "win32":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            with suppress(OSError):
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            with suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def data_key_migration_in_progress(data_dir: Path) -> Optional[str]:
+    """The kind of an unfinished data-key migration, or ``None``."""
+    payload = read_bytes_if_exists(
+        Path(data_dir) / MIGRATION_INTENT_FILENAME,
+        label="data-key migration intent",
+        max_bytes=4096,
+    )
+    if payload is None:
+        return None
+    try:
+        kind = str(json.loads(payload.decode("utf-8"))["kind"])
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError):
+        raise KeyMaterialIntegrityError(
+            "data-key migration intent is unreadable; the migration it "
+            "describes cannot be finished or abandoned automatically"
+        ) from None
+    if kind not in MIGRATION_COMMANDS:
+        raise KeyMaterialIntegrityError(
+            f"data-key migration intent names an unknown migration {kind!r}"
+        )
+    return kind
+
+
+@contextmanager
+def _envelope_mutation_lock(
+    data_dir: Path,
+    *,
+    purpose: str = "lockbox key operation",
+    migration: bool = False,
+):
+    """Serialize every envelope transaction; wait for a holder, boundedly.
+
+    ``migration`` is set only by the data-key migration, which owns the
+    intent journal; every other outermost acquisition refuses while one is
+    unfinished.  A nested acquisition in the same thread is re-entrant and
+    inherits the outer transaction's standing.
+    """
+    root = Path(data_dir)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    timeout_s = float(LOCK_WAIT_TIMEOUT_S)
+    deadline = time.monotonic() + timeout_s
+    held = _process_envelope_lock(root)
+    if not held.rlock.acquire(timeout=max(0.0, timeout_s)):
+        raise KeyMaterialPersistenceError(
+            "another lockbox DEK envelope transaction in this process "
+            f"(held by {held.purpose or 'unknown'}, pid {os.getpid()}) did "
+            f"not finish; gave up after {timeout_s:.0f}s"
+        )
+    try:
+        if held.depth > 0:
+            held.depth += 1
+            try:
+                yield
+            finally:
+                held.depth -= 1
+            return
+        fd = _acquire_envelope_file_lock(
+            root, purpose=purpose, deadline=deadline, timeout_s=timeout_s,
+        )
+        held.depth, held.purpose = 1, purpose
+        try:
+            if not migration:
+                kind = data_key_migration_in_progress(root)
+                if kind is not None:
+                    raise KeyMaterialProtectionError(
+                        f"a data-key migration ({kind.replace('_', '-')}) is "
+                        "unfinished on this installation; nothing may use the "
+                        "data key until it completes. Run "
+                        f"`{MIGRATION_COMMANDS[kind]}` again to finish it"
+                    )
+            yield
+        finally:
+            held.depth, held.purpose = 0, ""
+            _release_envelope_file_lock(fd)
+    finally:
+        held.rlock.release()
+
+
+def envelope_transaction(data_dir: Path, *, purpose: str):
+    """Hold the envelope transaction lock across a multi-step operation.
+
+    For callers outside this module whose consistency depends on no data-key
+    change interleaving with them (a backup export archives the envelope,
+    the DRK and state.db together).  Bounded wait; refuses during an
+    unfinished data-key migration.
+    """
+    return _envelope_mutation_lock(data_dir, purpose=purpose)
 
 
 def _publish_new_envelope(data_dir: Path, envelope: _DekEnvelope) -> _DekEnvelope:
@@ -784,11 +978,49 @@ def dek_artifacts_unopenable_by(
     return tuple(rejected)
 
 
-def _existing_data_refusal(paths: list[str]) -> KeyMaterialProtectionError:
+def dek_artifacts_unopenable_by_any(
+    data_dir: Path, data_keys: list[bytes],
+) -> tuple[DekProtectedArtifact, ...]:
+    """Present envelope artifacts that NONE of ``data_keys`` authenticates.
+
+    The preflight of a key migration: everything must open under the key it
+    is leaving or the key it is moving to, or the install is already damaged
+    and nothing may be changed.  Read-only.
+    """
+    root = Path(data_dir)
+    rejected = []
+    for artifact in present_dek_protected_artifacts(root):
+        if artifact.protection not in ENVELOPE_PROTECTIONS:
+            continue
+        blob = _read_dek_envelope_artifact(root, artifact)
+        if blob is None:
+            continue
+        if not any(_opens(key, blob) for key in data_keys):
+            rejected.append(artifact)
+    return tuple(rejected)
+
+
+def _existing_data_refusal(
+    paths: list[str], *, seeded: bool = True,
+) -> KeyMaterialProtectionError:
+    """The refusal every passphrase mint gives over existing data.
+
+    It names the migration that does the work: one offline transaction that
+    re-wraps every protected artifact and field under the new key.
+    """
+    if seeded:
+        remedy = "stop One Link and run `one-link recovery set-passphrase`"
+    else:
+        remedy = (
+            "this installation has no recovery seed: stop One Link, run "
+            "`one-link backup init` with ONE_LINK_PASSPHRASE unset and start "
+            "One Link once to establish one, then run "
+            "`one-link recovery set-passphrase`"
+        )
     return KeyMaterialProtectionError(
         "passphrase recovery envelope is missing for existing application "
         f"data ({', '.join(sorted(paths))}); explicit recovery migration is "
-        "required"
+        f"required: {remedy}"
     )
 
 
@@ -1165,7 +1397,7 @@ def prepare_bootstrap_recovery_envelope(data_dir: Path, *, seed: bytes) -> bool:
     if not isinstance(seed, (bytes, bytearray)) or len(seed) != 32:
         raise ValueError("seed must be 32 bytes")
     root = Path(data_dir)
-    with _envelope_mutation_lock(root):
+    with _envelope_mutation_lock(root, purpose="bootstrap recovery envelope"):
         envelope = _load_envelope(root)
         if envelope is None:
             passphrase = os.environ.get(PASSPHRASE_ENV, "")
@@ -1225,7 +1457,7 @@ def ensure_recovery_envelope_for_backup(
         raise ValueError("seed must be 32 bytes")
     root = Path(data_dir)
     passphrase = os.environ.get(PASSPHRASE_ENV, "")
-    with _envelope_mutation_lock(root):
+    with _envelope_mutation_lock(root, purpose="backup recovery envelope"):
         envelope = _load_envelope(root)
         if envelope is None and not passphrase:
             if artifact_exists(root / SALT_FILENAME, label="lockbox KDF salt"):
@@ -1339,7 +1571,7 @@ def rebind_recovery_envelope(
     if current_seed is not None and len(current_seed) != 32:
         raise ValueError("current_seed must be 32 bytes")
     root = Path(data_dir)
-    with _envelope_mutation_lock(root):
+    with _envelope_mutation_lock(root, purpose="recovery envelope rebind"):
         envelope = _load_envelope(root)
         if envelope is None:
             return False
@@ -1392,6 +1624,263 @@ def rebind_recovery_envelope(
             )
             _replace_envelope(root, replacement)
         return True
+
+
+# ─── data-key migration primitives (`one-link recovery *-passphrase`) ───
+#
+# recovery_api.set_data_key_passphrase / remove_data_key_passphrase own the
+# transaction; these are its key operations.  Each is idempotent: it inspects
+# what is on disk, classifies keys by authenticating them, and does only the
+# work that is still missing.  They run inside the migration's envelope
+# transaction (re-entrant), never on their own.
+
+
+def _envelope_slots_open(
+    envelope: _DekEnvelope, *, salt: bytes, passphrase: str, seed: bytes,
+) -> bytes:
+    """The DEK both slots authenticate; refuses unless BOTH open and agree."""
+    passphrase_dek, _key = _passphrase_envelope_candidate(
+        envelope, passphrase=passphrase, salt=salt,
+    )
+    if passphrase_dek is None:
+        raise KeyMaterialProtectionError(
+            "the passphrase does not open this installation's data key"
+        )
+    seed_dek = _decrypt_dek_slot(
+        envelope, wrapping_key=_seed_wrap_key(bytes(seed)), seed_slot=True,
+    )
+    if seed_dek is None:
+        raise KeyMaterialProtectionError(
+            "the master seed does not open this installation's data key envelope"
+        )
+    dek = _agree_deks(passphrase_dek, seed_dek)
+    if dek is None:  # pragma: no cover - both slots were proven present
+        raise KeyMaterialIntegrityError("lockbox DEK envelope slots are empty")
+    return dek
+
+
+def _read_salt_file(path: Path, *, label: str) -> Optional[bytes]:
+    salt = read_bytes_if_exists(path, label=label, max_bytes=1024)
+    if salt is not None and len(salt) != 16:
+        raise KeyMaterialIntegrityError(f"{label} has an invalid length")
+    return salt
+
+
+def _durable_rename(source: Path, target: Path) -> None:
+    """Atomically rename within one directory and make it durable."""
+    try:
+        os.replace(source, target)
+    except OSError as exc:
+        raise KeyMaterialPersistenceError(
+            f"cannot publish {target.name}"
+        ) from exc
+    if sys.platform != "win32":
+        fd = os.open(str(target.parent), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def _durable_remove(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise KeyMaterialPersistenceError(f"cannot remove {path.name}") from exc
+    if sys.platform != "win32":
+        fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def stage_passphrase_envelope(
+    data_dir: Path, *, passphrase: str, seed: bytes,
+) -> bytes:
+    """Stage the target envelope of set-passphrase; return its data key.
+
+    The staged envelope IS the migration's durable record of the target key:
+    it is published no-replace before any value is carried, under names no
+    reader consults (``STAGED_*``).  The target DEK is fresh randomness, not
+    scrypt(passphrase): knowing the passphrase and the (non-secret, backed-up)
+    salt is then not enough to compute it.  A replay re-opens the staged
+    envelope and proves the operator's passphrase against its passphrase
+    slot, so a different passphrase on replay refuses instead of forking.
+    """
+    if not passphrase:
+        raise ValueError("passphrase must be non-empty")
+    if not isinstance(seed, (bytes, bytearray)) or len(seed) != 32:
+        raise ValueError("seed must be 32 bytes")
+    root = Path(data_dir)
+    staged_envelope = root / STAGED_ENVELOPE_FILENAME
+    staged_salt = root / STAGED_SALT_FILENAME
+    payload = read_bytes_if_exists(
+        staged_envelope,
+        label="staged lockbox DEK envelope",
+        max_bytes=DEK_ENVELOPE_LEN + 1,
+    )
+    if payload is not None:
+        salt = _read_salt_file(staged_salt, label="staged lockbox KDF salt")
+        if salt is None:
+            raise KeyMaterialIntegrityError(
+                "staged lockbox DEK envelope exists without its staged salt"
+            )
+        return _envelope_slots_open(
+            _DekEnvelope.decode(payload), salt=salt, passphrase=passphrase, seed=bytes(seed),
+        )
+    salt = _read_salt_file(staged_salt, label="staged lockbox KDF salt")
+    if salt is None:
+        salt = secrets.token_bytes(16)
+
+        def _validate_salt(blob: bytes, _expected: bytes = salt) -> None:
+            if not secrets.compare_digest(blob, _expected):
+                raise KeyMaterialIntegrityError("staged lockbox KDF salt read-back mismatch")
+
+        if not atomic_create_bytes(
+            staged_salt, salt, label="staged lockbox KDF salt", validate=_validate_salt,
+        ):
+            raise KeyMaterialPersistenceError(
+                "a concurrent writer published the staged lockbox KDF salt"
+            )
+    dek = secrets.token_bytes(32)
+    legacy = _derive_legacy_passphrase_dek(passphrase.encode("utf-8"), salt)
+    envelope = _new_envelope(
+        dek=dek, salt=salt, passphrase_key=_passphrase_wrap_key(legacy), seed=bytes(seed),
+    )
+    expected = envelope.encode()
+
+    def _validate(blob: bytes) -> None:
+        if not secrets.compare_digest(blob, expected):
+            raise KeyMaterialIntegrityError("staged lockbox DEK envelope read-back mismatch")
+
+    if not atomic_create_bytes(
+        staged_envelope,
+        expected,
+        label="staged lockbox DEK envelope",
+        validate=_validate,
+        harden_path=_harden_envelope_path,
+    ):
+        raise KeyMaterialPersistenceError(
+            "a concurrent writer published the staged lockbox DEK envelope"
+        )
+    return dek
+
+
+def open_live_passphrase_envelope(
+    data_dir: Path, *, passphrase: str, seed: bytes,
+) -> Optional[bytes]:
+    """The live envelope's DEK, proven by the passphrase AND the seed.
+
+    ``None`` when no live envelope exists (silent mode).  A wrong passphrase
+    raises rather than falling back to the seed slot: remove-passphrase must
+    be authorized by the factor it removes.
+    """
+    root = Path(data_dir)
+    envelope = _load_envelope(root)
+    if envelope is None:
+        return None
+    salt = _read_salt_file(root / SALT_FILENAME, label="lockbox KDF salt")
+    if salt is None:
+        raise KeyMaterialProtectionError(
+            "the lockbox KDF salt is missing, so the passphrase cannot be "
+            "verified against this installation's data key"
+        )
+    return _envelope_slots_open(envelope, salt=salt, passphrase=passphrase, seed=bytes(seed))
+
+
+def publish_staged_passphrase_envelope(
+    data_dir: Path, *, passphrase: str, seed: bytes, expected_dek: bytes,
+) -> None:
+    """Make the staged envelope (and then its salt) the live authority.
+
+    The envelope rename is the switch: from that instant every reader opens
+    ``expected_dek``.  A live envelope with its salt still staged is already
+    a consistent passphrase install (acquire_lockbox re-salts it), and the
+    replay finishes the salt rename.  Every step re-proves the key first.
+    """
+    root = Path(data_dir)
+    live = root / DEK_ENVELOPE_FILENAME
+    staged = root / STAGED_ENVELOPE_FILENAME
+    staged_salt = root / STAGED_SALT_FILENAME
+    salt = _read_salt_file(staged_salt, label="staged lockbox KDF salt")
+    if not artifact_exists(live, label="lockbox DEK envelope"):
+        payload = read_bytes_if_exists(
+            staged, label="staged lockbox DEK envelope", max_bytes=DEK_ENVELOPE_LEN + 1,
+        )
+        if payload is None or salt is None:
+            raise KeyMaterialIntegrityError(
+                "set-passphrase has neither a live nor a staged data-key envelope"
+            )
+        dek = _envelope_slots_open(
+            _DekEnvelope.decode(payload), salt=salt, passphrase=passphrase, seed=bytes(seed),
+        )
+        if not secrets.compare_digest(dek, bytes(expected_dek)):
+            raise KeyMaterialIntegrityError(
+                "staged data-key envelope does not hold the key the data was carried to"
+            )
+        _durable_rename(staged, live)
+    envelope = _load_envelope(root)
+    if envelope is None:  # pragma: no cover - published or present above
+        raise KeyMaterialIntegrityError("published lockbox DEK envelope disappeared")
+    live_salt = _read_salt_file(root / SALT_FILENAME, label="lockbox KDF salt")
+    if salt is not None:
+        if live_salt is None:
+            _durable_rename(staged_salt, root / SALT_FILENAME)
+        elif secrets.compare_digest(live_salt, salt):
+            _durable_remove(staged_salt)
+        else:
+            raise KeyMaterialIntegrityError(
+                "a different lockbox KDF salt appeared during set-passphrase"
+            )
+    final_salt = _read_salt_file(root / SALT_FILENAME, label="lockbox KDF salt")
+    if final_salt is None:
+        raise KeyMaterialIntegrityError("published lockbox KDF salt is missing")
+    dek = _envelope_slots_open(envelope, salt=final_salt, passphrase=passphrase, seed=bytes(seed))
+    if not secrets.compare_digest(dek, bytes(expected_dek)):
+        raise KeyMaterialIntegrityError(
+            "the live data-key envelope does not hold the key the data was carried to"
+        )
+
+
+def retire_passphrase_envelope(
+    data_dir: Path, *, passphrase: str, seed: bytes, expected_dek: bytes,
+) -> None:
+    """Take the envelope and salt out of service (remove-passphrase's switch).
+
+    Renamed, not deleted: the old authority is deleted only after the
+    silent key has been verified against every artifact and field
+    (``discard_retired_passphrase_authority``).
+    """
+    root = Path(data_dir)
+    live = root / DEK_ENVELOPE_FILENAME
+    if artifact_exists(live, label="lockbox DEK envelope"):
+        dek = open_live_passphrase_envelope(root, passphrase=passphrase, seed=seed)
+        if dek is None or not secrets.compare_digest(dek, bytes(expected_dek)):
+            raise KeyMaterialIntegrityError(
+                "the live data-key envelope changed during remove-passphrase"
+            )
+        _durable_rename(live, root / RETIRED_ENVELOPE_FILENAME)
+    if artifact_exists(root / SALT_FILENAME, label="lockbox KDF salt"):
+        _durable_rename(root / SALT_FILENAME, root / RETIRED_SALT_FILENAME)
+
+
+def holds_data_key(box: "LockBox", data_key: bytes) -> bool:
+    """Whether ``box`` holds exactly ``data_key`` (an in-memory probe)."""
+    probe = LockBox(bytes(data_key)).wrap(b"OL/lockbox/same-key-probe|v1")
+    try:
+        box.unwrap(probe)
+    except LockBoxError:
+        return False
+    return True
+
+
+def discard_retired_passphrase_authority(data_dir: Path) -> None:
+    root = Path(data_dir)
+    for name in (RETIRED_ENVELOPE_FILENAME, RETIRED_SALT_FILENAME):
+        _durable_remove(root / name)
 
 
 # ─── silent-mode DRK acquisition (v0.20.7 audit C5 partial-auto) ───
@@ -1641,7 +2130,7 @@ def acquire_lockbox(data_dir: Path) -> "LockBox":
     root = Path(data_dir)
     pw = os.environ.get(PASSPHRASE_ENV, "")
     seed = master_seed.load_seed(root)
-    with _envelope_mutation_lock(root):
+    with _envelope_mutation_lock(root, purpose="data key acquisition"):
         envelope = _load_envelope(root)
         if pw:
             salt_preexisted = artifact_exists(
@@ -1655,7 +2144,7 @@ def acquire_lockbox(data_dir: Path) -> "LockBox":
                     # because a silent LockBox was issued, and no envelope
                     # will ever arbitrate between it and a passphrase key.
                     if artifact_exists(_drk_path(root), label="data root key"):
-                        raise _existing_data_refusal([DRK_FILENAME])
+                        raise _existing_data_refusal([DRK_FILENAME], seeded=False)
                 else:
                     _refuse_passphrase_dek_over_silent_data(
                         root,

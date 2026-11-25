@@ -198,6 +198,235 @@ def carry_key_protected_fields(
         state.close()
 
 
+def rekey_field_rows(
+    conn: Any,
+    *,
+    previous_data_key: Optional[bytes],
+    target_data_key: bytes,
+    previous_seed: Optional[bytes],
+    target_seed: bytes,
+    dry_run: bool = False,
+) -> dict[str, dict[str, int]]:
+    """Classify and re-key every ``KEY_PROTECTED_FIELDS`` value on ``conn``.
+
+    The caller owns the transaction (``State.rekey_protected_fields`` uses
+    its durable write transaction; the offline data-key migration opens its
+    own).  Semantics are documented on ``State.rekey_protected_fields``.
+    ``dry_run`` classifies without writing: ``rekeyed`` then counts the
+    values that WOULD be re-sealed.  Verifying that every value opens under
+    one key K is a dry run with previous == target == K: anything that is
+    not ``current`` is ``unopenable``.
+    """
+    from one_link.lockbox import LockBox, LockBoxError, MIN_WRAPPED_LEN
+    from one_link.path_pii import PATH_PII_MARKER, PathPIIEncryptor
+
+    target_box = LockBox(bytes(target_data_key))
+    previous_box = (
+        LockBox(bytes(previous_data_key)) if previous_data_key is not None else None
+    )
+    target_paths = PathPIIEncryptor(bytes(target_seed))
+    previous_paths = (
+        PathPIIEncryptor(bytes(previous_seed)) if previous_seed is not None else None
+    )
+
+    def _opens(box, blob: bytes) -> bool:
+        try:
+            box.unwrap(blob)
+        except LockBoxError:
+            return False
+        return True
+
+    tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    report: dict[str, dict[str, int]] = {}
+    for field in KEY_PROTECTED_FIELDS:
+        counts = {"rekeyed": 0, "current": 0, "unopenable": 0}
+        report[field.name] = counts
+        # Path-PII ciphertext is deterministic: every chunk row of one
+        # file stores the same value, so classify each distinct value
+        # once: stored value -> ("current" | "unopenable", None) or
+        # ("rekey", resealed value).
+        path_verdicts: dict[str, tuple[str, Optional[str]]] = {}
+        if field.table not in tables:
+            continue  # an older schema without this table holds no such value
+        if field.family == FIELD_FAMILY_DATA_KEY and previous_box is None:
+            continue
+        if field.family == FIELD_FAMILY_PATH_PII and previous_paths is None:
+            continue
+        # Exactly one previous key applies to this field's family and
+        # the guards above guarantee it is present. Bind it once, as a
+        # non-optional name, so a missing key can never be mistaken for
+        # an undecryptable row further down.
+        field_previous_box = previous_box if field.family == FIELD_FAMILY_DATA_KEY else None
+        field_previous_paths = previous_paths if field.family != FIELD_FAMILY_DATA_KEY else None
+        # SQLite cannot bind identifiers, so the statements are composed
+        # from the registry entry. KeyProtectedField.__post_init__
+        # admits only plain lowercase ASCII identifiers, and the
+        # registry is a module constant; every value is still bound.
+        select_page = (
+            f"SELECT rowid, {field.column} FROM {field.table} "  # nosec B608
+            f"WHERE rowid > ? AND {field.column} IS NOT NULL ORDER BY rowid LIMIT 512"
+        )
+        update_row = (
+            f"UPDATE OR REPLACE {field.table} SET {field.column} = ? WHERE rowid = ?"  # nosec B608
+        )
+        last_rowid = 0
+        while True:
+            rows = conn.execute(select_page, (last_rowid,)).fetchall()
+            if not rows:
+                break
+            for rowid, stored in rows:
+                last_rowid = int(rowid)
+                if field.family == FIELD_FAMILY_DATA_KEY:
+                    blob = bytes(stored)
+                    if len(blob) != field.plaintext_len + MIN_WRAPPED_LEN:
+                        continue  # legacy cleartext: keyless
+                    if _opens(target_box, blob):
+                        counts["current"] += 1
+                        continue
+                    if field_previous_box is None:
+                        raise RuntimeError(
+                            f"re-key of {field.name} reached without its previous data key"
+                        )
+                    try:
+                        plaintext = field_previous_box.unwrap(blob)
+                    except LockBoxError:
+                        counts["unopenable"] += 1
+                        continue
+                    sealed: Any = target_box.wrap(plaintext)
+                else:
+                    document: Any = None
+                    if field.json_key:
+                        try:
+                            document = json.loads(stored)
+                        except (TypeError, ValueError):
+                            continue
+                        if not isinstance(document, dict):
+                            continue
+                        value = document.get(field.json_key)
+                    else:
+                        value = stored
+                    if not isinstance(value, str) or not value.startswith(
+                        PATH_PII_MARKER
+                    ):
+                        continue  # legacy cleartext: keyless
+                    verdict = path_verdicts.get(value)
+                    if verdict is None:
+                        if target_paths.unwrap(value, aad=field.aad) is not None:
+                            verdict = ("current", None)
+                        else:
+                            if field_previous_paths is None:
+                                raise RuntimeError(
+                                    f"re-key of {field.name} reached without its previous path key"
+                                )
+                            plaintext_path = field_previous_paths.unwrap(
+                                value, aad=field.aad,
+                            )
+                            verdict = (
+                                ("unopenable", None)
+                                if plaintext_path is None
+                                else (
+                                    "rekey",
+                                    target_paths.wrap(plaintext_path, aad=field.aad),
+                                )
+                            )
+                        path_verdicts[value] = verdict
+                    if verdict[0] != "rekey":
+                        counts[verdict[0]] += 1
+                        continue
+                    resealed = verdict[1]
+                    if document is not None:
+                        document[field.json_key] = resealed
+                        sealed = json.dumps(
+                            document, separators=(",", ":"), sort_keys=True,
+                        )
+                    else:
+                        sealed = resealed
+                # OR REPLACE: a deterministic path ciphertext can be a
+                # key column (chunk_sources, file_index_cache); if the
+                # same plaintext path already has a current-key row,
+                # the two rows describe one path and one survives.
+                if not dry_run:
+                    conn.execute(update_row, (sealed, rowid))
+                counts["rekeyed"] += 1
+    return report
+
+
+def open_offline_state_connection(
+    db_path: Path, database_keys: Iterable[Optional[str]],
+) -> tuple[Any, Optional[str]]:
+    """Open an OFFLINE state.db with the first database key that authenticates.
+
+    Returns ``(connection, key)``; ``key`` is ``None`` for a plaintext file.
+    Never State(): that picks its SQLCipher key from the environment and may
+    encrypt a plaintext file as a side effect.  The caller holds the daemon
+    instance lock, so no other connection is open.
+    """
+    from one_link import state_encryption
+    from one_link.key_material import KeyMaterialProtectionError
+
+    kind = state_encryption.detect_db_state(Path(db_path))
+    if kind == "plaintext":
+        return sqlite3.connect(str(db_path), isolation_level=None), None
+    if kind != "encrypted":
+        raise KeyMaterialProtectionError(f"state.db is {kind}; nothing can be re-keyed in it")
+    for key in database_keys:
+        if not key:
+            continue
+        try:
+            return state_encryption.open_encrypted_connection(Path(db_path), key), key
+        except Exception:  # nosec B112 - wrong key: authentication is the classifier
+            continue
+    raise KeyMaterialProtectionError(
+        "state.db opens with none of the database keys this migration holds"
+    )
+
+
+def rekey_offline_state_fields(
+    db_path: Path,
+    *,
+    database_keys: Iterable[Optional[str]],
+    previous_data_key: bytes,
+    target_data_key: bytes,
+    seed: bytes,
+    dry_run: bool = False,
+) -> dict[str, dict[str, int]]:
+    """Re-key (or, with ``dry_run``, classify) an offline state.db's data-key fields.
+
+    One FULL-synchronous transaction: all of it or none of it.  Path-PII
+    fields are keyed by the seed, which a data-key migration does not change,
+    so they are not touched.  A missing state.db holds no field.
+    """
+    if not Path(db_path).exists():
+        return {}
+    conn, _key = open_offline_state_connection(Path(db_path), database_keys)
+    try:
+        kwargs: dict[str, Any] = dict(
+            previous_data_key=previous_data_key,
+            target_data_key=target_data_key,
+            previous_seed=None,
+            target_seed=seed,
+        )
+        if dry_run:
+            return rekey_field_rows(conn, dry_run=True, **kwargs)
+        conn.execute("PRAGMA synchronous = FULL")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            report = rekey_field_rows(conn, **kwargs)
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        return report
+    finally:
+        conn.close()
+
+
 MAX_REMOTE_INSTRUCTION_SEEN_ROWS = 65_536
 MAX_REMOTE_INSTRUCTION_REPLAY_RETENTION_MS = 16 * 60 * 1000
 _LOWER_HEX_CHARS = frozenset("0123456789abcdef")
@@ -961,135 +1190,14 @@ class State:
         SQLite commits all of it or none of it, so an interruption leaves
         every row under the previous key and the replay re-runs it.
         """
-        from one_link.lockbox import LockBox, LockBoxError, MIN_WRAPPED_LEN
-        from one_link.path_pii import PATH_PII_MARKER, PathPIIEncryptor
-
-        target_box = LockBox(bytes(target_data_key))
-        previous_box = (
-            LockBox(bytes(previous_data_key)) if previous_data_key is not None else None
-        )
-        target_paths = PathPIIEncryptor(bytes(target_seed))
-        previous_paths = (
-            PathPIIEncryptor(bytes(previous_seed)) if previous_seed is not None else None
-        )
-
-        def _opens(box, blob: bytes) -> bool:
-            try:
-                box.unwrap(blob)
-            except LockBoxError:
-                return False
-            return True
-
-        report: dict[str, dict[str, int]] = {}
         with self.durable_write_transaction():
-            for field in KEY_PROTECTED_FIELDS:
-                counts = {"rekeyed": 0, "current": 0, "unopenable": 0}
-                report[field.name] = counts
-                # Path-PII ciphertext is deterministic: every chunk row of one
-                # file stores the same value, so classify each distinct value
-                # once: stored value -> ("current" | "unopenable", None) or
-                # ("rekey", resealed value).
-                path_verdicts: dict[str, tuple[str, Optional[str]]] = {}
-                if field.family == FIELD_FAMILY_DATA_KEY and previous_box is None:
-                    continue
-                if field.family == FIELD_FAMILY_PATH_PII and previous_paths is None:
-                    continue
-                # Exactly one previous key applies to this field's family and
-                # the guards above guarantee it is present. Bind it once, as a
-                # non-optional name, so a missing key can never be mistaken for
-                # an undecryptable row further down.
-                field_previous_box = previous_box if field.family == FIELD_FAMILY_DATA_KEY else None
-                field_previous_paths = previous_paths if field.family != FIELD_FAMILY_DATA_KEY else None
-                # SQLite cannot bind identifiers, so the statements are composed
-                # from the registry entry. KeyProtectedField.__post_init__
-                # admits only plain lowercase ASCII identifiers, and the
-                # registry is a module constant; every value is still bound.
-                select_page = (
-                    f"SELECT rowid, {field.column} FROM {field.table} "  # nosec B608
-                    f"WHERE rowid > ? AND {field.column} IS NOT NULL ORDER BY rowid LIMIT 512"
-                )
-                update_row = (
-                    f"UPDATE OR REPLACE {field.table} SET {field.column} = ? WHERE rowid = ?"  # nosec B608
-                )
-                last_rowid = 0
-                while True:
-                    rows = self._conn.execute(select_page, (last_rowid,)).fetchall()
-                    if not rows:
-                        break
-                    for rowid, stored in rows:
-                        last_rowid = int(rowid)
-                        if field.family == FIELD_FAMILY_DATA_KEY:
-                            blob = bytes(stored)
-                            if len(blob) != field.plaintext_len + MIN_WRAPPED_LEN:
-                                continue  # legacy cleartext: keyless
-                            if _opens(target_box, blob):
-                                counts["current"] += 1
-                                continue
-                            if field_previous_box is None:
-                                raise RuntimeError(
-                                    f"re-key of {field.name} reached without its previous data key"
-                                )
-                            try:
-                                plaintext = field_previous_box.unwrap(blob)
-                            except LockBoxError:
-                                counts["unopenable"] += 1
-                                continue
-                            sealed: Any = target_box.wrap(plaintext)
-                        else:
-                            document: Any = None
-                            if field.json_key:
-                                try:
-                                    document = json.loads(stored)
-                                except (TypeError, ValueError):
-                                    continue
-                                if not isinstance(document, dict):
-                                    continue
-                                value = document.get(field.json_key)
-                            else:
-                                value = stored
-                            if not isinstance(value, str) or not value.startswith(
-                                PATH_PII_MARKER
-                            ):
-                                continue  # legacy cleartext: keyless
-                            verdict = path_verdicts.get(value)
-                            if verdict is None:
-                                if target_paths.unwrap(value, aad=field.aad) is not None:
-                                    verdict = ("current", None)
-                                else:
-                                    if field_previous_paths is None:
-                                        raise RuntimeError(
-                                            f"re-key of {field.name} reached without its previous path key"
-                                        )
-                                    plaintext_path = field_previous_paths.unwrap(
-                                        value, aad=field.aad,
-                                    )
-                                    verdict = (
-                                        ("unopenable", None)
-                                        if plaintext_path is None
-                                        else (
-                                            "rekey",
-                                            target_paths.wrap(plaintext_path, aad=field.aad),
-                                        )
-                                    )
-                                path_verdicts[value] = verdict
-                            if verdict[0] != "rekey":
-                                counts[verdict[0]] += 1
-                                continue
-                            resealed = verdict[1]
-                            if document is not None:
-                                document[field.json_key] = resealed
-                                sealed = json.dumps(
-                                    document, separators=(",", ":"), sort_keys=True,
-                                )
-                            else:
-                                sealed = resealed
-                        # OR REPLACE: a deterministic path ciphertext can be a
-                        # key column (chunk_sources, file_index_cache); if the
-                        # same plaintext path already has a current-key row,
-                        # the two rows describe one path and one survives.
-                        self._conn.execute(update_row, (sealed, rowid))
-                        counts["rekeyed"] += 1
-        return report
+            return rekey_field_rows(
+                self._conn,
+                previous_data_key=previous_data_key,
+                target_data_key=target_data_key,
+                previous_seed=previous_seed,
+                target_seed=target_seed,
+            )
 
     def _wrap_path(self, value: str, *, aad: bytes) -> str:
         if self._path_pii is None or not value:

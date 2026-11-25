@@ -1603,6 +1603,12 @@ async def test_api_audit_describes_surface():
             assert "CAPS" in j["peer_protocol"]["message_types"]
             assert "CAPSULE_RECEIPT" in j["peer_protocol"]["message_types"]
             assert "FILE_COMMIT" in j["peer_protocol"]["message_types"]
+            assert j["peer_protocol"]["handshake_policy"]["default_version"] == 3
+            assert "ML-KEM-768" in j["peer_protocol"]["encryption"]
+            assert j["peer_protocol"]["handshake_policy"]["browser_webrtc_pq_qualified"] is False
+            assert j["peer_protocol"]["file_payload_routes"]["supported_requests"] == [
+                "auto", "tcp", "relay",
+            ]
             assert "CALL_SDP_ANSWER" in j["peer_protocol"]["message_types"]
             assert any(s["name"] == "file_cdc_transfer" for s in j["peer_protocol"]["sessions"])
             assert "file_cdc" in j["local_capabilities"]

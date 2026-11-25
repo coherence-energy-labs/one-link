@@ -1,6 +1,13 @@
 """Encrypted bidirectional channel between two peers.
 
-Handshake (Noise-IK-flavored, simplified):
+The live default is the version-3, mutually confirmed X25519 + ML-KEM-768
+hybrid handshake. Ed25519 signatures bind the negotiated suite, identities,
+ephemeral keys and transcript. Missing native support fails closed unless an
+explicit migration policy permits classical operation. Browser WebRTC uses
+its separate DTLS/DataChannel protocol; this channel's PQ claim does not apply
+to that browser transport.
+
+The following describes the retained classical migration protocol only:
     1. Initiator -> Responder
        HELLO = init_pub_ed25519 || init_pub_x25519 || nonce_init || sig_init
        sig_init signs: "OL1|HELLO|" + init_pub_ed25519 + init_pub_x25519 + nonce_init
@@ -1717,6 +1724,26 @@ def _legacy_handshake_override_enabled(explicit: bool | None) -> bool:
         os.environ.get("ONE_LINK_ALLOW_CLASSICAL_HANDSHAKE") == "1"
         or os.environ.get("ONE_LINK_ALLOW_V1_HELLO") == "1"
     )
+
+
+def configured_handshake_policy() -> dict[str, object]:
+    """Describe configured defaults without asserting any live session's suite.
+
+    The receiver migration switch and explicit initiator downgrade arguments
+    are distinct. Connection evidence lives on Channel.handshake_suite and
+    Channel.pq_protected; merely advertising a capability is not that evidence.
+    """
+    return {
+        "default_version": PQ_HANDSHAKE_VERSION,
+        "default_suite": PQ_HYBRID_HANDSHAKE_CAP,
+        "default_key_agreement": "X25519 + ML-KEM-768",
+        "default_requires_native_pq": True,
+        "classical_receiver_override": _legacy_handshake_override_enabled(None),
+        "unbound_v1_migration_override": os.environ.get("ONE_LINK_ALLOW_V1_HELLO") == "1",
+        "automatic_downgrade": False,
+        "evidence_scope": "configured policy; inspect each channel's negotiated suite",
+        "browser_webrtc_pq_qualified": False,
+    }
 
 
 def _reject_legacy_hello_by_policy(

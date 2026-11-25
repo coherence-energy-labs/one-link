@@ -27813,7 +27813,7 @@ class UIServer:
                 "kind": "lan_peer_quic",
                 "destination": "paired peer address and negotiated UDP port",
                 "protocol": "QUIC/TLS 1.3 native transfer path",
-                "activation": "native module + mutual capability + reachable route",
+                "activation": "experimental native primitive; desktop file payload lane is disabled",
             },
             {"kind": "mdns_multicast",
              "destination": "224.0.0.251:5353",
@@ -27871,9 +27871,21 @@ class UIServer:
                     "websocket_subprotocol_bound": OWNER_WS_PROTOCOL,
                 },
             "peer_protocol": {
-                "transport": "authenticated peer TCP plus negotiated native QUIC file lanes",
+                "transport": "authenticated encrypted peer stream over direct TCP or configured relay",
                 "auth": "Ed25519 mutual signature in handshake",
-                "encryption": "X25519 ECDH + HKDF + ChaCha20-Poly1305 (64-bit nonce counter)",
+                "encryption": (
+                    "default X25519 + ML-KEM-768 hybrid key agreement, HKDF, "
+                    "ChaCha20-Poly1305; negotiated Double Ratchet after capability exchange"
+                ),
+                "handshake_policy": __import__(
+                    "one_link.channel", fromlist=["configured_handshake_policy"]
+                ).configured_handshake_policy(),
+                "file_payload_routes": {
+                    "supported_requests": ["auto", "tcp", "relay"],
+                    "quic": "unsupported by desktop send_file; native primitive only",
+                    "webrtc": "separate browser DataChannel path; not desktop send_file",
+                    "receipt_scope": "acknowledged application payload; excludes wire overhead",
+                },
                 "message_types": peer_msg_types,
                     "message_type_inventory": (
                         "declared daemon vocabulary; capability negotiation selects "

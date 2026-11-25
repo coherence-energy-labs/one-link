@@ -17,6 +17,7 @@ SPEC = importlib.util.spec_from_file_location("build_browser_ui", ROOT / "script
 assert SPEC and SPEC.loader
 builder = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(builder)
+BUILD_COMMAND = [sys.executable, "-X", "utf8", str(ROOT / "scripts/build_owner_ui.py")]
 
 
 def test_peer_artifact_is_current_and_canonical_sources_stay_outside_runtime() -> None:
@@ -33,35 +34,36 @@ def test_peer_artifact_is_current_and_canonical_sources_stay_outside_runtime() -
 
 def test_existing_ci_entry_point_checks_both_generated_pages() -> None:
     result = subprocess.run(
-        [sys.executable, str(ROOT / "scripts/build_owner_ui.py"), "--check"],
-        capture_output=True, text=True, timeout=20,
+        [*BUILD_COMMAND, "--check"],
+        capture_output=True, encoding="utf-8", timeout=20,
     )
     assert result.returncode == 0, result.stderr
     assert "Owner UI generated HTML is current." in result.stdout
     assert "Peer UI generated HTML is current." in result.stdout
 
 
-def test_peer_check_rejects_stale_output_without_rewriting(tmp_path: Path) -> None:
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
+def test_peer_check_rejects_stale_output_without_rewriting(tmp_path: Path, newline: bytes) -> None:
     output = tmp_path / "peer.html"
-    output.write_text("stale peer\n")
+    original_bytes = b"stale peer" + newline
+    output.write_bytes(original_bytes)
     command = [
-        sys.executable, str(ROOT / "scripts/build_owner_ui.py"),
-        "--page", "peer", "--output", str(output),
+        *BUILD_COMMAND, "--page", "peer", "--output", str(output),
     ]
-    result = subprocess.run(command + ["--check"], capture_output=True, text=True, timeout=20)
+    result = subprocess.run(command + ["--check"], capture_output=True, encoding="utf-8", timeout=20)
     assert result.returncode == 1
-    assert output.read_text() == "stale peer\n"
-    built = subprocess.run(command, capture_output=True, text=True, timeout=20)
+    assert output.read_bytes() == original_bytes
+    built = subprocess.run(command, capture_output=True, encoding="utf-8", timeout=20)
     assert built.returncode == 0, built.stderr
-    assert output.read_bytes() == builder.PEER_OUTPUT.read_bytes()
+    assert output.read_bytes() == builder.build(builder.PEER_SOURCE).encode("utf-8")
+    assert subprocess.run(command + ["--check"], capture_output=True, timeout=20).returncode == 0
 
 
 def test_source_page_identity_cannot_be_overridden(tmp_path: Path) -> None:
     output = tmp_path / "wrong.html"
     result = subprocess.run(
-        [sys.executable, str(ROOT / "scripts/build_owner_ui.py"),
-         "--page", "owner", "--source", str(builder.PEER_SOURCE), "--output", str(output)],
-        capture_output=True, text=True, timeout=20,
+        [*BUILD_COMMAND, "--page", "owner", "--source", str(builder.PEER_SOURCE), "--output", str(output)],
+        capture_output=True, encoding="utf-8", timeout=20,
     )
     assert result.returncode == 2
     assert "differs from --page" in result.stderr
@@ -72,6 +74,6 @@ def test_source_page_identity_cannot_be_overridden(tmp_path: Path) -> None:
 def test_peer_modules_and_isolated_services_execute_in_javascript() -> None:
     result = subprocess.run(
         ["node", "--test", str(ROOT / "tests/js/test_peer_ui_services.cjs")],
-        cwd=ROOT, capture_output=True, text=True, timeout=30,
+        cwd=ROOT, capture_output=True, encoding="utf-8", timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr

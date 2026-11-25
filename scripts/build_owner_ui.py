@@ -7,6 +7,10 @@ lifecycles. Isolated services declare dependencies in factory parameters.
 The historical entry point checks both pages by default. Use ``--page owner``
 or ``--page peer`` for a single artifact. CI can keep running
 ``python scripts/build_owner_ui.py --check`` to reject either stale output.
+
+Canonical sources and generated artifacts are UTF-8. Text reads normalize
+Git's LF/CRLF checkout forms for comparison; writes always emit LF. Check mode
+never rewrites an existing artifact, including its checkout newline bytes.
 """
 
 from __future__ import annotations

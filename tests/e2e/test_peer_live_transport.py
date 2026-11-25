@@ -685,6 +685,8 @@ _RTC_CAPTURE_INIT = """
         peerConnections: [],
         channels: [],
         messages: [],
+        events: [],
+        droppedEvents: 0,
     };
     window.__oneLinkRtcE2E = telemetry;
     if (!NativePeerConnection) return;
@@ -693,15 +695,68 @@ _RTC_CAPTURE_INIT = """
     const captureChannel = (channel) => {
         if (seen.has(channel)) return channel;
         seen.add(channel);
+        const channelIndex = telemetry.channels.length;
         telemetry.channels.push(channel);
-        channel.addEventListener("message", (event) => {
-            telemetry.messages.push({
-                label: channel.label,
-                data: typeof event.data === "string"
-                    ? event.data
-                    : `[binary:${event.data?.byteLength ?? -1}]`,
+        const observe = (event, data) => {
+            if (telemetry.events.length >= 64) {
+                telemetry.droppedEvents += 1;
+                return;
+            }
+            // Retain only protocol/type allowlists and state, never the
+            // frame body, key, nonce, message text, token, or SDP credentials.
+            let frame = null;
+            if (typeof data === "string" && data.length <= 4096) {
+                try {
+                    const parsed = JSON.parse(data);
+                    if (parsed?.v === "OL-PAIR-1" &&
+                        ["hello", "confirm"].includes(parsed.t)) {
+                        frame = `pair:${parsed.t}`;
+                    }
+                } catch (_) { /* malformed frames have no protocol label */ }
+            }
+            const pairing = window.__oneLinkPeer?.state?.pairing;
+            telemetry.events.push({
+                index: telemetry.events.length,
+                atMs: Math.round(performance.now()),
+                channel: channelIndex,
+                label: ["one-link-control-v1", "one-link-bulk-v1"].includes(channel.label)
+                    ? channel.label : "other",
+                event,
+                readyState: channel.readyState,
+                frame,
+                textChars: typeof data === "string" ? data.length : null,
+                pairingPresent: Boolean(pairing),
+                activeChannel: pairing?.session?.control === channel,
+                sentHello: Boolean(pairing?.sent_hello),
+                hasRemoteHello: Boolean(pairing?.remote_hello),
+                finished: Boolean(pairing?.finished),
             });
+        };
+        for (const event of ["open", "close", "error"]) {
+            channel.addEventListener(event, () => observe(event));
+        }
+        channel.addEventListener("message", (event) => {
+            observe("message", event.data);
+            if (telemetry.messages.length < 64) {
+                telemetry.messages.push({
+                    label: channel.label,
+                    data: typeof event.data === "string"
+                        ? event.data
+                        : `[binary:${event.data?.byteLength ?? -1}]`,
+                });
+            }
         });
+        const send = channel.send.bind(channel);
+        channel.send = (data) => {
+            try {
+                const result = send(data);
+                observe("send", data);
+                return result;
+            } catch (error) {
+                observe("send-error", data);
+                throw error;
+            }
+        };
         return channel;
     };
 
@@ -793,12 +848,8 @@ def _transport_diagnostics(page: Page) -> dict[str, Any]:
                     signalingState: pc.signalingState,
                     localDescriptionType: pc.localDescription?.type || null,
                     remoteDescriptionType: pc.remoteDescription?.type || null,
-                    localCandidates: String(pc.localDescription?.sdp || '')
-                      .split(/\\r?\\n/)
-                      .filter((line) => line.startsWith('a=candidate:')),
-                    remoteCandidates: String(pc.remoteDescription?.sdp || '')
-                      .split(/\\r?\\n/)
-                      .filter((line) => line.startsWith('a=candidate:')),
+                    // getStats supplies candidate metadata without copying
+                    // raw SDP candidate extensions or ICE credentials.
                     stats: Array.from((await pc.getStats()).values())
                       .filter((entry) => [
                         'candidate-pair', 'local-candidate', 'remote-candidate',
@@ -818,9 +869,15 @@ def _transport_diagnostics(page: Page) -> dict[str, Any]:
                 })),
             ),
             channels: (window.__oneLinkRtcE2E?.channels || []).map((channel) => ({
-                label: channel.label,
+                label: ["one-link-control-v1", "one-link-bulk-v1"].includes(channel.label)
+                    ? channel.label : "other",
                 readyState: channel.readyState,
             })),
+            // These listeners observe incoming events before the page's
+            // handlers. "send" means the native send call returned normally;
+            // it does not by itself prove remote receipt. Clocks are per page.
+            events: window.__oneLinkRtcE2E?.events || [],
+            droppedEvents: window.__oneLinkRtcE2E?.droppedEvents || 0,
             // Pairing state was missing here, which is why a remote_hello
             // stall on CI produced a bare "Timeout 10000ms exceeded" with
             // nothing to diagnose. An abort (wrong signer, self-pair, hello
@@ -845,6 +902,20 @@ def _transport_diagnostics(page: Page) -> dict[str, Any]:
             })(),
         })"""
     )
+
+
+def _both_peer_transport_diagnostics(
+    page_a: Page, page_b: Page,
+) -> dict[str, Any]:
+    snapshots: dict[str, Any] = {}
+    for label, page in (("a", page_a), ("b", page_b)):
+        try:
+            snapshots[label] = _transport_diagnostics(page)
+        except Exception as exc:
+            # Preserve the other peer even if this page has already closed.
+            # Exception text can contain a URL or payload; retain only its type.
+            snapshots[label] = {"captureError": type(exc).__name__}
+    return snapshots
 
 
 def _send_control_probe(page: Page, payload: dict[str, str]) -> None:
@@ -999,13 +1070,9 @@ def test_two_isolated_peer_pages_complete_manual_webrtc_and_exchange_probe(
         page_a.locator("#btn-webrtc-accept").click()
         _wait_for_control_open(page_a)
         _wait_for_control_open(page_b)
-        # This wait failed on a ubuntu/chromium run with a bare "Timeout
-        # 10000ms exceeded" and no evidence, unlike its instrumented
-        # neighbour _wait_for_control_open -- so the cause could not be
-        # determined afterwards. Report the same diagnostics (now including
-        # pairing state and any abort reason from #pair-status), and use the
-        # 20 s budget every other wait in this test already uses: 10 s was the
-        # outlier here, not a considered value.
+        # Keep the existing timeout. If either peer stalls, retain both peers'
+        # bounded event order and pairing state so the first failed wait does
+        # not hide whether the other peer sent, received, or aborted a hello.
         for label, page in (("a", page_a), ("b", page_b)):
             try:
                 page.wait_for_function(
@@ -1015,7 +1082,7 @@ def test_two_isolated_peer_pages_complete_manual_webrtc_and_exchange_probe(
             except PlaywrightTimeoutError as exc:
                 pytest.fail(
                     f"peer {label} never received a pair hello: "
-                    + json.dumps(_transport_diagnostics(page), sort_keys=True)
+                    + json.dumps(_both_peer_transport_diagnostics(page_a, page_b), sort_keys=True)
                     + f" ({exc})"
                 )
 
@@ -1025,12 +1092,22 @@ def test_two_isolated_peer_pages_complete_manual_webrtc_and_exchange_probe(
         # cause it exists to reveal. Asserting the healthy snapshot here keeps
         # the reporter honest and pins what a good pairing looks like.
         for label, page in (("a", page_a), ("b", page_b)):
-            snapshot = _transport_diagnostics(page)["pairing"]
+            diagnostics = _transport_diagnostics(page)
+            snapshot = diagnostics["pairing"]
             assert snapshot["present"] is True, label
             assert snapshot["sentHello"] is True, label
             assert snapshot["hasRemoteHello"] is True, label
             assert snapshot["hasPinnedSigner"] is True, label
             assert snapshot["identityUnlocked"] is True, label
+            assert len(diagnostics["events"]) <= 64, label
+            assert any(
+                event["event"] == "send" and event["frame"] == "pair:hello"
+                for event in diagnostics["events"]
+            ), label
+            assert any(
+                event["event"] == "message" and event["frame"] == "pair:hello"
+                for event in diagnostics["events"]
+            ), label
 
         trust_bindings = {
             "a": page_a.evaluate(

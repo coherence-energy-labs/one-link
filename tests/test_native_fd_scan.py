@@ -25,6 +25,12 @@ import pytest
 
 chunk = pytest.importorskip("one_link_native.chunk")
 PARAMS = (1024, 4096, 16384)
+FD_EXPORTS = [
+    ("cdc_fd", ()),
+    ("cdc_fd_params", PARAMS),
+    ("format_aware_fd", ("none",)),
+    ("format_aware_fd_params", ("none", *PARAMS)),
+]
 
 
 def os_handle(handle) -> int:
@@ -110,6 +116,45 @@ def test_fd_scan_ignores_the_callers_file_position(tmp_path: Path):
         handle.seek(0)
         assert handle.read() == data, "the caller's handle stays readable after a scan"
     assert _flat(moved) == _flat(from_start)
+
+
+@pytest.mark.parametrize("name,args", FD_EXPORTS, ids=[entry[0] for entry in FD_EXPORTS])
+def test_fd_scan_rejects_an_already_closed_positive_handle(tmp_path: Path, name: str, args):
+    path = tmp_path / "closed.bin"
+    data = _noise(4096)
+    path.write_bytes(data)
+    scan = getattr(chunk, name)
+    with path.open("rb") as handle:
+        raw = os_handle(handle)
+        assert raw > 0
+    # The integer remains after its owner's close. It must reach an OS error,
+    # without first being assumed to represent a live borrowed Rust resource.
+    with pytest.raises(OSError, match="cannot duplicate"):
+        scan(raw, len(data), *args)
+
+
+@pytest.mark.parametrize("name,args", FD_EXPORTS, ids=[entry[0] for entry in FD_EXPORTS])
+def test_fd_scan_owns_only_its_duplicate_on_success_and_failure(tmp_path: Path, name: str, args):
+    path = tmp_path / "owned.bin"
+    data = _noise(32768)
+    path.write_bytes(data)
+    scan = getattr(chunk, name)
+    with path.open("rb", buffering=0) as handle:
+        raw = os_handle(handle)
+        identity = os.fstat(handle.fileno())
+        boundaries = scan(raw, len(data), *args)
+        assert boundaries and boundaries[-1].end == len(data)
+        handle.seek(0)
+        assert handle.read() == data
+        # Error propagation also drops only the duplicate, leaving the
+        # caller's original file identity and ownership intact.
+        with pytest.raises(OSError):
+            scan(raw, len(data) + 1, *args)
+        after = os.fstat(handle.fileno())
+        assert (after.st_dev, after.st_ino) == (identity.st_dev, identity.st_ino)
+        assert os_handle(handle) == raw
+        handle.seek(0)
+        assert handle.read() == data
 
 
 @pytest.mark.parametrize("delta", [-1, 1, 4096])

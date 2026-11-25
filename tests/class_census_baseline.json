@@ -1,7 +1,7 @@
 {
   "classes": {
     "Daemon": {
-      "class_lines": 33845,
+      "class_lines": 33897,
       "domains": {
         "call": {
           "lines": 660,
@@ -28,8 +28,8 @@
           "methods": 21
         },
         "other": {
-          "lines": 10859,
-          "methods": 205
+          "lines": 10910,
+          "methods": 206
         },
         "peer": {
           "lines": 4411,
@@ -48,12 +48,12 @@
           "methods": 124
         }
       },
-      "method_lines": 33169,
-      "methods": 498,
+      "method_lines": 33220,
+      "methods": 499,
       "self_attributes_assigned": 190
     },
     "UIServer": {
-      "class_lines": 25820,
+      "class_lines": 25842,
       "domains": {
         "call": {
           "lines": 537,
@@ -80,8 +80,8 @@
           "methods": 19
         },
         "other": {
-          "lines": 11336,
-          "methods": 213
+          "lines": 11357,
+          "methods": 214
         },
         "peer": {
           "lines": 4003,
@@ -100,8 +100,8 @@
           "methods": 26
         }
       },
-      "method_lines": 25011,
-      "methods": 444,
+      "method_lines": 25032,
+      "methods": 445,
       "self_attributes_assigned": 52
     }
   },
@@ -144,6 +144,20 @@
         "UIServer": {
           "method_lines": 25011,
           "methods": 444
+        }
+      }
+    },
+    {
+      "growth_reason": "merged from the concurrent branch: Daemon._abort_authority_startup (+1 method, +51 lines) releases early resources when authority startup is refused; UIServer.api_runtime_identity (+1 method, +21 lines) lets the launcher authenticate without dashboard diagnostics. Both are new behaviour that arrived by merge; neither is yet behind a service boundary",
+      "label": "merge of the concurrent rollout fixes (8110100, 64de6ed)",
+      "totals": {
+        "Daemon": {
+          "method_lines": 33220,
+          "methods": 499
+        },
+        "UIServer": {
+          "method_lines": 25032,
+          "methods": 445
         }
       }
     }

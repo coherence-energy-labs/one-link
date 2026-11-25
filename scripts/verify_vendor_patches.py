@@ -308,7 +308,7 @@ def discover_cargo_inputs(root: Path) -> tuple[list[str], list[str]]:
 
 
 def _within(path: str, directory: str) -> bool:
-    return path == directory or path.startswith(directory.rstrip("/") + "/")
+    return directory == "." or path == directory or path.startswith(directory.rstrip("/") + "/")
 
 
 def inspect_config(path: Path, label: str) -> None:
@@ -336,14 +336,15 @@ def inspect_repository(
     for config in configs:
         inspect_config(root / config, config)
     documents = {name: tomllib.loads((root / name).read_text(encoding="utf-8")) for name in manifests}
-    vendored_dirs = []
-    for name, document in documents.items():
-        for path in manifest_patches(document, name).values():
-            vendored_dirs.append(posixpath.normpath(posixpath.join(posixpath.dirname(name), path)))
-    # A vendored package's own manifest and lockfile are part of its verified
-    # upstream bytes, and Cargo never reads a dependency's [patch] or lockfile.
-    workspace_manifests = [name for name in manifests
-                           if not any(_within(name, directory) for directory in vendored_dirs)]
+    # Unverified declarations may order inspection, but cannot exclude inputs.
+    # Verify the declaring manifest before considering its dependency trees.
+    declared_dirs = {
+        name: [posixpath.normpath(posixpath.join(posixpath.dirname(name), path))
+               for path in manifest_patches(document, name).values()]
+        for name, document in documents.items()
+    }
+    vendored_dirs: list[str] = []
+    workspace_manifests: list[str] = []
     downloaded: dict[str, bytes] = {}
 
     def cached(url: str) -> bytes:
@@ -352,9 +353,24 @@ def inspect_repository(
         return downloaded[url]
 
     packages: dict[tuple[str, str], dict[str, Any]] = {}
-    for name in workspace_manifests:
+    pending = set(manifests)
+    while pending:
+        ready = [name for name in sorted(pending)
+                 if not any(_within(name, directory)
+                            for owner in pending for directory in declared_dirs[owner])]
+        if not ready:
+            raise VendorError("unverified patch paths form a self-containing or cyclic vendor exclusion: "
+                              + ", ".join(sorted(pending)))
+        name = ready[0]
         inspected = inspect_patches(root / name, fetch_upstream=fetch_upstream,
                                     upstream_archives=upstream_archives, download=cached, repository=root)
+        # A dependency's own manifest and lockfile are inactive Cargo inputs
+        # only after every selected tree has passed the full provenance check.
+        verified_dirs = [value["source_path"].relative_to(root).as_posix() for value in inspected.values()]
+        vendored_dirs.extend(verified_dirs)
+        workspace_manifests.append(name)
+        pending = {other for other in pending if other != name
+                   and not any(_within(other, directory) for directory in verified_dirs)}
         for key, value in inspected.items():
             selected_by = value["source_path"].relative_to(root).as_posix()
             if key in packages:
@@ -370,6 +386,7 @@ def inspect_repository(
                                                       and value["upstream_archive_verified"])
             else:
                 packages[key] = {**value, "manifests": [name], "sources": [posixpath.normpath(selected_by)]}
+    workspace_manifests.sort()
     unknown = sorted(set(upstream_archives or {}) - set(packages))
     if unknown:
         raise VendorError(f"supplied upstream archives match no selected backport: {unknown}")

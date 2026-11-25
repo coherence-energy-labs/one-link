@@ -350,29 +350,37 @@ fn scan_format_aware_path(
 /// even if its pathname is replaced meanwhile, and it stays valid if Python
 /// closes its own object while the scan runs without the GIL. It shares the
 /// file position: after a `*_fd` call that position is unspecified, so
-/// callers seek before reading further.
+/// callers seek before reading further. Callers retain the original until
+/// duplication completes and prevent concurrent reads/seeks through any
+/// handle sharing that position. A raw integer does not prove ownership.
 fn duplicate_handle(handle: i64) -> PyResult<File> {
     #[cfg(unix)]
     {
-        use std::os::fd::{BorrowedFd, RawFd};
+        use std::os::fd::{FromRawFd, OwnedFd, RawFd};
         let raw = RawFd::try_from(handle)
             .ok()
             .filter(|fd| *fd >= 0)
             .ok_or_else(|| PyValueError::new_err("file descriptor must be a non-negative int"))?;
-        // SAFETY: `borrow_raw` requires `raw` to stay open for the borrow's
-        // lifetime. The borrow lasts only for the duplication below, which
-        // runs while the caller holds the GIL and therefore while the caller's
-        // descriptor is still open; an invalid descriptor makes `dup` fail
-        // with EBADF, reported as OSError.
-        let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
-        let owned = borrowed.try_clone_to_owned().map_err(|err| {
-            PyOSError::new_err(format!("cannot duplicate descriptor {raw}: {err}"))
-        })?;
+        // SAFETY: fcntl accepts a raw integer and reports EBADF for a closed
+        // descriptor; no Rust borrow assumes it is valid. Atomically retain
+        // CLOEXEC and avoid stdio slots, as std's try_clone_to_owned does.
+        let duplicate = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicate < 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(PyOSError::new_err(format!(
+                "cannot duplicate descriptor {raw}: {err}"
+            )));
+        }
+        // SAFETY: successful fcntl returned a new live descriptor owned only
+        // by this call. OwnedFd closes the duplicate, never the caller's fd.
+        let owned = unsafe { OwnedFd::from_raw_fd(duplicate) };
         Ok(File::from(owned))
     }
     #[cfg(windows)]
     {
-        use std::os::windows::io::{BorrowedHandle, RawHandle};
+        use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
+        use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
         // A file handle is always positive. 0 is NULL, -1 INVALID_HANDLE_VALUE,
         // and other negative values are pseudo-handles (-1 the current
         // process, -2 the current thread, ...) that DuplicateHandle would
@@ -382,13 +390,32 @@ fn duplicate_handle(handle: i64) -> PyResult<File> {
             .filter(|v| *v > 0)
             .ok_or_else(|| PyValueError::new_err("handle must be an open OS file handle"))?;
         let raw = value as RawHandle;
-        // SAFETY: as above: the borrow lasts only for `DuplicateHandle`, made
-        // while the caller holds the GIL and its handle is open; an invalid
-        // handle makes the duplication fail, reported as OSError.
-        let borrowed = unsafe { BorrowedHandle::borrow_raw(raw) };
-        let owned = borrowed
-            .try_clone_to_owned()
-            .map_err(|err| PyOSError::new_err(format!("cannot duplicate handle: {err}")))?;
+        let mut duplicate = std::ptr::null_mut();
+        // SAFETY: the process pseudo-handle is valid for both process
+        // arguments, and the output points to a live local. DuplicateHandle
+        // validates the raw source and cannot close it without CLOSE_SOURCE.
+        // The duplicate is noninheritable and has the same access rights.
+        let success = unsafe {
+            let process = GetCurrentProcess();
+            DuplicateHandle(
+                process,
+                raw,
+                process,
+                &mut duplicate,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if success == 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(PyOSError::new_err(format!(
+                "cannot duplicate handle: {err}"
+            )));
+        }
+        // SAFETY: successful DuplicateHandle returned a new live handle that
+        // this call exclusively owns. Only that duplicate transfers to Rust.
+        let owned = unsafe { OwnedHandle::from_raw_handle(duplicate) };
         Ok(File::from(owned))
     }
 }

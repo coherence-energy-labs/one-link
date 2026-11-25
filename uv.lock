@@ -2057,6 +2057,7 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
+    { name = "defusedxml" },
     { name = "hypothesis" },
     { name = "mypy" },
     { name = "pytest" },
@@ -2112,6 +2113,9 @@ window = [
 ]
 
 [package.dev-dependencies]
+ct-audit = [
+    { name = "defusedxml" },
+]
 release-tools = [
     { name = "blake3" },
     { name = "build" },
@@ -2138,6 +2142,7 @@ requires-dist = [
     { name = "click", specifier = ">=8.1" },
     { name = "cryptography", specifier = ">=50.0.0" },
     { name = "cyclonedx-bom", marker = "extra == 'security'", specifier = ">=4.4" },
+    { name = "defusedxml", marker = "extra == 'dev'", specifier = ">=0.7.1,<0.8" },
     { name = "dnspython", specifier = ">=2.9.2" },
     { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.164.0" },
     { name = "keyring", specifier = ">=24" },
@@ -2184,6 +2189,7 @@ requires-dist = [
 provides-extras = ["native", "window", "tray", "tor", "dev", "e2e", "preview-ml", "release", "security"]
 
 [package.metadata.requires-dev]
+ct-audit = [{ name = "defusedxml", specifier = ">=0.7.1,<0.8" }]
 release-tools = [
     { name = "blake3", specifier = ">=1.0,<2" },
     { name = "build", specifier = ">=1.5,<2" },

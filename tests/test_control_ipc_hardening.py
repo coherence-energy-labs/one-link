@@ -508,9 +508,11 @@ class _RealProofHandler(BaseHTTPRequestHandler):
     status: dict = {}
     client_ports: list[int] = []
     authorization_headers: list[str | None] = []
+    request_paths: list[str] = []
 
     def do_GET(self):  # noqa: N802 - stdlib handler contract
         parsed = urllib.parse.urlsplit(self.path)
+        type(self).request_paths.append(parsed.path)
         type(self).client_ports.append(int(self.client_address[1]))
         type(self).authorization_headers.append(self.headers.get("Authorization"))
         if parsed.path == "/api/local-instance-proof":
@@ -531,7 +533,7 @@ class _RealProofHandler(BaseHTTPRequestHandler):
                 ),
             }
             status_code = 200
-        elif parsed.path == "/api/status":
+        elif parsed.path == "/api/runtime-identity":
             status_code = (
                 200
                 if self.headers.get("Authorization") == f"Bearer {self.token}"
@@ -622,6 +624,7 @@ def test_launcher_sends_bearer_only_on_same_authenticated_ui_connection(monkeypa
     _RealProofHandler.status = status
     _RealProofHandler.client_ports.clear()
     _RealProofHandler.authorization_headers.clear()
+    _RealProofHandler.request_paths.clear()
     server = ThreadingHTTPServer(("127.0.0.1", 0), _RealProofHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -660,6 +663,9 @@ def test_launcher_sends_bearer_only_on_same_authenticated_ui_connection(monkeypa
         assert commands == ["status", "ui_launch_info"]
         assert _RealProofHandler.authorization_headers == [None, f"Bearer {token}"]
         assert len(set(_RealProofHandler.client_ports)) == 1
+        assert _RealProofHandler.request_paths == [
+            "/api/local-instance-proof", "/api/runtime-identity",
+        ]
     finally:
         server.shutdown()
         server.server_close()

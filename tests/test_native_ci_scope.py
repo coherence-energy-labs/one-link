@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import posixpath
 import re
+import shlex
 import subprocess
 import sys
 import tomllib
@@ -603,7 +604,13 @@ def test_every_pr_produces_exact_gate_and_preserves_required_work_dependencies(k
         build = next(item for item in audit["steps"] if "cargo build" in item.get("run", ""))
         assert build["working-directory"] == "native"
         assert build["run"] == "cargo build --locked --profile ct-audit -p ol_ct_audit"
-        assert ("python3 scripts/run_ct_audit.py --binary native/target/ct-audit/ol_ct_audit "
+        assert "uv sync --frozen --python python --only-group ct-audit" in runs
+        pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        parser_dependencies = pyproject["dependency-groups"]["ct-audit"]
+        assert parser_dependencies == ["defusedxml>=0.7.1,<0.8"]
+        assert parser_dependencies[0] in pyproject["project"]["optional-dependencies"]["dev"]
+        assert ("uv run --frozen --only-group ct-audit python scripts/run_ct_audit.py "
+                "--binary native/target/ct-audit/ol_ct_audit "
                 "--source-root native --report test-results/ct-audit/report.json") in runs
         upload = audit["steps"][-1]
         assert upload["if"] == "always()" and "upload-artifact@" in upload["uses"]
@@ -615,6 +622,14 @@ def test_every_pr_produces_exact_gate_and_preserves_required_work_dependencies(k
                                       "matrix": {"os": ["ubuntu-latest", "windows-latest", "macos-latest"]}}
         assert memory["defaults"]["run"]["shell"] == "bash"
         binding = jobs["python_binding"]["steps"]
+        regression = next(item for item in binding if "pytest tests/test_chunk_native_v0210.py" in item.get("run", ""))
+        assert "if" not in regression
+        # The module's optional import must not turn a broken required build
+        # into a skipped descriptor suite. Import it explicitly before pytest.
+        assert regression["run"].splitlines()[0] == (
+            'uv run --frozen --extra dev --extra release python -c "import one_link_native.chunk"'
+        )
+        assert "tests/test_native_fd_scan.py" in shlex.split(regression["run"], comments=True)
         for name in ("Install maturin + project deps", "Build + install one_link_native (editable)"):
             mine = next(item for item in memory["steps"] if item.get("name") == name)
             theirs = next(item for item in binding if item.get("name") == name)

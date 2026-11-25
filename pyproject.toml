@@ -115,6 +115,8 @@ dev = [
   # Parse every workflow with duplicate-key rejection in the supply-chain
   # regression suite before GitHub ever attempts to schedule it.
   "PyYAML>=6.0.3,<7",
+  # Contract tests import the same hardened XML parser as the native CT audit.
+  "defusedxml>=0.7.1,<0.8",
   # Distribution-contract tests build from an isolated source snapshot using
   # the reviewed backend rather than resolving mutable build tools at runtime.
   "setuptools>=84.1,<85",
@@ -188,6 +190,10 @@ security = [
 ]
 
 [dependency-groups]
+ct-audit = [
+  # The native Valgrind lane needs no application dependencies to parse reports.
+  "defusedxml>=0.7.1,<0.8",
+]
 # The native-wheel matrix needs exactly maturin. The full release-tools
 # group drags in sigstore -> cryptography, which has no win_arm64 wheel and
 # demands an OpenSSL toolchain that a pure maturin job should never need --

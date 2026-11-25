@@ -18,14 +18,16 @@ definedness into syscalls, ...) is always a violation.
 Verdicts:
 * ``clean`` cases pass with zero violations;
 * ``flagged`` cases (negative controls) pass only with at least one
-  violation, which proves the instrument can see a leak;
+  undeclassified secret-dependent branch/address report and no unrelated
+  Memcheck errors; a memory fault cannot stand in for detecting a secret leak;
 * a case that did not run to completion under Valgrind fails, whatever it
   reported, so a broken Valgrind cannot produce a vacuous pass.
 
 Usage (Linux x86-64)::
 
     cargo build --locked --profile ct-audit -p ol_ct_audit   # in native/
-    python scripts/run_ct_audit.py --binary native/target/ct-audit/ol_ct_audit \
+    uv run --frozen --only-group ct-audit python scripts/run_ct_audit.py \
+        --binary native/target/ct-audit/ol_ct_audit \
         --source-root native --report test-results/ct-audit/report.json
 """
 
@@ -37,8 +39,10 @@ import os
 import pathlib
 import subprocess
 import sys
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+
+from defusedxml import ElementTree as ET
+from defusedxml.common import DefusedXmlException
 
 MARKER = "ct-audit: declassify"
 SECRET_KINDS = frozenset({"UninitCondition", "UninitValue"})
@@ -91,6 +95,10 @@ class CaseResult:
     def passed(self) -> bool:
         if self.problems or not self.completed or not self.under_valgrind:
             return False
+        # Unrelated errors fail every case, including negative controls.
+        # Only secret-dependent branches/addresses can prove sensitivity.
+        if any(report.kind not in SECRET_KINDS for report in self.reports):
+            return False
         if self.expect == "clean":
             return not self.violations
         if self.expect == "uniform":
@@ -102,26 +110,11 @@ class CaseResult:
         return False
 
 
-def parse_dtd_free_xml(text: str) -> ET.Element:
-    """Parse XML that carries no document type declaration; refuse any that does.
-
-    Entity-expansion and external-entity attacks both need a DTD: an internal
-    subset to declare entities, or an external one to fetch. A DTD can only be
-    introduced by the literal ``<!DOCTYPE`` (XML is case-sensitive, and the
-    input here is already-decoded text, so no encoding trick hides it).
-    Memcheck's protocol never emits one. Without it, only the five predefined
-    entities and character references exist, which cannot expand or resolve
-    anything. The literal inside a comment or CDATA is refused too: fail
-    closed.
-    """
-    if "<!DOCTYPE" in text or "<!ENTITY" in text:
-        raise ET.ParseError("document type and entity declarations are not accepted in Memcheck XML")
-    return ET.fromstring(text)  # nosec B314 - DTD-free by the check above; see docstring
-
-
 def parse_memcheck_xml(text: str) -> tuple[list[Report], str | None]:
-    """Parse Memcheck protocol-4 XML into reports (with occurrence counts)."""
-    root = parse_dtd_free_xml(text)
+    """Parse DTD-free Memcheck protocol-4 XML into reports and counts."""
+    # Memcheck protocol 4 needs none of these features. Reject declarations
+    # before entity expansion or access to an external resource is possible.
+    root = ET.fromstring(text, forbid_dtd=True, forbid_entities=True, forbid_external=True)
     status = None
     for st in root.iter("status"):
         state = st.findtext("state")
@@ -369,7 +362,7 @@ def run_case(
         return result
     try:
         reports, status = parse_memcheck_xml(xml_path.read_text(encoding="utf-8", errors="replace"))
-    except ET.ParseError as exc:
+    except (ET.ParseError, DefusedXmlException) as exc:
         result.problems.append(f"unparseable Memcheck XML: {exc}")
         return result
     if status != "FINISHED":
@@ -463,7 +456,7 @@ def main(argv: list[str] | None = None) -> int:
         "passed": sum(r.passed for r in results),
         "failed": failed,
         "negative_controls": len(controls),
-        "negative_controls_detected": sum(bool(r.violations) for r in controls),
+        "negative_controls_detected": sum(r.passed for r in controls),
         "external_declassifications": [
             f"{e.package}@{e.version} {e.file}:{e.line}" for e in external
         ],

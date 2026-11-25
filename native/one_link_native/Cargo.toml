@@ -61,6 +61,14 @@ thiserror       = { workspace = true }
 tracing         = { workspace = true }
 bytes           = "1"
 
+# Match the already locked platform bindings. Raw OS duplication validates a
+# caller-supplied integer before it becomes a Rust-owned resource.
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.189"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
 

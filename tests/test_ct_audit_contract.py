@@ -143,6 +143,55 @@ def _xml(frames: list[tuple[str, str, int]], kind: str = "UninitCondition", stat
     )
 
 
+@pytest.mark.parametrize("declaration", [
+    "<!DOCTYPE valgrindoutput>",
+    '<!DOCTYPE valgrindoutput SYSTEM "file:///untrusted.dtd">',
+    '<!DOCTYPE valgrindoutput PUBLIC "untrusted" "https://example.invalid/audit.dtd">',
+    '<!DOCTYPE valgrindoutput [<!ENTITY leak SYSTEM "file:///untrusted">]>',
+    '<!DOCTYPE valgrindoutput [<!ENTITY a "expanded"><!ENTITY b "&a;&a;&a;">]>',
+    '<!DOCTYPE valgrindoutput [<!ENTITY % p SYSTEM "file:///untrusted.dtd">%p;]>',
+])
+def test_memcheck_parser_rejects_every_dtd_before_entity_processing(declaration):
+    xml = declaration + '<valgrindoutput><status><state>FINISHED</state></status></valgrindoutput>'
+    with pytest.raises(audit.DefusedXmlException, match="DTDForbidden"):
+        audit.parse_memcheck_xml(xml)
+
+
+def test_memcheck_parser_preserves_xml_escapes_and_reports_malformed_input():
+    reports, status = audit.parse_memcheck_xml(_xml([]).replace("synthetic", "a &lt; b &amp; c"))
+    assert status == "FINISHED"
+    assert reports[0].what == "a < b & c"
+    with pytest.raises(audit.ET.ParseError):
+        audit.parse_memcheck_xml("<valgrindoutput>")
+
+
+@pytest.mark.parametrize("expect", ["clean", "flagged"])
+def test_memcheck_dtd_is_a_failed_case_with_preserved_evidence(tmp_path, monkeypatch, expect):
+    def fake_run(command, **_kwargs):
+        xml_path = Path(next(arg.split("=", 1)[1] for arg in command if arg.startswith("--xml-file=")))
+        xml_path.write_text(
+            '<!DOCTYPE valgrindoutput [<!ENTITY verdict "FINISHED">]>'
+            '<valgrindoutput><status><state>&verdict;</state></status></valgrindoutput>',
+            encoding="utf-8",
+        )
+        return audit.subprocess.CompletedProcess(
+            command, 0, f"{audit.COMPLETE_PREFIX}name=control valgrind=1\n", "retained stderr",
+        )
+
+    monkeypatch.setattr(audit.subprocess, "run", fake_run)
+    result = audit.run_case(
+        {"name": "control", "expect": expect}, tmp_path / "unused-binary", ["unused-valgrind"],
+        tmp_path, audit.SourceIndex(tmp_path), timeout=1,
+    )
+    assert result.completed and result.under_valgrind
+    assert not result.passed
+    assert len(result.problems) == 1
+    assert result.problems[0].startswith("unparseable Memcheck XML: DTDForbidden(")
+    assert result.reports == []
+    assert "<!DOCTYPE" in (tmp_path / "control.xml").read_text(encoding="utf-8")
+    assert (tmp_path / "control.stderr").read_text(encoding="utf-8") == "retained stderr"
+
+
 @pytest.fixture()
 def tree(tmp_path: Path) -> Path:
     src = tmp_path / "native" / "crate" / "src"
@@ -252,20 +301,81 @@ def test_case_verdicts_fail_closed():
     assert not with_problem.passed
 
 
-def test_memcheck_xml_with_a_document_type_or_entity_declaration_is_refused():
-    plain = _xml([("f", "/x/src/lib.rs", 1)])
-    assert audit.parse_dtd_free_xml(plain).tag == "valgrindoutput"
-    bomb = (
-        '<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY lol "lol">'
-        '<!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">]>'
-        "<valgrindoutput><what>&lol2;</what></valgrindoutput>"
+@pytest.mark.parametrize("kind", [
+    "InvalidRead", "InvalidWrite", "InvalidFree", "MismatchedFree", "Overlap",
+    "SyscallParam", "Leak_DefinitelyLost", "Leak_IndirectlyLost", "Leak_PossiblyLost",
+    "Leak_StillReachable", "FishyValue", "UnknownFutureError",
+])
+@pytest.mark.parametrize("secret_kind", [None, "UninitCondition", "UninitValue"])
+def test_negative_control_rejects_unrelated_memcheck_error(kind, secret_kind):
+    control = audit.CaseResult(
+        name="control", expect="flagged", covers=[], what="",
+        completed=True, under_valgrind=True, returncode=0,
     )
-    external = (
-        '<?xml version="1.0"?><!DOCTYPE valgrindoutput SYSTEM "http://127.0.0.1:9/x.dtd">'
-        "<valgrindoutput/>"
+    control.reports = [audit.Report(unique="memory", kind=kind, what="", frames=[])]
+    if secret_kind:
+        control.reports.append(audit.Report(unique="secret", kind=secret_kind, what="", frames=[]))
+    assert not control.passed, "unrelated errors cannot prove sensitivity or be excused by a real leak"
+
+
+@pytest.mark.parametrize("kind", ["UninitCondition", "UninitValue"])
+def test_negative_control_requires_undeclassified_secret_error_and_completion(kind):
+    control = audit.CaseResult(
+        name="control", expect="flagged", covers=[], what="",
+        completed=True, under_valgrind=True, returncode=0,
     )
-    for hostile in (bomb, external, "<valgrindoutput><!ENTITY x 'y'></valgrindoutput>"):
-        with pytest.raises(audit.ET.ParseError):
-            audit.parse_dtd_free_xml(hostile)
-        with pytest.raises(audit.ET.ParseError):
-            audit.parse_memcheck_xml(hostile)
+    report = audit.Report(unique="secret", kind=kind, what="", frames=[])
+    control.reports = [report]
+    assert control.passed
+    report.classification = "declassified"
+    assert not control.passed, "an allowed public verdict is not a detected secret leak"
+    report.classification = "violation"
+    control.completed = False
+    assert not control.passed
+    control.completed = True
+    control.under_valgrind = False
+    assert not control.passed
+    control.under_valgrind = True
+    control.problems.append("Memcheck status 'RUNNING', expected 'FINISHED'")
+    assert not control.passed
+
+
+def test_summary_counts_only_successful_secret_negative_controls(tmp_path, monkeypatch):
+    def result(name, kinds, *, completed=True, expect="flagged", declassified=False):
+        return audit.CaseResult(
+            name=name, expect=expect, covers=[], what="",
+            completed=completed, under_valgrind=True, returncode=0,
+            reports=[
+                audit.Report(
+                    unique=str(i), kind=kind, what="", frames=[],
+                    classification="declassified" if declassified else "violation",
+                )
+                for i, kind in enumerate(kinds)
+            ],
+        )
+
+    results = [
+        result("detected", ["UninitCondition", "UninitValue"]),
+        result("memory-only", ["InvalidRead"]),
+        result("mixed", ["UninitCondition", "InvalidWrite"]),
+        result("allowed-verdict", ["UninitCondition"], declassified=True),
+        result("incomplete", ["UninitValue"], completed=False),
+        result("clean-allowed-verdict", ["UninitCondition"], expect="clean", declassified=True),
+    ]
+    cases = [{"name": r.name, "expect": r.expect} for r in results]
+    by_name = {r.name: r for r in results}
+    monkeypatch.setattr(audit, "list_cases", lambda _binary: cases)
+    monkeypatch.setattr(audit, "run_case", lambda case, *_args: by_name[case["name"]])
+    monkeypatch.setattr(audit, "load_external", lambda _path: [])
+    report_path = tmp_path / "report.json"
+    status = audit.main([
+        "--binary", str(tmp_path / "unused-binary"),
+        "--source-root", str(tmp_path / "native"),
+        "--report", str(report_path),
+    ])
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert status == 1
+    assert report["negative_controls"] == 5
+    assert report["negative_controls_detected"] == 1
+    assert report["passed"] == 2
+    assert set(report["failed"]) == {"memory-only", "mixed", "allowed-verdict", "incomplete"}

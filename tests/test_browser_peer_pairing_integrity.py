@@ -8,6 +8,7 @@ transactional in-memory handle with the same methods the production code uses.
 
 from __future__ import annotations
 
+import ast
 import shutil
 import subprocess
 from pathlib import Path
@@ -514,3 +515,311 @@ async function makeSigner() {{
 }});
 """
     assert _run_node(script) == "session-binding-ok"
+
+
+@pytest.mark.parametrize("initiator", [False, True], ids=["remote-channel", "local-channel"])
+@pytest.mark.parametrize("message_first", [True, False], ids=["message-first", "open-first"])
+def test_open_channel_message_initializes_pairing_once(
+    peer_source: str, initiator: bool, message_first: bool,
+) -> None:
+    """Exercise real handshake/wrappers with explicitly ordered channel callbacks.
+
+    A received DataChannel can be open before its open event is dispatched.
+    This harness controls that boundary; it is not a reproduction of the
+    timing of any particular browser or historical hosted test failure.
+    """
+    ice_config_factory = _section(peer_source, "function createPeerIceConfig(", "\n}\n") + "\n}\n"
+    webrtc = _section(
+        peer_source, 'const WRTC_PROTOCOL_VERSION = "OL-WRTC-1";',
+        "// ── rendezvous UI wiring",
+    )
+    pair_constants = _section(
+        peer_source, 'const PAIR_PROTOCOL_VERSION = "OL-PAIR-1";', "// OPFS peers store.",
+    )
+    pairing = _section(
+        peer_source, "function _sasWordsFromDigest(digest)", "// peer-ui module: ui/peers.js",
+    )
+    wrappers = _section(
+        peer_source, "const _origCreateOffer = createOfferSignal;",
+        "// Show the rdz card once identity is loaded.",
+    )
+    random_bytes = _section(
+        peer_source, "function _randomBytes(n)", "function _encodeIdentityPassphrase(",
+    )
+    script = r"""
+const assert = require("node:assert/strict");
+const { webcrypto } = require("node:crypto");
+Object.defineProperty(globalThis, "crypto", { value: webcrypto });
+class Channel {
+  constructor(label) { this.label = label; this.readyState = "connecting"; this.sent = []; }
+  send(data) {
+    assert.equal(this.readyState, "open");
+    this.sent.push(JSON.parse(data));
+  }
+}
+class PeerConnection {
+  constructor() { this.iceGatheringState = "complete"; }
+  createDataChannel(label) { return new Channel(label); }
+  async createOffer() { return { type: "offer", sdp: "v=0\r\n" }; }
+  async createAnswer() { return { type: "answer", sdp: "v=0\r\n" }; }
+  async setLocalDescription(value) { this.localDescription = { toJSON: () => value }; }
+  async setRemoteDescription(value) { this.remoteDescription = value; }
+}
+globalThis.RTCPeerConnection = PeerConnection;
+globalThis.RTCSessionDescription = class { constructor(value) { Object.assign(this, value); } };
+globalThis.window = { RTCPeerConnection, RTCSessionDescription, AbortController };
+const state = { rec: null, pairing: null };
+const $ = () => null;
+let statusText = "";
+const text = (_host, value) => { statusText = value; };
+const show = () => undefined;
+const hide = () => undefined;
+"""
+    script += _encoding_and_crypto_source(peer_source) + _pinned_ed25519_fetch_source()
+    script += r"""
+const artifactFetch = globalThis.fetch;
+globalThis.fetch = async (url) => url === "/api/v1/peer-rtc/ice-config"
+  ? Response.json({ iceServers: [] }) : artifactFetch(url);
+"""
+    script += ice_config_factory + webrtc + pair_constants + random_bytes + pairing + wrappers
+    script += f"\nconst initiator = {str(initiator).lower()};\n"
+    script += f"const messageFirst = {str(message_first).lower()};\n"
+    script += r"""
+const helloTasks = [];
+const actualOnPairHello = _onPairHello;
+_onPairHello = (envelope) => {
+  const task = actualOnPairHello(envelope);
+  helloTasks.push(task);
+  return task;
+};
+async function settleHellos() { await Promise.all(helloTasks.splice(0)); }
+async function makeSigner() {
+  const pair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+  const raw = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+  return {
+    private_key_jwk: await crypto.subtle.exportKey("jwk", pair.privateKey),
+    public_key_b64u: bytesToB64Url(raw),
+    fingerprint: await fingerprintOf(raw),
+  };
+}
+(async () => {
+  const local = await makeSigner();
+  const remote = await makeSigner();
+  const hello = {
+    v: PAIR_PROTOCOL_VERSION, t: "hello",
+    pubkey: remote.public_key_b64u, fingerprint: remote.fingerprint,
+    nonce: bytesToB64Url(_randomBytes(PAIR_NONCE_BYTES)), ts: Date.now(),
+  };
+  async function newSession() {
+    state.rec = remote;
+    const signalType = initiator ? "answer" : "offer";
+    const signal = await _signSignal(signalType, { type: signalType, sdp: "v=0\r\n" });
+    state.rec = local;
+    const events = [];
+    const opts = { onState: (label) => events.push(label) };
+    const { session } = initiator
+      ? await createOfferSignal(opts) : await acceptOfferSignal(signal, opts);
+    if (initiator) {
+      await acceptAnswerSignal(session, signal);
+    } else {
+      session.pc.ondatachannel({ channel: new Channel(WEBRTC_CONTROL_LABEL) });
+    }
+    return { session, channel: session.control, events };
+  }
+  const first = await newSession();
+  assert.equal(state.pairing, null);
+  first.channel.readyState = "open";
+  if (!messageFirst) first.channel.onopen();
+  first.channel.onmessage({ data: JSON.stringify(hello) });
+  assert.ok(state.pairing, "an open channel's first frame must not precede pairing initialization");
+  await settleHellos();
+  const pairing = state.pairing;
+  assert.equal(pairing.session, first.session);
+  assert.equal(pairing.remote_hello.fingerprint, remote.fingerprint);
+  assert.equal(pairing.sas.words.length, 5);
+  assert.equal(pairing.finished, false);
+  assert.equal(pairing.sent_hello, true);
+  const nonce = pairing.local_nonce;
+  const timer = pairing.timeout;
+  assert.equal(first.channel.sent.length, 1);
+  assert.equal(first.channel.sent[0].fingerprint, local.fingerprint);
+
+  // The delayed real open event and an exact duplicate hello cannot rotate
+  // the nonce, restart the deadline, or transmit a second local hello.
+  first.channel.onopen();
+  first.channel.onopen();
+  first.channel.onmessage({ data: JSON.stringify(hello) });
+  await settleHellos();
+  assert.equal(state.pairing, pairing);
+  assert.equal(pairing.local_nonce, nonce);
+  assert.equal(pairing.timeout, timer);
+  assert.equal(first.channel.sent.length, 1);
+  assert.deepEqual(first.events, ["control:open"]);
+
+  // Once a newer channel owns the active pairing, traffic and late open
+  // notifications from the old channel cannot regain that authority.
+  const second = await newSession();
+  second.channel.readyState = "open";
+  second.channel.onopen();
+  const active = state.pairing;
+  assert.notEqual(active, pairing);
+  assert.equal(pairing.finished, true);
+  first.channel.onmessage({ data: JSON.stringify(hello) });
+  first.channel.onopen();
+  await settleHellos();
+  assert.equal(state.pairing, active);
+  assert.equal(active.remote_hello, null);
+  assert.equal(active.finished, false);
+  assert.equal(first.channel.sent.length, 1);
+
+  // A non-open channel cannot acquire pairing authority through a frame.
+  const unopened = await newSession();
+  for (const readyState of ["connecting", "closing", "closed"]) {
+    unopened.channel.readyState = readyState;
+    unopened.channel.onmessage({ data: JSON.stringify(hello) });
+    assert.equal(state.pairing, active);
+  }
+  assert.deepEqual(unopened.events, []);
+
+  // Starting from a first frame still goes through real fingerprint/key
+  // validation and the exact signer pinned by the signed offer/answer.
+  const hostile = await newSession();
+  hostile.channel.readyState = "open";
+  hostile.channel.onmessage({ data: JSON.stringify({
+    ...hello, pubkey: local.public_key_b64u, fingerprint: local.fingerprint,
+  }) });
+  await settleHellos();
+  assert.equal(state.pairing.session, hostile.session);
+  assert.equal(state.pairing.remote_hello, null);
+  assert.equal(state.pairing.finished, true);
+  assert.match(statusText, /does not match the verified signaling signer/);
+  const rejected = state.pairing;
+  hostile.channel.onopen();
+  assert.equal(state.pairing, rejected);
+  assert.equal(hostile.channel.sent.length, 1);
+  process.stdout.write("channel-ordering-ok");
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exitCode = 1;
+}).finally(() => {
+  if (state.pairing?.timeout) clearTimeout(state.pairing.timeout);
+});
+"""
+    assert _run_node(script) == "channel-ordering-ok"
+
+
+def _transport_evidence_source() -> tuple[str, str, ast.FunctionDef]:
+    """Read the actual E2E reporters without importing optional browser packages."""
+    tree = ast.parse(Path("tests/e2e/test_peer_live_transport.py").read_text(encoding="utf-8"))
+    capture = next(
+        node for node in tree.body if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "_RTC_CAPTURE_INIT"
+                for target in node.targets)
+    )
+    reporter = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef)
+        and node.name == "_transport_diagnostics"
+    )
+    both = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef)
+        and node.name == "_both_peer_transport_diagnostics"
+    )
+    expression = reporter.body[0]
+    assert isinstance(expression, ast.Return) and isinstance(expression.value, ast.Call)
+    return ast.literal_eval(capture.value), ast.literal_eval(expression.value.args[0]), both
+
+
+def test_transport_evidence_is_bounded_metadata_without_payloads() -> None:
+    capture, reporter, _ = _transport_evidence_source()
+    script = r"""
+const assert = require("node:assert/strict");
+const secret = "synthetic-private-fixture-value";
+class Channel extends EventTarget {
+  constructor(label) { super(); this.label = label; this.readyState = "open"; }
+  send(data) {
+    assert.ok(this instanceof Channel, "instrumentation must preserve the native receiver");
+    if (this.failSend) throw new Error(secret);
+    this.lastSent = data;
+  }
+}
+class PeerConnection extends EventTarget {
+  constructor() {
+    super();
+    this.localDescription = { type: "offer", sdp: `a=ice-pwd:${secret}` };
+    this.remoteDescription = { type: "answer", sdp: `a=candidate:1 1 UDP 1 127.0.0.1 9 typ host ufrag ${secret}` };
+  }
+  createDataChannel(label) { return new Channel(label); }
+  async getStats() {
+    return new Map([["candidate", {
+      id: "candidate", type: "local-candidate", address: "127.0.0.1", usernameFragment: secret,
+    }]]);
+  }
+}
+globalThis.window = { RTCPeerConnection: PeerConnection };
+globalThis.document = { querySelector: () => ({ textContent: "fixture", value: secret }) };
+"""
+    script += capture
+    script += "\nconst diagnostics = " + reporter + ";\n"
+    script += r"""
+(async () => {
+  const pc = new window.RTCPeerConnection();
+  const channel = pc.createDataChannel("one-link-control-v1");
+  const hello = JSON.stringify({ v: "OL-PAIR-1", t: "hello", token: secret, nonce: secret });
+  channel.dispatchEvent(new MessageEvent("message", { data: hello }));
+  window.__oneLinkPeer = { state: { pairing: {
+    session: { control: channel }, sent_hello: false, finished: false,
+  } } };
+  channel.send(hello);
+  window.__oneLinkPeer.state.pairing.sent_hello = true;
+  channel.dispatchEvent(new Event("open"));
+  channel.failSend = true;
+  assert.throws(() => channel.send(hello), /synthetic-private-fixture-value/);
+  channel.failSend = false;
+  channel.send(new Uint8Array([1, 2]));
+
+  const incoming = new Channel(secret);
+  const announced = new Event("datachannel");
+  Object.defineProperty(announced, "channel", { value: incoming });
+  pc.dispatchEvent(announced);
+  incoming.dispatchEvent(new MessageEvent("message", { data: secret }));
+  for (let i = 0; i < 100; i += 1) {
+    channel.dispatchEvent(new MessageEvent("message", { data: hello }));
+  }
+  const snapshot = await diagnostics();
+  assert.equal(snapshot.events.length, 64);
+  assert.ok(snapshot.droppedEvents > 0);
+  assert.equal(window.__oneLinkRtcE2E.messages.length, 64);
+  assert.deepEqual(snapshot.events.slice(0, 3).map((event) => [
+    event.event, event.pairingPresent, event.sentHello,
+  ]), [["message", false, false], ["send", true, false], ["open", true, true]]);
+  assert.equal(snapshot.events[0].frame, "pair:hello");
+  assert.equal(snapshot.events[1].activeChannel, true);
+  assert.equal(snapshot.events[3].event, "send-error");
+  assert.equal(snapshot.events[4].frame, null);
+  assert.equal(snapshot.events[5].label, "other");
+  assert.equal(snapshot.events[5].frame, null);
+  assert.ok(!JSON.stringify(snapshot).includes(secret), "reports must omit payloads and SDP credentials");
+  assert.ok(!Object.hasOwn(snapshot, "messages"));
+  process.stdout.write("transport-evidence-ok");
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exitCode = 1;
+});
+"""
+    assert _run_node(script) == "transport-evidence-ok"
+
+
+@pytest.mark.parametrize("failed_peer", ["a", "b"])
+def test_both_peer_report_keeps_other_snapshot_when_one_page_is_closed(failed_peer: str) -> None:
+    _, _, helper = _transport_evidence_source()
+    namespace = {"_transport_diagnostics": lambda page: page()}
+    exec(compile(ast.Module(body=[helper], type_ignores=[]), "<E2E reporter>", "exec"), namespace)
+
+    def unavailable() -> None:
+        raise RuntimeError("synthetic-private-url-or-payload")
+
+    pages = {"a": lambda: {"events": ["a"]}, "b": lambda: {"events": ["b"]}}
+    pages[failed_peer] = unavailable
+    result = namespace["_both_peer_transport_diagnostics"](pages["a"], pages["b"])
+    other = "b" if failed_peer == "a" else "a"
+    assert result == {failed_peer: {"captureError": "RuntimeError"}, other: {"events": [other]}}

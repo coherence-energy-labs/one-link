@@ -1898,11 +1898,15 @@ def finalize_pending_rotation(
     exact-match checked. The ``finalized`` phase is published only after
     SQLite commits, so every crash boundary safely replays.
     """
-    from one_link import master_seed, paths
+    from one_link import lockbox, master_seed, paths
 
     root = Path(data_dir)
     id_path = Path(identity_path) if identity_path is not None else paths.key_path()
-    with _recovery_transaction_lock(root):
+    # Every boot passes through here; a stall is logged while it lasts.
+    with (
+        lockbox.audible_step("recovery: pending identity rotation check"),
+        _recovery_transaction_lock(root),
+    ):
         intent = _load_recovery_intent(root)
         if intent is None or intent.get("kind", "restore") != "rotation":
             return {"completed": False, "queued_peer_count": 0}

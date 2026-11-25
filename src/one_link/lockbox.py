@@ -59,12 +59,14 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import os
 import secrets
 import hashlib
 import sys
 import threading
 import time
+import traceback
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -470,23 +472,114 @@ def _load_envelope(data_dir: Path) -> Optional[_DekEnvelope]:
 # and on timeout names the holder, recorded in the lock file after byte 0
 # (the byte Windows locks).  Within one process the lock is re-entrant per
 # thread and threads wait for each other: two handles conflict exactly like
-# two processes do (Windows byte-range locks and POSIX flock are per handle).
+# two processes do (Windows byte-range locks and POSIX flock are per handle,
+# measured on both).  So the process-local lock is keyed by the lock FILE's
+# identity, never by how its directory was spelled: two spellings of one
+# directory (an 8.3 short name, a junction, a symlink) once meant two process
+# locks, two handles, and a thread nested through the second spelling waiting
+# on its own first handle until the deadline.
+#
+# A wait is never silent.  Past LOCK_WAIT_WARN_AFTER_S one warning names the
+# holder (purpose, pid, how long it has held) and the bound; acquisition or
+# abandonment is logged with the time waited.  An event-loop thread -- a
+# daemon starting, or a coroutine of a running one -- waits at most
+# LOCK_WAIT_ON_EVENT_LOOP_S: while it waits, everything that loop serves
+# stops, and a boot that waits out a supervisor's readiness deadline looks
+# hung instead of refused.  It still rides out a short holder (an export
+# finishing); a long one fails it fast with the holder named, and a restart
+# retries.  Offline commands and worker threads block nobody else and wait
+# LOCK_WAIT_TIMEOUT_S.
 
 LOCK_WAIT_TIMEOUT_S = 30.0
+LOCK_WAIT_ON_EVENT_LOOP_S = 2.0
+LOCK_WAIT_WARN_AFTER_S = 1.0
+# A boot step that can stall (sqlite schema work, DPAPI, an fsync) says so
+# WHILE it stalls; see audible_step.
+SLOW_STEP_WARN_AFTER_S = 1.0
 _LOCK_BACKOFF_START_S = 0.01
 _LOCK_BACKOFF_MAX_S = 0.25
 _LOCK_HOLDER_MAX_BYTES = 512
-_LOCK_CONTENTION_ERRNOS = frozenset(
+# Contention is the ONLY lock failure worth waiting on; anything else fails at
+# once with the platform's own error.  Windows: LockFileEx reports contention
+# as ERROR_LOCK_VIOLATION -- msvcrt.locking maps EVERY LockFile failure to
+# EACCES (measured: errno 13, no winerror), so it cannot tell contention from
+# a refusal and a refusal would spin to the deadline.  POSIX flock reports
+# contention as EWOULDBLOCK (== EAGAIN on Linux).
+_ERROR_LOCK_VIOLATION = 33
+_LOCKFILE_FAIL_IMMEDIATELY = 0x1
+_LOCKFILE_EXCLUSIVE_LOCK = 0x2
+_FLOCK_CONTENTION_ERRNOS = frozenset(
     code
-    for code in (
-        getattr(errno, "EACCES", None),
-        getattr(errno, "EAGAIN", None),
-        getattr(errno, "EWOULDBLOCK", None),
-        getattr(errno, "EDEADLK", None),
-        getattr(errno, "EDEADLOCK", None),
-    )
+    for code in (getattr(errno, "EWOULDBLOCK", None), getattr(errno, "EAGAIN", None))
     if code is not None
 )
+log = logging.getLogger("one_link.lockbox")
+
+
+def _innermost_frames(thread_id: int, limit: int = 6) -> str:
+    """``file:line function`` of a thread's innermost frames, innermost first."""
+    frame = sys._current_frames().get(thread_id)
+    if frame is None:
+        return "its stack is not available"
+    entries = traceback.extract_stack(frame, limit=limit)
+    return " <- ".join(
+        f"{os.path.basename(entry.filename)}:{entry.lineno} {entry.name}"
+        for entry in reversed(entries)
+    )
+
+
+class _StepWatch:
+    """State shared by an audible step and its timer, under one guard."""
+
+    def __init__(self) -> None:
+        self.guard = threading.Lock()
+        self.done = False
+        self.fired = False
+
+
+@contextmanager
+def audible_step(
+    label: str,
+    *,
+    logger: Optional[logging.Logger] = None,
+    after_s: Optional[float] = None,
+):
+    """Make a step that can stall say so WHILE it is stalled.
+
+    A process killed by a readiness deadline never logs "that took 30s", so a
+    timer thread logs once as soon as the step passes ``after_s`` (default
+    SLOW_STEP_WARN_AFTER_S), naming the innermost frames of the stalled
+    thread -- the log then says which call is stuck -- and the step logs
+    again when it finishes.  A step that finishes in time logs nothing.
+    """
+    sink = logger or log
+    threshold = SLOW_STEP_WARN_AFTER_S if after_s is None else float(after_s)
+    started = time.monotonic()
+    thread_id = threading.get_ident()
+    watch = _StepWatch()
+
+    def _still_running() -> None:
+        with watch.guard:
+            if watch.done:
+                return
+            watch.fired = True
+        sink.warning(
+            "%s has been running for %.1fs; the thread is in %s",
+            label, time.monotonic() - started, _innermost_frames(thread_id),
+        )
+
+    timer = threading.Timer(max(0.0, threshold), _still_running)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+        with watch.guard:
+            watch.done = True
+            fired = watch.fired
+        if fired:
+            sink.warning("%s finished after %.1fs", label, time.monotonic() - started)
 
 # A data-key migration (`one-link recovery set-passphrase` / remove-passphrase)
 # journals itself here.  While it exists every other envelope transaction
@@ -508,14 +601,28 @@ class _ProcessEnvelopeLock:
     rlock: Any
     depth: int = 0
     purpose: str = ""
+    thread: str = ""
 
 
 _PROCESS_ENVELOPE_LOCKS: dict[str, _ProcessEnvelopeLock] = {}
 _PROCESS_ENVELOPE_LOCKS_GUARD = threading.Lock()
 
 
-def _process_envelope_lock(root: Path) -> _ProcessEnvelopeLock:
-    key = os.path.normcase(os.path.abspath(str(root)))
+def _lock_file_identity(fd: int, root: Path) -> str:
+    """Which lock FILE ``fd`` is, however its directory was spelled.
+
+    ``(st_dev, st_ino)`` -- volume serial and file index on NTFS, device and
+    inode on POSIX -- is the same through every spelling of the directory
+    (measured through a junction and a symlink).  A filesystem that reports
+    no file index falls back to the fully resolved path.
+    """
+    st = os.fstat(fd)
+    if st.st_ino:
+        return f"file:{st.st_dev}:{st.st_ino}"
+    return "path:" + os.path.normcase(os.path.realpath(str(root)))
+
+
+def _process_envelope_lock(key: str) -> _ProcessEnvelopeLock:
     with _PROCESS_ENVELOPE_LOCKS_GUARD:
         held = _PROCESS_ENVELOPE_LOCKS.get(key)
         if held is None:
@@ -524,16 +631,244 @@ def _process_envelope_lock(root: Path) -> _ProcessEnvelopeLock:
         return held
 
 
-def _lock_holder_hint(fd: int) -> str:
-    """`` (held by <purpose>, pid <n>)`` if the holder recorded itself."""
+def _lock_holder(fd: int) -> str:
+    """The holder another process recorded: ``<purpose>, pid <n>, for <t>s``."""
     try:
         os.lseek(fd, 1, os.SEEK_SET)
         record = json.loads(os.read(fd, _LOCK_HOLDER_MAX_BYTES).decode("utf-8"))
         purpose = str(record["purpose"])[:120]
         pid = int(record["pid"])
-    except (OSError, ValueError, KeyError, TypeError, UnicodeDecodeError):
-        return " (holder not recorded)"
-    return f" (held by {purpose}, pid {pid})"
+        since_ms = int(record.get("since_ms", 0))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, UnicodeDecodeError):
+        return "a holder that did not record itself"
+    holder = f"{purpose}, pid {pid}"
+    if since_ms > 0:
+        held_s = max(0.0, time.time() - since_ms / 1000.0)
+        holder += f", for {held_s:.1f}s"
+    return holder
+
+
+def _in_process_holder(held: _ProcessEnvelopeLock) -> str:
+    return (
+        f"{held.purpose or 'an unrecorded operation'} in this process, "
+        f"pid {os.getpid()}, thread {held.thread or 'unknown'}"
+    )
+
+
+def _lock_wait_bound_s() -> float:
+    """How long the CALLING thread may wait for the envelope lock."""
+    bound = float(LOCK_WAIT_TIMEOUT_S)
+    # A running loop implies asyncio was imported; offline commands that never
+    # import it are never on an event-loop thread.
+    asyncio_module = sys.modules.get("asyncio")
+    if asyncio_module is None:
+        return bound
+    try:
+        asyncio_module.get_running_loop()
+    except RuntimeError:
+        return bound
+    return min(bound, float(LOCK_WAIT_ON_EVENT_LOOP_S))
+
+
+class _LockWait:
+    """One outermost acquisition: one deadline, and never silent."""
+
+    def __init__(self, purpose: str, bound_s: float) -> None:
+        self.purpose = purpose
+        self.bound_s = bound_s
+        self.started = time.monotonic()
+        self.deadline = self.started + bound_s
+        self.warned = False
+
+    def waited(self) -> float:
+        return time.monotonic() - self.started
+
+    def remaining(self) -> float:
+        return self.deadline - time.monotonic()
+
+    def warn(self, holder: str) -> None:
+        """The one mid-wait warning: who holds the lock, how long we may wait."""
+        if self.warned:
+            return
+        self.warned = True
+        log.warning(
+            "lockbox: %s is waiting for the DEK envelope lock held by %s; "
+            "it will wait up to %.1fs more (bound %gs)",
+            self.purpose, holder, max(0.0, self.remaining()), self.bound_s,
+        )
+
+    def maybe_warn(self, holder: Callable[[], str]) -> None:
+        if not self.warned and self.waited() >= LOCK_WAIT_WARN_AFTER_S:
+            self.warn(holder())
+
+    def acquired(self) -> None:
+        """Called once, when the whole acquisition (thread, then file) is done."""
+        if self.warned:
+            log.warning(
+                "lockbox: %s acquired the DEK envelope lock after waiting %.1fs",
+                self.purpose, self.waited(),
+            )
+
+    def abandoned(self, holder: str, *, in_process: bool) -> KeyMaterialPersistenceError:
+        waited = self.waited()
+        log.warning(
+            "lockbox: %s gave up on the DEK envelope lock after waiting %.1fs "
+            "(bound %gs); it is held by %s",
+            self.purpose, waited, self.bound_s, holder,
+        )
+        if in_process:
+            head = (
+                "another lockbox DEK envelope transaction in this process "
+                f"(held by {holder}) did not finish"
+            )
+        else:
+            head = (
+                f"another lockbox DEK envelope transaction (held by {holder}) "
+                "is still in progress"
+            )
+        return KeyMaterialPersistenceError(
+            f"{head}; gave up after waiting {waited:.1f}s (bound {self.bound_s:g}s)"
+        )
+
+
+def _acquire_process_lock(held: _ProcessEnvelopeLock, wait: _LockWait) -> None:
+    """Wait, audibly and boundedly, for another THREAD of this process."""
+    first = max(0.0, min(LOCK_WAIT_WARN_AFTER_S, wait.remaining()))
+    if held.rlock.acquire(timeout=first):
+        return
+    if wait.remaining() > 0:
+        wait.warn(_in_process_holder(held))
+        if held.rlock.acquire(timeout=max(0.0, wait.remaining())):
+            return
+    raise wait.abandoned(_in_process_holder(held), in_process=True)
+
+
+def _open_envelope_lock_file(root: Path) -> int:
+    path = root / DEK_ENVELOPE_LOCK_FILENAME
+    flags = os.O_RDWR | os.O_CREAT | int(getattr(os, "O_BINARY", 0))
+    flags |= int(getattr(os, "O_CLOEXEC", 0))
+    flags |= int(getattr(os, "O_NOFOLLOW", 0))
+    try:
+        fd = os.open(str(path), flags, 0o600)
+    except OSError as exc:
+        raise KeyMaterialPersistenceError(
+            "cannot open lockbox DEK envelope lock"
+        ) from exc
+    try:
+        if os.fstat(fd).st_size == 0:
+            # Byte 0 is the locked byte on Windows; the holder record follows.
+            os.write(fd, b"\x00")
+            os.fsync(fd)
+    except OSError as exc:
+        os.close(fd)
+        raise KeyMaterialPersistenceError(
+            "cannot initialise lockbox DEK envelope lock"
+        ) from exc
+    return fd
+
+
+_WIN32_LOCK_API: Optional[tuple[Any, Any, Any]] = None
+
+
+def _win32_lock_api() -> tuple[Any, Any, Any]:
+    """``(LockFileEx, UnlockFileEx, OVERLAPPED)`` with explicit signatures."""
+    global _WIN32_LOCK_API
+    if _WIN32_LOCK_API is None:
+        import ctypes
+        from ctypes import wintypes
+
+        class _Overlapped(ctypes.Structure):
+            _fields_ = [
+                ("internal", ctypes.c_size_t),
+                ("internal_high", ctypes.c_size_t),
+                ("offset", wintypes.DWORD),
+                ("offset_high", wintypes.DWORD),
+                ("event", wintypes.HANDLE),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        lock_file_ex = kernel32.LockFileEx
+        lock_file_ex.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+            wintypes.DWORD, ctypes.POINTER(_Overlapped),
+        ]
+        lock_file_ex.restype = wintypes.BOOL
+        unlock_file_ex = kernel32.UnlockFileEx
+        unlock_file_ex.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+            ctypes.POINTER(_Overlapped),
+        ]
+        unlock_file_ex.restype = wintypes.BOOL
+        _WIN32_LOCK_API = (lock_file_ex, unlock_file_ex, _Overlapped)
+    return _WIN32_LOCK_API
+
+
+def _win32_byte_lock(fd: int, *, lock: bool) -> int:
+    """Lock (exclusive, fail-immediately) or unlock byte 0 of ``fd``.
+
+    Returns 0 on success, else the Win32 error code.  Interoperates with
+    ``msvcrt.locking`` holders: both are byte-range locks on byte 0.
+    """
+    import ctypes
+    import msvcrt
+
+    lock_file_ex, unlock_file_ex, overlapped_type = _win32_lock_api()
+    overlapped = overlapped_type()  # offset 0: byte 0
+    handle = msvcrt.get_osfhandle(fd)
+    if lock:
+        ok = lock_file_ex(
+            handle, _LOCKFILE_EXCLUSIVE_LOCK | _LOCKFILE_FAIL_IMMEDIATELY,
+            0, 1, 0, ctypes.byref(overlapped),
+        )
+    else:
+        ok = unlock_file_ex(handle, 0, 1, 0, ctypes.byref(overlapped))
+    return 0 if ok else int(ctypes.get_last_error())
+
+
+def _try_lock_envelope_file(fd: int) -> bool:
+    """True: locked.  False: another handle holds it.  Anything else raises."""
+    if sys.platform == "win32":
+        try:
+            code = _win32_byte_lock(fd, lock=True)
+        except OSError as exc:
+            raise KeyMaterialPersistenceError(
+                f"cannot lock the lockbox DEK envelope: {exc}"
+            ) from exc
+        if code == 0:
+            return True
+        if code == _ERROR_LOCK_VIOLATION:
+            return False
+        import ctypes
+
+        raise KeyMaterialPersistenceError(
+            f"cannot lock the lockbox DEK envelope: {ctypes.WinError(code)}"
+        )
+    import fcntl
+
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if exc.errno in _FLOCK_CONTENTION_ERRNOS:
+            return False
+        raise KeyMaterialPersistenceError(
+            f"cannot lock the lockbox DEK envelope: {exc}"
+        ) from exc
+    return True
+
+
+def _lock_envelope_file(fd: int, root: Path, wait: _LockWait) -> None:
+    """Wait, audibly and boundedly, for another PROCESS (or a handle of this
+    one that predates the identity-keyed process lock)."""
+    delay = _LOCK_BACKOFF_START_S
+    while not _try_lock_envelope_file(fd):
+        remaining = wait.remaining()
+        if remaining <= 0:
+            raise wait.abandoned(_lock_holder(fd), in_process=False)
+        wait.maybe_warn(lambda: _lock_holder(fd))
+        time.sleep(min(delay, remaining))
+        delay = min(delay * 2, _LOCK_BACKOFF_MAX_S)
+    if sys.platform != "win32":
+        os.chmod(root / DEK_ENVELOPE_LOCK_FILENAME, 0o600)
 
 
 def _record_lock_holder(fd: int, purpose: str) -> None:
@@ -550,70 +885,14 @@ def _record_lock_holder(fd: int, purpose: str) -> None:
         pass
 
 
-def _acquire_envelope_file_lock(
-    root: Path, *, purpose: str, deadline: float, timeout_s: float,
-) -> int:
-    path = root / DEK_ENVELOPE_LOCK_FILENAME
-    flags = os.O_RDWR | os.O_CREAT | int(getattr(os, "O_BINARY", 0))
-    flags |= int(getattr(os, "O_CLOEXEC", 0))
-    flags |= int(getattr(os, "O_NOFOLLOW", 0))
-    try:
-        fd = os.open(str(path), flags, 0o600)
-    except OSError as exc:
-        raise KeyMaterialPersistenceError(
-            "cannot open lockbox DEK envelope lock"
-        ) from exc
-    try:
-        if os.fstat(fd).st_size == 0:
-            # Byte 0 is the locked byte on Windows; the holder record follows.
-            os.write(fd, b"\x00")
-            os.fsync(fd)
-        delay = _LOCK_BACKOFF_START_S
-        while True:
-            try:
-                if sys.platform == "win32":
-                    import msvcrt
-
-                    os.lseek(fd, 0, os.SEEK_SET)
-                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except OSError as exc:
-                if exc.errno not in _LOCK_CONTENTION_ERRNOS:
-                    raise KeyMaterialPersistenceError(
-                        f"cannot lock the lockbox DEK envelope: {exc}"
-                    ) from exc
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise KeyMaterialPersistenceError(
-                        "another lockbox DEK envelope transaction is in "
-                        f"progress{_lock_holder_hint(fd)}; gave up after "
-                        f"{timeout_s:.0f}s"
-                    ) from exc
-                time.sleep(min(delay, remaining))
-                delay = min(delay * 2, _LOCK_BACKOFF_MAX_S)
-        if sys.platform != "win32":
-            os.chmod(path, 0o600)
-        _record_lock_holder(fd, purpose)
-        return fd
-    except BaseException:
-        os.close(fd)
-        raise
-
-
 def _release_envelope_file_lock(fd: int) -> None:
     try:
         with suppress(OSError):
             os.ftruncate(fd, 1)
         if sys.platform == "win32":
-            import msvcrt
-
-            os.lseek(fd, 0, os.SEEK_SET)
+            # Closing the handle below releases the lock regardless.
             with suppress(OSError):
-                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                _win32_byte_lock(fd, lock=False)
         else:
             import fcntl
 
@@ -669,32 +948,43 @@ def _envelope_mutation_lock(
 
     ``migration`` is set only by the data-key migration, which owns the
     intent journal; every other outermost acquisition refuses while one is
-    unfinished.  A nested acquisition in the same thread is re-entrant and
-    inherits the outer transaction's standing.
+    unfinished.  A nested acquisition in the same thread -- through any
+    spelling of the directory -- is re-entrant and inherits the outer
+    transaction's standing.  The wait is bounded by ``_lock_wait_bound_s``
+    and is never silent (see the section comment above).
     """
     root = Path(data_dir)
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    timeout_s = float(LOCK_WAIT_TIMEOUT_S)
-    deadline = time.monotonic() + timeout_s
-    held = _process_envelope_lock(root)
-    if not held.rlock.acquire(timeout=max(0.0, timeout_s)):
-        raise KeyMaterialPersistenceError(
-            "another lockbox DEK envelope transaction in this process "
-            f"(held by {held.purpose or 'unknown'}, pid {os.getpid()}) did "
-            f"not finish; gave up after {timeout_s:.0f}s"
-        )
+    wait = _LockWait(purpose, _lock_wait_bound_s())
+    # Open first: the process lock is chosen by the FILE's identity.  A
+    # nested acquisition closes its extra descriptor; that releases nothing,
+    # because Windows byte-range locks and flock belong to the descriptor
+    # that took them (measured on both).
+    fd = _open_envelope_lock_file(root)
+    try:
+        held = _process_envelope_lock(_lock_file_identity(fd, root))
+        _acquire_process_lock(held, wait)
+    except BaseException:
+        os.close(fd)
+        raise
     try:
         if held.depth > 0:
+            os.close(fd)
             held.depth += 1
             try:
                 yield
             finally:
                 held.depth -= 1
             return
-        fd = _acquire_envelope_file_lock(
-            root, purpose=purpose, deadline=deadline, timeout_s=timeout_s,
-        )
+        try:
+            _lock_envelope_file(fd, root, wait)
+        except BaseException:
+            os.close(fd)
+            raise
+        wait.acquired()
+        _record_lock_holder(fd, purpose)
         held.depth, held.purpose = 1, purpose
+        held.thread = threading.current_thread().name
         try:
             if not migration:
                 refusal = data_key_migration_refusal(root)
@@ -702,7 +992,7 @@ def _envelope_mutation_lock(
                     raise refusal
             yield
         finally:
-            held.depth, held.purpose = 0, ""
+            held.depth, held.purpose, held.thread = 0, "", ""
             _release_envelope_file_lock(fd)
     finally:
         held.rlock.release()
@@ -2175,6 +2465,17 @@ def acquire_or_create_silent_drk(data_dir: Path) -> bytes:
 
 
 def acquire_lockbox(data_dir: Path) -> "LockBox":
+    """The data key for ``data_dir`` -- every boot's entry point.
+
+    The rules are ``_acquire_lockbox``'s.  This step is audible: a stall
+    anywhere inside it (DPAPI, an fsync, the envelope lock) is logged while
+    it lasts, naming the call the thread is in.
+    """
+    with audible_step("lockbox: data key acquisition"):
+        return _acquire_lockbox(data_dir)
+
+
+def _acquire_lockbox(data_dir: Path) -> "LockBox":
     """v0.20.7: top-level "give me a lockbox now" entry point used
     by Daemon. Returns a LockBox using the strongest available key
     derivation:

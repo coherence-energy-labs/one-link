@@ -960,7 +960,11 @@ class State:
         # honestly.
         self.is_encrypted = False
         self._encryption_backup_path: Optional[Path] = None
-        conn = self._open_connection_with_encryption_if_available()
+        # Boot passes through here; a stall is logged while it lasts.
+        from one_link.lockbox import audible_step
+
+        with audible_step("state.db open", logger=log):
+            conn = self._open_connection_with_encryption_if_available()
         self._conn = conn
         # Row factory must come from the connection's OWN module —
         # sqlite3.Row only accepts sqlite3.Cursor, sqlcipher3.Row only
@@ -1038,9 +1042,10 @@ class State:
         with contextlib.suppress(Exception):
             self._clean_marker.unlink()
         try:
-            self._init_pragmas()
-            self._migrate()
-            self._cleanup_verified_plaintext_backup()
+            with audible_step("state.db schema initialisation", logger=log):
+                self._init_pragmas()
+                self._migrate()
+                self._cleanup_verified_plaintext_backup()
         except BaseException:
             # A half-constructed State must not retain a native SQLite handle.
             # Windows otherwise refuses recovery's atomic state.db replace;

@@ -109,6 +109,9 @@ from one_link import (
     wave_forecast_native,
 )
 from one_link.build_identity import runtime_build_identity
+from one_link.transfer_routes import (
+    PayloadRouteAccounting, peer_stream_transport, validate_file_transport,
+)
 from one_link import control_ipc
 from one_link.fault_observability import report_best_effort_failure
 from one_link.capabilities import (
@@ -1221,6 +1224,13 @@ _OUTBOUND_DELIVERY_RESERVED_METADATA_KEYS = frozenset(
         "transfer_report",
         "performance_summary",
         "adaptive_scheduler",
+        "transport_requested",
+        "payload_transport",
+        "payload_bytes_by_transport",
+        "payload_chunks_by_transport",
+        "payload_fallbacks",
+        "payload_accounting_scope",
+        "source_index_engine",
     }
 )
 
@@ -32897,6 +32907,7 @@ class Daemon:
         extra_metadata: dict | None = None,
         display_name: str | None = None,
         chat_inline: bool = False,
+        transport: str = "auto",
     ) -> dict:
         """Serialize callers that target the same durable delivery intent.
 
@@ -32919,6 +32930,7 @@ class Daemon:
                 extra_metadata=extra_metadata,
                 display_name=display_name,
                 chat_inline=chat_inline,
+                transport=transport,
             )
         gates = self._outbound_file_gates
         gate_key = str(transfer_id)
@@ -32937,6 +32949,7 @@ class Daemon:
                     extra_metadata=extra_metadata,
                     display_name=display_name,
                     chat_inline=chat_inline,
+                    transport=transport,
                 )
         finally:
             gate.users -= 1
@@ -32953,6 +32966,7 @@ class Daemon:
         extra_metadata: dict | None = None,
         display_name: str | None = None,
         chat_inline: bool = False,
+        transport: str = "auto",
     ) -> dict:
         """Send a single file to a paired peer.
 
@@ -32994,6 +33008,9 @@ class Daemon:
         intentionally inherits the unthrottled behavior — if you
         clicked Send on a 10 GB folder, you want it to go.
         """
+        transport = validate_file_transport(transport)
+        payload_routes = PayloadRouteAccounting(transport)
+
         # The clean on-wire / ledger name. Strip the internal staging
         # prefix the upload pipeline adds (<ts>_<hex>_<orig>) — that
         # was leaking through to the recipient AND to the sender's own
@@ -33160,6 +33177,7 @@ class Daemon:
                 # durable result before the planning upsert below has any
                 # chance to downgrade it back to queued/offered.
                 return {
+                    **payload_routes.snapshot(),
                     "offer": None,
                     "chunks": 0,
                     "total_chunks": int(existing.chunks_total or 0),
@@ -33219,6 +33237,8 @@ class Daemon:
             # those bytes have been hashed.
             **safe_extra_metadata,
             "mode": "planning",
+            **payload_routes.snapshot(),
+            "source_index_engine": prepared_source.file_index.engine,
             "path": str(path),
             "delivery_state": "queued",
             "display_name": _wire_name,
@@ -33326,6 +33346,19 @@ class Daemon:
 
         peer_fp = sess.peer_fp  # cryptographically-verified fingerprint
         channel = sess.channel
+        stream_transport = peer_stream_transport(sess)
+        if transport != "auto" and transport != stream_transport:
+            self._update_transfer(
+                transfer_id, status="failed", metadata={
+                    **base_metadata, "delivery_state": "needs_attention",
+                    "error_class": "UnsupportedFileTransport",
+                    "error": f"requested {transport}; session selected {stream_transport}",
+                },
+            )
+            raise ValueError(
+                f"unavailable_file_transport: requested {transport}; "
+                f"session selected {stream_transport}"
+            )
         peer_caps_frame = getattr(channel, "peer_caps", None) or {}
         peer_features = list(peer_caps_frame.get("features") or [])
         if not peer_features and self.state is not None:
@@ -34008,6 +34041,7 @@ class Daemon:
                     confirmed: bool = False,
                 ) -> dict:
                     return {
+                        **payload_routes.snapshot(),
                         "offer": None,
                         "chunks": 0,
                         "total_chunks": planned_chunks_total,
@@ -34227,6 +34261,7 @@ class Daemon:
                         ) from exc
                     self._clear_remote_commit_failstop(transfer_id)
                     return {
+                        **payload_routes.snapshot(),
                         "offer": offer,
                         "chunks": 0,
                         "total_chunks": planned_chunks_total,
@@ -34487,6 +34522,7 @@ class Daemon:
                             chunks_sent += 1
                             raw_bytes_sent += raw_size
                             wire_bytes_sent += wire_size
+                            payload_routes.acknowledge(stream_transport, wire_size)
                             self._update_transfer(
                                 transfer_id,
                                 status="active",
@@ -34530,7 +34566,7 @@ class Daemon:
                         # would always be False on first run because
                         # _quic_outbound is empty.
                         if (
-                            FILE_QUIC_CHUNKS_ENABLED
+                            FILE_QUIC_CHUNKS_ENABLED and transport == "auto"
                             and
                             peer_fp_for_policy
                             and NATIVE_TRANSFER_INDEXED_V1 in peer_feature_set
@@ -34542,7 +34578,7 @@ class Daemon:
                                     peer_fp_for_policy, peer,
                                 )
                         cdc_quic_eligible = (
-                            FILE_QUIC_CHUNKS_ENABLED
+                            FILE_QUIC_CHUNKS_ENABLED and transport == "auto"
                             and peer_fp_for_policy is not None
                             and NATIVE_TRANSFER_INDEXED_V1 in peer_feature_set
                             and peer_fp_for_policy in self._quic_outbound
@@ -34616,6 +34652,7 @@ class Daemon:
                                 chunks_sent += 1
                                 raw_bytes_sent += raw_sz
                                 wire_bytes_sent += wire_sz
+                                payload_routes.acknowledge("quic", wire_sz)
                                 cdc_scheduler.observe_ack(
                                     ack_ms=elapsed_ms / max(1, len(cdc_quic_sizes)),
                                     raw_bytes=raw_sz,
@@ -34763,8 +34800,9 @@ class Daemon:
                                                 if peer_fp_for_policy else None,
                                             "reason": "send_chunk_via_quic batch returned not-ok",
                                             "expected": "FILE_CDC_CHUNK over QUIC",
-                                            "actual": "FILE_CDC_CHUNK over WebRTC",
+                                            "actual": f"FILE_CDC_CHUNK over {stream_transport}",
                                         })
+                                        payload_routes.fallbacks += 1
                                         cdc_quic_eligible = False
                                         for fb_msg, (fb_raw, fb_wire) in zip(
                                             cdc_quic_batch, cdc_quic_sizes,
@@ -34818,7 +34856,7 @@ class Daemon:
                                         if peer_fp_for_policy else None,
                                     "reason": "send_chunk_via_quic final batch returned not-ok",
                                     "expected": "FILE_CDC_CHUNK over QUIC",
-                                    "actual": "FILE_CDC_CHUNK over WebRTC",
+                                    "actual": f"FILE_CDC_CHUNK over {stream_transport}",
                                 })
                                 for fb_msg, (fb_raw, fb_wire) in zip(
                                     cdc_quic_batch, cdc_quic_sizes,
@@ -34977,6 +35015,7 @@ class Daemon:
                             chunks_sent += 1
                             raw_bytes_sent += acked_size
                             wire_bytes_sent += acked_size
+                            payload_routes.acknowledge(stream_transport, acked_size)
                             self._update_transfer(
                                 transfer_id,
                                 status="active",
@@ -35016,7 +35055,7 @@ class Daemon:
                         # dial per chunk. Failure here just means
                         # the transfer rides WebRTC, no error.
                         if (
-                            FILE_QUIC_CHUNKS_ENABLED
+                            FILE_QUIC_CHUNKS_ENABLED and transport == "auto"
                             and
                             native_transfer_used
                             and peer_fp_for_policy
@@ -35134,7 +35173,7 @@ class Daemon:
                                 # — the transfer always completes.
                                 quic_dispatched = False
                                 if (
-                                    FILE_QUIC_CHUNKS_ENABLED
+                                    FILE_QUIC_CHUNKS_ENABLED and transport == "auto"
                                     and peer_fp_for_policy
                                     and peer_fp_for_policy in self._quic_outbound
                                 ):
@@ -35188,6 +35227,7 @@ class Daemon:
                                             chunks_sent += 1
                                             raw_bytes_sent += sz
                                             wire_bytes_sent += sz
+                                            payload_routes.acknowledge("quic", sz)
                                         if qres.get("ok"):
                                             quic_pending_batch.clear()
                                             quic_pending_sizes.clear()
@@ -35213,8 +35253,9 @@ class Daemon:
                                                     or "send_chunks_via_quic_parallel returned not-ok"
                                                 ),
                                                 "expected": "FILE_NATIVE_CHUNK over QUIC",
-                                                "actual": "FILE_NATIVE_CHUNK over WebRTC",
+                                                "actual": f"FILE_NATIVE_CHUNK over {stream_transport}",
                                             })
+                                            payload_routes.fallbacks += 1
                                             await _fallback_quic_batch_to_webrtc(
                                                 unresolved_positions,
                                             )
@@ -35370,6 +35411,7 @@ class Daemon:
             self._assert_file_signature(path, file_sig)
             final_status = "complete" if delivery_confirmed else "failed"
             final_delivery_state = "done" if delivery_confirmed else "sent_unconfirmed"
+            base_metadata = {**base_metadata, **payload_routes.snapshot()}
             terminal_kwargs = dict(
                 status=final_status,
                 progress_bytes=size,
@@ -35441,6 +35483,7 @@ class Daemon:
             if delivery_confirmed:
                 self._schedule_resume_paused(sess.peer_fp)
             return {
+                **payload_routes.snapshot(),
                 "offer": offer,
                 "chunks": chunks_sent,
                 "total_chunks": len(cdc_chunks) if cdc_used else chunks_sent,
@@ -35818,7 +35861,9 @@ class Daemon:
                 last_error = None
                 for peer in peers:
                     try:
-                        result = await self.send_file(peer, p)
+                        result = await self.send_file(
+                            peer, p, transport=req.get("transport", "auto"),
+                        )
                         await self._reply(writer, {"ok": True, "result": result})
                         return
                     except Exception as e:

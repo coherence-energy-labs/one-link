@@ -145,7 +145,7 @@ def test_required_mode_live_pair_owner_request_and_immediate_revoke(
                 "token": invite["token"],
                 "device_pub_b64": identity["pub"],
                 "device_kind": "browser-peer",
-                "label": "Chromium authority",
+                "label": f"{browser.browser_type.name} authority",
             },
         )
         assert claim["pending"] is True
@@ -172,23 +172,29 @@ def test_required_mode_live_pair_owner_request_and_immediate_revoke(
 
         peer.evaluate(
             """(handoff) => {
+                window.__olIdentityPairError = null;
                 window.__olIdentityPairFlow =
                   window.__oneLinkPeer._runAutoPairFlow({
                     pair_token: handoff.pair_token,
                     daemon_fingerprint: handoff.daemon_fingerprint,
                     ws_url: handoff.ws_signaling_url,
+                  }).catch((error) => {
+                    window.__olIdentityPairError = String(error?.message || error);
+                    throw error;
                   });
             }""",
             handoff,
         )
         try:
             peer.wait_for_function(
-                """() => Boolean(
+                """() => Boolean(window.__olIdentityPairError) || Boolean(
                     window.__oneLinkPeer.state.daemon_identity_ready?.verified &&
                     window.__oneLinkPeer.state.daemon_dc?.readyState === 'open'
                 )""",
                 timeout=90_000,
             )
+            pair_error = peer.evaluate("() => window.__olIdentityPairError")
+            assert pair_error is None, f"browser pairing rejected: {pair_error}"
         except PlaywrightTimeoutError as exc:
             browser_state = peer.evaluate(
                 """() => ({

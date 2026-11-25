@@ -178,18 +178,54 @@ async def test_other_endpoints_still_guarded(http):
 
 # ───────── Frontend: 401 banner ─────────────────────────────────────
 
+def _function_body(page: str, signature: str) -> str:
+    """Source of one top-level feature function in the shipped page."""
+    start = page.find(signature)
+    assert start > 0, f"{signature} is not in the shipped page"
+    end = page.find("\n  }\n", start)
+    assert end > start
+    return page[start:end]
+
+
+def _css_rule(page: str, selector: str) -> str:
+    start = page.find(selector + " {")
+    assert start > 0, f"no CSS rule for {selector}"
+    return page[start:page.find("}", start)]
+
+
 def test_global_401_handler_present(index_html: str):
     """Pin _maybe401 + the banner so a refactor can't quietly drop
-    the global 401 handling."""
-    assert "function _maybe401(status)" in index_html
-    assert "function showSessionExpiredBanner()" in index_html
+    the global 401 handling.
+
+    A 401 is handed to windowLink, which probes the credential, keeps
+    retrying while the daemon cannot be reached, and renders the signed-out
+    line only after the daemon has refused the credential twice
+    (tests/js/test_window_link.cjs)."""
+    handler = _function_body(index_html, "function _maybe401(status)")
+    assert "if (status !== 401) return;" in handler
+    assert "windowLink.unauthorized();" in handler
+    assert "function showSessionExpiredBanner(text)" in index_html
+    renderer = _function_body(index_html, "function _renderWindowStatus(kind)")
+    assert "showSessionExpiredBanner(text);" in renderer
 
 
 def test_session_expired_banner_class_styled(index_html: str):
-    """The banner needs visible CSS or it's invisible noise."""
-    assert ".session-expired-banner {" in index_html
-    # Sticky to top so the user can't miss it.
-    assert "position: fixed" in index_html
+    """The signed-out line needs its own visible styling, and it must take
+    its place in the layout.
+
+    This test used to assert ``position: fixed`` appeared somewhere in the
+    page, which any rule satisfied. The fixed position was the defect: at
+    ``top: 56px`` the banner sat on the grid row the status line occupies,
+    so the two printed over each other (2026-11-25). The rule is now a
+    modifier on that one in-flow element and may not position itself."""
+    rule = _css_rule(index_html, ".offline-banner.session-expired-banner")
+    assert "background:" in rule and "var(--bad)" in rule
+    for declaration in ("position", "top:", "left:", "right:", "z-index"):
+        assert declaration not in rule, f"the signed-out line positions itself ({declaration})"
+    # No free-standing rule either: it would style a second element.
+    assert "\n  .session-expired-banner {" not in index_html
+    base = _css_rule(index_html, "  .offline-banner")
+    assert "position" not in base
 
 
 def test_api_wrappers_call_maybe401(index_html: str):
@@ -215,23 +251,43 @@ def test_api_wrappers_call_maybe401(index_html: str):
 def test_session_expired_banner_has_relaunch_guidance(index_html: str):
     """The banner must tell the user WHAT to do, not just announce
     a problem."""
-    idx = index_html.find("function showSessionExpiredBanner()")
-    snippet = index_html[idx:idx + 3200]
+    body = _function_body(index_html, "function showSessionExpiredBanner(text)")
     # The actionable instruction is the load-bearing UX: without it
-    # the user is stuck staring at a banner that says "expired".
-    # 2026-06-04: the banner is now case-aware — when a token is
-    # stashed it offers "Reload" (which works); when none is, it tells
-    # the user to re-open from the desktop shortcut / tray (the only
-    # real fix) rather than a Reload button that would re-land on the
-    # banner. Either way it must give a concrete next step.
-    assert "Reload" in snippet
-    assert "desktop shortcut" in snippet or "tray" in snippet
+    # the user is stuck staring at a line that says "signed out".
+    # This test used to look for the word "Reload" within 3200 characters
+    # of the function, and a code comment supplied it. It now reads the
+    # function's own body, comments removed.
+    code = "\n".join(line for line in body.splitlines() if not line.lstrip().startswith("//"))
+    assert '"This window was signed out."' in code
+    assert "desktop shortcut" in code and "tray icon" in code
+    assert "Your data is safe." in code
+    # Signed out is reached only after the daemon refused the credential
+    # twice, and nothing on the page can mint a new one. A button here
+    # could not work, so there is none; while the credential is merely
+    # unverified the line says "Restoring One Link…" and offers Try now.
+    assert "button" not in code.lower()
+    # Engineer wording does not belong in front of a person.
+    for jargon in ("access key", "address bar", "validate", "bearer", "token", "401"):
+        assert jargon not in code.lower()
+    restoring = _function_body(index_html, "function _renderWindowStatus(kind)")
+    assert '"Try now"' in restoring
+    assert "windowLink.retryNow();" in restoring
+    assert "LiveRefresh.forceReconnectNow();" in restoring
 
 
 def test_session_expired_banner_only_shows_once(index_html: str):
     """If five endpoints all 401 in quick succession, we should
-    NOT stack five banners. Pin the once-only flag."""
-    assert "_sessionExpiredBannerShown" in index_html
+    NOT stack five banners.
+
+    The once-only flag this test used to pin is gone because there is no
+    second element to stack: the signed-out status is written into the
+    status line's own text node. A burst of 401s starting exactly one
+    recovery is tested in tests/js/test_window_link.cjs."""
+    assert 'id = "session-expired-banner"' not in index_html
+    assert 'getElementById("session-expired-banner")' not in index_html
+    body = _function_body(index_html, "function showSessionExpiredBanner(text)")
+    assert "document.body.appendChild" not in body
+    assert 'createElement("div")' not in body
 
 
 # ───────── version pin ──────────────────────────────────────────────

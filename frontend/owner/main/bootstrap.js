@@ -90,9 +90,9 @@
     // 2026-05-21 audit T3-P: track the polling cluster so we can
     // pause it on a 401 burst and resume on recovery. Without
     // this, six concurrent timers keep firing through the
-    // session-expired banner — each one re-firing _maybe401 ->
-    // _attemptAutoRecovery -> Promise pileup. The auth-loss
-    // banner now stops the cluster; explicit recovery resumes.
+    // session-expired banner — each one re-firing _maybe401.
+    // windowLink suspends the cluster on the first 401 and resumes
+    // it by itself when the link to the daemon is restored.
     // pollingCluster owns the timers.
     pollingCluster.start(_mainPollTasks());
     // T3-O: free in-tab File-cache blob URLs on page hide so a

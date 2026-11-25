@@ -671,7 +671,7 @@ test("a call event the call driver throws on is counted and logged, and the even
     window,
     location: { protocol: "https:", host: "127.0.0.1:7117" },
     WebSocket: FakeWebSocket,
-    LiveRefresh: { onOpen() {}, onClose() {} },
+    LiveRefresh: { onGreeted() {}, onClose() {} },
     _ownerBearerToken: () => "",
     console: { ...console, error: (...args) => logged.push(args) },
   }, "return { connectWS, callEventHandlerFailures };");

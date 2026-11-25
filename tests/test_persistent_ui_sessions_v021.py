@@ -985,7 +985,14 @@ def test_session_bearer_recovery_never_serializes_secret_into_url():
     ).read_text(encoding="utf-8")
     assert "encodeURIComponent(stashedToken)" not in src
     assert 'location.href = location.pathname + "?t="' not in src
-    assert "const recovered = await _attemptAutoRecovery();" in src
+    # Recovery validates the bearer by one header-authenticated request;
+    # the probe's own source may not build a URL from anything.
+    start = src.find("async function _probeOwnerSession()")
+    assert start > 0
+    probe = src[start:src.find("\n  }\n", start)]
+    assert 'await fetch("/api/me", { cache: "no-store" });' in probe
+    assert "?t=" not in probe and "encodeURIComponent" not in probe and "location" not in probe
+    assert "probe: _probeOwnerSession," in src
 
     sw = (
         Path(__file__).resolve().parents[1]

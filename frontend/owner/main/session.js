@@ -97,91 +97,102 @@
     return _nativeWindowFetch(input, next);
   };
 
-  let _sessionExpiredBannerShown = false;
-  let _autoRecoveryInFlight = false;
-  let _autoRecoveryAttempts = 0;
-  const _AUTO_RECOVERY_MAX_ATTEMPTS = 2;
+  // ── This window's link to the daemon ──────────────────────────────
+  // windowLink (services/window_link.js) owns the session state, its
+  // recovery and the one status line. This module supplies what that
+  // service cannot reach by itself: the probe, the credential stores, the
+  // polling cluster and the DOM element.
 
-  async function _attemptAutoRecovery() {
-    if (_autoRecoveryInFlight) return false;
-    if (_autoRecoveryAttempts >= _AUTO_RECOVERY_MAX_ATTEMPTS) return false;
-    // The bootstrap head script captures the URL token into tab-scoped
-    // sessionStorage before scrubbing the address bar. Long-lived access is
-    // handled by the revocable origin-scoped browser-session credential.
-    let token = "";
-    token = _ownerBearerToken();
-    if (!token) return false;
-    _autoRecoveryInFlight = true;
-    _autoRecoveryAttempts += 1;
+  // Ask the daemon whether this window's credential still works. The
+  // origin-scoped bearer goes in the Authorization header (the fetch wrapper
+  // above adds it); it is never serialized into a URL.
+  //
+  //   "ok"           the daemon accepted it
+  //   "rejected"     the daemon answered and refused it (401/403)
+  //   "unavailable"  no answer about the credential: unreachable, a 5xx, or
+  //                  a rate limit. This says nothing about the credential.
+  async function _probeOwnerSession() {
     try {
-      // Validate the origin-scoped bearer directly. It may be a revocable
-      // browser session that intentionally is not accepted in a URL.
-      const r = await fetch("/api/me", {
-        cache: "no-store",
-      });
-      if (r.ok) {
-        // Keep the current-tab credential hot; the bootstrap decides whether
-        // a revocable copy is also retained in origin-persistent storage.
-        try { sessionStorage.setItem("ol_session_token", token); } catch (_) {}
-        return true;
-      }
-      // 401 from the recovery fetch itself means the stashed
-      // token is no longer an active owner/session credential.
-      // That stash is dead — flush it so we don't keep retrying
-      // a known-bad value on every poll.
-      if (r.status === 401 || r.status === 403) {
-        try { sessionStorage.removeItem("ol_session_token"); } catch (_) {}
-        try { localStorage.removeItem(_PERSISTENT_OWNER_SESSION_KEY); } catch (_) {}
-      }
-      return false;
+      const r = await fetch("/api/me", { cache: "no-store" });
+      if (r.ok) return "ok";
+      if (r.status === 401 || r.status === 403) return "rejected";
+      return "unavailable";
     } catch (_) {
-      return false;
-    } finally {
-      _autoRecoveryInFlight = false;
+      return "unavailable";
     }
   }
 
+  // The credential was refused twice in a row: it is dead. Flush it so a
+  // reload does not present a known-bad value again.
+  function _forgetRejectedOwnerSession() {
+    try { sessionStorage.removeItem("ol_session_token"); } catch (_) {}
+    try { localStorage.removeItem(_PERSISTENT_OWNER_SESSION_KEY); } catch (_) {}
+  }
+
+  let _offlineStatusCopy = null;
+  function _renderWindowStatus(kind) {
+    const b = document.querySelector("#offline-banner");
+    if (!b) return;
+    const text = b.querySelector("span:not(.offline-dot)");
+    if (!text) return;
+    // The markup carries the offline copy; keep it so the line can return
+    // to it after showing something else.
+    if (_offlineStatusCopy === null) _offlineStatusCopy = text.textContent;
+    b.querySelector(".status-action")?.remove();
+    b.classList.toggle("session-expired-banner", kind === "signed_out");
+    b.dataset.status = kind || "";
+    if (!kind) {
+      b.classList.remove("show");
+      text.textContent = _offlineStatusCopy;
+      return;
+    }
+    if (kind === "signed_out") {
+      showSessionExpiredBanner(text);
+    } else if (kind === "restoring") {
+      // doctrine-ok: §3.2.a grandfathered legacy surface (ADR-PENDING-doctrine-sweep-v0.21); reconnect banner is on the v0.21 cleanup list. Replace with silent prewarm + capsule-mode fallback per LIVING_PRESENCE_ARCHITECTURE §3.
+      text.textContent = "Restoring One Link…";
+      // Recovery retries by itself. The button only skips the wait.
+      const now = document.createElement("button");
+      now.type = "button";
+      now.className = "btn-ghost status-action";
+      now.textContent = "Try now";
+      now.addEventListener("click", () => {
+        windowLink.retryNow();
+        LiveRefresh.forceReconnectNow();
+      });
+      b.appendChild(now);
+    } else {
+      text.textContent = _offlineStatusCopy;
+    }
+    b.classList.add("show");
+  }
+
+  const windowLink = createWindowLink({
+    probe: _probeOwnerSession,
+    forgetCredential: _forgetRejectedOwnerSession,
+    // Six polls answering 401 in a burst would each start a recovery;
+    // stop them while the link is being restored.
+    suspend: () => _pauseMainPollTimers(),
+    resume: () => {
+      _resumeMainPollTimers();
+      // Refresh now instead of leaving the page stale until each poll's
+      // next tick. Each refresh tolerates a failed request.
+      try { refreshPeers(); } catch (_) {}
+      try { refreshTransfers(); } catch (_) {}
+      try { refreshStatus(); } catch (_) {}
+      try { refreshGroups(); } catch (_) {}
+    },
+    render: _renderWindowStatus,
+    setTimeout: (fn, ms) => setTimeout(fn, ms),
+    clearTimeout: (id) => clearTimeout(id),
+    random: () => Math.random(),
+  });
+
+  // Every API call reports its status here (services/api_client.js). A 401
+  // starts recovery; anything else is the caller's business.
   function _maybe401(status) {
     if (status !== 401) return;
-    if (_sessionExpiredBannerShown) return;
-    // 2026-05-21 audit T3-P: pause the polling cluster while we
-    // try to recover so we don't fire six concurrent _maybe401
-    // → _attemptAutoRecovery chains. Recovery itself is guarded
-    // by ``_autoRecoveryInFlight`` but the polling timers still
-    // bombard the daemon with retries that immediately bounce. Pause once;
-    // resume on success.
-    _pauseMainPollTimers();
-    // Try silent auto-recovery FIRST. If it succeeds, the next
-    // fetch should succeed too - no banner. If it fails (token
-    // mismatch with new daemon), fall through to the banner.
-    _attemptAutoRecovery().then((ok) => {
-      if (ok) {
-        // Bearer validated. Reload the data without a full page refresh.
-        _resumeMainPollTimers();
-        // 2026-05-22 audit T2-M: the prior code called
-        // ``refreshAll()`` here behind a ``typeof === "function"``
-        // guard, but no such function exists anywhere in the
-        // file — the guard hid the dead reference. The intent
-        // was an immediate post-recovery refresh; without it
-        // recovery would succeed but the user waited up to 30 s
-        // for the next polling tick. Call the real refresh
-        // functions directly. Each tolerates network errors so
-        // we don't need to chain catches.
-        try { refreshPeers(); } catch (_) {}
-        try { refreshTransfers(); } catch (_) {}
-        try { refreshStatus(); } catch (_) {}
-        try { refreshGroups(); } catch (_) {}
-        return;
-      }
-      // Token also rejected → the daemon really minted a new
-      // token (rare; only happens if the user explicitly
-      // resets via tray "forget credentials"). Show the banner.
-      // Timers stay paused; the banner's "Sign in" button (or a
-      // page reload after authorize) resumes them.
-      if (_sessionExpiredBannerShown) return;
-      _sessionExpiredBannerShown = true;
-      showSessionExpiredBanner();
-    });
+    windowLink.unauthorized();
   }
 
   // The background polling cluster: [refresh, period ms]. Boot starts
@@ -206,57 +217,17 @@
     pollingCluster.resume(_mainPollTasks());
   }
 
-  function showSessionExpiredBanner() {
-    let banner = document.getElementById("session-expired-banner");
-    if (banner) return;
-    banner = document.createElement("div");
-    banner.id = "session-expired-banner";
-    banner.className = "session-expired-banner";
-    // 2026-06-04: distinguish the two real dead-end cases and speak
-    // honestly about which one the user is in. A Reload button that
-    // re-lands on the same banner is worse than no button at all.
-    //
-    //   Case A — we still have a tab-scoped bearer because validation failed
-    //     with a transient network error. Offer a direct retry; never place the
-    //     bearer in a URL, history entry, referrer, or access log.
-    //
-    //   Case B — this tab has no token. We genuinely cannot
-    //     recover from JS. The only way forward is for the user to
-    //     re-open One Link from the desktop shortcut or tray, which
-    //     re-mints a fresh URL with ?t= via the launcher. A Reload
-    //     button here just reloads the bare URL → 401 → same banner
-    //     again. So we omit it and tell the user exactly what to do.
-    let stashedToken = "";
-    try { stashedToken = sessionStorage.getItem("ol_session_token") || ""; } catch (_) {}
-    if (stashedToken) {
-      banner.innerHTML = `
-        <strong>This tab's access key expired.</strong>
-        Click Retry to validate it again without exposing it in the address bar.
-        <button class="btn-ghost" id="session-expired-reload">Retry</button>
-      `;
-    } else {
-      banner.innerHTML = `
-        <strong>This tab's access key expired.</strong>
-        Open One Link from the desktop shortcut (or its tray icon)
-        to refresh this window with a fresh key. Your data is safe.
-      `;
-    }
-    document.body.appendChild(banner);
-    document.getElementById("session-expired-reload")
-      ?.addEventListener("click", async (event) => {
-        const button = event.currentTarget;
-        if (button) button.disabled = true;
-        const recovered = await _attemptAutoRecovery();
-        if (recovered) {
-          banner.remove();
-          _sessionExpiredBannerShown = false;
-          _resumeMainPollTimers();
-          try { refreshPeers(); } catch (_) {}
-          try { refreshTransfers(); } catch (_) {}
-          try { refreshStatus(); } catch (_) {}
-          try { refreshGroups(); } catch (_) {}
-          return;
-        }
-        if (button) button.disabled = false;
-      });
+  // The daemon refused this window's credential twice. Nothing on this page
+  // can obtain a new one: the launcher mints it. So the line says exactly
+  // that, in the person's terms, and offers no button that cannot work.
+  // It is written into the status line's own text node, so it cannot be
+  // shown twice or on top of another status.
+  function showSessionExpiredBanner(text) {
+    text.textContent = "";
+    const lead = document.createElement("strong");
+    lead.textContent = "This window was signed out.";
+    text.appendChild(lead);
+    text.appendChild(document.createTextNode(
+      " Open One Link from its desktop shortcut or tray icon to continue. Your data is safe.",
+    ));
   }

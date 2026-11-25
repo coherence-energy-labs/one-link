@@ -419,10 +419,11 @@
   // keep it on a separate channel from the toast stack so a long
   // offline interval doesn't clutter the toast surface; the banner
   // sits above main and stays as long as offline persists.
+  // The line itself belongs to windowLink: it shows the offline copy
+  // unless the window has something more pressing to say on that line
+  // (it is restoring its link to the daemon, or it was signed out).
   function _applyOnlineState(online) {
-    const b = document.querySelector("#offline-banner");
-    if (!b) return;
-    b.classList.toggle("show", !online);
+    windowLink.setOffline(!online);
   }
   // Apply at boot - navigator.onLine is set by the time scripts run.
   _applyOnlineState(navigator.onLine !== false);

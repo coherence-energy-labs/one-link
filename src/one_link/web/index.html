@@ -5395,29 +5395,29 @@
     cursor: pointer;
   }
 
-  /* v0.11.4 session-expired banner. Sits at the top of the viewport
-     above all other UI so the user can't miss it. */
-  .session-expired-banner {
-    /* Sits directly below the 56px app header — was previously
-       ``top: 0`` which slammed onto the One Link / Chat / Files
-       header row and made the banner unreadable. The header is a
-       fixed 56px grid row (.app grid-template-rows), so anchoring
-       there gives clean side-by-side stacking. On mobile, the safe-
-       area inset is added on top of the header padding via the
-       .top rule, so the banner still clears the notch. */
-    position: fixed; top: 56px; left: 0; right: 0;
-    z-index: 9999;
+  /* Signed-out state of the window status line (#offline-banner).
+     It is a modifier on that one in-flow element, never a second
+     positioned box. History: this was a separate element fixed at
+     ``top: 0`` (it covered the header), then fixed at ``top: 56px``
+     (it covered the status line that lives in that same grid row, so
+     "Restoring One Link…" and "access key expired" printed over each
+     other). A status that takes its place in the layout cannot cover
+     anything; windowLink (services/window_link.js) decides which one
+     status the line shows. */
+  .offline-banner.session-expired-banner {
     background: rgba(255,107,107,.18);
     border-bottom: 1px solid var(--bad);
     color: var(--text);
     padding: 12px 18px;
-    font-size: 13px;
     line-height: 1.5;
-    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
-    box-shadow: 0 4px 12px rgba(0,0,0,.4);
+    flex-wrap: wrap;
   }
-  .session-expired-banner strong { color: var(--bad); }
-  .session-expired-banner button { margin-left: auto; }
+  .offline-banner.session-expired-banner strong { color: var(--bad); }
+  .offline-banner.session-expired-banner .offline-dot {
+    background: var(--bad);
+    box-shadow: 0 0 8px rgba(255,107,107,.55);
+    animation: none;
+  }
 
   /* v0.11.3 mute indicator inline with sidebar names. */
   .mute-indicator {
@@ -5535,6 +5535,8 @@
     font-size: 13px;
   }
   .offline-banner.show { display: flex; }
+  /* The line's one optional action sits at its far end. */
+  .offline-banner .status-action { margin-left: auto; padding: 2px 10px; }
   .offline-banner .offline-dot {
     width: 8px; height: 8px; border-radius: 50%;
     background: var(--warn);
@@ -13543,6 +13545,247 @@ function createPollingCluster({ setInterval, clearInterval }) {
     timerIds: () => timers.slice(),
   });
 }
+// owner-ui module: services/window_link.js
+// Isolated service: dependencies are explicit parameters; no owner closure access.
+//
+// Owner of this window's link to its daemon, and of the ONE status line that
+// reports it. Three facts decide what the line says, and only this service
+// holds them:
+//
+//   session     "ok" | "recovering" | "signed_out"
+//   socketDown  the live event socket is closed
+//   offline     the operating system reports no network
+//
+// Why one owner. Before this, the event socket wrote "Restoring One Link…"
+// into one element and the session handler created a second, fixed-position
+// element for "access key expired". Each was correct alone; shown together
+// they printed over each other, and neither knew the other existed. One
+// owner means one line, so two messages cannot overlap or contradict.
+//
+// Why recovery never gives up. A daemon restart is a routine event (an
+// update restarts it), and a window that needs a person to notice a banner
+// and click it has not recovered. So while the credential has not been
+// disproved the service keeps probing, with backoff, for as long as it
+// takes, and resumes the page by itself when a probe succeeds or the
+// daemon greets the event socket.
+//
+// Why a rejection is confirmed before the credential is forgotten.
+// Forgetting it strands the window until it is reopened from the launcher,
+// so it takes two consecutive rejections, CONFIRM_REJECTION_MS apart. A
+// probe that could not get an answer ("unavailable": no response, a 5xx, a
+// rate limit) says nothing about the credential and resets the count.
+function createWindowLink({
+  probe,
+  forgetCredential,
+  suspend,
+  resume,
+  render,
+  setTimeout,
+  clearTimeout,
+  random,
+}) {
+  for (const [name, value] of Object.entries({
+    probe, forgetCredential, suspend, resume, render, setTimeout, clearTimeout, random,
+  })) {
+    if (typeof value !== "function") {
+      throw new TypeError(`createWindowLink needs ${name}`);
+    }
+  }
+
+  // A restart that completes inside this window passes without a word.
+  const QUIET_MS = 4000;
+  const CONFIRM_REJECTION_MS = 2000;
+  const REJECTIONS_TO_SIGN_OUT = 2;
+  const BACKOFF_BASE_MS = 1000;
+  const BACKOFF_CAP_MS = 30000;
+
+  let session = "ok";
+  let socketDown = false;
+  let offline = false;
+  let troubleVisible = false;
+  let quietTimer = null;
+  let probeTimer = null;
+  let probeInFlight = false;
+  let failures = 0;
+  let rejections = 0;
+  let disposed = false;
+  let rendered;
+
+  function status() {
+    if (session === "signed_out") return "signed_out";
+    if (troubleVisible) return "restoring";
+    if (offline) return "offline";
+    return null;
+  }
+
+  function publish() {
+    const next = status();
+    if (next === rendered) return;
+    rendered = next;
+    render(next);
+  }
+
+  // "Trouble" is the recoverable condition: the page cannot currently talk
+  // to its daemon. It becomes visible only after QUIET_MS without recovery.
+  function reconcileTrouble() {
+    const inTrouble = session === "recovering" || socketDown;
+    if (!inTrouble) {
+      if (quietTimer !== null) { clearTimeout(quietTimer); quietTimer = null; }
+      troubleVisible = false;
+    } else if (!troubleVisible && quietTimer === null) {
+      quietTimer = setTimeout(() => {
+        quietTimer = null;
+        troubleVisible = true;
+        publish();
+      }, QUIET_MS);
+    }
+    publish();
+  }
+
+  function cancelProbe() {
+    if (probeTimer !== null) { clearTimeout(probeTimer); probeTimer = null; }
+  }
+
+  function backoffMs() {
+    // 1 s, 2 s, 4 s ... capped at 30 s, with a quarter of jitter either way
+    // so several windows restoring together do not probe in step.
+    const base = Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * Math.pow(2, Math.max(0, failures - 1)));
+    return Math.floor(base + (random() - 0.5) * 0.5 * base);
+  }
+
+  function scheduleProbe(delayMs) {
+    cancelProbe();
+    probeTimer = setTimeout(() => {
+      probeTimer = null;
+      runProbe();
+    }, delayMs);
+  }
+
+  function recover() {
+    const wasSuspended = session !== "ok";
+    session = "ok";
+    failures = 0;
+    rejections = 0;
+    cancelProbe();
+    reconcileTrouble();
+    if (wasSuspended) resume();
+  }
+
+  function signOut() {
+    session = "signed_out";
+    cancelProbe();
+    forgetCredential();
+    reconcileTrouble();
+  }
+
+  function runProbe() {
+    if (disposed || probeInFlight || session !== "recovering") return;
+    cancelProbe();
+    probeInFlight = true;
+    let outcome;
+    try {
+      outcome = Promise.resolve(probe());
+    } catch (_) {
+      outcome = Promise.resolve("unavailable");
+    }
+    outcome.catch(() => "unavailable").then((result) => {
+      probeInFlight = false;
+      // The event socket may have recovered the session while this probe
+      // was in flight; its answer is then about a state that is gone.
+      if (disposed || session !== "recovering") return;
+      if (result === "ok") {
+        recover();
+        return;
+      }
+      if (result === "rejected") {
+        rejections += 1;
+        if (rejections >= REJECTIONS_TO_SIGN_OUT) {
+          signOut();
+          return;
+        }
+        scheduleProbe(CONFIRM_REJECTION_MS);
+        return;
+      }
+      rejections = 0;
+      failures += 1;
+      scheduleProbe(backoffMs());
+    });
+  }
+
+  // An API call was answered 401. Stop the polls (each would repeat the
+  // same answer) and find out whether the credential is really gone.
+  function unauthorized() {
+    if (disposed || session !== "ok") return;
+    session = "recovering";
+    failures = 0;
+    rejections = 0;
+    suspend();
+    reconcileTrouble();
+    runProbe();
+  }
+
+  // The daemon greeted the event socket (its first message, "hello"). The
+  // handshake carries the same credential the probe would validate, and the
+  // daemon greets only a socket it has authenticated, so a greeting is proof
+  // the session works.
+  //
+  // The browser's `open` event is NOT that proof. The daemon accepts an
+  // unauthenticated socket and then closes it with code 4401, so `open`
+  // fires for a refused credential too. Treating `open` as recovery made the
+  // window resume its polls, collect a burst of 401s, and start over, about
+  // once a second, until the daemon rate-limited it.
+  function socketGreeted() {
+    if (disposed) return;
+    socketDown = false;
+    if (session !== "ok") {
+      recover();
+      return;
+    }
+    reconcileTrouble();
+  }
+
+  function socketClosed() {
+    if (disposed) return;
+    socketDown = true;
+    reconcileTrouble();
+  }
+
+  function setOffline(value) {
+    if (disposed) return;
+    offline = !!value;
+    publish();
+  }
+
+  // The person asked (or the window came back to the foreground): probe now
+  // instead of waiting out the backoff. Returns whether there was anything
+  // to retry.
+  function retryNow() {
+    if (disposed || session !== "recovering") return false;
+    failures = 0;
+    runProbe();
+    return true;
+  }
+
+  function dispose() {
+    disposed = true;
+    cancelProbe();
+    if (quietTimer !== null) { clearTimeout(quietTimer); quietTimer = null; }
+  }
+
+  return Object.freeze({
+    unauthorized,
+    socketGreeted,
+    socketClosed,
+    setOffline,
+    retryNow,
+    dispose,
+    session: () => session,
+    status,
+    // A signed-out window has no credential to present, so reconnecting the
+    // event socket would only add failed sign-in attempts.
+    shouldReconnectSocket: () => !disposed && session !== "signed_out",
+  });
+}
 // owner-ui module: services/call_log_bridge.js
 // Isolated service: dependencies are explicit parameters; no owner closure access.
 //
@@ -14443,91 +14686,102 @@ function createOwnerApiClient({
     return _nativeWindowFetch(input, next);
   };
 
-  let _sessionExpiredBannerShown = false;
-  let _autoRecoveryInFlight = false;
-  let _autoRecoveryAttempts = 0;
-  const _AUTO_RECOVERY_MAX_ATTEMPTS = 2;
+  // ── This window's link to the daemon ──────────────────────────────
+  // windowLink (services/window_link.js) owns the session state, its
+  // recovery and the one status line. This module supplies what that
+  // service cannot reach by itself: the probe, the credential stores, the
+  // polling cluster and the DOM element.
 
-  async function _attemptAutoRecovery() {
-    if (_autoRecoveryInFlight) return false;
-    if (_autoRecoveryAttempts >= _AUTO_RECOVERY_MAX_ATTEMPTS) return false;
-    // The bootstrap head script captures the URL token into tab-scoped
-    // sessionStorage before scrubbing the address bar. Long-lived access is
-    // handled by the revocable origin-scoped browser-session credential.
-    let token = "";
-    token = _ownerBearerToken();
-    if (!token) return false;
-    _autoRecoveryInFlight = true;
-    _autoRecoveryAttempts += 1;
+  // Ask the daemon whether this window's credential still works. The
+  // origin-scoped bearer goes in the Authorization header (the fetch wrapper
+  // above adds it); it is never serialized into a URL.
+  //
+  //   "ok"           the daemon accepted it
+  //   "rejected"     the daemon answered and refused it (401/403)
+  //   "unavailable"  no answer about the credential: unreachable, a 5xx, or
+  //                  a rate limit. This says nothing about the credential.
+  async function _probeOwnerSession() {
     try {
-      // Validate the origin-scoped bearer directly. It may be a revocable
-      // browser session that intentionally is not accepted in a URL.
-      const r = await fetch("/api/me", {
-        cache: "no-store",
-      });
-      if (r.ok) {
-        // Keep the current-tab credential hot; the bootstrap decides whether
-        // a revocable copy is also retained in origin-persistent storage.
-        try { sessionStorage.setItem("ol_session_token", token); } catch (_) {}
-        return true;
-      }
-      // 401 from the recovery fetch itself means the stashed
-      // token is no longer an active owner/session credential.
-      // That stash is dead — flush it so we don't keep retrying
-      // a known-bad value on every poll.
-      if (r.status === 401 || r.status === 403) {
-        try { sessionStorage.removeItem("ol_session_token"); } catch (_) {}
-        try { localStorage.removeItem(_PERSISTENT_OWNER_SESSION_KEY); } catch (_) {}
-      }
-      return false;
+      const r = await fetch("/api/me", { cache: "no-store" });
+      if (r.ok) return "ok";
+      if (r.status === 401 || r.status === 403) return "rejected";
+      return "unavailable";
     } catch (_) {
-      return false;
-    } finally {
-      _autoRecoveryInFlight = false;
+      return "unavailable";
     }
   }
 
+  // The credential was refused twice in a row: it is dead. Flush it so a
+  // reload does not present a known-bad value again.
+  function _forgetRejectedOwnerSession() {
+    try { sessionStorage.removeItem("ol_session_token"); } catch (_) {}
+    try { localStorage.removeItem(_PERSISTENT_OWNER_SESSION_KEY); } catch (_) {}
+  }
+
+  let _offlineStatusCopy = null;
+  function _renderWindowStatus(kind) {
+    const b = document.querySelector("#offline-banner");
+    if (!b) return;
+    const text = b.querySelector("span:not(.offline-dot)");
+    if (!text) return;
+    // The markup carries the offline copy; keep it so the line can return
+    // to it after showing something else.
+    if (_offlineStatusCopy === null) _offlineStatusCopy = text.textContent;
+    b.querySelector(".status-action")?.remove();
+    b.classList.toggle("session-expired-banner", kind === "signed_out");
+    b.dataset.status = kind || "";
+    if (!kind) {
+      b.classList.remove("show");
+      text.textContent = _offlineStatusCopy;
+      return;
+    }
+    if (kind === "signed_out") {
+      showSessionExpiredBanner(text);
+    } else if (kind === "restoring") {
+      // doctrine-ok: §3.2.a grandfathered legacy surface (ADR-PENDING-doctrine-sweep-v0.21); reconnect banner is on the v0.21 cleanup list. Replace with silent prewarm + capsule-mode fallback per LIVING_PRESENCE_ARCHITECTURE §3.
+      text.textContent = "Restoring One Link…";
+      // Recovery retries by itself. The button only skips the wait.
+      const now = document.createElement("button");
+      now.type = "button";
+      now.className = "btn-ghost status-action";
+      now.textContent = "Try now";
+      now.addEventListener("click", () => {
+        windowLink.retryNow();
+        LiveRefresh.forceReconnectNow();
+      });
+      b.appendChild(now);
+    } else {
+      text.textContent = _offlineStatusCopy;
+    }
+    b.classList.add("show");
+  }
+
+  const windowLink = createWindowLink({
+    probe: _probeOwnerSession,
+    forgetCredential: _forgetRejectedOwnerSession,
+    // Six polls answering 401 in a burst would each start a recovery;
+    // stop them while the link is being restored.
+    suspend: () => _pauseMainPollTimers(),
+    resume: () => {
+      _resumeMainPollTimers();
+      // Refresh now instead of leaving the page stale until each poll's
+      // next tick. Each refresh tolerates a failed request.
+      try { refreshPeers(); } catch (_) {}
+      try { refreshTransfers(); } catch (_) {}
+      try { refreshStatus(); } catch (_) {}
+      try { refreshGroups(); } catch (_) {}
+    },
+    render: _renderWindowStatus,
+    setTimeout: (fn, ms) => setTimeout(fn, ms),
+    clearTimeout: (id) => clearTimeout(id),
+    random: () => Math.random(),
+  });
+
+  // Every API call reports its status here (services/api_client.js). A 401
+  // starts recovery; anything else is the caller's business.
   function _maybe401(status) {
     if (status !== 401) return;
-    if (_sessionExpiredBannerShown) return;
-    // 2026-05-21 audit T3-P: pause the polling cluster while we
-    // try to recover so we don't fire six concurrent _maybe401
-    // → _attemptAutoRecovery chains. Recovery itself is guarded
-    // by ``_autoRecoveryInFlight`` but the polling timers still
-    // bombard the daemon with retries that immediately bounce. Pause once;
-    // resume on success.
-    _pauseMainPollTimers();
-    // Try silent auto-recovery FIRST. If it succeeds, the next
-    // fetch should succeed too - no banner. If it fails (token
-    // mismatch with new daemon), fall through to the banner.
-    _attemptAutoRecovery().then((ok) => {
-      if (ok) {
-        // Bearer validated. Reload the data without a full page refresh.
-        _resumeMainPollTimers();
-        // 2026-05-22 audit T2-M: the prior code called
-        // ``refreshAll()`` here behind a ``typeof === "function"``
-        // guard, but no such function exists anywhere in the
-        // file — the guard hid the dead reference. The intent
-        // was an immediate post-recovery refresh; without it
-        // recovery would succeed but the user waited up to 30 s
-        // for the next polling tick. Call the real refresh
-        // functions directly. Each tolerates network errors so
-        // we don't need to chain catches.
-        try { refreshPeers(); } catch (_) {}
-        try { refreshTransfers(); } catch (_) {}
-        try { refreshStatus(); } catch (_) {}
-        try { refreshGroups(); } catch (_) {}
-        return;
-      }
-      // Token also rejected → the daemon really minted a new
-      // token (rare; only happens if the user explicitly
-      // resets via tray "forget credentials"). Show the banner.
-      // Timers stay paused; the banner's "Sign in" button (or a
-      // page reload after authorize) resumes them.
-      if (_sessionExpiredBannerShown) return;
-      _sessionExpiredBannerShown = true;
-      showSessionExpiredBanner();
-    });
+    windowLink.unauthorized();
   }
 
   // The background polling cluster: [refresh, period ms]. Boot starts
@@ -14552,59 +14806,19 @@ function createOwnerApiClient({
     pollingCluster.resume(_mainPollTasks());
   }
 
-  function showSessionExpiredBanner() {
-    let banner = document.getElementById("session-expired-banner");
-    if (banner) return;
-    banner = document.createElement("div");
-    banner.id = "session-expired-banner";
-    banner.className = "session-expired-banner";
-    // 2026-06-04: distinguish the two real dead-end cases and speak
-    // honestly about which one the user is in. A Reload button that
-    // re-lands on the same banner is worse than no button at all.
-    //
-    //   Case A — we still have a tab-scoped bearer because validation failed
-    //     with a transient network error. Offer a direct retry; never place the
-    //     bearer in a URL, history entry, referrer, or access log.
-    //
-    //   Case B — this tab has no token. We genuinely cannot
-    //     recover from JS. The only way forward is for the user to
-    //     re-open One Link from the desktop shortcut or tray, which
-    //     re-mints a fresh URL with ?t= via the launcher. A Reload
-    //     button here just reloads the bare URL → 401 → same banner
-    //     again. So we omit it and tell the user exactly what to do.
-    let stashedToken = "";
-    try { stashedToken = sessionStorage.getItem("ol_session_token") || ""; } catch (_) {}
-    if (stashedToken) {
-      banner.innerHTML = `
-        <strong>This tab's access key expired.</strong>
-        Click Retry to validate it again without exposing it in the address bar.
-        <button class="btn-ghost" id="session-expired-reload">Retry</button>
-      `;
-    } else {
-      banner.innerHTML = `
-        <strong>This tab's access key expired.</strong>
-        Open One Link from the desktop shortcut (or its tray icon)
-        to refresh this window with a fresh key. Your data is safe.
-      `;
-    }
-    document.body.appendChild(banner);
-    document.getElementById("session-expired-reload")
-      ?.addEventListener("click", async (event) => {
-        const button = event.currentTarget;
-        if (button) button.disabled = true;
-        const recovered = await _attemptAutoRecovery();
-        if (recovered) {
-          banner.remove();
-          _sessionExpiredBannerShown = false;
-          _resumeMainPollTimers();
-          try { refreshPeers(); } catch (_) {}
-          try { refreshTransfers(); } catch (_) {}
-          try { refreshStatus(); } catch (_) {}
-          try { refreshGroups(); } catch (_) {}
-          return;
-        }
-        if (button) button.disabled = false;
-      });
+  // The daemon refused this window's credential twice. Nothing on this page
+  // can obtain a new one: the launcher mints it. So the line says exactly
+  // that, in the person's terms, and offers no button that cannot work.
+  // It is written into the status line's own text node, so it cannot be
+  // shown twice or on top of another status.
+  function showSessionExpiredBanner(text) {
+    text.textContent = "";
+    const lead = document.createElement("strong");
+    lead.textContent = "This window was signed out.";
+    text.appendChild(lead);
+    text.appendChild(document.createTextNode(
+      " Open One Link from its desktop shortcut or tray icon to continue. Your data is safe.",
+    ));
   }
 // owner-ui module: main/api.js
   const api = createOwnerApiClient({
@@ -25881,10 +26095,11 @@ function createOwnerApiClient({
   // keep it on a separate channel from the toast stack so a long
   // offline interval doesn't clutter the toast surface; the banner
   // sits above main and stays as long as offline persists.
+  // The line itself belongs to windowLink: it shows the offline copy
+  // unless the window has something more pressing to say on that line
+  // (it is restoring its link to the daemon, or it was signed out).
   function _applyOnlineState(online) {
-    const b = document.querySelector("#offline-banner");
-    if (!b) return;
-    b.classList.toggle("show", !online);
+    windowLink.setOffline(!online);
   }
   // Apply at boot - navigator.onLine is set by the time scripts run.
   _applyOnlineState(navigator.onLine !== false);
@@ -28020,9 +28235,9 @@ function createOwnerApiClient({
     // 2026-05-21 audit T3-P: track the polling cluster so we can
     // pause it on a 401 burst and resume on recovery. Without
     // this, six concurrent timers keep firing through the
-    // session-expired banner — each one re-firing _maybe401 ->
-    // _attemptAutoRecovery -> Promise pileup. The auth-loss
-    // banner now stops the cluster; explicit recovery resumes.
+    // session-expired banner — each one re-firing _maybe401.
+    // windowLink suspends the cluster on the first 401 and resumes
+    // it by itself when the link to the daemon is restored.
     // pollingCluster owns the timers.
     pollingCluster.start(_mainPollTasks());
     // T3-O: free in-tab File-cache blob URLs on page hide so a
@@ -28196,9 +28411,10 @@ function createOwnerApiClient({
   //      reload until they're idle - there is no hurry.
   //   3. Stay silent when normal. A brief WS reconnect (< 4s) should
   //      pass without surfacing anything. Only when reconnect drags
-  //      do we light up the existing offline banner with a calm
-  //      link-repair message - same channel users already know
-  //      from the OS-offline path, so it reads as familiar, not new.
+  //      does the status line say so - and that line belongs to
+  //      windowLink (services/window_link.js), which also owns the
+  //      session state, so the two can never be shown on top of
+  //      each other. This module reports socket open/close to it.
   //   4. Never reload-loop. We persist "already refreshed for version
   //      X" in sessionStorage so a misbehaving daemon can't flap us
   //      into a refresh cycle.
@@ -28232,8 +28448,6 @@ function createOwnerApiClient({
   const LiveRefresh = (() => {
     let reconnectAttempts = 0;
     let reconnectTimer = null;
-    let bannerTimer = null;
-    let bannerShown = false;
     let pendingReloadTimer = null;
     let lastInputActivity = 0;
     let lastConnectedAt = 0;
@@ -28273,47 +28487,19 @@ function createOwnerApiClient({
       return Math.floor(base + jitter);
     }
 
-    function showReconnectBanner() {
-      if (bannerShown) return;
-      bannerShown = true;
-      const b = document.querySelector("#offline-banner");
-      if (!b) return;
-      const txt = b.querySelector("span:not(.offline-dot)");
-      if (txt && b._savedText == null) {
-        b._savedText = txt.textContent;
-        // doctrine-ok: §3.2.a grandfathered legacy surface (ADR-PENDING-doctrine-sweep-v0.21); reconnect banner is on the v0.21 cleanup list. Replace with silent prewarm + capsule-mode fallback per LIVING_PRESENCE_ARCHITECTURE §3.
-        txt.textContent = "Restoring One Link…";
-      }
-      b.classList.add("show");
-    }
-
-    function hideReconnectBanner() {
-      if (!bannerShown && navigator.onLine !== false) return;
-      bannerShown = false;
-      const b = document.querySelector("#offline-banner");
-      if (!b) return;
-      const txt = b.querySelector("span:not(.offline-dot)");
-      if (txt && b._savedText != null) {
-        txt.textContent = b._savedText;
-        b._savedText = null;
-      }
-      // Only fully clear if the OS reports online. If the OS still
-      // says offline, the offline handler's "You're offline" copy
-      // belongs there.
-      if (navigator.onLine !== false) {
-        b.classList.remove("show");
-      } else {
-        // Restore the OS-offline copy (saved above already).
-      }
-    }
-
-    function onOpen() {
+    // The daemon's first message on an authenticated socket. Everything
+    // that means "we are connected" happens here and not on the browser's
+    // `open` event (see events.js): resetting the backoff on `open` let a
+    // refused socket reconnect about once a second, each attempt a failed
+    // sign-in the daemon counts toward its rate limit.
+    function onGreeted() {
       reconnectAttempts = 0;
       lastConnectedAt = Date.now();
       const wasReconnect = wsHadOpen;
       wsHadOpen = true;
-      if (bannerTimer) { clearTimeout(bannerTimer); bannerTimer = null; }
-      hideReconnectBanner();
+      // A greeting proves the credential works: windowLink clears the
+      // status line and, if a 401 had suspended the polls, resumes them.
+      windowLink.socketGreeted();
       // After a reconnect (not the very first open), the daemon may
       // have upgraded. Check now so any version drift triggers a
       // soft reload instead of stale-page mystery errors.
@@ -28327,12 +28513,18 @@ function createOwnerApiClient({
       }
     }
 
-    function onClose() {
-      if (!bannerTimer) {
-        // Don't flash the banner for sub-4s reconnects. Most daemon
-        // restarts during dev / upgrade complete inside this window.
-        bannerTimer = setTimeout(showReconnectBanner, 4000);
-      }
+    // The daemon accepts an unauthenticated event socket only to close it
+    // with this code (server.py _guarded_ws), so the page can tell "your
+    // credential was refused" from "nothing answered".
+    const WS_CLOSE_UNAUTHORIZED = 4401;
+
+    function onClose(ev) {
+      // windowLink keeps sub-4s reconnects silent. Most daemon restarts
+      // during dev / upgrade complete inside that window.
+      windowLink.socketClosed();
+      // A refused socket is the same news as a 401 from the API: have the
+      // credential checked now rather than when a poll happens to notice.
+      if (ev && ev.code === WS_CLOSE_UNAUTHORIZED) windowLink.unauthorized();
       scheduleReconnect();
     }
 
@@ -28342,6 +28534,11 @@ function createOwnerApiClient({
       reconnectAttempts++;
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
+        // A signed-out window has no credential to present; reconnecting
+        // would only add failed sign-in attempts against the daemon. Checked
+        // here, when the timer fires, so it also covers a reconnect that was
+        // scheduled before the sign-out.
+        if (!windowLink.shouldReconnectSocket()) return;
         try { connectWS(); }
         catch (e) {
           // connectWS itself blew up (e.g. invalid host). Treat as
@@ -28355,6 +28552,7 @@ function createOwnerApiClient({
       // Used by visibilitychange / network-restored. Cancel pending
       // backoff, reset attempt counter, fire immediately.
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      if (!windowLink.shouldReconnectSocket()) return;
       reconnectAttempts = 0;
       try { connectWS(); } catch { scheduleReconnect(); }
     }
@@ -28436,6 +28634,8 @@ function createOwnerApiClient({
       // we were dormant. Force a reconnect and re-check version.
       document.addEventListener("visibilitychange", () => {
         if (document.visibilityState !== "visible") return;
+        // A window brought back to the front should not sit out a backoff.
+        windowLink.retryNow();
         if (!ws || ws.readyState >= 2 /* CLOSING|CLOSED */) {
           forceReconnectNow();
         } else if (ws.readyState === 1 /* OPEN */) {
@@ -28447,12 +28647,13 @@ function createOwnerApiClient({
       // OS reports network-up → reconnect immediately, don't wait
       // for the backoff window.
       window.addEventListener("online", () => {
+        windowLink.retryNow();
         forceReconnectNow();
       });
     }
 
     return {
-      onOpen, onClose,
+      onGreeted, onClose,
       forceReconnectNow,
       scheduleSoftReload,
       checkVersionDrift,
@@ -28476,10 +28677,16 @@ function createOwnerApiClient({
     const protocols = ["one-link.owner.v1"];
     if (bearer) protocols.push(`one-link.bearer.${bearer}`);
     ws = new WebSocket(`${proto}//${location.host}/api/events`, protocols);
-    ws.onopen = LiveRefresh.onOpen;
+    // No onopen handler, on purpose: the daemon accepts an unauthenticated
+    // socket and then closes it with code 4401, so `open` does not mean
+    // "connected". The socket counts as connected when the daemon greets it.
     ws.onmessage = (ev) => {
       let m;
       try { m = JSON.parse(ev.data); } catch { return; }
+      if (m.type === "hello") {
+        try { LiveRefresh.onGreeted(); } catch (e) { console.warn(e); }
+        return;
+      }
       if (m.type === "peers" || m.type === "peers_changed") {
         // v0.4: daemon now signals "peers_changed"; legacy "peers" event
         // tolerated for forward/backward compat.
@@ -29169,7 +29376,7 @@ function createOwnerApiClient({
         scheduleRefreshStatus();
       }
     };
-    ws.onclose = () => { try { LiveRefresh.onClose(); } catch (e) { console.warn(e); } };
+    ws.onclose = (ev) => { try { LiveRefresh.onClose(ev); } catch (e) { console.warn(e); } };
     ws.onerror = () => { try { ws.close(); } catch {} };
   }
 

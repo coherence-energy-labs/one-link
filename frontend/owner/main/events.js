@@ -12,10 +12,16 @@
     const protocols = ["one-link.owner.v1"];
     if (bearer) protocols.push(`one-link.bearer.${bearer}`);
     ws = new WebSocket(`${proto}//${location.host}/api/events`, protocols);
-    ws.onopen = LiveRefresh.onOpen;
+    // No onopen handler, on purpose: the daemon accepts an unauthenticated
+    // socket and then closes it with code 4401, so `open` does not mean
+    // "connected". The socket counts as connected when the daemon greets it.
     ws.onmessage = (ev) => {
       let m;
       try { m = JSON.parse(ev.data); } catch { return; }
+      if (m.type === "hello") {
+        try { LiveRefresh.onGreeted(); } catch (e) { console.warn(e); }
+        return;
+      }
       if (m.type === "peers" || m.type === "peers_changed") {
         // v0.4: daemon now signals "peers_changed"; legacy "peers" event
         // tolerated for forward/backward compat.
@@ -705,7 +711,7 @@
         scheduleRefreshStatus();
       }
     };
-    ws.onclose = () => { try { LiveRefresh.onClose(); } catch (e) { console.warn(e); } };
+    ws.onclose = (ev) => { try { LiveRefresh.onClose(ev); } catch (e) { console.warn(e); } };
     ws.onerror = () => { try { ws.close(); } catch {} };
   }
 

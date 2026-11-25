@@ -64,6 +64,12 @@
           "factory": "createPollingCluster"
         },
         {
+          "path": "services/window_link.js",
+          "kind": "service",
+          "responsibility": "This window's link to its daemon: session state, automatic recovery, and the one status line that reports it",
+          "factory": "createWindowLink"
+        },
+        {
           "path": "services/call_log_bridge.js",
           "kind": "service",
           "responsibility": "The call driver's only route into message rendering state: peer lookup and CALL_LOG rows",

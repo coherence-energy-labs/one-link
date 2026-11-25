@@ -11,9 +11,10 @@
   //      reload until they're idle - there is no hurry.
   //   3. Stay silent when normal. A brief WS reconnect (< 4s) should
   //      pass without surfacing anything. Only when reconnect drags
-  //      do we light up the existing offline banner with a calm
-  //      link-repair message - same channel users already know
-  //      from the OS-offline path, so it reads as familiar, not new.
+  //      does the status line say so - and that line belongs to
+  //      windowLink (services/window_link.js), which also owns the
+  //      session state, so the two can never be shown on top of
+  //      each other. This module reports socket open/close to it.
   //   4. Never reload-loop. We persist "already refreshed for version
   //      X" in sessionStorage so a misbehaving daemon can't flap us
   //      into a refresh cycle.
@@ -47,8 +48,6 @@
   const LiveRefresh = (() => {
     let reconnectAttempts = 0;
     let reconnectTimer = null;
-    let bannerTimer = null;
-    let bannerShown = false;
     let pendingReloadTimer = null;
     let lastInputActivity = 0;
     let lastConnectedAt = 0;
@@ -88,47 +87,19 @@
       return Math.floor(base + jitter);
     }
 
-    function showReconnectBanner() {
-      if (bannerShown) return;
-      bannerShown = true;
-      const b = document.querySelector("#offline-banner");
-      if (!b) return;
-      const txt = b.querySelector("span:not(.offline-dot)");
-      if (txt && b._savedText == null) {
-        b._savedText = txt.textContent;
-        // doctrine-ok: §3.2.a grandfathered legacy surface (ADR-PENDING-doctrine-sweep-v0.21); reconnect banner is on the v0.21 cleanup list. Replace with silent prewarm + capsule-mode fallback per LIVING_PRESENCE_ARCHITECTURE §3.
-        txt.textContent = "Restoring One Link…";
-      }
-      b.classList.add("show");
-    }
-
-    function hideReconnectBanner() {
-      if (!bannerShown && navigator.onLine !== false) return;
-      bannerShown = false;
-      const b = document.querySelector("#offline-banner");
-      if (!b) return;
-      const txt = b.querySelector("span:not(.offline-dot)");
-      if (txt && b._savedText != null) {
-        txt.textContent = b._savedText;
-        b._savedText = null;
-      }
-      // Only fully clear if the OS reports online. If the OS still
-      // says offline, the offline handler's "You're offline" copy
-      // belongs there.
-      if (navigator.onLine !== false) {
-        b.classList.remove("show");
-      } else {
-        // Restore the OS-offline copy (saved above already).
-      }
-    }
-
-    function onOpen() {
+    // The daemon's first message on an authenticated socket. Everything
+    // that means "we are connected" happens here and not on the browser's
+    // `open` event (see events.js): resetting the backoff on `open` let a
+    // refused socket reconnect about once a second, each attempt a failed
+    // sign-in the daemon counts toward its rate limit.
+    function onGreeted() {
       reconnectAttempts = 0;
       lastConnectedAt = Date.now();
       const wasReconnect = wsHadOpen;
       wsHadOpen = true;
-      if (bannerTimer) { clearTimeout(bannerTimer); bannerTimer = null; }
-      hideReconnectBanner();
+      // A greeting proves the credential works: windowLink clears the
+      // status line and, if a 401 had suspended the polls, resumes them.
+      windowLink.socketGreeted();
       // After a reconnect (not the very first open), the daemon may
       // have upgraded. Check now so any version drift triggers a
       // soft reload instead of stale-page mystery errors.
@@ -142,12 +113,18 @@
       }
     }
 
-    function onClose() {
-      if (!bannerTimer) {
-        // Don't flash the banner for sub-4s reconnects. Most daemon
-        // restarts during dev / upgrade complete inside this window.
-        bannerTimer = setTimeout(showReconnectBanner, 4000);
-      }
+    // The daemon accepts an unauthenticated event socket only to close it
+    // with this code (server.py _guarded_ws), so the page can tell "your
+    // credential was refused" from "nothing answered".
+    const WS_CLOSE_UNAUTHORIZED = 4401;
+
+    function onClose(ev) {
+      // windowLink keeps sub-4s reconnects silent. Most daemon restarts
+      // during dev / upgrade complete inside that window.
+      windowLink.socketClosed();
+      // A refused socket is the same news as a 401 from the API: have the
+      // credential checked now rather than when a poll happens to notice.
+      if (ev && ev.code === WS_CLOSE_UNAUTHORIZED) windowLink.unauthorized();
       scheduleReconnect();
     }
 
@@ -157,6 +134,11 @@
       reconnectAttempts++;
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
+        // A signed-out window has no credential to present; reconnecting
+        // would only add failed sign-in attempts against the daemon. Checked
+        // here, when the timer fires, so it also covers a reconnect that was
+        // scheduled before the sign-out.
+        if (!windowLink.shouldReconnectSocket()) return;
         try { connectWS(); }
         catch (e) {
           // connectWS itself blew up (e.g. invalid host). Treat as
@@ -170,6 +152,7 @@
       // Used by visibilitychange / network-restored. Cancel pending
       // backoff, reset attempt counter, fire immediately.
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      if (!windowLink.shouldReconnectSocket()) return;
       reconnectAttempts = 0;
       try { connectWS(); } catch { scheduleReconnect(); }
     }
@@ -251,6 +234,8 @@
       // we were dormant. Force a reconnect and re-check version.
       document.addEventListener("visibilitychange", () => {
         if (document.visibilityState !== "visible") return;
+        // A window brought back to the front should not sit out a backoff.
+        windowLink.retryNow();
         if (!ws || ws.readyState >= 2 /* CLOSING|CLOSED */) {
           forceReconnectNow();
         } else if (ws.readyState === 1 /* OPEN */) {
@@ -262,12 +247,13 @@
       // OS reports network-up → reconnect immediately, don't wait
       // for the backoff window.
       window.addEventListener("online", () => {
+        windowLink.retryNow();
         forceReconnectNow();
       });
     }
 
     return {
-      onOpen, onClose,
+      onGreeted, onClose,
       forceReconnectNow,
       scheduleSoftReload,
       checkVersionDrift,

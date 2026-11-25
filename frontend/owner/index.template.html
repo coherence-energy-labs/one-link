@@ -5395,29 +5395,29 @@
     cursor: pointer;
   }
 
-  /* v0.11.4 session-expired banner. Sits at the top of the viewport
-     above all other UI so the user can't miss it. */
-  .session-expired-banner {
-    /* Sits directly below the 56px app header — was previously
-       ``top: 0`` which slammed onto the One Link / Chat / Files
-       header row and made the banner unreadable. The header is a
-       fixed 56px grid row (.app grid-template-rows), so anchoring
-       there gives clean side-by-side stacking. On mobile, the safe-
-       area inset is added on top of the header padding via the
-       .top rule, so the banner still clears the notch. */
-    position: fixed; top: 56px; left: 0; right: 0;
-    z-index: 9999;
+  /* Signed-out state of the window status line (#offline-banner).
+     It is a modifier on that one in-flow element, never a second
+     positioned box. History: this was a separate element fixed at
+     ``top: 0`` (it covered the header), then fixed at ``top: 56px``
+     (it covered the status line that lives in that same grid row, so
+     "Restoring One Link…" and "access key expired" printed over each
+     other). A status that takes its place in the layout cannot cover
+     anything; windowLink (services/window_link.js) decides which one
+     status the line shows. */
+  .offline-banner.session-expired-banner {
     background: rgba(255,107,107,.18);
     border-bottom: 1px solid var(--bad);
     color: var(--text);
     padding: 12px 18px;
-    font-size: 13px;
     line-height: 1.5;
-    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
-    box-shadow: 0 4px 12px rgba(0,0,0,.4);
+    flex-wrap: wrap;
   }
-  .session-expired-banner strong { color: var(--bad); }
-  .session-expired-banner button { margin-left: auto; }
+  .offline-banner.session-expired-banner strong { color: var(--bad); }
+  .offline-banner.session-expired-banner .offline-dot {
+    background: var(--bad);
+    box-shadow: 0 0 8px rgba(255,107,107,.55);
+    animation: none;
+  }
 
   /* v0.11.3 mute indicator inline with sidebar names. */
   .mute-indicator {
@@ -5535,6 +5535,8 @@
     font-size: 13px;
   }
   .offline-banner.show { display: flex; }
+  /* The line's one optional action sits at its far end. */
+  .offline-banner .status-action { margin-left: auto; padding: 2px 10px; }
   .offline-banner .offline-dot {
     width: 8px; height: 8px; border-radius: 50%;
     background: var(--warn);

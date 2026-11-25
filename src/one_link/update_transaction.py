@@ -718,15 +718,14 @@ def _safe_symlink_target(
     def _present(name: str) -> bool:
         return name in all_names or any(n.startswith(name + "/") for n in all_names)
 
-    if _present(relocated_name):
-        return
-    # Not a literal member: follow the chain before declaring it missing.
+    # A literal manifest member may itself be a link. Resolve before testing
+    # presence so direct cycles cannot bypass the bounded chain validator.
     if rows is not None:
-        resolved = _resolve_through_manifest(
+        relocated_name = _resolve_through_manifest(
             relocated_name, rows, root, label=row.path,
         )
-        if _present(resolved):
-            return
+    if _present(relocated_name):
+        return
     raise UpdateArchiveError(f"bundle symlink escapes or targets missing content: {row.path!r}")
 
 
@@ -799,7 +798,7 @@ def _validate_zip_index(
         if (row.kind == "SYMLINK") != is_link or info.file_size != row.size:
             raise UpdateArchiveError(f"standalone ZIP type/size differs from manifest: {info.filename!r}")
         if row.kind == "SYMLINK":
-            _safe_symlink_target(row, all_names)
+            _safe_symlink_target(row, all_names, rows=rows)
     if rows[expected_member].kind != "FILE" or rows[expected_member].size <= 0:
         raise UpdateArchiveError("standalone executable is not a non-empty regular file")
     return infos, manifest_raw, rows

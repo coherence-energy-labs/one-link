@@ -321,61 +321,30 @@ jobs:
                 > "one-link/${EXE_NAME}.sha256"
             fi
           fi
-          # Store the complete content manifest *inside* the archive, in the
-          # ONE format the product parses.
-          #
-          # This step used to write its own: `"<digest>  <path>"`, classic
-          # sha256sum output, two columns, no header. The consumer
-          # (one_link.update_transaction) requires a five-column TSV with a
-          # header, so every bundle built here failed validate_installed_bundle
-          # and inspect_external_update_capability returned
-          # `managed_bundle_validation_failed`. Measured on the real frozen
-          # Windows bundle: update_install_available was False, and flipped to
-          # True with no change but the manifest format. Since the website's
-          # download button points at the rolling channel, that was the bundle
-          # users installed -- their in-app updater could never activate.
-          #
-          # scripts/write_bundle_manifest.py imports the header and row shape
-          # from the parser instead of restating them, so this cannot drift
-          # apart again, and --verify re-reads the result through the product's
-          # own validator before this step succeeds.
-          # Through uv, not a bare `python`: the writer imports the parser to
-          # get the format, and one_link.update_transaction pulls `packaging`
-          # transitively. A bare interpreter fails with ModuleNotFoundError.
-          #
-          # --verify re-reads the result through the product's own
-          # validate_installed_bundle, on EVERY platform including macOS.
-          #
-          # It was withheld on macOS while that validator hardcoded the bundle
-          # root as "one-link": macOS installs as `one-link.app` (its launcher
-          # is Contents/MacOS/one-link, so the install root IS the .app) and
-          # every one of the 701 rows in a real macOS bundle was refused, plus
-          # 79 of its 126 symlinks by a rule requiring a resolved target to be
-          # a literal manifest entry. Both are fixed -- the root is derived and
-          # chains resolve -- so this step is now the REAL-RUNNER proof: it
-          # validates an actual .app, with actual framework symlinks, on
-          # macos-latest. A Windows workstation cannot even create those links.
-          cd ..
+      - name: package and verify the complete CI bundle
+        shell: bash
+        env:
+          ARTIFACT_NAME: ${{ matrix.artifact-name }}
+          EXE_NAME: ${{ matrix.exe-name }}
+        run: |
+          set -euo pipefail
+          # Use the tagged pipeline's canonical packager: ordinary zip follows
+          # macOS links, and Compress-Archive emits Windows-only path spelling.
+          # The packager writes and verifies the ZIP's complete member manifest.
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          uv run --frozen --extra release python scripts/package_standalone_bundle.py \
+            --bundle dist/one-link \
+            --output "dist/${ARTIFACT_NAME}.zip" \
+            --executable "${EXE_NAME}" \
+            --epoch "${SOURCE_DATE_EPOCH}"
+          # Only now write the on-disk manifest used by other CI installers.
+          # The canonical packager refuses a pre-existing reserved manifest.
           ONE_LINK_BUNDLE_EXECUTABLE="${EXE_NAME}" \
             uv run --frozen --extra release python scripts/write_bundle_manifest.py \
               --bundle dist/one-link \
               --root-name one-link \
               --verify
           cd dist
-
-      - name: package bundle as a zip
-        shell: bash
-        env:
-          ARTIFACT_NAME: ${{ matrix.artifact-name }}
-        run: |
-          cd dist
-          # Zip the whole onedir bundle. zip works on Windows runners
-          # via the built-in `zip` (Git Bash) or PowerShell fallback.
-          if command -v zip >/dev/null 2>&1; then
-            zip -r "${ARTIFACT_NAME}.zip" one-link
-          else
-            powershell -Command "Compress-Archive -Path one-link -DestinationPath '${ARTIFACT_NAME}.zip'"
-          fi
           # This is the release-page sidecar: hash the archive itself, not an
           # unrelated platform's bundle manifest with a colliding filename.
           if command -v sha256sum >/dev/null 2>&1; then

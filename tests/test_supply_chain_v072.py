@@ -624,6 +624,81 @@ def test_rolling_archives_have_noncolliding_archive_sidecars():
     assert "| sort -z" not in text
 
 
+def test_continuous_zip_step_preserves_stamps_and_framework_links(tmp_path):
+    """Run the real CI shell step against the observed failing link shape."""
+    import hashlib
+    import os
+    import shutil
+    import stat
+    import subprocess
+    import zipfile
+
+    if os.name == "nt" or shutil.which("bash") is None:
+        pytest.skip("executes the Bash workflow fixture on a POSIX host")
+    workflows = dict(_workflow_documents())
+    steps = workflows[_WORKFLOWS / "auto_build.yml"]["jobs"]["build"]["steps"]
+    matches = [step for step in steps
+               if "scripts/package_standalone_bundle.py" in step.get("run", "")]
+    assert len(matches) == 1
+    step = matches[0]
+    assert step["shell"] == "bash"
+    assert step.get("env", {}).get("EXE_NAME") == "${{ matrix.exe-name }}"
+    assert "if" not in step and "continue-on-error" not in step
+    command = step["run"]
+    assert command.index("package_standalone_bundle.py") < command.index("write_bundle_manifest.py")
+    assert "zip -r" not in command and "Compress-Archive -Path" not in command
+
+    bundle = tmp_path / "dist" / "one-link"
+    framework = bundle / "_internal" / "Python.framework" / "Versions"
+    (framework / "3.12").mkdir(parents=True)
+    (framework / "3.12" / "Python").write_bytes(b"framework binary fixture")
+    (framework / "Current").symlink_to("3.12", target_is_directory=True)
+    (bundle / "_internal" / "Python").symlink_to("Python.framework/Versions/Current/Python")
+    executable = bundle / "one-link"
+    executable.write_bytes(b"launcher fixture")
+    executable.chmod(0o755)
+    build_info = b"commit: " + b"a" * 40 + b"\nrun_id: 123\n"
+    (bundle / "BUILD_INFO.txt").write_bytes(build_info)
+    stamp = bundle / "_internal" / "one_link_build_stamp.json"
+    stamp.write_text(json.dumps({"schema": 1, "commit": "a" * 40, "channel": "rolling"}))
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    for name in ("package_standalone_bundle.py", "write_bundle_manifest.py"):
+        shutil.copyfile(_REPO / "scripts" / name, scripts / name)
+    shims = tmp_path / "tools"
+    shims.mkdir()
+    (shims / "uv").write_text(
+        '#!/bin/sh\nset -eu\n[ "$1 $2 $3 $4 $5" = "run --frozen --extra release python" ]\n'
+        'shift 5\nexec "$ONE_LINK_TEST_PYTHON" "$@"\n'
+    )
+    (shims / "git").write_text(
+        '#!/bin/sh\nset -eu\n[ "$*" = "show -s --format=%ct HEAD" ]\n'
+        'printf "%s\\n" 1700000001\n'
+    )
+    for shim in shims.iterdir():
+        shim.chmod(0o755)
+    env = dict(os.environ, PATH=str(shims) + os.pathsep + os.environ["PATH"],
+               PYTHONPATH=str(_REPO / "src"), ONE_LINK_TEST_PYTHON=sys.executable,
+               ARTIFACT_NAME="one-link-test", EXE_NAME="one-link")
+    completed = subprocess.run(["bash", "-c", command], cwd=tmp_path, env=env,
+                               text=True, capture_output=True, check=False)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    archive_path = tmp_path / "dist" / "one-link-test.zip"
+    digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+    assert (archive_path.with_suffix(".zip.sha256")).read_text().split() == [digest, archive_path.name]
+    with zipfile.ZipFile(archive_path) as archive:
+        assert all(not member.is_dir() and "\\" not in member.filename for member in archive.infolist())
+        assert archive.read("one-link/BUILD_INFO.txt") == build_info
+        assert archive.read("one-link/_internal/one_link_build_stamp.json") == stamp.read_bytes()
+        link = archive.getinfo("one-link/_internal/Python")
+        assert stat.S_ISLNK(link.external_attr >> 16)
+        assert archive.read(link) == b"Python.framework/Versions/Current/Python"
+        from one_link.update_transaction import _validate_zip_index
+
+        _validate_zip_index(archive, expected_executable="one-link")
+    assert (bundle / "BUNDLE_SHA256SUMS").is_file()
+
+
 def test_continuous_aggregate_never_mutates_a_public_release():
     text = (_WORKFLOWS / "auto_build.yml").read_text(encoding="utf-8")
     assert "bundle-ephemeral-artifacts:" in text

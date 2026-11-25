@@ -510,7 +510,8 @@ def test_fresh_wheel_and_sdist_pass_two_clean_install_probes(tmp_path: Path) -> 
     assert result["source_python_file_count"] == sum(
         name.endswith(".py") for name in staged_contract.payload_hashes
     )
-    assert result["declared_requirement_count"] == 52
+    # The dev extra declares defusedxml for the hardened CT-audit XML parser.
+    assert result["declared_requirement_count"] == 53
     assert result["declared_extra_count"] == 9
     assert result["wheel_bytes"] > 0
     assert result["sdist_bytes"] > 0

@@ -156,6 +156,7 @@ jobs:
           PYTHONUNBUFFERED: "1"
 
       - name: call reliability soak gate
+        shell: bash
         env:
           REPORT_OS: ${{ matrix.os }}
           PYTHON_VERSION: ${{ matrix.python }}

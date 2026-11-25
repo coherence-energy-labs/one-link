@@ -70,7 +70,9 @@ jobs:
         with:
           name: formal-verification-${{ github.sha }}
           path: |
-            .formal-results/
+            .formal-results/summary.json
+            .formal-results/logs/*.log
             docs/formal/models.json
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 90

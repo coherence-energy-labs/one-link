@@ -6,7 +6,8 @@
 //! - Long-running operations detach from the interpreter via `py.detach`.
 //! - Buffer arguments use the Python buffer protocol (`bytes`, `bytearray`,
 //!   `memoryview`) for zero-copy ingest.
-//! - Errors map to `one_link_native.OlChunkError` (subclass of `OlError`).
+//! - Buffer errors map to `OlChunkError`; invalid parameters/format names to
+//!   `ValueError`; file I/O and length-change failures to `OSError`.
 
 use ol_chunk::{
     blake3_wrap, frame_count_for_plaintext, scan_format_aware, scan_to_vec_parallel,
@@ -245,7 +246,12 @@ fn scan_file_boundaries_with_params(
     // addressed in parallel, boundaries equal to the in-memory scanner's
     // (ol_chunk::stream::scan_stream, shared with format_aware_file).
     let file = File::open(path)?;
-    let file_len = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+    let file_len = usize::try_from(file.metadata()?.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file exceeds this platform's addressable size",
+        )
+    })?;
     Ok(ol_chunk::stream::scan_stream(file, file_len, params)?
         .into_iter()
         .map(|b| PyBoundary {
@@ -267,7 +273,12 @@ fn scan_format_aware_path(
 ) -> PyResult<Vec<PyFormatBoundary>> {
     let open = || -> std::io::Result<(File, usize)> {
         let file = File::open(path)?;
-        let len = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+        let len = usize::try_from(file.metadata()?.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "file exceeds this platform's addressable size",
+            )
+        })?;
         Ok((file, len))
     };
     let (mut file, len) = open()
@@ -298,12 +309,17 @@ fn scan_format_aware_path(
         .collect())
 }
 
-/// [`format_aware_boundaries`] of a file, with bounded memory: record-framed
-/// containers (MCAP, MP4/MOV, WAV) are walked by their record headers and
-/// chunked range by range, so a multi-GB robot log never has to fit in RAM.
-/// Equal to `format_aware_boundaries(open(path).read(), format_name)`.
+/// [`format_aware_boundaries`] of an immutable file. Record-framed containers
+/// (MCAP, MP4/MOV, WAV) coalesce headers online, without retaining every record
+/// offset. Payload workspace is at most max(32 MiB, 4 * max_size), plus bounded
+/// CDC candidate workspace and 64 KiB header read-ahead. Returned boundary/hash
+/// objects still require O(output chunks) memory; total RAM is not constant.
+/// Equal to `format_aware_boundaries(open(path).read(), format_name)` for the
+/// same immutable bytes. Shrinkage, growth and IO failures raise `OSError`;
+/// same-length concurrent rewrites require caller-owned snapshot protection.
 /// ZIP and H.264 need a byte scan: up to 256 MiB they are read whole; above
-/// that `ValueError` (the caller falls back to plain `cdc_file`).
+/// that `ValueError` is raised. Fallback to plain `cdc_file` is an explicit
+/// caller policy, never an automatic change of chunking algorithm.
 #[pyfunction]
 pub fn format_aware_file(
     py: Python<'_>,
@@ -344,9 +360,12 @@ fn scan_file_boundaries(path: &Path) -> std::io::Result<Vec<PyBoundary>> {
 
 /// Scan a file with bounded memory instead of materializing its complete bytes.
 ///
-/// The scanner retains at most roughly two `FastCDC` maximum chunks (~512 KiB)
-/// plus the boundary vector. Output is byte-for-byte equivalent to `cdc_iter` on
-/// the same immutable file, while avoiding file-size-proportional RAM use.
+/// Payload workspace is at most 32 MiB with the default parameters (or
+/// max(32 MiB, 4 * max_size) with selected parameters), capped by file length.
+/// Parallel CDC also uses candidate workspace bounded by that window. Returned
+/// boundary/hash objects occupy O(output chunks); total RAM is not constant.
+/// Output equals `cdc_iter` on the same immutable bytes. Shrinkage and growth
+/// raise `OSError`; callers must prevent same-length concurrent rewrites.
 #[pyfunction]
 pub fn cdc_file(py: Python<'_>, path: &str) -> PyResult<Vec<PyBoundary>> {
     let owned = PathBuf::from(path);
@@ -612,6 +631,8 @@ pub(crate) fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     m.add("CDC_MIN_SIZE", 8 * 1024usize)?;
     m.add("CDC_AVG_SIZE", 64 * 1024usize)?;
     m.add("CDC_MAX_SIZE", 256 * 1024usize)?;
+    m.add("CDC_FILE_WINDOW_BYTES", ol_chunk::stream::STREAM_WINDOW)?;
+    m.add("FORMAT_AWARE_IN_MEMORY_LIMIT", FORMAT_AWARE_IN_MEMORY_LIMIT)?;
     m.add("AEAD_FRAME_PLAINTEXT_LEN", AEAD_FRAME_PLAINTEXT_LEN)?;
     m.add("AEAD_TAG_LEN", AEAD_TAG_LEN)?;
 

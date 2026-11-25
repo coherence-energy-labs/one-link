@@ -18,7 +18,8 @@
 //! engine's wire-format compatibility surface — changing them silently
 //! breaks dedup with peers running older builds.
 
-use ol_chunk::{scan_to_vec, Boundary};
+use ol_chunk::{scan_to_vec, scan_to_vec_parallel, stream::scan_stream, Boundary, CdcParams};
+use std::io::Cursor;
 
 /// Deterministic xorshift fill. Seed pinned for reproducibility.
 fn pseudo_random_buf(seed: u64, len: usize) -> Vec<u8> {
@@ -33,41 +34,79 @@ fn pseudo_random_buf(seed: u64, len: usize) -> Vec<u8> {
     buf
 }
 
-/// Expected boundaries (start offsets) produced by ADR-0001 kernel on
-/// `pseudo_random_buf(0xDEAD_BEEF_CAFE_F00D, 1 MiB)`.
-///
-/// These are filled in the first time CI runs on the reference build by
-/// reading `boundary.start` for every yielded boundary. After that, this
-/// list is the determinism contract: any change here is a wire-format
-/// break.
-///
-/// For the initial commit we only assert the *count* is stable; once
-/// the first reference run happens in CI we'll pin the exact offset list.
-const EXPECTED_BOUNDARY_COUNT_RANGE: std::ops::RangeInclusive<usize> = 12..=20;
+/// Frozen before the streaming remediation using the audited 0.22.1 native
+/// build (1279a450). Exact starts, ends and hashes are committed; CI never
+/// regenerates this file. The input hash also freezes the corpus generator.
+const GOLDEN: &str = include_str!("fixtures/cdc_golden_v1.txt");
+
+fn assert_golden(name: &str, buf: &[u8]) {
+    let marker = format!("[{name}]\n");
+    let mut lines = GOLDEN
+        .split_once(marker.as_str())
+        .unwrap()
+        .1
+        .lines()
+        .take_while(|line| !line.starts_with('['));
+    let identity: Vec<&str> = lines.next().unwrap().split_whitespace().collect();
+    assert_eq!(identity[0], "input");
+    assert_eq!(identity[1].parse::<usize>().unwrap(), buf.len());
+    assert_eq!(identity[2], blake3::hash(buf).to_hex().as_str());
+    let expected: Vec<Boundary> = lines
+        .map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(fields.len(), 3);
+            Boundary {
+                start: fields[0].parse().unwrap(),
+                end: fields[1].parse().unwrap(),
+                raw_address: hex::decode(fields[2]).unwrap().try_into().unwrap(),
+            }
+        })
+        .collect();
+    for (engine, boundaries) in [
+        ("serial", scan_to_vec(buf)),
+        ("parallel", scan_to_vec_parallel(buf)),
+        (
+            "streamed",
+            scan_stream(Cursor::new(buf), buf.len(), CdcParams::default()).unwrap(),
+        ),
+    ] {
+        assert_eq!(boundaries, expected, "fixture {name}, engine {engine}");
+        assert_eq!(boundaries.first().unwrap().start, 0);
+        assert_eq!(boundaries.last().unwrap().end, buf.len());
+        for b in &boundaries {
+            assert_eq!(
+                b.raw_address,
+                *blake3::hash(&buf[b.start..b.end]).as_bytes()
+            );
+        }
+        for pair in boundaries.windows(2) {
+            assert_eq!(pair[0].end, pair[1].start);
+        }
+    }
+}
 
 #[test]
-fn boundaries_are_within_expected_count_range() {
-    let buf = pseudo_random_buf(0xDEAD_BEEF_CAFE_F00D, 1024 * 1024);
-    let boundaries: Vec<Boundary> = scan_to_vec(&buf);
-    let count = boundaries.len();
-    assert!(
-        EXPECTED_BOUNDARY_COUNT_RANGE.contains(&count),
-        "1 MiB random buffer with default CDC params should produce \
-         {EXPECTED_BOUNDARY_COUNT_RANGE:?} boundaries, got {count}",
+fn frozen_random_boundaries_and_hashes_match_all_engines() {
+    assert_golden(
+        "RANDOM",
+        &pseudo_random_buf(0xDEAD_BEEF_CAFE_F00D, 1024 * 1024),
     );
+}
 
-    // Every boundary's BLAKE3 must equal hashing the underlying slice.
-    for b in &boundaries {
-        let actual = blake3::hash(&buf[b.start..b.end]);
-        assert_eq!(b.raw_address, *actual.as_bytes());
-    }
+#[test]
+fn frozen_zero_boundaries_and_hashes_match_all_engines() {
+    assert_golden("ZEROS", &vec![0; 640 * 1024]);
+}
 
-    // Boundaries tile the buffer exactly.
-    assert_eq!(boundaries[0].start, 0);
-    assert_eq!(boundaries.last().unwrap().end, buf.len());
-    for w in boundaries.windows(2) {
-        assert_eq!(w[0].end, w[1].start);
+#[test]
+fn frozen_edited_boundaries_and_hashes_match_all_engines() {
+    let original = pseudo_random_buf(0xDEAD_BEEF_CAFE_F00D, 1024 * 1024);
+    let mut edited = original[..512 * 1024].to_vec();
+    for _ in 0..317 {
+        edited.extend_from_slice(b"one-link-edit\0");
     }
+    edited.extend_from_slice(&original[512 * 1024..]);
+    assert_golden("EDITED", &edited);
 }
 
 #[test]

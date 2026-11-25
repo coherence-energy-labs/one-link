@@ -1,7 +1,8 @@
-//! Bounded-memory chunking of files: plain `FastCDC` and format-aware.
+//! Chunking of files with bounded input workspace: plain `FastCDC` and
+//! format-aware. Returned boundary/hash vectors still grow with chunk count.
 //!
 //! [`scan_stream`] chunks `len` bytes read from any [`Read`] holding at most
-//! one window, with boundaries equal to [`crate::ChunkScanner`]'s over the same
+//! one payload window, with boundaries equal to [`crate::ChunkScanner`]'s over the same
 //! bytes (parallel two-phase scan per window, a chunk accepted only once its
 //! cut has seen `max_size` bytes or the end).
 //!
@@ -12,7 +13,16 @@
 //! [`scan_stream`] over its byte range. The result equals `scan_format_aware`
 //! on the whole file's bytes. Containers whose cuts need a full byte scan (ZIP,
 //! H.264 Annex B) are read whole up to `in_memory_limit`; above it the scan
-//! reports [`StreamScanError::NeedsWholeFile`] and the caller decides.
+//! reports [`StreamScanError::NeedsWholeFile`] and the caller decides. Header
+//! candidates are consumed online: dense records do not create an auxiliary
+//! vector proportional to record count. Header read-ahead is 64 KiB. The
+//! parallel CDC kernel has additional candidate workspace bounded by the
+//! payload window, not by the file length. This is not a constant-total-memory
+//! API: its returned boundaries and format flags occupy O(output chunks).
+//!
+//! Declared lengths are checked, including short reads and growth. Callers
+//! must nevertheless keep the contents immutable: a same-length concurrent
+//! rewrite cannot be detected reliably without a filesystem snapshot.
 
 use std::io::{self, Read, Seek, SeekFrom};
 
@@ -21,7 +31,8 @@ use crate::cdc::{Boundary, CdcParams};
 use crate::format_aware::{scan_format_aware, ContainerFormat, FormatAwareChunkSet, MCAP_MAGIC};
 use crate::pcdc;
 
-/// The window [`scan_stream`] holds (never more than the source's length).
+/// Default payload window for [`scan_stream`]. Custom parameters use at least
+/// four maximum chunks; the allocation never exceeds the declared source length.
 pub const STREAM_WINDOW: usize = 32 << 20;
 
 /// Read-ahead used to walk record headers.
@@ -65,8 +76,11 @@ impl From<io::Error> for StreamScanError {
     }
 }
 
-/// `FastCDC` over the `len` bytes `reader` yields, holding at most one window.
-/// Boundaries are relative to the reader's start.
+/// `FastCDC` over exactly the `len` bytes `reader` yields, holding one payload
+/// window plus bounded kernel workspace and O(output chunks) boundaries.
+/// Boundaries are relative to the reader's start. Short input is an
+/// `UnexpectedEof`; extra input is `InvalidData`. At most one extra byte is
+/// consumed to detect growth. For a range within a larger reader use `take(len)`.
 pub fn scan_stream<R: Read>(reader: R, len: usize, params: CdcParams) -> io::Result<Vec<Boundary>> {
     scan_stream_windowed(reader, len, params, STREAM_WINDOW)
 }
@@ -83,33 +97,23 @@ fn scan_stream_windowed<R: Read>(
     let max_size = params.max_size as usize;
     // Sized to the source when it is small (a fixed window was zero-filled
     // for every small file once, halving ingest).
-    let mut window_cap = window.max(4 * max_size).min(len.max(1));
+    let window_cap = window.max(4 * max_size).min(len);
     let mut buffer: Vec<u8> = Vec::with_capacity(window_cap);
     let mut base = 0usize;
-    let mut eof = false;
     let mut out = Vec::new();
-    loop {
-        while buffer.len() < window_cap && !eof {
-            let wanted = (window_cap - buffer.len()) as u64;
-            let read = (&mut reader).take(wanted).read_to_end(&mut buffer)?;
-            eof = read == 0;
-        }
-        if buffer.is_empty() {
-            break;
-        }
+    while base < len {
+        let held = buffer.len();
+        let wanted = window_cap.min(len - base);
+        buffer.resize(wanted, 0);
+        reader.read_exact(&mut buffer[held..])?;
+        let final_window = wanted == len - base;
         let ranges: Vec<(usize, usize)> = pcdc::chunk_ranges(&buffer, params)
             .into_iter()
-            .take_while(|&(s, _)| eof || s + max_size <= buffer.len())
+            .take_while(|&(s, _)| final_window || s + max_size <= buffer.len())
             .collect();
         let consumed = ranges.last().map_or(0, |&(_, e)| e);
         if consumed == 0 {
-            if eof {
-                return Err(io::Error::other("stream scan made no progress"));
-            }
-            // A window that exactly fits the source fills before EOF is seen:
-            // its last chunk cannot be final yet, so grow and read on.
-            window_cap = window_cap.saturating_mul(2).max(4 * max_size);
-            continue;
+            return Err(io::Error::other("stream scan made no progress"));
         }
         for b in pcdc::address_ranges(&buffer, &ranges) {
             let start = base
@@ -124,18 +128,21 @@ fn scan_stream_windowed<R: Read>(
         base += consumed;
         buffer.copy_within(consumed.., 0);
         buffer.truncate(buffer.len() - consumed);
-        if eof && buffer.is_empty() {
-            break;
-        }
     }
-    // The source must hold exactly the bytes it was declared to: a file that
-    // shrank or grew while it was scanned is an error, never a chunk set that
-    // silently describes other bytes.
-    if base != len {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            format!("source holds {base} bytes, declared {len}"),
-        ));
+    // Do not follow an unbounded/growing source beyond the declared snapshot.
+    // read_exact already rejected shrinkage; one byte suffices to reject growth.
+    loop {
+        match reader.read(&mut [0u8; 1]) {
+            Ok(0) => break,
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "source grew beyond its declared length",
+                ))
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
     }
     Ok(out)
 }
@@ -170,14 +177,9 @@ impl<'a, R: Read + Seek> Headers<'a, R> {
         if !held {
             let want = HEADER_READ_AHEAD.max(n).min(self.len - pos);
             self.source.seek(SeekFrom::Start(pos as u64))?;
-            self.window.clear();
-            (&mut *self.source)
-                .take(want as u64)
-                .read_to_end(&mut self.window)?;
+            self.window.resize(want, 0);
+            self.source.read_exact(&mut self.window)?;
             self.window_start = pos;
-            if self.window.len() < n {
-                return Ok(None);
-            }
         }
         let offset = pos - self.window_start;
         Ok(Some(&self.window[offset..offset + n]))
@@ -185,20 +187,34 @@ impl<'a, R: Read + Seek> Headers<'a, R> {
 }
 
 /// [`crate::format_aware::mcap_record_offsets`] over a seekable source of
-/// `len` bytes, reading only record headers.
+/// `len` bytes, reading only record headers. This explicit list API returns
+/// O(records) offsets; the chunk scanner uses the online visitor instead.
 pub fn mcap_record_offsets_seekable<R: Read + Seek>(
     source: &mut R,
     len: usize,
 ) -> io::Result<Vec<usize>> {
+    let mut offsets = Vec::new();
+    visit_mcap_record_offsets(source, len, |_, pos| {
+        offsets.push(pos);
+        Ok(())
+    })?;
+    Ok(offsets)
+}
+
+fn visit_mcap_record_offsets<R: Read + Seek>(
+    source: &mut R,
+    len: usize,
+    mut visit: impl FnMut(&mut R, usize) -> io::Result<()>,
+) -> io::Result<()> {
     const RECORD_HEADER: usize = 9;
     let magic_len = MCAP_MAGIC.len();
     let mut h = Headers::new(source, len);
     if len < magic_len + RECORD_HEADER {
-        return Ok(Vec::new());
+        return Ok(());
     }
     match h.at(0, magic_len + 1)? {
         Some(head) if head[..magic_len] == MCAP_MAGIC && head[magic_len] == 0x01 => {}
-        _ => return Ok(Vec::new()),
+        _ => return Ok(()),
     }
     let data_end = if len >= 2 * magic_len
         && h.at(len - magic_len, magic_len)?
@@ -208,9 +224,11 @@ pub fn mcap_record_offsets_seekable<R: Read + Seek>(
     } else {
         len
     };
-    let mut offsets = Vec::new();
     let mut pos = magic_len;
-    while pos + RECORD_HEADER <= data_end {
+    while pos
+        .checked_add(RECORD_HEADER)
+        .is_some_and(|end| end <= data_end)
+    {
         let Some(header) = h.at(pos, RECORD_HEADER)? else {
             break;
         };
@@ -231,21 +249,34 @@ pub fn mcap_record_offsets_seekable<R: Read + Seek>(
         if next > data_end {
             break;
         }
-        offsets.push(pos);
+        visit(h.source, pos)?;
         pos = next;
     }
-    Ok(offsets)
+    Ok(())
 }
 
-/// [`crate::format_aware::mp4_box_offsets`] over a seekable source.
+/// [`crate::format_aware::mp4_box_offsets`] over a seekable source. This list
+/// API retains O(boxes) offsets; the chunk scanner uses the online visitor.
 pub fn mp4_box_offsets_seekable<R: Read + Seek>(
     source: &mut R,
     len: usize,
 ) -> io::Result<Vec<usize>> {
-    let mut h = Headers::new(source, len);
     let mut offsets = Vec::new();
+    visit_mp4_box_offsets(source, len, |_, pos| {
+        offsets.push(pos);
+        Ok(())
+    })?;
+    Ok(offsets)
+}
+
+fn visit_mp4_box_offsets<R: Read + Seek>(
+    source: &mut R,
+    len: usize,
+    mut visit: impl FnMut(&mut R, usize) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut h = Headers::new(source, len);
     let mut pos = 0usize;
-    while pos + 8 <= len {
+    while pos.checked_add(8).is_some_and(|end| end <= len) {
         let Some(header) = h.at(pos, 8)? else {
             break;
         };
@@ -258,7 +289,7 @@ pub fn mp4_box_offsets_seekable<R: Read + Seek>(
         {
             break;
         }
-        offsets.push(pos);
+        visit(h.source, pos)?;
         let advance = match size {
             1 => {
                 let Some(large) = h.at(pos + 8, 8)? else {
@@ -282,7 +313,7 @@ pub fn mp4_box_offsets_seekable<R: Read + Seek>(
         };
         pos = next;
     }
-    Ok(offsets)
+    Ok(())
 }
 
 /// [`crate::format_aware::wav_data_offset`] over a seekable source.
@@ -310,9 +341,77 @@ pub fn wav_data_offset_seekable<R: Read + Seek>(
     Ok(None)
 }
 
-/// [`scan_format_aware`] over a seekable source of `len` bytes with bounded
-/// memory (see the module documentation). Equal to `scan_format_aware` on the
-/// source's bytes.
+/// Verify the declared whole-source size before and after scanning. This
+/// detects growth even when segment readers are deliberately capped by `take`.
+fn verify_source_length<R: Seek>(source: &mut R, len: usize) -> io::Result<()> {
+    let actual = source.seek(SeekFrom::End(0))?;
+    let declared = u64::try_from(len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source length exceeds u64"))?;
+    if actual != declared {
+        return Err(io::Error::new(
+            if actual < declared {
+                io::ErrorKind::UnexpectedEof
+            } else {
+                io::ErrorKind::InvalidData
+            },
+            format!("source holds {actual} bytes, declared {len}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Append one segment ending at a format-forced cut (or EOF). Keeping the
+/// small-segment scratch buffer avoids one payload allocation per tiny record.
+fn append_segment<R: Read + Seek>(
+    source: &mut R,
+    start: usize,
+    end: usize,
+    params: CdcParams,
+    scratch: &mut Vec<u8>,
+    out: &mut FormatAwareChunkSet,
+) -> io::Result<()> {
+    if start == end {
+        return Ok(());
+    }
+    source.seek(SeekFrom::Start(start as u64))?;
+    if end - start <= params.max_size as usize {
+        scratch.resize(end - start, 0);
+        source.read_exact(scratch)?;
+        out.boundaries.push(Boundary {
+            start,
+            end,
+            raw_address: blake3_wrap::chunk_address_raw(scratch),
+        });
+        out.format_aware.push(start != 0);
+    } else {
+        for (i, b) in scan_stream(
+            (&mut *source).take((end - start) as u64),
+            end - start,
+            params,
+        )?
+        .into_iter()
+        .enumerate()
+        {
+            out.boundaries.push(Boundary {
+                start: b.start + start,
+                end: b.end + start,
+                raw_address: b.raw_address,
+            });
+            out.format_aware.push(i == 0 && start != 0);
+        }
+    }
+    Ok(())
+}
+
+/// [`scan_format_aware`] over an immutable seekable source of exactly `len`
+/// bytes. Boundaries and format flags equal the in-memory scanner's. Shrinkage,
+/// growth and read/seek failures are errors, never a successful partial result.
+///
+/// Record headers are coalesced online using the same minimum-distance rule as
+/// the in-memory implementation. No candidate, accepted-cut or segment list is
+/// retained. Payload/kernel workspace is bounded independently of source size;
+/// returned boundaries/flags still require O(output chunks) memory. ZIP/H264
+/// retain the explicit whole-file limit (see the module documentation).
 pub fn scan_format_aware_seekable<R: Read + Seek>(
     source: &mut R,
     len: usize,
@@ -321,91 +420,65 @@ pub fn scan_format_aware_seekable<R: Read + Seek>(
     in_memory_limit: usize,
 ) -> Result<FormatAwareChunkSet, StreamScanError> {
     params.validate().map_err(StreamScanError::Params)?;
-    let forced_cuts = match format {
-        Some(ContainerFormat::Mcap) => mcap_record_offsets_seekable(source, len)?,
-        Some(ContainerFormat::Mp4) => mp4_box_offsets_seekable(source, len)?,
-        Some(ContainerFormat::Wav) => wav_data_offset_seekable(source, len)?.into_iter().collect(),
-        None => Vec::new(),
-        Some(ContainerFormat::Zip | ContainerFormat::H264AnnexB) => {
-            if len > in_memory_limit {
-                return Err(StreamScanError::NeedsWholeFile {
-                    len,
-                    limit: in_memory_limit,
-                });
-            }
-            let mut bytes = Vec::with_capacity(len);
-            source.seek(SeekFrom::Start(0))?;
-            (&mut *source).take(len as u64).read_to_end(&mut bytes)?;
-            return scan_format_aware(&bytes, format, params).map_err(StreamScanError::Params);
+    if matches!(
+        format,
+        Some(ContainerFormat::Zip | ContainerFormat::H264AnnexB)
+    ) {
+        if len > in_memory_limit {
+            return Err(StreamScanError::NeedsWholeFile {
+                len,
+                limit: in_memory_limit,
+            });
         }
-    };
+        verify_source_length(source, len)?;
+        let mut bytes = vec![0; len];
+        source.seek(SeekFrom::Start(0))?;
+        source.read_exact(&mut bytes)?;
+        verify_source_length(source, len)?;
+        return scan_format_aware(&bytes, format, params).map_err(StreamScanError::Params);
+    }
 
-    // The absorption rule of scan_format_aware, verbatim.
-    let mut accepted: Vec<usize> = Vec::new();
+    verify_source_length(source, len)?;
+    let mut out = FormatAwareChunkSet {
+        boundaries: Vec::new(),
+        format_aware: Vec::new(),
+    };
+    let mut scratch = Vec::new();
     let mut last_accepted = 0usize;
     let min = params.min_size as usize;
-    for &c in &forced_cuts {
-        if c >= last_accepted + min && c <= len.saturating_sub(min) {
-            accepted.push(c);
-            last_accepted = c;
+    // The same absorption rule as scan_format_aware, with no O(records) list.
+    // A visitor may seek/read payload through the header reader's source: its
+    // cached window is position-independent and every refill seeks explicitly.
+    let mut accept = |source: &mut R, cut: usize| -> io::Result<()> {
+        if cut.saturating_sub(last_accepted) >= min && cut <= len.saturating_sub(min) {
+            append_segment(source, last_accepted, cut, params, &mut scratch, &mut out)?;
+            last_accepted = cut;
         }
-    }
-
-    if accepted.is_empty() {
-        source.seek(SeekFrom::Start(0))?;
-        let boundaries = scan_stream(&mut *source, len, params)?;
-        let format_aware = vec![false; boundaries.len()];
-        return Ok(FormatAwareChunkSet {
-            boundaries,
-            format_aware,
-        });
-    }
-
-    let mut segments = Vec::with_capacity(accepted.len() + 1);
-    let mut prev = 0usize;
-    for &c in &accepted {
-        segments.push((prev, c));
-        prev = c;
-    }
-    segments.push((prev, len));
-
-    let mut boundaries = Vec::new();
-    let mut format_aware = Vec::new();
-    let mut segment_bytes = Vec::new();
-    for (seg_idx, &(s, e)) in segments.iter().enumerate() {
-        if s == e {
-            continue;
-        }
-        source.seek(SeekFrom::Start(s as u64))?;
-        let local: Vec<Boundary> = if e - s <= params.max_size as usize {
-            segment_bytes.clear();
-            (&mut *source)
-                .take((e - s) as u64)
-                .read_to_end(&mut segment_bytes)?;
-            if segment_bytes.len() != e - s {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "source shrank").into());
+        Ok(())
+    };
+    match format {
+        Some(ContainerFormat::Mcap) => visit_mcap_record_offsets(source, len, &mut accept)?,
+        Some(ContainerFormat::Mp4) => visit_mp4_box_offsets(source, len, &mut accept)?,
+        Some(ContainerFormat::Wav) => {
+            if let Some(cut) = wav_data_offset_seekable(source, len)? {
+                accept(source, cut)?;
             }
-            vec![Boundary {
-                start: 0,
-                end: e - s,
-                raw_address: blake3_wrap::chunk_address_raw(&segment_bytes),
-            }]
-        } else {
-            scan_stream((&mut *source).take((e - s) as u64), e - s, params)?
-        };
-        for (chunk_idx, b) in local.into_iter().enumerate() {
-            boundaries.push(Boundary {
-                start: b.start + s,
-                end: b.end + s,
-                raw_address: b.raw_address,
-            });
-            format_aware.push(chunk_idx == 0 && seg_idx > 0);
         }
+        None => {}
+        Some(ContainerFormat::Zip | ContainerFormat::H264AnnexB) => unreachable!(),
     }
-    Ok(FormatAwareChunkSet {
-        boundaries,
-        format_aware,
-    })
+    if last_accepted == 0 {
+        // With no accepted forced cuts use plain CDC, including natural cuts
+        // in inputs shorter than max_size. The forced-segment shortcut above
+        // intentionally treats such segments as one chunk, matching the oracle.
+        source.seek(SeekFrom::Start(0))?;
+        out.boundaries = scan_stream(&mut *source, len, params)?;
+        out.format_aware = vec![false; out.boundaries.len()];
+    } else {
+        append_segment(source, last_accepted, len, params, &mut scratch, &mut out)?;
+    }
+    verify_source_length(source, len)?;
+    Ok(out)
 }
 
 #[cfg(test)]

@@ -230,3 +230,83 @@ def test_case_verdicts_fail_closed():
     with_problem = audit.CaseResult(name="p", expect="clean", covers=[], what="", **complete)
     with_problem.problems.append("Memcheck status 'RUNNING', expected 'FINISHED'")
     assert not with_problem.passed
+
+
+@pytest.mark.parametrize("kind", [
+    "InvalidRead", "InvalidWrite", "InvalidFree", "MismatchedFree", "Overlap",
+    "SyscallParam", "Leak_DefinitelyLost", "Leak_IndirectlyLost", "Leak_PossiblyLost",
+    "Leak_StillReachable", "FishyValue", "UnknownFutureError",
+])
+@pytest.mark.parametrize("secret_kind", [None, "UninitCondition", "UninitValue"])
+def test_negative_control_rejects_unrelated_memcheck_error(kind, secret_kind):
+    control = audit.CaseResult(
+        name="control", expect="flagged", covers=[], what="",
+        completed=True, under_valgrind=True, returncode=0,
+    )
+    control.reports = [audit.Report(unique="memory", kind=kind, what="", frames=[])]
+    if secret_kind:
+        control.reports.append(audit.Report(unique="secret", kind=secret_kind, what="", frames=[]))
+    assert not control.passed, "unrelated errors cannot prove sensitivity or be excused by a real leak"
+
+
+@pytest.mark.parametrize("kind", ["UninitCondition", "UninitValue"])
+def test_negative_control_requires_undeclassified_secret_error_and_completion(kind):
+    control = audit.CaseResult(
+        name="control", expect="flagged", covers=[], what="",
+        completed=True, under_valgrind=True, returncode=0,
+    )
+    report = audit.Report(unique="secret", kind=kind, what="", frames=[])
+    control.reports = [report]
+    assert control.passed
+    report.classification = "declassified"
+    assert not control.passed, "an allowed public verdict is not a detected secret leak"
+    report.classification = "violation"
+    control.completed = False
+    assert not control.passed
+    control.completed = True
+    control.under_valgrind = False
+    assert not control.passed
+    control.under_valgrind = True
+    control.problems.append("Memcheck status 'RUNNING', expected 'FINISHED'")
+    assert not control.passed
+
+
+def test_summary_counts_only_successful_secret_negative_controls(tmp_path, monkeypatch):
+    def result(name, kinds, *, completed=True, expect="flagged", declassified=False):
+        return audit.CaseResult(
+            name=name, expect=expect, covers=[], what="",
+            completed=completed, under_valgrind=True, returncode=0,
+            reports=[
+                audit.Report(
+                    unique=str(i), kind=kind, what="", frames=[],
+                    classification="declassified" if declassified else "violation",
+                )
+                for i, kind in enumerate(kinds)
+            ],
+        )
+
+    results = [
+        result("detected", ["UninitCondition", "UninitValue"]),
+        result("memory-only", ["InvalidRead"]),
+        result("mixed", ["UninitCondition", "InvalidWrite"]),
+        result("allowed-verdict", ["UninitCondition"], declassified=True),
+        result("incomplete", ["UninitValue"], completed=False),
+        result("clean-allowed-verdict", ["UninitCondition"], expect="clean", declassified=True),
+    ]
+    cases = [{"name": r.name, "expect": r.expect} for r in results]
+    by_name = {r.name: r for r in results}
+    monkeypatch.setattr(audit, "list_cases", lambda _binary: cases)
+    monkeypatch.setattr(audit, "run_case", lambda case, *_args: by_name[case["name"]])
+    monkeypatch.setattr(audit, "load_external", lambda _path: [])
+    report_path = tmp_path / "report.json"
+    status = audit.main([
+        "--binary", str(tmp_path / "unused-binary"),
+        "--source-root", str(tmp_path / "native"),
+        "--report", str(report_path),
+    ])
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert status == 1
+    assert report["negative_controls"] == 5
+    assert report["negative_controls_detected"] == 1
+    assert report["passed"] == 2
+    assert set(report["failed"]) == {"memory-only", "mixed", "allowed-verdict", "incomplete"}

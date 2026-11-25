@@ -18,7 +18,8 @@ definedness into syscalls, ...) is always a violation.
 Verdicts:
 * ``clean`` cases pass with zero violations;
 * ``flagged`` cases (negative controls) pass only with at least one
-  violation, which proves the instrument can see a leak;
+  undeclassified secret-dependent branch/address report and no unrelated
+  Memcheck errors; a memory fault cannot stand in for detecting a secret leak;
 * a case that did not run to completion under Valgrind fails, whatever it
   reported, so a broken Valgrind cannot produce a vacuous pass.
 
@@ -90,6 +91,10 @@ class CaseResult:
     @property
     def passed(self) -> bool:
         if self.problems or not self.completed or not self.under_valgrind:
+            return False
+        # Unrelated errors fail every case, including negative controls.
+        # Only secret-dependent branches/addresses can prove sensitivity.
+        if any(report.kind not in SECRET_KINDS for report in self.reports):
             return False
         if self.expect == "clean":
             return not self.violations
@@ -425,7 +430,7 @@ def main(argv: list[str] | None = None) -> int:
         "passed": sum(r.passed for r in results),
         "failed": failed,
         "negative_controls": len(controls),
-        "negative_controls_detected": sum(bool(r.violations) for r in controls),
+        "negative_controls_detected": sum(r.passed for r in controls),
         "external_declassifications": [
             f"{e.package}@{e.version} {e.file}:{e.line}" for e in external
         ],

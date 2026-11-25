@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import hashlib
 import importlib.metadata
+import json
 import importlib.util
 import os
 import platform
 import random
 import subprocess
+import sys
 import time
 import zlib
 from pathlib import Path
@@ -70,6 +72,81 @@ def _git(root: Path, *args: str) -> str | None:
         return None
 
 
+def cpu_model() -> str:
+    """The CPU model string (platform.processor() is empty or generic on Linux)."""
+    try:
+        if os.name == "nt":
+            import winreg
+
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as key:
+                return str(winreg.QueryValueEx(key, "ProcessorNameString")[0]).strip()
+        if os.path.exists("/proc/cpuinfo"):
+            with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as info:
+                for line in info:
+                    if line.lower().startswith(("model name", "hardware", "cpu model")):
+                        return line.split(":", 1)[1].strip()
+        if platform.system() == "Darwin":
+            out = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True, timeout=5)
+            if out.returncode == 0 and out.stdout.strip():
+                return out.stdout.strip()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return platform.processor() or "unknown"
+
+
+def memory_total_bytes() -> int | None:
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class Status(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            status = Status()
+            status.dwLength = ctypes.sizeof(Status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.ullTotalPhys)
+            return None
+        else:
+            return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _host_record() -> dict[str, Any]:
+    """Host provenance with an identity that actually distinguishes machines.
+
+    ``host_id`` used to hash only the hostname, which is identical across
+    GitHub-hosted runners, so two runners in different regions reported the
+    same host. It now hashes hostname, CPU model, core count, physical memory
+    and the runner identity GitHub exposes, so measurements from different
+    machines can never be presented as like-for-like.
+    """
+    runner = {
+        key: os.environ.get(env)
+        for key, env in (("name", "RUNNER_NAME"), ("os", "RUNNER_OS"), ("arch", "RUNNER_ARCH"),
+                         ("environment", "RUNNER_ENVIRONMENT"), ("image_os", "ImageOS"),
+                         ("image_version", "ImageVersion"))
+        if os.environ.get(env)
+    }
+    model = cpu_model()
+    memory = memory_total_bytes()
+    identity = {"node": platform.node(), "cpu_model": model, "cpu_count": os.cpu_count(),
+                "memory_total_bytes": memory, "runner": runner}
+    return {
+        "platform": platform.platform(), "machine": platform.machine(),
+        "python": platform.python_version(), "implementation": platform.python_implementation(),
+        "processor": platform.processor(), "cpu_count": os.cpu_count(),
+        "cpu_model": model, "memory_total_bytes": memory, "runner": runner,
+        "host_id": hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest(),
+        "host_id_inputs": sorted(identity),
+    }
+
+
 def provenance(root: Path | None = None) -> dict[str, Any]:
     """Describe the harness, installed native artifact, host and measurement clock.
 
@@ -103,12 +180,7 @@ def provenance(root: Path | None = None) -> dict[str, Any]:
         "source_dirty": bool(_git(root, "status", "--porcelain", "--untracked-files=no")),
         "native_source_revision": os.environ.get("ONE_LINK_BENCH_NATIVE_REVISION"),
         "native": native,
-        "host": {
-            "platform": platform.platform(), "machine": platform.machine(),
-            "python": platform.python_version(), "implementation": platform.python_implementation(),
-            "processor": platform.processor(), "cpu_count": os.cpu_count(),
-            "host_id": hashlib.sha256(platform.node().encode()).hexdigest(),
-        },
+        "host": _host_record(),
         "clock": {"name": "perf_counter", "monotonic": clock.monotonic, "resolution_s": clock.resolution},
         "session_id": os.environ.get("ONE_LINK_BENCH_SESSION"),
         "pair_index": os.environ.get("ONE_LINK_BENCH_PAIR"),

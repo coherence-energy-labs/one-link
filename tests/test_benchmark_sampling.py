@@ -61,6 +61,12 @@ def test_suite_actually_dispatches_the_requested_sampling_plan(monkeypatch, prof
     assert len(storage) == 4 and all(args["iterations"] == storage_samples for args in storage)
     sequential = [kwargs for name, kwargs in calls if name == "_bench_quic_loopback_round_trip"]
     parallel = [kwargs for name, kwargs in calls if name == "_bench_quic_parallel_streams"]
+    # Exactly one ungated first-traffic probe runs before every gated QUIC
+    # metric, and it is not among the 28 gated results.
+    assert sequential[0] == {"payload_kib": 16, "iterations": 200, "bench_iterations": 1, "warmup_iterations": 0}
+    sequential = sequential[1:]
+    first_quic = next(i for i, (name, _) in enumerate(calls) if name.startswith("_bench_quic"))
+    assert calls[first_quic][1] == {"payload_kib": 16, "iterations": 200, "bench_iterations": 1, "warmup_iterations": 0}
     assert len(sequential) == 4 and len(parallel) == 2
     assert all(args["bench_iterations"] == quic_samples and args["warmup_iterations"] == warmups
                for args in sequential + parallel)
@@ -72,6 +78,48 @@ def test_suite_actually_dispatches_the_requested_sampling_plan(monkeypatch, prof
     else:
         assert [args["iterations"] for args in sequential] == [200, 200, 50, 20]
         assert [args["iterations_per_stream"] for args in parallel] == [4, 4]
+
+
+def test_quic_sizes_rotate_by_pair_so_no_metric_always_runs_first(monkeypatch):
+    orders = [lab.quic_size_order(pair) for pair in range(8)]
+    assert all(sorted(order) == [16, 64, 256, 1024] for order in orders)
+    first = [order[0] for order in orders]
+    assert {size: first.count(size) for size in (16, 64, 256, 1024)} == {16: 2, 64: 2, 256: 2, 1024: 2}
+    assert lab.quic_size_order(None) == (16, 64, 256, 1024)
+    monkeypatch.setenv("ONE_LINK_BENCH_PAIR", "3")
+    assert lab._pair_index() == 3
+    monkeypatch.setenv("ONE_LINK_BENCH_PAIR", "not-a-number")
+    assert lab._pair_index() is None
+
+
+def test_warmup_durations_are_retained_but_excluded_from_timed_samples():
+    seen = []
+
+    def work():
+        seen.append(1)
+        return 10
+
+    result = lab._bench("fixture", work, iterations=3, warmup_iterations=2)
+    assert len(seen) == 5
+    assert len(result.seconds_per_iteration) == 3
+    assert len(result.warmup_seconds_per_iteration) == 2
+    assert all(value >= 0 for value in result.warmup_seconds_per_iteration)
+
+
+def test_host_identity_separates_machines_that_share_a_hostname(monkeypatch):
+    from one_link import benchmark_contract as contract
+
+    monkeypatch.setattr(contract.platform, "node", lambda: "runnervm")
+    monkeypatch.setattr(contract, "cpu_model", lambda: "AMD EPYC 7763 64-Core Processor")
+    monkeypatch.setenv("RUNNER_NAME", "GitHub Actions 11")
+    first = contract._host_record()
+    monkeypatch.setattr(contract, "cpu_model", lambda: "Intel(R) Xeon(R) Platinum 8370C CPU")
+    second = contract._host_record()
+    assert first["host_id"] != second["host_id"], "same hostname, different CPU must not compare as one host"
+    monkeypatch.setattr(contract, "cpu_model", lambda: "AMD EPYC 7763 64-Core Processor")
+    assert contract._host_record()["host_id"] == first["host_id"], "identity must be deterministic"
+    monkeypatch.setenv("RUNNER_NAME", "GitHub Actions 12")
+    assert contract._host_record()["host_id"] != first["host_id"]
 
 
 @pytest.mark.parametrize("parallel", [False, True])
@@ -127,12 +175,21 @@ def test_quic_executes_warmup_on_the_same_connection_and_retains_all_31_samples(
 
 def test_cli_records_the_sampling_contract_it_executed(monkeypatch, capsys):
     calls = []
-    monkeypatch.setattr(lab, "run_full_suite", lambda **kwargs: calls.append(kwargs) or [])
+
+    def suite(**kwargs):
+        calls.append({**kwargs, "diagnostics": dict(kwargs["diagnostics"])})
+        kwargs["diagnostics"]["quic_first_traffic"] = {"seconds": 0.25}
+        return []
+
+    monkeypatch.setattr(lab, "run_full_suite", suite)
     monkeypatch.setattr(lab, "provenance", lambda: {"host": {}})
     monkeypatch.setattr(lab.chunk_native, "diagnostics", dict)
     assert lab.main(["--profile", "ci", "--json", "--no-legacy", "--size-mib", "8"]) == 0
-    assert calls == [{"size_mib": 8, "include_legacy": False, "sampling_profile": "ci"}]
-    contract = json.loads(capsys.readouterr().out)["measurement_contract"]
+    assert calls == [{"size_mib": 8, "include_legacy": False, "sampling_profile": "ci", "diagnostics": {}}]
+    payload = json.loads(capsys.readouterr().out)
+    # Ungated observations (the first-traffic probe) reach the evidence file.
+    assert payload["ungated_observations"] == {"quic_first_traffic": {"seconds": 0.25}}
+    contract = payload["measurement_contract"]
     assert contract["sampling_profile"] == "ci"
     assert contract["sampling_plan"] == {"storage_iterations": 31, "quic_iterations": 31,
                                          "quic_warmup_iterations": 3, "quic_min_batch_kib": 16384}

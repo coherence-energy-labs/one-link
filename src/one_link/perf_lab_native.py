@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import blake3
 import json
+import os
 import platform
 import statistics
 import sys
@@ -80,6 +81,10 @@ class BenchResult:
     seconds_per_iteration: list[float] = field(default_factory=list)
     bytes_per_iteration: list[int] = field(default_factory=list)
     warmup_iterations: int = 0
+    # Warm-up batches are excluded from the timed samples but retained, so a
+    # regime that only warm-ups exercise (first traffic, cache fill) stays
+    # visible in the evidence instead of being discarded unmeasured.
+    warmup_seconds_per_iteration: list[float] = field(default_factory=list)
 
 
 def _bench(
@@ -95,8 +100,11 @@ def _bench(
     """
     if iterations < 1 or warmup_iterations < 0:
         raise ValueError("iterations must be positive and warmup nonnegative")
+    warmup_durations: list[float] = []
     for _ in range(warmup_iterations):
+        start = time.perf_counter_ns()
         fn()
+        warmup_durations.append((time.perf_counter_ns() - start) / 1e9)
     durations: list[float] = []
     byte_counts: list[int] = []
     bytes_one_iter = 0
@@ -122,6 +130,7 @@ def _bench(
         seconds_per_iteration=durations,
         bytes_per_iteration=byte_counts,
         warmup_iterations=warmup_iterations,
+        warmup_seconds_per_iteration=warmup_durations,
     )
 
 
@@ -785,14 +794,40 @@ def _bench_quic_parallel_streams(
         client.close()
 
 
+def quic_size_order(pair_index: int | None) -> tuple[int, ...]:
+    """QUIC payload sizes, rotated by the paired-run index.
+
+    Both arms of a pair share the index, so a pair compares the same position;
+    across pairs every size runs first equally often, so no metric is always
+    the one that meets the process's earliest QUIC traffic.
+    """
+    sizes = (16, 64, 256, 1024)
+    shift = (pair_index or 0) % len(sizes)
+    return sizes[shift:] + sizes[:shift]
+
+
+def _pair_index() -> int | None:
+    raw = os.environ.get("ONE_LINK_BENCH_PAIR")
+    try:
+        return int(raw) if raw not in (None, "") else None
+    except ValueError:
+        return None
+
+
 def run_full_suite(
     size_mib: int = 256, include_legacy: bool = True, sampling_profile: str = "quick",
+    diagnostics: dict[str, object] | None = None,
 ) -> list[BenchResult]:
     """Run the complete A1 native-bench suite.
 
     ``size_mib`` controls the CDC scan input size (256 MiB default; reduce
     for quick checks on slow disks). ``ci`` uses a predeclared longer storage
     and QUIC sample plan; ``quick`` retains the local/build smoke workload.
+
+    ``diagnostics``, when given, receives ungated observations, such as the
+    process's first QUIC traffic on a freshly created runtime. That regime is
+    timed once by an explicit probe before any gated QUIC metric, so no gated
+    metric measures runtime start-up and the start-up cost stays recorded.
     """
     if sampling_profile not in SAMPLING_PROFILES:
         raise ValueError(f"unknown sampling profile: {sampling_profile}")
@@ -831,7 +866,19 @@ def run_full_suite(
         results.append(bench_native_chunk_store_locate(iterations=500_000))
     # ol_quic
     if quic_native.HAS_NATIVE:
-        for size_kib in (16, 64, 256, 1024):
+        # The first QUIC traffic of the process creates the shared runtime;
+        # time it once, ungated, before the gated metrics (see docstring).
+        first = _bench_quic_loopback_round_trip(
+            payload_kib=16, iterations=200, bench_iterations=1, warmup_iterations=0,
+        )
+        if diagnostics is not None:
+            diagnostics["quic_first_traffic"] = {
+                "seconds": first.seconds_per_iteration[0],
+                "bytes": first.bytes_processed,
+                "payload_kib": 16, "round_trips": 200,
+                "scope": "first QUIC traffic of this process, on a freshly created runtime; not gated",
+            }
+        for size_kib in quic_size_order(_pair_index()):
             iters = 200 if size_kib <= 64 else 50 if size_kib <= 256 else 20
             iters = max(iters, (plan.quic_min_batch_kib + size_kib - 1) // size_kib)
             results.append(_bench_quic_loopback_round_trip(
@@ -903,8 +950,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="quick smoke or predeclared longer CI sampling (default: quick)")
     args = parser.parse_args(argv)
 
+    observed: dict[str, object] = {}
     results = run_full_suite(size_mib=args.size_mib, include_legacy=not args.no_legacy,
-                             sampling_profile=args.profile)
+                             sampling_profile=args.profile, diagnostics=observed)
     if args.json:
         identity = provenance()
         out = {
@@ -913,6 +961,7 @@ def main(argv: list[str] | None = None) -> int:
                                      "sampling_profile": args.profile, "sampling_plan": asdict(SAMPLING_PROFILES[args.profile])},
             "provenance": identity,
             "diagnostics": chunk_native.diagnostics(),
+            "ungated_observations": observed,
             "host": identity["host"],
             "results": [asdict(r) for r in results],
         }

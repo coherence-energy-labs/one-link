@@ -311,3 +311,23 @@ def test_controlled_timing_is_separate_from_required_correctness():
     assert not job.get("continue-on-error")
     assert any("--build-only" in step.get("run", "") for step in job["steps"])
     assert all(not step.get("continue-on-error") for step in job["steps"])
+
+
+def test_shell_graph_is_audited_and_inventoried_without_hiding_upstream_warnings():
+    for name in ("security.yml", "release.yml"):
+        document = workflow(name)
+        text = (ROOT / ".github/workflows" / name).read_text()
+        assert "cargo audit --file native/Cargo.lock --deny warnings" in text
+        assert "cargo audit --file native/fuzz/Cargo.lock --deny warnings" in text
+        assert "cargo audit --file native/ol_shell/Cargo.lock --json" in text
+        assert "cargo-audit-shell.json" in text
+        assert "--additional-cargo shell native/ol_shell/Cargo.toml" in text
+        assert "--additional-cargo fuzz native/fuzz/Cargo.toml" in text
+        gates = [step for job in document["jobs"].values() for step in job.get("steps", [])
+                 if step.get("run", "").strip() == "cargo audit --file native/ol_shell/Cargo.lock"]
+        assert len(gates) == 1
+        assert "!cancelled()" in gates[0]["if"]
+        assert not gates[0].get("continue-on-error")
+    release = workflow("release.yml")["jobs"]
+    assert not any("libwebkit2gtk" in step.get("run", "") for step in release["native_wheels"]["steps"])
+    assert any("libwebkit2gtk" in step.get("run", "") for step in release["binaries"]["steps"])

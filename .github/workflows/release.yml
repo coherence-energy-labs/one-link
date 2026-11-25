@@ -227,11 +227,29 @@ jobs:
             --vulnerability-service osv
           uv run --no-sync bandit -c pyproject.toml -r src/one_link scripts --severity-level medium
 
-      - name: install pinned cargo-audit and gate both Rust lockfiles
+      - name: install pinned cargo-audit
+        id: cargo_audit
+        if: ${{ !cancelled() }}
+        run: cargo install --locked --version 0.22.2 cargo-audit
+
+      - name: retain reports for all three Rust lockfiles
+        if: ${{ !cancelled() && steps.cargo_audit.outcome == 'success' }}
         run: |
-          cargo install --locked --version 0.22.2 cargo-audit
+          mkdir -p test-results
+          cargo audit --file native/Cargo.lock --deny warnings --json > test-results/cargo-audit.json || true
+          cargo audit --file native/fuzz/Cargo.lock --deny warnings --json > test-results/cargo-audit-fuzz.json || true
+          cargo audit --file native/ol_shell/Cargo.lock --json > test-results/cargo-audit-shell.json || true
+
+      - name: gate native and fuzz Rust dependencies
+        if: ${{ !cancelled() && steps.cargo_audit.outcome == 'success' }}
+        run: |
           cargo audit --file native/Cargo.lock --deny warnings
           cargo audit --file native/fuzz/Cargo.lock --deny warnings
+
+      - name: gate shell vulnerabilities with upstream warnings retained
+        if: ${{ !cancelled() && steps.cargo_audit.outcome == 'success' }}
+        # See docs/DEPENDENCY_QUALIFICATION.md: Linux GTK warnings are open.
+        run: cargo audit --file native/ol_shell/Cargo.lock
 
       - name: install checksummed Gitleaks release
         env:
@@ -534,21 +552,6 @@ jobs:
           rustup toolchain install 1.96.0 --profile minimal --no-self-update
           rustup default 1.96.0
 
-      # ONE LINK'S NATIVE WINDOW needs WebKitGTK on Linux. Without it `wry` cannot build, and
-      # `build_binary.py` packages the browser fallback instead (the shell is `--required` only on
-      # Windows, where it is verified end to end). Installing these lets the Linux build produce
-      # the window; whether it OPENS correctly on Linux is a separate question this does not answer.
-      #
-      # `|| true` deliberately: a runner image that already carries these, or an apt hiccup, must
-      # not fail a release over a window that is optional on this platform.
-      - name: Install WebKitGTK for the native window (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update || true
-          sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
-            librsvg2-dev libxdo-dev || true
-
       - name: setup Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -631,6 +634,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # ONE LINK'S NATIVE WINDOW needs WebKitGTK on Linux. Without it `wry` cannot build, and
+      # `build_binary.py` packages the browser fallback instead (the shell is `--required` only on
+      # Windows, where it is verified end to end). Installing these lets the Linux build produce
+      # the window; whether it OPENS correctly on Linux is a separate question this does not answer.
+      #
+      # `|| true` deliberately: a runner image that already carries these, or an apt hiccup, must
+      # not fail a release over a window that is optional on this platform.
+      - name: Install WebKitGTK for the native window (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev || true
 
       - name: setup Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -933,6 +951,8 @@ jobs:
             --exclude-python-extra native \
             --cargo-lock native/Cargo.lock \
             --cargo-workspace native/Cargo.toml \
+            --additional-cargo shell native/ol_shell/Cargo.toml \
+            --additional-cargo fuzz native/fuzz/Cargo.toml \
             --artifacts-dir dist \
             --artifact-pattern 'one_link-*.whl' \
             --artifact-pattern 'one_link-*.tar.gz' \
@@ -1076,9 +1096,13 @@ jobs:
             for the standalone cross-platform binaries.
 
             `sbom.cdx.json` inventories the frozen Python graph, the complete
-            native Cargo.lock/workspace graph, and SHA-256 hashes of the exact
+            native, shell and fuzz Cargo.lock graphs, and SHA-256 hashes of the exact
             wheels and standalone bundles assembled by this run. The SBOM is
             itself covered by SHA256SUMS, Sigstore, and provenance attestation.
+            It includes build and test dependencies and does not assert runtime
+            reachability in every artifact. Linux shell GTK dependency warnings
+            remain documented in `docs/DEPENDENCY_QUALIFICATION.md` and in this
+            run's RustSec evidence; this is not a warning-free qualification.
 
             `UPDATE_MANIFEST.json` is the signed, commit-bound authority used by
             the standalone transactional updater. It names and hashes each

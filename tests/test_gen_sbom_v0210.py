@@ -404,6 +404,63 @@ def test_real_native_workspace_inventory_passes_locked_cyclonedx_schema(tmp_path
     gen_sbom._strict_schema_validate(gen_sbom._canonical_json(merged))
 
 
+def test_independent_cargo_graphs_preserve_separate_resolutions(tmp_path: Path):
+    cargo_lock, workspace = _write_cargo_fixture(tmp_path)
+    shell = tmp_path / "shell"
+    shell.mkdir()
+    manifest = shell / "Cargo.toml"
+    manifest.write_text('[package]\nname="ol_shell"\nversion="0.1.0"\n[workspace]\n')
+    (shell / "Cargo.lock").write_text(
+        cargo_lock.read_text().replace("one_link_native", "ol_shell").replace("0.21.0-alpha.0", "0.1.0")
+        + '\ndependencies = ["leaf"]\n\n[[package]]\nname="leaf"\nversion="2.0.0"\n'
+    )
+    merged = gen_sbom.augment_sbom(
+        copy.deepcopy(_base_bom()), cargo_lock=cargo_lock, cargo_workspace=workspace,
+        additional_cargo=[("shell", manifest)], output_path=tmp_path / "sbom.json",
+    )
+    deps = {row["ref"]: row["dependsOn"] for row in merged["dependencies"]}
+    duplicate = [row for row in merged["components"] if row["purl"] == "pkg:cargo/dep@1.2.3"]
+    assert len(duplicate) == 2
+    main = next(row for row in duplicate if "one-link:cargo:graph" not in _property_map(row))
+    other = next(row for row in duplicate if _property_map(row).get("one-link:cargo:graph") == "shell")
+    assert deps[main["bom-ref"]] == []
+    assert len(deps[other["bom-ref"]]) == 1
+    assert deps[other["bom-ref"]][0].startswith("urn:one-link:cargo-graph:shell:")
+    metadata = _property_map(merged["metadata"])
+    assert metadata["one-link:sbom:cargo-graph:shell:workspace-member-count"] == "1"
+    assert metadata["one-link:sbom:cargo-graph:shell:lock-sha256"] == hashlib.sha256(
+        (shell / "Cargo.lock").read_bytes()
+    ).hexdigest()
+
+
+def test_all_three_real_cargo_graphs_are_complete_and_schema_valid(tmp_path: Path):
+    merged = gen_sbom.augment_sbom(
+        copy.deepcopy(_base_bom()), cargo_lock=REPO / "native/Cargo.lock",
+        cargo_workspace=REPO / "native/Cargo.toml",
+        additional_cargo=[("shell", REPO / "native/ol_shell/Cargo.toml"),
+                          ("fuzz", REPO / "native/fuzz/Cargo.toml")],
+        output_path=tmp_path / "sbom.json",
+    )
+    for name, path in [("shell", "native/ol_shell"), ("fuzz", "native/fuzz")]:
+        expected = gen_sbom._parse_cargo_packages(REPO / path / "Cargo.lock")
+        actual = [row for row in merged["components"]
+                  if _property_map(row).get("one-link:cargo:graph") == name]
+        assert {row["purl"] for row in actual} == {package.ref for package in expected}
+        assert _property_map(merged["metadata"])[f"one-link:sbom:cargo-graph:{name}:package-count"] == str(len(expected))
+    if importlib.util.find_spec("cyclonedx") is not None:
+        gen_sbom._strict_schema_validate(gen_sbom._canonical_json(merged))
+
+
+@pytest.mark.parametrize("names", [("native",), ("shell", "shell"), ("bad graph",)])
+def test_additional_cargo_graph_names_are_unambiguous(tmp_path: Path, names):
+    with pytest.raises(gen_sbom.SbomError, match="Cargo graph name"):
+        gen_sbom.augment_sbom(
+            copy.deepcopy(_base_bom()),
+            additional_cargo=[(name, tmp_path / "Cargo.toml") for name in names],
+            output_path=tmp_path / "sbom.json",
+        )
+
+
 def test_cli_builds_atomic_reproducible_complete_document(tmp_path: Path):
     if importlib.util.find_spec("cyclonedx") is None:
         pytest.skip("locked release-tools dependency is not installed in this test environment")

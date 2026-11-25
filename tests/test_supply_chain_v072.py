@@ -407,7 +407,7 @@ def test_rolling_publisher_never_empties_the_release_before_uploading():
 
 def test_workflows_use_frozen_uv_and_explicit_root_for_native_builds():
     sync_count = 0
-    nested_maturin_count = 0
+    nested_maturin_workflows = set()
     for path, workflow in _workflow_documents():
         text = path.read_text(encoding="utf-8")
         for line in text.splitlines():
@@ -418,7 +418,7 @@ def test_workflows_use_frozen_uv_and_explicit_root_for_native_builds():
             for step in job.get("steps", []):
                 run = str(step.get("run", ""))
                 if step.get("working-directory") == "native" and "maturin" in run:
-                    nested_maturin_count += 1
+                    nested_maturin_workflows.add(path.name)
                     assert any(command in run for command in (
                         "uv run --project .. --frozen", "uv run --project .. --no-sync")), (
                         f"{path.name}: nested maturin build would discover native/pyproject "
@@ -430,26 +430,14 @@ def test_workflows_use_frozen_uv_and_explicit_root_for_native_builds():
                             f"{path.name}: no-sync requires an earlier frozen environment install"
                         )
     assert sync_count >= 15
-    # 10th audited site 2026-07-25: full_suite_and_e2e.yml builds the native
-    # engine so the suite exercises the real fail-closed PQ channel path.
-    # 12 as of the tests.yml native builds. Two were added there: the test
-    # matrix (test_channel's live handshake fails closed without the native
-    # pqkem ABI) and build_windows_binary (build_binary.py treats
-    # one_link_native as mandatory for a stable artifact). Both were invisible
-    # while the tests gate could not conclude.
-    # 13 as of e2e_call_ui_browser.yml. That gate had failed on every run it
-    # ever had because it never built the engine: the daemon came up reporting
-    # "PQ-hybrid KEM UNAVAILABLE" and the call never reached media
-    # (caller_frames=0, stopped during incoming_call). It was measuring an
-    # incomplete install rather than the product.
-    # 16 as of the paired benchmark gates. Three were added in
-    # native_bench_gate.yml: the PR gate builds the head AND its merge base,
-    # and drift_watch builds master AND the anchor commit. Both compare two
-    # builds made on ONE runner because the old gate compared a 4-core cloud
-    # VM against a baseline recorded on a 24-core Windows desktop, and failed
-    # every PR it ever ran on.
-    # The tagged publisher now independently rebuilds its actual Linux wheel.
-    assert nested_maturin_count == 17
+    # Check every discovered invocation, plus the important explicit builders.
+    # The acceptance matrix now consumes one source-bootstrap wheel per OS;
+    # counting old duplicated builds would reject that supported design.
+    assert {"release.yml", "native_build.yml", "native_bench_gate.yml"} <= nested_maturin_workflows
+    acceptance = dict(_workflow_documents())[_WORKFLOWS / "full_suite_and_e2e.yml"]
+    commands = "\n".join(step.get("run", "")
+                         for step in acceptance["jobs"]["native_runtime"]["steps"])
+    assert "python scripts/bootstrap_source.py --report" in commands
 
 
 def test_windows_native_binding_uses_shell_matching_its_commands():

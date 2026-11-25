@@ -102,6 +102,14 @@ jobs:
           uv run --frozen --extra security python -m pip_audit --requirement requirements.lock --no-deps --disable-pip
           uv run --frozen --extra security python -m pip_audit --requirement requirements.lock --no-deps --disable-pip --vulnerability-service osv
 
+      - name: audit locked rendezvous container subset
+        if: ${{ !cancelled() && steps.audit_tools.outcome == 'success' }}
+        run: |
+          uv run --frozen --extra security python -m pip_audit --requirement deploy/rendezvous/requirements.lock --no-deps --disable-pip --format json --output rendezvous-pip-audit.json || true
+          uv run --frozen --extra security python -m pip_audit --requirement deploy/rendezvous/requirements.lock --no-deps --disable-pip --vulnerability-service osv --format json --output rendezvous-pip-audit-osv.json || true
+          uv run --frozen --extra security python -m pip_audit --requirement deploy/rendezvous/requirements.lock --no-deps --disable-pip
+          uv run --frozen --extra security python -m pip_audit --requirement deploy/rendezvous/requirements.lock --no-deps --disable-pip --vulnerability-service osv
+
       - name: bandit (SAST)
         if: ${{ !cancelled() && steps.audit_tools.outcome == 'success' }}
         # Excludes + skip-list configured in pyproject.toml [tool.bandit].
@@ -119,7 +127,12 @@ jobs:
       - name: generate SBOM
         if: ${{ !cancelled() && steps.audit_tools.outcome == 'success' }}
         run: |
-          uv run --frozen --extra security python scripts/gen_sbom.py --from requirements --output dist/sbom.cdx.json
+          uv run --frozen --extra security python scripts/gen_sbom.py \
+            --from requirements --python-lock uv.lock --exclude-python-extra native \
+            --cargo-lock native/Cargo.lock --cargo-workspace native/Cargo.toml \
+            --additional-cargo shell native/ol_shell/Cargo.toml \
+            --additional-cargo fuzz native/fuzz/Cargo.toml \
+            --output dist/sbom.cdx.json
 
       - name: upload supply-chain artifacts
         if: always()
@@ -130,6 +143,8 @@ jobs:
             requirements.lock
             pip-audit.json
             pip-audit-osv.json
+            rendezvous-pip-audit.json
+            rendezvous-pip-audit-osv.json
             bandit.json
             dist/sbom.cdx.json
           if-no-files-found: warn
@@ -157,14 +172,23 @@ jobs:
         run: cargo install --locked --version 0.22.2 cargo-audit
 
       - name: Archive RustSec report
+        id: rustsec_reports
         run: |
           cargo audit --file native/Cargo.lock --deny warnings --json > cargo-audit.json || true
           cargo audit --file native/fuzz/Cargo.lock --deny warnings --json > cargo-audit-fuzz.json || true
+          cargo audit --file native/ol_shell/Cargo.lock --json > cargo-audit-shell.json || true
 
       - name: Gate on RustSec vulnerabilities and warnings
         run: |
           cargo audit --file native/Cargo.lock --deny warnings
           cargo audit --file native/fuzz/Cargo.lock --deny warnings
+
+      # GTK's upstream glib/proc-macro-error warnings remain visible in full.
+      # This is a vulnerability gate, not a warning-free qualification; see
+      # docs/DEPENDENCY_QUALIFICATION.md. No advisory IDs are suppressed.
+      - name: Gate shell vulnerabilities and retain upstream warnings
+        if: ${{ !cancelled() && steps.rustsec_reports.outcome == 'success' }}
+        run: cargo audit --file native/ol_shell/Cargo.lock
 
       - name: Upload RustSec report
         if: always()
@@ -174,4 +198,5 @@ jobs:
           path: |
             cargo-audit.json
             cargo-audit-fuzz.json
+            cargo-audit-shell.json
           if-no-files-found: error

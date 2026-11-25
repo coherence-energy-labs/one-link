@@ -8,8 +8,8 @@
 # buy a title bar. The shell is a LEAF BINARY — nothing links it, it only receives a URL and paints
 # — so its dependency set is isolated here and `../Cargo.toml` never sees it.
 #
-# The cost of that choice, stated: a second lockfile to audit and update. That is the right trade
-# for keeping `cargo audit` over the daemon meaningful.
+# This is a separately audited lockfile, alongside the main native and fuzz graphs.
+# All three are included in release and continuous dependency evidence.
 
 [package]
 name = "ol_shell"
@@ -23,25 +23,14 @@ publish = false
 # the parent workspace it physically sits inside.
 [workspace]
 
-# ── KNOWN ADVISORY, NAMED RATHER THAN SILENT ────────────────────────────────────────────────
-#
-# GHSA-wrw7-89jp-8q8g (medium) — unsoundness in the `Iterator`/`DoubleEndedIterator` impls for
-# `glib::VariantStrIter`, in glib 0.18.5.
-#
-# NOT FIXABLE HERE. 0.18.5 is the newest 0.18.x, and it is pinned by `gtk 0.18.2` <- `tao 0.36`.
-# The fix requires tao/gtk to move to glib 0.19+, which is upstream of this crate.
-#
-# SCOPE, measured rather than assumed:
-#   * glib is the LINUX GTK backend. `cargo tree -i glib` on Windows prints nothing — it is not
-#     in the Windows dependency graph at all, so Windows builds do not compile it.
-#   * this crate never references `glib` or `Variant`; the unsound iterators are not reachable
-#     from any code here.
-#   * ol_shell is a LEAF BINARY in its OWN workspace, so this does not enter the daemon's
-#     lockfile. The crates that touch keys, ciphertext and the wire are unaffected — which is
-#     the reason the workspace was split in the first place.
-#
-# This is the cost of choosing a webview stack, stated plainly. Re-check when tao releases a
-# version built on glib 0.19+, and delete this block when it lands.
+# Remaining upstream warnings, reviewed 2026-11-25:
+# RUSTSEC-2024-0429: glib 0.18.5 VariantStrIter unsoundness; fixed in >=0.20.0.
+# RUSTSEC-2024-0370: proc-macro-error 1.x is unmaintained, with no patched release.
+# The Linux GTK 0.18 chain still appears in current tao/wry upstream manifests.
+# This crate has no direct VariantStrIter use, but that does not prove absence
+# of transitive reachability. Separate workspace resolution is not a security
+# boundary for the shipped UI. Keep both warnings in audit output; do not call
+# this graph warning-free. See docs/DEPENDENCY_QUALIFICATION.md for exact scope.
 
 [dependencies]
 ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }

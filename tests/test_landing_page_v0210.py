@@ -35,14 +35,14 @@ def test_primary_cta_fails_closed_to_local_source_instructions():
 def test_landing_page_states_current_release_evidence_gap():
     normalized = " ".join(_html().lower().split())
     for required in (
-        "no verified production download is currently published",
-        "only release is the mutable <code>auto-latest</code> prerelease",
-        "rolling binaries and checksum files were refreshed on 2026-07-22",
-        "no sigstore bundles",
-        "published sbom",
-        "provenance assets",
-        "not an approved install source",
-        "has not yet produced a production tag",
+        "published release; qualification incomplete",
+        "as reviewed on 2026-11-24, v0.21.0 is published",
+        "sigstore bundles, an sbom and checksum assets",
+        "independent reproducibility comparison failed",
+        "provenance verification of downloaded bytes and fresh-device qualification",
+        "remain separate required checks",
+        "<code>auto-latest</code> is not a trust baseline",
+        "dated release evidence ledger",
     ):
         assert required in normalized
 
@@ -65,7 +65,8 @@ def test_source_evaluation_requires_reviewed_commit_and_frozen_lock():
     html = _html()
     assert 'id="source-install"' in html
     assert "git checkout &lt;reviewed-commit-sha&gt;" in html
-    assert "uv sync --frozen" in html
+    assert "python scripts/bootstrap_source.py" in html
+    assert "uv run --no-sync one-link app" in html
     assert "development path, not a production installation" in html
 
 
@@ -73,7 +74,8 @@ def test_future_verification_is_conditional_and_exact_tag_bound():
     normalized = " ".join(_html().lower().split())
     assert "future release verification contract" in normalized
     assert "after an immutable <code>v*</code> tag successfully publishes" in normalized
-    assert "verifier is tooling, not evidence" in normalized
+    assert "published filenames alone do not authenticate downloaded bytes" in normalized
+    assert "fails on missing or mismatched evidence" in normalized
     assert "never substitute <code>latest</code>" in normalized
     assert "scripts/verify-release.sh ./&lt;artifact&gt; vx.y.z" in normalized
 

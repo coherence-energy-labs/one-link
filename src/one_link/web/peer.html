@@ -4060,10 +4060,20 @@ function createPeerProgress({
       if (kind === "bulk") {
         channel.bufferedAmountLowThreshold = WEBRTC_BULK_BUFFER_LOW_BYTES;
       }
-      channel.onopen = () => emitState(`${kind}:open`);
+      let openNotified = false;
+      const notifyOpen = () => {
+        if (openNotified || channel.readyState !== "open") return;
+        openNotified = true;
+        emitState(`${kind}:open`);
+      };
+      channel.onopen = notifyOpen;
       channel.onclose = () => emitState(`${kind}:closed`);
       channel.onerror = () => emitState(`${kind}:error`);
       channel.onmessage = (event) => {
+        // Received channels can already be open while their open event is
+        // pending. Establish the session lifecycle before routing its first
+        // frame, then ignore the delayed open event instead of restarting it.
+        notifyOpen();
         if (opts.onMessage) opts.onMessage(kind, event.data, session);
       };
       return channel;

@@ -1557,9 +1557,27 @@ class State:
                         target_version=target_version,
                         current_version=current,
                         apply=apply_fn,
+                        exactly_once=target_version in self._EXACTLY_ONCE_MIGRATIONS,
                     )
             finally:
                 c.close()
+
+    # Migrations that transform stored values one way. The runner re-applies
+    # every other step on every boot (they are idempotent backfills); these
+    # may run only on the boot that first crosses their version.
+    #
+    #   28  replaces each stored browser-session bearer with its SHA-256
+    #       record key. A record key has the same shape as a bearer (64
+    #       lowercase hex), so applying the step to an already-migrated row
+    #       hashes the key again and the browser's bearer no longer matches
+    #       anything. From 2026-07-25 until this set existed, that happened
+    #       on EVERY daemon start: each restart signed every open window out,
+    #       and "stay signed in across daemon restarts" could not work.
+    #
+    # tests/test_state_migrations_rerun.py re-opens a populated database and
+    # fails on any row a re-run changes, so a new one-way step that is not
+    # listed here is caught.
+    _EXACTLY_ONCE_MIGRATIONS = frozenset({28})
 
     def _run_atomic_migration(
         self,
@@ -1568,24 +1586,32 @@ class State:
         target_version: int,
         apply,
         current_version: Optional[int] = None,
+        exactly_once: bool = False,
     ) -> None:
         """Apply ``apply(cursor)`` and (if first-time-crossing) stamp
         ``target_version`` in one transaction.
 
-        Each migration step is idempotent — most use ``CREATE ... IF
+        Most migration steps are idempotent — they use ``CREATE ... IF
         NOT EXISTS`` and PRAGMA-introspected ``ALTER TABLE``, and a few
         also serve as boot-time backfills (e.g. v2's root_id sweep).
-        We therefore always run ``apply`` so backfills keep healing
-        any drifted rows, but only INSERT the version stamp the first
-        time we cross the boundary. The whole thing is wrapped in a
-        single ``BEGIN IMMEDIATE`` so a crash mid-step rolls back
-        cleanly — no half-applied DDL with a stale version stamp.
+        Those are always run, so backfills keep healing any drifted
+        rows, and only the version stamp is first-crossing-only. The
+        whole thing is wrapped in a single ``BEGIN IMMEDIATE`` so a
+        crash mid-step rolls back cleanly — no half-applied DDL with a
+        stale version stamp.
+
+        A step that is NOT idempotent passes ``exactly_once=True`` and is
+        skipped once the database has reached its version. The stamp is
+        written in the same transaction as the step, so "reached its
+        version" and "the step was applied" are one fact.
         """
         if current_version is None:
             row = c.execute("SELECT MAX(version) FROM schema_version").fetchone()
             current_version = (
                 row[0] if row and row[0] is not None else 0
             )
+        if exactly_once and current_version >= target_version:
+            return
         c.execute("BEGIN IMMEDIATE")
         try:
             apply(c)
@@ -2075,9 +2101,12 @@ class State:
         database disclosure could therefore be replayed directly against a
         running daemon. Tokens are 256-bit random values, so a domain-separated
         SHA-256 record key is sufficient: lookup remains O(1), while the value
-        at rest is no longer a bearer credential. The schema version makes the
-        transformation exactly-once; hashing a record key a second time would
-        invalidate every outstanding browser session.
+        at rest is no longer a bearer credential. Hashing a record key a second
+        time would invalidate every outstanding browser session, so this step
+        is listed in ``_EXACTLY_ONCE_MIGRATIONS``: the runner applies it only
+        on the boot that first crosses v28. (The schema version alone did not
+        make it exactly-once: the runner re-applies ordinary steps on every
+        boot, and until that set existed it re-applied this one too.)
         """
         rows = c.execute(
             "SELECT id, session_uuid FROM ui_sessions"

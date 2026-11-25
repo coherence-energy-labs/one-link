@@ -6,7 +6,9 @@ property — the user-visible reason these matter.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -244,6 +246,63 @@ def test_owner_bootstrap_token_rotates_across_daemon_restart():
             assert _owner_api_status(port2, token2) == 200
         finally:
             _stop(proc2, home=home)
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _bootstrap_browser_bearer(port: int, token: str) -> tuple[str, bool]:
+    """Load the owner page as a window does; return (the bearer it is given, persisted?)."""
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/?t={token}", timeout=10.0) as response:
+        page = response.read().decode("utf-8", errors="replace")
+    match = re.search(r'const b=("[^"]*");const persist=(true|false);', page)
+    assert match, "the owner page no longer carries the bootstrap bearer script"
+    return json.loads(match.group(1)), match.group(2) == "true"
+
+
+@pytest.mark.live_daemon
+@pytest.mark.timeout(240)
+def test_a_browser_session_survives_daemon_restarts():
+    """The other half of the test above: the owner token dies with the process,
+    and the browser session a window is given does NOT.
+
+    From 2026-07-25 to 2026-11-25 it did. The schema runner re-applied the
+    one-way session-key migration on every start, so each restart (each
+    update) signed every open window out, and no test restarted a daemon with
+    a session to notice. Two restarts here, because the damage compounded: a
+    session that survives one could still be lost on the next.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="ol_lifecycle_"))
+    try:
+        home = tmp / "H"
+        home.mkdir()
+
+        proc = _spawn_daemon(home, tmp / "0.log")
+        try:
+            owner_token = _read_text(home, "ui.token")
+            port = _read_port(home, "server.port")
+            bearer, persisted = _bootstrap_browser_bearer(port, owner_token)
+            assert persisted, "a default install no longer gives its window a persistent session"
+            assert bearer != owner_token, "the window was handed the process owner token"
+            assert re.fullmatch("[0-9a-f]{64}", bearer)
+            assert _owner_api_status(port, bearer) == 200
+        finally:
+            _stop(proc, home=home)
+
+        for restart in (1, 2):
+            time.sleep(0.4)
+            proc = _spawn_daemon(home, tmp / f"{restart}.log")
+            try:
+                previous_owner_token = owner_token
+                owner_token = _read_text(home, "ui.token", different_from=previous_owner_token)
+                port = _read_port(home, "server.port")
+                assert _owner_api_status(port, bearer) == 200, (
+                    f"restart {restart} signed the browser session out"
+                )
+                # The rule the neighbouring test pins still holds beside it.
+                assert _owner_api_status(port, previous_owner_token) == 401
+            finally:
+                _stop(proc, home=home)
     finally:
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)

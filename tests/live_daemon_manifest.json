@@ -41,6 +41,7 @@
     "tests/test_integration.py::test_text_with_unicode",
     "tests/test_integration.py::test_unicode_filename",
     "tests/test_integration.py::test_unknown_command_returns_error",
+    "tests/test_lifecycle.py::test_a_browser_session_survives_daemon_restarts",
     "tests/test_lifecycle.py::test_control_status_and_shutdown_contract",
     "tests/test_lifecycle.py::test_corrupt_token_file_is_replaced_safely",
     "tests/test_lifecycle.py::test_harness_stop_reaps_serving_interpreter_and_launcher",

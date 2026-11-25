@@ -244,6 +244,28 @@ def test_measured_samples_from_the_doubling_window_fail_on_workspace():
     assert not any(f.startswith("cdc_file") for f in verdict["failures"])
 
 
+def test_scan_speed_is_reported_against_the_plain_log_of_the_same_run():
+    """The memory limit has a cost beside it: what the buffer sizes do to speed, as a ratio a run can compare."""
+    rows = corpus(healthy, sizes_mib=(256, 1024), repeats=2)
+    speeds = {"mcap-dense": 600.0, "mcap-sparse": 2400.0, "plain": 1200.0}  # MiB/s
+    for row in rows:
+        row["seconds"] = (row["size"] / MIB) / speeds[row["kind"]] * (1.0 + 0.02 * row["repeat"])
+    verdict = bench.evaluate(rows)
+    assert verdict["passed"], "a speed ratio is reported, never a reason to fail"
+    table = {(r["api"], r["size"] // MIB, r["kind"]): r for r in verdict["relative_throughput"]}
+    assert set(table) == {(api, size, kind) for api in APIS for size in (256, 1024)
+                          for kind in ("mcap-dense", "mcap-sparse")}, "one row per non-plain kind, API and size"
+    dense = table[("format_aware_file", 1024, "mcap-dense")]
+    assert dense["ratio_to_plain"] == pytest.approx(0.5, rel=1e-6)
+    assert dense["median_mib_per_s"] == pytest.approx((600.0 + 600.0 / 1.02) / 2, rel=1e-6)  # two repeats
+    assert table[("format_aware_fd", 256, "mcap-sparse")]["ratio_to_plain"] == pytest.approx(2.0, rel=1e-6)
+
+
+def test_samples_without_timing_report_no_speed_rather_than_a_guess():
+    assert bench.evaluate(corpus(healthy))["relative_throughput"] == []
+    assert bench.relative_throughput(measured("ubuntu")) == []
+
+
 @pytest.mark.parametrize("record_bytes", [32, 1024, 262144])
 def test_generated_logs_are_exact_size_valid_mcap(tmp_path: Path, record_bytes: int):
     chunk = pytest.importorskip("one_link_native.chunk")

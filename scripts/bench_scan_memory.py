@@ -401,7 +401,37 @@ def evaluate(samples: list[dict]) -> dict:
         density_pairs.extend(pairs)
         verdicts.extend(failures)
     return {"fits": fits, "growth": growth, "density_output_cost": density_output_cost,
-            "dense_vs_sparse": density_pairs, "failures": verdicts, "passed": not verdicts}
+            "dense_vs_sparse": density_pairs, "relative_throughput": relative_throughput(samples),
+            "failures": verdicts, "passed": not verdicts}
+
+
+def relative_throughput(samples: list[dict]) -> list[dict]:
+    """Scan speed of each kind of log against the plain log of the same size, in the same run.
+
+    Reported, not gated. Memory is not the only thing a scanner's buffer sizes
+    decide: smaller batches hash fewer segments in parallel. A memory limit
+    with no cost beside it will always prefer the smallest buffer, so every
+    run states what the current sizes cost in speed. The plain log is the
+    control: it shares the machine, the file size and the page cache, and its
+    scanner does not depend on those buffers. Absolute MiB/s on a shared
+    runner means little; this ratio is comparable between runs.
+    """
+    timed = [s for s in samples if s.get("seconds")]
+    cells: dict[tuple[str, int, str], list[float]] = {}
+    for s in timed:
+        cells.setdefault((s["api"], s["size"], s["kind"]), []).append(s["size"] / MIB / s["seconds"])
+    rows = []
+    for (api, size, kind), speeds in sorted(cells.items()):
+        plain = cells.get((api, size, "plain"))
+        if kind == "plain" or not plain:
+            continue
+        rows.append({
+            "api": api, "size": size, "kind": kind,
+            "median_mib_per_s": statistics.median(speeds),
+            "plain_median_mib_per_s": statistics.median(plain),
+            "ratio_to_plain": statistics.median(speeds) / statistics.median(plain),
+        })
+    return rows
 
 
 def print_verdict(verdict: dict) -> None:
@@ -418,6 +448,9 @@ def print_verdict(verdict: dict) -> None:
         print(f"  {pair['api']} {pair['size'] / MIB:.0f} MiB: plain-only chunk-adjusted dense-sparse "
               f"{pair['chunk_adjusted_difference'] / MIB:+.2f} MiB (limit {pair['limit'] / MIB:.1f} MiB; "
               f"{pair['output_cost_bytes_per_chunk']:.1f} B/chunk)")
+    for row in verdict["relative_throughput"]:
+        print(f"  speed {row['api']} {row['kind']} {row['size'] / MIB:.0f} MiB: {row['median_mib_per_s']:.0f} MiB/s, "
+              f"{row['ratio_to_plain']:.2f}x the plain log's {row['plain_median_mib_per_s']:.0f} (reported, not gated)")
     print("PASS" if verdict["passed"] else "FAIL: " + "; ".join(verdict["failures"]))
 
 

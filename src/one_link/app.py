@@ -214,14 +214,19 @@ def _ui_status_on_verified_connection(
     connection: http.client.HTTPConnection,
     token: str,
 ) -> dict:
-    """Fetch status without permitting HTTPConnection to reconnect."""
+    """Fetch runtime identity without permitting HTTPConnection to reconnect.
+
+    Dashboard status can enumerate the chunk cache and refresh OS hardware
+    probes. Launcher authentication needs only the process/build/profile
+    identity, so it must not wait for that unrelated work.
+    """
 
     if connection.sock is None:
         return {"ok": False, "error": "verified UI connection is closed"}
     try:
         connection.request(
             "GET",
-            "/api/status",
+            "/api/runtime-identity",
             headers={
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/json",

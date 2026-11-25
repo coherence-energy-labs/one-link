@@ -4024,6 +4024,7 @@ class UIServer:
         # / tray / supervisor handles that if present).
         r.add_post("/api/v1/daemon/shutdown", self._guarded(self.api_daemon_shutdown))
         r.add_get("/api/status", self._guarded(self.api_status))
+        r.add_get("/api/runtime-identity", self._guarded(self.api_runtime_identity))
         # ── Living Presence Tier α-pre — Call API ────────────────
         # Browser hits these to drive the per-call state machines.
         # POST /api/v1/calls dispatches an action (initiate / accept /
@@ -18324,6 +18325,27 @@ class UIServer:
             return web.json_response({"ok": True})
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+    async def api_runtime_identity(self, request: web.Request) -> web.Response:
+        """Authenticate a launcher without collecting dashboard diagnostics.
+
+        The owner bearer uses the same guard as /api/status. Return the identity
+        checked against authenticated control status after the launcher has
+        proven this HTTP connection's instance. Keep this path
+        independent of state queries, cache enumeration and hardware probes.
+        """
+
+        return web.json_response(
+            {
+                "ok": True,
+                "app_version": __import__("one_link").__version__,
+                **runtime_build_identity(),
+                "daemon_instance_id": getattr(self.daemon, "_control_instance_id", None),
+                "pid": os.getpid(),
+                "me": {"fingerprint": self.daemon.me.fingerprint},
+            },
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def api_status(self, request: web.Request) -> web.Response:
         state = self.daemon.state

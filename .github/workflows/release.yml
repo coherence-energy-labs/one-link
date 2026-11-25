@@ -246,11 +246,13 @@ jobs:
           cargo audit --file native/Cargo.lock --deny warnings
           cargo audit --file native/fuzz/Cargo.lock --deny warnings
 
-      - name: gate shell RustSec vulnerability category with warnings retained
+      - name: gate shell RustSec vulnerabilities and warnings with one dispositioned exception
         if: ${{ !cancelled() && steps.cargo_audit.outcome == 'success' }}
-        # Path packages are covered by the required live ancestor query below;
-        # the remaining proc-macro-error maintenance warning stays visible.
-        run: cargo audit --file native/ol_shell/Cargo.lock
+        # Every warning class fails except the exact, documented
+        # RUSTSEC-2024-0370 (proc-macro-error unmaintained, no patched release;
+        # docs/DEPENDENCY_QUALIFICATION.md). The archived JSON above keeps it
+        # visible. Path packages are covered by the live ancestor query below.
+        run: cargo audit --file native/ol_shell/Cargo.lock --deny warnings --ignore RUSTSEC-2024-0370
 
       - name: audit verified vendor registry ancestors against live advisories
         if: ${{ !cancelled() }}
@@ -909,10 +911,194 @@ jobs:
           path: reproducibility/
           if-no-files-found: error
 
+  # Every release artifact a fresh runner of the SAME OS image can rebuild is
+  # rebuilt there and compared with the artifact selected for publication.
+  # x86_64 Linux native wheel: verify_reproducibility above. aarch64 Linux
+  # native wheel: this job. Pure-Python wheel and sdist: the next job. The
+  # Windows and macOS native wheels, the standalone binaries, and the derived
+  # SBOM, update manifest, SHA256SUMS and Sigstore bundles have no independent
+  # rebuild; docs/RELEASE_PROTECTION.md lists them.
+  verify_reproducibility_linux_arm64:
+    name: released Linux aarch64 wheel byte-equivalent rebuild
+    needs: [build, native_wheels]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the release Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+      - name: setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: setup uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.13.10"
+          enable-cache: false
+      - name: install the release native build tooling
+        run: uv sync --frozen --python python --only-group wheel-tools
+      - name: Download the actual wheel selected for publication
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-wheel-linux-arm64
+          path: reproducibility/candidate/
+      - name: Independently rebuild the same source on a fresh runner
+        working-directory: native
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.build.outputs.source_date_epoch }}
+        run: >-
+          uv run --project .. --frozen --only-group wheel-tools maturin build
+          --release --strip --locked --out ../reproducibility/rebuilt/
+      - name: Compare exact candidate and rebuilt wheel bytes
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+        run: >-
+          python scripts/verify_reproducible_wheels.py
+          --candidate reproducibility/candidate --rebuilt reproducibility/rebuilt
+          --source-revision "$SOURCE_REVISION"
+          --report reproducibility/comparison.json
+      - name: Preserve reproducibility result and both compared artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-reproducibility-evidence-linux-arm64
+          path: reproducibility/
+          if-no-files-found: error
+
+  # The pure-Python wheel must match byte for byte. The sdist is compared
+  # member by member (names, order, types, modes, sizes, link targets and
+  # content). Its archive bytes are NOT reproducible: setuptools writes the
+  # build time into the gzip header MTIME and checkout/build times into tar
+  # member mtimes, and it does not honour SOURCE_DATE_EPOCH for sdists
+  # (measured 2026-11-25 with setuptools 84.2.1: two builds of one commit
+  # differed in exactly those fields). The report states what was not compared.
+  verify_reproducibility_python:
+    name: released Python wheel and sdist independent rebuild
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: setup uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.13.10"
+          enable-cache: false
+      - name: install build tooling
+        run: uv sync --frozen --python python --only-group release-tools
+      # Same command and environment as the build job, on a fresh checkout.
+      # The candidate is downloaded only afterwards, so it cannot enter the
+      # rebuilt sdist.
+      - name: Independently rebuild sdist + wheel from locked tooling
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.build.outputs.source_date_epoch }}
+          PYTHONHASHSEED: 0
+        run: |
+          rm -rf dist/ build/ *.egg-info src/*.egg-info
+          uv run --frozen --only-group release-tools python -m build --no-isolation --sdist --wheel --outdir dist/
+          mkdir -p reproducibility/rebuilt
+          cp dist/*.whl dist/*.tar.gz reproducibility/rebuilt/
+      - name: Download the actual distributions selected for publication
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: reproducibility/candidate/
+      - name: Compare exact candidate and rebuilt wheel bytes
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+        run: >-
+          python scripts/verify_reproducible_wheels.py
+          --candidate reproducibility/candidate --rebuilt reproducibility/rebuilt
+          --source-revision "$SOURCE_REVISION"
+          --report reproducibility/wheel-comparison.json
+      - name: Compare every sdist member of candidate and rebuild
+        if: ${{ !cancelled() }}
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, pathlib, sys, tarfile
+
+          def inventory(directory):
+              found = sorted(pathlib.Path(directory).glob("*.tar.gz"))
+              if len(found) != 1:
+                  sys.exit(f"REPRODUCIBILITY VACUOUS: expected one sdist in {directory}, found {[p.name for p in found]}")
+              rows = []
+              with tarfile.open(found[0], "r:gz") as archive:
+                  for member in archive.getmembers():
+                      stream = archive.extractfile(member) if member.isfile() else None
+                      rows.append({
+                          "name": member.name, "type": member.type.decode("ascii"), "mode": member.mode,
+                          "size": member.size, "linkname": member.linkname,
+                          "sha256": hashlib.sha256(stream.read()).hexdigest() if stream else None,
+                      })
+              data = found[0].read_bytes()
+              return rows, {"name": found[0].name, "sha256": hashlib.sha256(data).hexdigest(), "size_bytes": len(data)}
+
+          left, candidate = inventory("reproducibility/candidate")
+          right, rebuilt = inventory("reproducibility/rebuilt")
+          differences = [
+              {"index": index, "candidate": a, "rebuilt": b}
+              for index, (a, b) in enumerate(zip(left, right)) if a != b
+          ]
+          if len(left) != len(right):
+              differences.append({"member_count": {"candidate": len(left), "rebuilt": len(right)}})
+          identical = not differences and bool(left) and candidate["name"] == rebuilt["name"]
+          report = {
+              "schema": "one-link-reproducible-sdist/v1",
+              "source_revision": os.environ["SOURCE_REVISION"],
+              "compared": "sdist file name and every member's name, order, type, mode, size, link target and content",
+              "not_compared": ("member mtime, uid, gid, uname and gname, and the gzip header MTIME: setuptools "
+                               "writes build-time and checkout-time values there, so the archive bytes are not reproducible"),
+              "candidate": candidate, "rebuilt": rebuilt,
+              "archive_bytes_identical": candidate["sha256"] == rebuilt["sha256"],
+              "members_identical": identical, "member_count": len(left), "differences": differences[:50],
+          }
+          pathlib.Path("reproducibility/sdist-comparison.json").write_text(json.dumps(report, indent=2) + "\n")
+          print(json.dumps(report, indent=2))
+          sys.exit(0 if identical else 1)
+          PY
+      - name: Preserve reproducibility results and both compared distributions
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-reproducibility-evidence-python
+          path: reproducibility/
+          if-no-files-found: error
+
   sign:
     name: sigstore-attest dist
-    needs: [release_quality_gate, build, native_wheels, binaries, verify_reproducibility]
+    needs:
+      - release_quality_gate
+      - build
+      - native_wheels
+      - binaries
+      - verify_reproducibility
+      - verify_reproducibility_linux_arm64
+      - verify_reproducibility_python
     runs-on: ubuntu-latest
+    # Release-protection boundary (docs/RELEASE_PROTECTION.md). A YAML key
+    # cannot protect itself: the reviewers and the v* tag deployment policy
+    # that make this gate real are environment settings. GitHub creates an
+    # environment named here on first use, unprotected, so this key is inert
+    # until those settings are applied and cannot break an unconfigured run.
+    environment: release
     permissions:
       contents: read
       id-token: write # Required to obtain the Sigstore/GitHub OIDC identity.
@@ -1076,6 +1262,8 @@ jobs:
     name: publish tagged release
     needs: [release_quality_gate, build, sign, verify_reproducibility]
     runs-on: ubuntu-latest
+    # Same release-protection environment as sign; see the note there.
+    environment: release
     permissions:
       contents: write # Required only for `gh release` publication below.
     steps:
@@ -1119,9 +1307,13 @@ jobs:
             (the deterministic source-timestamp input used by this build).
 
             `SHA256SUMS` verifies the exact published bytes. Separate unsigned
-            CI evidence currently proves byte-for-byte reproducibility only for
-            the explicitly compared Linux native wheel; no such claim is made
-            for the standalone cross-platform binaries.
+            CI evidence from an independent rebuild on a fresh runner proves
+            byte-for-byte reproducibility only for the compared Linux x86_64
+            and aarch64 native wheels and the pure-Python wheel. The sdist's
+            members (names, modes, sizes and content) are rebuilt identically,
+            but its archive timestamps are not reproducible, so no byte-level
+            claim is made for it. No rebuild claim is made for the Windows and
+            macOS native wheels or the standalone cross-platform binaries.
 
             `sbom.cdx.json` inventories the frozen Python graph, the complete
             native, shell and fuzz Cargo.lock graphs, and SHA-256 hashes of the exact

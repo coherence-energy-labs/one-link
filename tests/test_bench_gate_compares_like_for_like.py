@@ -148,12 +148,14 @@ def test_workflows_build_separately_and_require_complete_paired_evidence():
         assert "bench_baselines/native_chunk.json" not in runs
         assert any(step.get("if") == "always()" and "upload-artifact@" in step.get("uses", "") for step in job["steps"])
     events = spec.get("on", spec.get(True))
-    # PRs always emit the required aggregate. The explicit, tested diff scope
-    # uses the same policy as this master push filter (test_native_ci_scope.py).
+    # PRs always emit the required aggregate, and its applicability comes from
+    # the base revision's tested diff policy (test_native_ci_scope.py). Master
+    # pushes carry NO path filter: GitHub evaluates `paths:` over at most 300
+    # changed files, and a filter that omits an input (a parent cargo config,
+    # a toolchain file) let native changes land on master unmeasured. Every
+    # master push therefore runs the bench gate.
     assert "pull_request" in events and not events["pull_request"]
-    patterns = events["push"]["paths"]
-    for changed in ("scripts/bench_gate.py", "scripts/bench_paired_native.py", "src/one_link/aead_native.py", "src/one_link/quic_native.py", "src/one_link/wal_native.py", "src/one_link/chunk_store_native.py", "src/one_link/benchmark_contract.py", "uv.lock"):
-        assert any(bench_gate.fnmatch.fnmatchcase(changed, pattern) for pattern in patterns), changed
+    assert events["push"] == {"branches": ["master"]}, "a master push filter can skip native inputs"
 
 
 def test_json_cli_returns_nonzero_for_the_original_audit_fixture(tmp_path):

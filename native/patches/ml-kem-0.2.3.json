@@ -1,5 +1,7 @@
 {
  "backport": {
+  "advisories": [],
+  "advisory_note": "No RustSec/GHSA identifier exists for this defect and OSV returns no advisory for ml-kem 0.2.3 (queried 2026-11-25). The upstream fix is RustCrypto/KEMs #386, released in 0.3.3.",
   "changed_files": [
    "src/algebra.rs"
   ],
@@ -8,7 +10,10 @@
   "patch_sha256": "cbb3bdadb8be5bcf442851c67e6f5658cd9bc236abb7d618b80ae89c59640ee3",
   "reference": "ml-kem 0.3.4 src/algebra.rs cbd_coefficient (table-free CBD sampling)",
   "reference_crate_sha256": "84ca78b66f46050d49fa21693ae8adab2081d8101b65d8067316b6b70b64a0d1",
-  "reference_crate_url": "https://static.crates.io/crates/ml-kem/ml-kem-0.3.4.crate"
+  "reference_crate_url": "https://static.crates.io/crates/ml-kem/ml-kem-0.3.4.crate",
+  "upstream_fix_commit": "415bfd11f05727f2657c8f1bed53eeae188a9bfb",
+  "upstream_fix_released_in": "ml-kem 0.3.3",
+  "upstream_url": "https://github.com/RustCrypto/KEMs/pull/386"
  },
  "files": {
   ".cargo_vcs_info.json": "3f8061e2d01a38419ac059be1cc5eccb48387e2663454a0415adac5297519ad4",

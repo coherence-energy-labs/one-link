@@ -12,6 +12,33 @@ import pytest
 from scripts import gen_sbom
 
 
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("MIT", [{"license": {"id": "MIT"}}]),
+        ("AGPL-3.0-or-later", [{"license": {"id": "AGPL-3.0-or-later"}}]),
+        ("Apache-2.0 OR MIT", [{"expression": "Apache-2.0 OR MIT"}]),
+        ("MIT AND Unicode-3.0", [{"expression": "MIT AND Unicode-3.0"}]),
+        ("GPL-2.0-only WITH Classpath-exception-2.0", [{"expression": "GPL-2.0-only WITH Classpath-exception-2.0"}]),
+        ("(MIT OR Apache-2.0) AND BSD-3-Clause", [{"expression": "(MIT OR Apache-2.0) AND BSD-3-Clause"}]),
+    ],
+)
+def test_compound_spdx_licenses_use_the_expression_form(value, expected):
+    # CycloneDX `license.id` takes one SPDX identifier; an expression there
+    # fails schema validation (found with the dual-licensed ml-kem backport).
+    assert gen_sbom._license_choice(value) == expected
+
+
+def test_every_vendored_backport_license_validates_in_the_generated_sbom():
+    for record in sorted(REPO.glob("native/**/patches/*.json")):
+        proof = json.loads(record.read_text(encoding="utf-8"))
+        if proof.get("schema") != "one-link-vendored-cargo-patch/v1":
+            continue
+        choice = gen_sbom._license_choice(proof["package"]["license"])
+        compound = any(word in proof["package"]["license"].split() for word in ("OR", "AND", "WITH"))
+        assert ("expression" in choice[0]) is compound, record.name
+
+
 REPO = Path(__file__).resolve().parent.parent
 ARTIFACT_PATTERNS = (
     "one_link-*.whl",

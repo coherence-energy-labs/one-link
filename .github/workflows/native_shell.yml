@@ -18,38 +18,20 @@
 # experiment has been done on Windows only. A green run here is the sentence above and nothing more.
 
 # Every PR emits native shell gate. Only a verified source diff can mark the
-# three-OS matrix not applicable; failed scope or skipped required work blocks.
+# three-OS matrix not applicable: every changed path is applicable unless a
+# reviewed inert rule proves no job here reads it. Failed scope or skipped
+# required work blocks. A pull request is judged by scripts/native_ci_scope.py
+# as it exists at its BASE revision; see docs/RELEASE_PROTECTION.md.
+#
+# Pushes to master always run the work. There is no `paths:` filter: GitHub's
+# push filter sees at most 300 files and cannot express "applicable unless
+# proven inert". The scope script decides, and for a push it requires the work.
 name: native shell builds
 
 on:
   pull_request:
   push:
     branches: [master]
-    paths:
-      - "native/ol_shell/**"
-      - "src/one_link/web/**"
-      - "frontend/owner/**"
-      - "scripts/build_owner_ui.py"
-      - "scripts/build_native_shell.py"
-      - "scripts/build_binary.py"
-      - "scripts/smoke_native_shell.py"
-      - "scripts/verify_vendor_patches.py"
-      - "scripts/audit_vendor_advisories.py"
-      - "tests/test_vendor_patches.py"
-      - "tests/test_vendor_advisories.py"
-      - "tests/test_owner_ui_build.py"
-      - "tests/test_delivery_evidence.py"
-      - "pyproject.toml"
-      - "uv.lock"
-      - ".gitattributes"
-      - ".cargo/**"
-      - "native/.cargo/**"
-      - "rust-toolchain*"
-      - "native/rust-toolchain*"
-      - ".github/actions/**"
-      - ".github/workflows/native_shell.yml"
-      - "scripts/native_ci_scope.py"
-      - "tests/test_native_ci_scope.py"
   workflow_dispatch:
 
 permissions:
@@ -79,7 +61,26 @@ jobs:
           persist-credentials: false
       - name: Verify source identities and classify the complete diff
         id: scope
-        run: python scripts/native_ci_scope.py scope --kind shell --report native-scope.json
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # Pull requests are judged by the policy at their BASE revision, never
+          # by their own tree. A base that predates the policy falls back to the
+          # candidate's copy, which can skip nothing because its own file is in
+          # the diff. Every other event uses the tested checkout's copy. The
+          # policy re-derives this choice and verifies its own bytes.
+          policy_rev="$GITHUB_SHA"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            listing="$(git ls-tree --full-tree --name-only "$PR_BASE_SHA" -- scripts/native_ci_scope.py)"
+            if [ -n "$listing" ]; then
+              policy_rev="$PR_BASE_SHA"
+            fi
+          fi
+          policy="$RUNNER_TEMP/native-ci-policy.py"
+          git show "$policy_rev:scripts/native_ci_scope.py" > "$policy"
+          sha256sum "$policy"
+          python "$policy" scope --kind shell --policy-revision "$policy_rev" --report native-scope.json
       - name: Preserve applicability evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -219,8 +220,27 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - name: Require applicable work or a verified not-applicable diff
         env:
           NATIVE_CI_NEEDS: ${{ toJSON(needs) }}
-        run: python scripts/native_ci_scope.py gate --kind shell
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # Pull requests are judged by the policy at their BASE revision, never
+          # by their own tree. A base that predates the policy falls back to the
+          # candidate's copy, which can skip nothing because its own file is in
+          # the diff. Every other event uses the tested checkout's copy. The
+          # policy re-derives this choice and verifies its own bytes.
+          policy_rev="$GITHUB_SHA"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            listing="$(git ls-tree --full-tree --name-only "$PR_BASE_SHA" -- scripts/native_ci_scope.py)"
+            if [ -n "$listing" ]; then
+              policy_rev="$PR_BASE_SHA"
+            fi
+          fi
+          policy="$RUNNER_TEMP/native-ci-policy.py"
+          git show "$policy_rev:scripts/native_ci_scope.py" > "$policy"
+          sha256sum "$policy"
+          python "$policy" gate --kind shell --policy-revision "$policy_rev"

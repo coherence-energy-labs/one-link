@@ -186,6 +186,8 @@ jobs:
       - name: Install pinned cargo-audit
         run: cargo install --locked --version 0.22.2 cargo-audit
 
+      # The archived JSON reports carry no exception, so every warning stays
+      # visible in the evidence, including the one dispositioned below.
       - name: Archive RustSec report
         id: rustsec_reports
         run: |
@@ -198,12 +200,16 @@ jobs:
           cargo audit --file native/Cargo.lock --deny warnings
           cargo audit --file native/fuzz/Cargo.lock --deny warnings
 
-      # RustSec retains the macro-maintenance warning. It omits path packages,
-      # so the separately required live ancestor query below covers glib and
-      # fails closed on any advisory not addressed by the exact verified patch.
-      - name: Gate shell RustSec vulnerability category with warnings retained
+      # Every warning class (unsound, unmaintained, yanked, notice) fails the
+      # shell graph too. The one exception is exact: RUSTSEC-2024-0370
+      # (proc-macro-error unmaintained, no patched release), dispositioned in
+      # docs/DEPENDENCY_QUALIFICATION.md. Any other or new warning fails.
+      # RustSec omits path packages, so the separately required live ancestor
+      # query below covers every vendored backport and fails closed on any
+      # advisory not addressed by the exact verified patch.
+      - name: Gate shell RustSec vulnerabilities and warnings with one dispositioned exception
         if: ${{ !cancelled() && steps.rustsec_reports.outcome == 'success' }}
-        run: cargo audit --file native/ol_shell/Cargo.lock
+        run: cargo audit --file native/ol_shell/Cargo.lock --deny warnings --ignore RUSTSEC-2024-0370
 
       - name: Audit verified vendor registry ancestors against live advisories
         if: ${{ !cancelled() }}

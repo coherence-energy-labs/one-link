@@ -20,8 +20,27 @@
 //! lookup or control-flow branch.  This test is a regression alarm for changes
 //! that introduce an observable operand-dependent fast path; it is not a claim
 //! that wall-clock sampling replaces a target-specific side-channel audit.
+//!
+//! What blocks a regression, and what this gate is for. The check that fails
+//! required CI when `gf_mul` gains a secret-dependent branch or table index is
+//! the dataflow audit: case `threshold_gf_mul` in `native/ol_ct_audit` runs
+//! this function under Valgrind with its operands marked secret, and the
+//! table-based `gf_mul_fast` is that audit's planted leak. It does not sample
+//! time, so it cannot be moved by a busy runner.
+//!
+//! This wall-clock gate was the last secret-dependent timing test that could
+//! still fail required CI on a shared runner. It was kept hard on purpose
+//! while nothing else blocked a regression here. With unchanged code it has
+//! reported spreads of 5.17% and 10.13% on hosted macOS against its 5% limit:
+//! that is the runner, not the multiply. It now follows the convention of
+//! `test_support/timing_gate.rs` like the other eleven: it measures and
+//! reports on every run, and fails only under `OL_TIMING_GATES=1`, which the
+//! controlled timing workflow sets on a dedicated machine.
 
 use std::{array, hint::black_box, time::Instant};
+
+#[path = "../../test_support/timing_gate.rs"]
+mod timing_gate;
 
 use ol_threshold_recovery::gf256::gf_mul;
 
@@ -185,7 +204,8 @@ fn gf_mul_constant_time_across_operand_buckets() {
     // This peak-to-peak bound is stricter than the old five-percent relative
     // standard-deviation bound: no pair of representative bucket costs may
     // differ by five percent, while isolated wall-clock outliers are ignored.
-    assert!(
+    // Enforced under OL_TIMING_GATES=1; reported otherwise (see the header).
+    timing_gate!(
         spread < MAX_PAIRWISE_MEDIAN_SPREAD,
         "gf_mul representative operand-bucket costs differ by {:.2}% (limit {:.2}%): fastest {:?}, slowest {:?}",
         spread * 100.0,

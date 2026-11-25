@@ -102,6 +102,47 @@ def test_secret_sites_and_audit_cases_cover_each_other():
             assert name in by_site[site]["audit_cases"], f"{site} does not list case {name}"
 
 
+def test_no_secret_timing_site_can_fail_required_ci_on_wall_clock_noise():
+    """A wall-clock result on a shared runner is advisory; the dataflow audit is what blocks.
+
+    Every secret-dataflow timing site reports through ``timing_gate!``, which
+    fails only under OL_TIMING_GATES=1, and (by the test above) is covered by
+    an audit case that must come out clean. If a site were made a bare assert
+    again it could fail required CI on runner noise; if its audit case were
+    removed, nothing would block a real regression. Either breaks a test.
+    """
+    cases = audit_cases()
+    files = set()
+    for entry in INVENTORY["sites"]:
+        if entry["class"] != "secret_dataflow":
+            continue
+        path = NATIVE / entry["site"].split("::")[0]
+        files.add(path)
+        source = path.read_text(encoding="utf-8")
+        assert "timing_gate!" in source and "mod timing_gate;" in source, (
+            f"{entry['site']} can fail required CI on wall-clock noise: it does not use timing_gate!"
+        )
+        assert any(cases[name]["expect"] in ("clean", "uniform") for name in entry["audit_cases"]), entry
+    assert len(files) >= 5, "too few secret timing files found; the check would be blind"
+    # The strict mode still exists and is what the controlled runner uses.
+    runner = (ROOT / "scripts" / "run_native_timing.py").read_text(encoding="utf-8")
+    assert 'OL_TIMING_GATES="1"' in runner
+    gate = (NATIVE / "test_support" / "timing_gate.rs").read_text(encoding="utf-8")
+    assert 'var_os("OL_TIMING_GATES")' in gate and "panic!" in gate
+
+
+def test_the_gf_mul_gate_is_backed_by_an_audit_case_and_a_planted_leak():
+    """The one gate that used to be hard: its blocking check is the audit, with gf_mul_fast as the leak."""
+    cases = audit_cases()
+    site = "ol_threshold_recovery/tests/constant_time_gate.rs::gf_mul_constant_time_across_operand_buckets"
+    assert cases["threshold_gf_mul"]["expect"] == "clean"
+    assert site in cases["threshold_gf_mul"]["covers"]
+    main = (NATIVE / "ol_ct_audit" / "src" / "main.rs").read_text(encoding="utf-8")
+    assert "ol_threshold_recovery::gf_mul(" in main, "the audit case must call the production multiply"
+    assert "ol_threshold_recovery::gf_mul_fast(" in main, "the table-based multiply must stay as the planted leak"
+    assert any(case["expect"] == "flagged" for case in cases.values())
+
+
 def test_audit_keeps_negative_controls():
     cases = audit_cases()
     controls = [name for name, case in cases.items() if case["expect"] == "flagged"]

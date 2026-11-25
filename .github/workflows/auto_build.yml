@@ -1,652 +1,226 @@
-name: auto-build standalone binary
+name: Windows ARM64 dependency stdio diagnostic
 
-# Continuously-built standalone binary so "the newest" stops being
-# "whatever Alex last rebuilt locally" and becomes "whatever the
-# most recent green push to master produced."
-#
-# Differs from .github/workflows/release.yml (which fires only on
-# `v*` tags and runs the full reproducible-build pipeline +
-# Sigstore attestation): this one runs on every push, builds the
-# PyInstaller standalone exe for each OS and uploads short-lived CI workflow
-# artifacts for maintainer testing. It deliberately cannot mutate Releases;
-# only the fully gated tagged pipeline in `release.yml` distributes binaries.
-#
-# Why this matters in practice: PyInstaller bundles index.html +
-# all Python source AT BUILD TIME. A locally-running exe serves
-# WHATEVER index.html it was built with, not the current source.
-# Without an auto-build pipeline, every "I just fixed it" requires
-# a manual `python scripts/build_binary.py --gui` + redistribute.
-# With this workflow, every push produces a downloadable bundle.
-
+# Temporary, manual-only diagnostic for a dedicated branch only.
+# This filename is already registered for workflow_dispatch on the default branch.
+# Do not merge this branch-only replacement. No publishing or signing.
 on:
-  push:
-    branches: [master]
   workflow_dispatch:
-
-# Workflow-level concurrency: if a new push lands while a build is
-# in flight, cancel the in-flight build. Keeps continuous artifacts focused on
-# master HEAD and avoids wasting runners on superseded commits.
-concurrency:
-  group: auto-build-${{ github.ref }}
-  cancel-in-progress: true
 
 permissions:
   contents: read
 
-jobs:
-  build:
-    name: build (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    # 30-minute cap per matrix leg. The previous setup had no timeout, so a
-    # wedged hosted runner could prevent the workflow from concluding. The
-    # downstream ephemeral bundling jobs have ``if: always()`` to retain
-    # evidence from successful legs when another leg fails, but
-    # ``always()`` only fires when needs CONCLUDE, not when they sit
-    # queued forever. A timeout turns "stuck" into "cancelled," the
-    # build job concludes (with one leg's status: cancelled),
-    # downstream jobs retain whatever zips/installers DID build as CI
-    # artifacts. 30 min is generous for the longest
-    # real build leg (windows-11-arm at ~9 min when warmed) and
-    # short enough that a stuck queue gets caught within one cycle.
-    timeout-minutes: 30
-    strategy:
-      # fail-fast=false so a single platform's hiccup (rare wheel
-      # missing, a transient runner outage) does not torpedo the
-      # other five legs.
-      fail-fast: false
-      matrix:
-        include:
-          # ── x86_64 — the historical baseline ──────────────────
-          - os: windows-latest
-            artifact-name: one-link-windows-x86_64
-            exe-name: one-link.exe
-          - os: ubuntu-latest
-            artifact-name: one-link-linux-x86_64
-            exe-name: one-link
-          # Intel macOS is intentionally absent: GitHub's hosted Intel pool is
-          # retired for this repository and Intel is not a supported release
-          # target. A manual, non-scheduled recipe remains in
-          # auto_build_macos_intel.yml for an explicitly provisioned
-          # self-hosted Intel runner; it is validation evidence, not a release.
-          # ── arm64 — added to close the coverage gap ───────────
-          - os: macos-latest
-            artifact-name: one-link-macos-arm64
-            exe-name: one-link
-          # GitHub-hosted Linux ARM64 runner — GA Jan 2025, free
-          # for public repos. Covers Raspberry Pi 4/5 (64-bit OS),
-          # Apple Silicon under Asahi/UTM, and ARM cloud servers.
-          - os: ubuntu-24.04-arm
-            artifact-name: one-link-linux-arm64
-            exe-name: one-link
-          # GitHub-hosted Windows ARM64 runner — GA April 2025,
-          # free for public repos. Covers Surface Pro X / Copilot+
-          # ARM laptops (Snapdragon X / SQ3).
-          - os: windows-11-arm
-            artifact-name: one-link-windows-arm64
-            exe-name: one-link.exe
+concurrency:
+  group: arm64-stdio-diagnostic-${{ github.ref }}
+  cancel-in-progress: false
 
+jobs:
+  diagnose:
+    name: native ARM64 captured Python stdio
+    runs-on: windows-11-arm
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: check out exact application candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: 798026a8cb6af7cb45eedca4b2dec595ce4cb351
+          path: candidate
           persist-credentials: false
 
-      - name: setup Python
+      - name: check out this run's reviewed diagnostic files
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: diagnostics
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /.github/workflows/auto_build.yml
+            /scripts/arm64_stdio_probe.rs
+            /scripts/diagnose_arm64_stdio.py
+            /scripts/prepare_arm64_stdio_diagnostic.py
+
+      - name: setup the observed native Python version
+        id: python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
+          python-version: "3.12.10"
+          architecture: arm64
 
-      - name: setup uv
+      - name: setup pinned uv
+        id: uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: "0.13.10"
-          enable-cache: true
+          # Fresh per-job uv cache makes the source build observable and avoids
+          # saving diagnostic state into the normal build's shared cache.
+          enable-cache: false
 
-      # The native CDC scanner needs a LINKABLE C compiler. windows-latest
-      # images vary: some ship C:\msys64 with a ucrt64 gcc, others surface
-      # only an MSVC-target clang whose link dies (LNK1181) outside a
-      # developer shell. Install MSYS2 gcc explicitly and put its bin on
-      # PATH for every later step, so the compiler ladder always has a
-      # linkable candidate regardless of which image the run lands on.
-      - name: setup native CDC compiler (Windows x86_64)
-        if: matrix.os == 'windows-latest'
-        id: msys2
-        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
-        with:
-          msystem: UCRT64
-          path-type: inherit
-          # No ``location`` override, deliberately. The action APPENDS
-          # ``msys64`` to it, so ``location: C:\msys64`` installed into
-          # ``C:\msys64\msys64`` -- a path no ladder candidate probes. That
-          # override read as load-bearing and was a placebo: builds stayed
-          # green only while the runner image shipped its own C:\msys64 gcc,
-          # and went red the moment an image refresh stopped. Where MSYS2
-          # lands no longer matters -- the next step pins the ladder to the
-          # absolute path the action itself reports.
-          install: mingw-w64-ucrt-x86_64-gcc
-      - name: expose MSYS2 gcc to every later step
-        if: matrix.os == 'windows-latest'
+      - name: install pinned native Rust toolchain
+        id: rust
         shell: pwsh
-        env:
-          # Routed through env, never template-expanded into the script:
-          # the Actions security gate (rightly) rejects ${{ }} in run blocks.
-          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
-        run: |
-          $bin = Join-Path $env:MSYS2_LOCATION "ucrt64\bin"
-          $gcc = Join-Path $bin "gcc.exe"
-          if (-not (Test-Path $gcc)) { throw "gcc.exe missing under $bin" }
-          Add-Content -Path $env:GITHUB_PATH -Value $bin
-          # ONE_LINK_CC, never CC: cc-rs reads CC too, and pointing it at a
-          # GNU gcc hands GNU objects to the MSVC-target Rust link for
-          # ring/zstd-sys/blake3. This name pins the CDC ladder alone.
-          Add-Content -Path $env:GITHUB_ENV -Value "ONE_LINK_CC=$gcc"
-
-      - name: install Rust toolchain
-        # Moved BEFORE pip install: cryptography has no win_arm64 wheel
-        # in any release as of 2026-05, so on that leg ``pip install -e .``
-        # falls through to a source build that invokes maturin which
-        # invokes cargo. Without Rust available, the cryptography build
-        # fails at "Failed to build a native library through cargo" and
-        # we lose Windows ARM64 from the matrix. Installing Rust first
-        # fixes that without affecting the other legs (where a binary
-        # wheel resolves cleanly and Rust is just sitting there unused
-        # until the ``build native crate from source`` step below).
         run: |
           rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw "Rust installation failed" }
           rustup default 1.96.0
+          if ($LASTEXITCODE -ne 0) { throw "Rust selection failed" }
 
-      - name: restore/cache vcpkg ARM64 OpenSSL build
-        if: matrix.os == 'windows-11-arm'
+      - name: compile std-only native ARM64 capture harness
+        id: compile
+        continue-on-error: true
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          $diagRoot = Join-Path $env:GITHUB_WORKSPACE "diagnostics"
+          $diagOutput = Join-Path $env:GITHUB_WORKSPACE "diagnostic-output"
+          New-Item -ItemType Directory -Path $diagOutput -Force | Out-Null
+          & rustc +1.96.0 --edition=2021 --crate-name arm64_stdio_probe --target aarch64-pc-windows-msvc "$diagRoot\scripts\arm64_stdio_probe.rs" -o "$diagOutput\arm64_stdio_probe.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: restore candidate's pinned static ARM64 OpenSSL cache
+        if: steps.compile.outcome == 'success'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          # Restore before vcpkg runs so warm builds avoid recompiling OpenSSL.
           path: |
             C:/vcpkg/installed/arm64-windows-static
             C:/vcpkg/packages/openssl_arm64-windows-static
           key: vcpkg-openssl-arm64-windows-static-v3-cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
 
-      - name: install/verify OpenSSL on Windows ARM64 (cryptography build dep)
-        # cryptography's Rust core links against openssl-sys, which
-        # needs OpenSSL headers + libs at build time. The GitHub-
-        # hosted windows-11-arm runner image does NOT ship OpenSSL by
-        # default, and there is no published cp312-win_arm64 wheel
-        # for cryptography that would avoid the source build. We
-        # install OpenSSL STATICALLY via vcpkg's
-        # ``arm64-windows-static`` triplet and set OPENSSL_STATIC=1
-        # so the OpenSSL code is linked directly into
-        # ``cryptography._rust.pyd``.
-        #
-        # Why static and not dynamic: a previous attempt with the
-        # default dynamic triplet shipped libcrypto-3-arm64.dll +
-        # libssl-3-arm64.dll alongside _rust.pyd, but at PyInstaller's
-        # hook-import stage Windows resolved a different OpenSSL DLL
-        # off PATH first, leading to "DLL load failed while importing
-        # _rust: The specified procedure could not be found" — an ABI
-        # mismatch between cryptography's expected OpenSSL
-        # entrypoints and whatever was on PATH. Static linking
-        # eliminates the DLL-resolution race entirely; PyInstaller
-        # doesn't have to find or bundle OpenSSL DLLs because there
-        # aren't any.
-        #
-        # First run on a cold runner: ~5-10 min while vcpkg compiles
-        # static OpenSSL from source. The restore/cache step above makes repeat
-        # runs ~30 s.
-        if: matrix.os == 'windows-11-arm'
+      - name: install and verify pinned static ARM64 OpenSSL
+        id: openssl
+        if: steps.compile.outcome == 'success'
         shell: pwsh
         env:
-          VCPKG_COMMIT: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3 # 2026.06.24
+          VCPKG_COMMIT: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
         run: |
           $vcpkg = $env:VCPKG_INSTALLATION_ROOT
-          if (-not $vcpkg) { throw "VCPKG_INSTALLATION_ROOT not set on this runner" }
-          Write-Host "vcpkg at $vcpkg"
-          # Hosted images track vcpkg HEAD. Pin both the port definitions and
-          # executable so the OpenSSL input cannot drift on an image refresh.
+          if (-not $vcpkg) { throw "VCPKG_INSTALLATION_ROOT missing" }
           & git -C $vcpkg fetch --depth 1 origin $env:VCPKG_COMMIT
           if ($LASTEXITCODE -ne 0) { throw "vcpkg commit fetch failed" }
           & git -C $vcpkg checkout --detach $env:VCPKG_COMMIT
           if ($LASTEXITCODE -ne 0) { throw "vcpkg commit checkout failed" }
           $resolved = (& git -C $vcpkg rev-parse HEAD).Trim()
-          if ($resolved -ne $env:VCPKG_COMMIT) { throw "vcpkg commit mismatch: $resolved" }
+          if ($resolved -ne $env:VCPKG_COMMIT) { throw "vcpkg commit mismatch" }
           & "$vcpkg\bootstrap-vcpkg.bat" -disableMetrics
           if ($LASTEXITCODE -ne 0) { throw "pinned vcpkg bootstrap failed" }
           & "$vcpkg\vcpkg.exe" install openssl:arm64-windows-static --recurse
-          if ($LASTEXITCODE -ne 0) { throw "vcpkg install openssl (static) failed (exit $LASTEXITCODE)" }
+          if ($LASTEXITCODE -ne 0) { throw "static ARM64 OpenSSL install failed" }
           $prefix = "$vcpkg\installed\arm64-windows-static"
-          "OPENSSL_DIR=$prefix"                 | Out-File -Append $env:GITHUB_ENV -Encoding utf8
-          "OPENSSL_LIB_DIR=$prefix\lib"         | Out-File -Append $env:GITHUB_ENV -Encoding utf8
+          "OPENSSL_DIR=$prefix" | Out-File -Append $env:GITHUB_ENV -Encoding utf8
+          "OPENSSL_LIB_DIR=$prefix\lib" | Out-File -Append $env:GITHUB_ENV -Encoding utf8
           "OPENSSL_INCLUDE_DIR=$prefix\include" | Out-File -Append $env:GITHUB_ENV -Encoding utf8
-          "OPENSSL_STATIC=1"                    | Out-File -Append $env:GITHUB_ENV -Encoding utf8
-          "OPENSSL_NO_VENDOR=1"                 | Out-File -Append $env:GITHUB_ENV -Encoding utf8
+          "OPENSSL_STATIC=1" | Out-File -Append $env:GITHUB_ENV -Encoding utf8
+          "OPENSSL_NO_VENDOR=1" | Out-File -Append $env:GITHUB_ENV -Encoding utf8
           "VCPKG_DEFAULT_TRIPLET=arm64-windows-static" | Out-File -Append $env:GITHUB_ENV -Encoding utf8
 
-      - name: generate macOS .icns icon
-        # PyInstaller's BUNDLE() block expects a .icns for the Dock
-        # icon to render crisply at every size. Generated from the
-        # existing PNG family via macOS-native iconutil + sips so the
-        # repo never has to carry a pre-baked .icns next to the PNG
-        # (which would drift the moment someone updated the source
-        # art and forgot the regenerate step). Only runs on the
-        # macOS legs; no-op everywhere else.
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          chmod +x packaging/macos/make_icns.sh
-          packaging/macos/make_icns.sh
-
-      - name: install build tooling
-        shell: bash
-        # The universal lock covers PyInstaller, maturin, the project, and all
-        # transitive dependencies. On win_arm64 this may compile cryptography,
-        # so Rust + OpenSSL must already be present.
-        run: uv sync --frozen --python python --extra release
-
-      - name: cache cargo registry + target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            native/target
-          key: ${{ runner.os }}-cargo-auto-build-${{ hashFiles('native/Cargo.lock', 'native/**/Cargo.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-auto-build-
-
-      - name: build native crate from source
-        shell: bash
-        working-directory: native
-        # Build one_link_native locally with maturin instead of pulling
-        # a published wheel. Previous approach used `pip install
-        # one_link_native --find-links <github-release-html-url>`,
-        # which never actually resolved a wheel because the URL points
-        # at an HTML release page (not a pip-parseable index). That
-        # meant every auto-build silently fell back to pure-Python.
-        #
-        # Building from source adds ~3-5 min per OS but produces a
-        # bundle that includes the native fast paths (CDC, AEAD, QUIC,
-        # capability, ratchet, coherence-field). The cache step above
-        # makes incremental rebuilds much faster than this estimate.
-        #
-        # Native transfer acceleration is a release invariant. Never publish a
-        # silently degraded binary when the Rust build fails.
-        run: uv run --project .. --frozen --extra release maturin develop --release --locked
-
-      - name: build the standalone binary
-        shell: bash
-        env:
-          PYTHONIOENCODING: utf-8
-        run: |
-          # No --allow-native-cdc-fallback here, deliberately: the flag still
-          # exists but build_binary.py now REFUSES it for stable artifacts
-          # (exit 12, "non-releasable"), because a pure-Python fallback ships
-          # a binary whose advertised chunking performance is not the one
-          # measured. This comment used to describe the flag as if it were
-          # passed; it never was, and the script would reject it.
-          #
-          # Resilience lives one level down instead: native_cdc tries EVERY
-          # available compiler before giving up, so a driver that exists but
-          # cannot link (MSVC-target clang with no developer environment)
-          # can no longer mask a working gcc beside it and block every
-          # download.
-          uv run --frozen --extra release python scripts/build_binary.py --gui
-
-      - name: stamp build metadata
-        shell: bash
-        env:
-          MATRIX_OS: ${{ matrix.os }}
-        run: |
-          # A small marker file in the bundle so a user looking at
-          # dist/one-link/ can tell which commit they're running.
-          mkdir -p dist/one-link
-          {
-            echo "commit: ${GITHUB_SHA}"
-            echo "ref: ${GITHUB_REF}"
-            echo "run_id: ${GITHUB_RUN_ID}"
-            echo "built_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "runner: ${MATRIX_OS}"
-          } > dist/one-link/BUILD_INFO.txt
-
-      - name: compute SHA-256 of the bundle
-        shell: bash
-        env:
-          EXE_NAME: ${{ matrix.exe-name }}
-        run: |
-          cd dist
-          # Also produce a single-file digest of the main exe so
-          # users can verify it after extracting the bundle.
-          if [ -n "${EXE_NAME}" ] && [ -f "one-link/${EXE_NAME}" ]; then
-            if command -v sha256sum >/dev/null 2>&1; then
-              sha256sum "one-link/${EXE_NAME}" \
-                > "one-link/${EXE_NAME}.sha256"
-            else
-              shasum -a 256 "one-link/${EXE_NAME}" \
-                > "one-link/${EXE_NAME}.sha256"
-            fi
-          fi
-          # Store the complete content manifest *inside* the archive, in the
-          # ONE format the product parses.
-          #
-          # This step used to write its own: `"<digest>  <path>"`, classic
-          # sha256sum output, two columns, no header. The consumer
-          # (one_link.update_transaction) requires a five-column TSV with a
-          # header, so every bundle built here failed validate_installed_bundle
-          # and inspect_external_update_capability returned
-          # `managed_bundle_validation_failed`. Measured on the real frozen
-          # Windows bundle: update_install_available was False, and flipped to
-          # True with no change but the manifest format. Since the website's
-          # download button points at the rolling channel, that was the bundle
-          # users installed -- their in-app updater could never activate.
-          #
-          # scripts/write_bundle_manifest.py imports the header and row shape
-          # from the parser instead of restating them, so this cannot drift
-          # apart again, and --verify re-reads the result through the product's
-          # own validator before this step succeeds.
-          # Through uv, not a bare `python`: the writer imports the parser to
-          # get the format, and one_link.update_transaction pulls `packaging`
-          # transitively. A bare interpreter fails with ModuleNotFoundError.
-          #
-          # --verify re-reads the result through the product's own
-          # validate_installed_bundle, on EVERY platform including macOS.
-          #
-          # It was withheld on macOS while that validator hardcoded the bundle
-          # root as "one-link": macOS installs as `one-link.app` (its launcher
-          # is Contents/MacOS/one-link, so the install root IS the .app) and
-          # every one of the 701 rows in a real macOS bundle was refused, plus
-          # 79 of its 126 symlinks by a rule requiring a resolved target to be
-          # a literal manifest entry. Both are fixed -- the root is derived and
-          # chains resolve -- so this step is now the REAL-RUNNER proof: it
-          # validates an actual .app, with actual framework symlinks, on
-          # macos-latest. A Windows workstation cannot even create those links.
-          cd ..
-          ONE_LINK_BUNDLE_EXECUTABLE="${EXE_NAME}" \
-            uv run --frozen --extra release python scripts/write_bundle_manifest.py \
-              --bundle dist/one-link \
-              --root-name one-link \
-              --verify
-          cd dist
-
-      - name: package bundle as a zip
-        shell: bash
-        env:
-          ARTIFACT_NAME: ${{ matrix.artifact-name }}
-        run: |
-          cd dist
-          # Zip the whole onedir bundle. zip works on Windows runners
-          # via the built-in `zip` (Git Bash) or PowerShell fallback.
-          if command -v zip >/dev/null 2>&1; then
-            zip -r "${ARTIFACT_NAME}.zip" one-link
-          else
-            powershell -Command "Compress-Archive -Path one-link -DestinationPath '${ARTIFACT_NAME}.zip'"
-          fi
-          # This is the release-page sidecar: hash the archive itself, not an
-          # unrelated platform's bundle manifest with a colliding filename.
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "${ARTIFACT_NAME}.zip" > "${ARTIFACT_NAME}.zip.sha256"
-          else
-            shasum -a 256 "${ARTIFACT_NAME}.zip" > "${ARTIFACT_NAME}.zip.sha256"
-          fi
-
-      - name: package Linux .AppImage
-        # Produce a rootless single-file Linux package per supported arch
-        # (x86_64 + aarch64). Actual host compatibility still depends on the
-        # PyInstaller payload's kernel/glibc baseline; AppImage packaging is
-        # not a claim of support for every distribution. The packager fetches
-        # appimagetool by immutable asset id and verifies its pinned SHA-256
-        # before execution.
-        if: runner.os == 'Linux'
-        shell: bash
-        env:
-          ARTIFACT_NAME: ${{ matrix.artifact-name }}
-          RUNNER_ARCH_VALUE: ${{ runner.arch }}
-        run: |
-          set -euo pipefail
-          # AppImage convention: aarch64, not arm64.
-          if [ "${RUNNER_ARCH_VALUE}" = "ARM64" ]; then
-            APPIMAGE_ARCH="aarch64"
-          else
-            APPIMAGE_ARCH="x86_64"
-          fi
-          OUT="dist/${ARTIFACT_NAME}.AppImage"
-          chmod +x packaging/linux/make_appimage.sh
-          packaging/linux/make_appimage.sh \
-            "dist/one-link" \
-            "$OUT" \
-            "$APPIMAGE_ARCH"
-          (
-            cd dist
-            sha256sum "${ARTIFACT_NAME}.AppImage" \
-              > "${ARTIFACT_NAME}.AppImage.sha256"
-          )
-
-      - name: package macOS .dmg
-        # The PyInstaller spec now emits a BUNDLE() block on macOS so
-        # dist/one-link.app/ exists as a proper .app bundle. Wrap it
-        # in a compressed read-only .dmg with a /Applications symlink
-        # — that's the canonical "drag the app to Applications"
-        # install gesture every Mac user knows. hdiutil + ditto +
-        # iconutil are all built-in macOS tools; no homebrew, no extra
-        # CI install step.
-        if: runner.os == 'macOS'
-        shell: bash
-        env:
-          ARTIFACT_NAME: ${{ matrix.artifact-name }}
-        run: |
-          cd dist
-          DMG_NAME="${ARTIFACT_NAME}.dmg"
-          chmod +x ../packaging/macos/make_dmg.sh
-          ../packaging/macos/make_dmg.sh \
-            "one-link.app" \
-            "$DMG_NAME" \
-            "One Link"
-          shasum -a 256 "$DMG_NAME" > "$DMG_NAME.sha256"
-
-      - name: upload workflow artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ${{ matrix.artifact-name }}
-          path: |
-            dist/${{ matrix.artifact-name }}.zip
-            dist/${{ matrix.artifact-name }}.dmg
-            dist/${{ matrix.artifact-name }}.dmg.sha256
-            dist/${{ matrix.artifact-name }}.AppImage
-            dist/${{ matrix.artifact-name }}.AppImage.sha256
-            dist/${{ matrix.artifact-name }}.zip.sha256
-          if-no-files-found: warn
-          retention-days: 30
-
-  # ─── Windows installer (Inno Setup) ──────────────────────────────────
-  # A real Windows installer per architecture so end users get
-  # "double-click, Next, install, Start Menu shortcut, done" instead
-  # of "extract zip into Downloads, hunt for the exe, hope it works."
-  # Per-user install path → no UAC prompt. Inno Setup is pre-installed
-  # on the GitHub-hosted Windows runner images.
-  windows-installer:
-    name: windows installer (${{ matrix.arch }})
-    needs: build
-    runs-on: windows-latest
-    if: always()
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            artifact-name: one-link-windows-x86_64
-            installer-name: one-link-setup-x86_64
-          - arch: arm64
-            artifact-name: one-link-windows-arm64
-            installer-name: one-link-setup-arm64
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: download the windows binary artifact
-        id: dl
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        continue-on-error: true
-        with:
-          name: ${{ matrix.artifact-name }}
-          path: payload-zip
-
-      - name: skip when this arch did not build
-        id: gate
-        shell: pwsh
-        env:
-          ARTIFACT_NAME: ${{ matrix.artifact-name }}
-          TARGET_ARCH: ${{ matrix.arch }}
-        run: |
-          if (-not (Test-Path "payload-zip/$env:ARTIFACT_NAME.zip")) {
-            Write-Host "::warning::no payload for $env:TARGET_ARCH — skipping installer build"
-            "go=skip" | Out-File -Append $env:GITHUB_OUTPUT -Encoding utf8
-          } else {
-            "go=ok" | Out-File -Append $env:GITHUB_OUTPUT -Encoding utf8
-          }
-
-      - name: extract payload
-        if: steps.gate.outputs.go == 'ok'
-        shell: pwsh
-        env:
-          ARTIFACT_NAME: ${{ matrix.artifact-name }}
-        run: |
-          Expand-Archive -Path "payload-zip/$env:ARTIFACT_NAME.zip" -DestinationPath "payload" -Force
-          # The zip's top-level dir is ``one-link/`` (per build_binary.py).
-          # The Inno script's PayloadDir default points at it.
-          Get-ChildItem -Recurse payload | Select-Object -First 5 | Format-Table
-
-      - name: compute version stamp
-        id: ver
-        shell: pwsh
-        env:
-          COMMIT_SHA: ${{ github.sha }}
-        run: |
-          # Two version strings serve two different purposes:
-          #
-          #  * ``full`` is shown to humans in Add/Remove Programs and
-          #    in the AppVersion field. Carries pre-release suffix +
-          #    short SHA so continuous CI builds say what
-          #    commit they came from.
-          #  * ``numeric`` is the strict 4-part W.X.Y.Z that the
-          #    Windows VS_VERSIONINFO resource header demands. The
-          #    Inno Setup compiler rejects anything else for
-          #    VersionInfoVersion. Strip pre-release tags + pad to 4
-          #    parts, never letting through a hyphen / plus / letter.
-          $sha = $env:COMMIT_SHA.Substring(0,7)
-          $base = (Select-String -Path pyproject.toml -Pattern 'version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
-          if (-not $base) { $base = "0.21.0-alpha" }
-          $full = "$base+sha.$sha"
-          # Extract leading numeric ``X.Y.Z`` from the pyproject version
-          # (drops -alpha / -rc1 / +build-meta), then right-pad to
-          # exactly four dotted components.
-          $numericMatch = [regex]::Match($base, '^(\d+(?:\.\d+){0,3})')
-          $numeric = if ($numericMatch.Success) { $numericMatch.Groups[1].Value } else { "0.0.0" }
-          $parts = $numeric.Split('.')
-          while ($parts.Length -lt 4) { $parts += '0' }
-          $numeric = $parts[0..3] -join '.'
-          Write-Host "version full   : $full"
-          Write-Host "version numeric: $numeric"
-          "version=$full"          | Out-File -Append $env:GITHUB_OUTPUT -Encoding utf8
-          "numeric=$numeric"       | Out-File -Append $env:GITHUB_OUTPUT -Encoding utf8
-
-      - name: compile installer with Inno Setup
-        if: steps.gate.outputs.go == 'ok'
-        shell: pwsh
-        run: |
-          # ISCC.exe ships pre-installed on windows-latest. The
-          # /D flags override .iss script defines so a single .iss
-          # produces both x86_64 + arm64 installers.
-          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) {
-            $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
-          }
-          if (-not $iscc) { throw "ISCC.exe (Inno Setup compiler) not found on runner" }
-          & $iscc `
-            "/DMyAppVersion=$env:STEPS_VER_OUTPUTS_VERSION" `
-            "/DMyAppNumericVersion=$env:STEPS_VER_OUTPUTS_NUMERIC" `
-            "/DPayloadDir=$(Resolve-Path payload/one-link)" `
-            "/DOutputBaseName=$env:INSTALLER_NAME" `
-            "/DOutputDir=$(Resolve-Path .)/installer-out" `
-            packaging/windows/one-link.iss
-          if ($LASTEXITCODE -ne 0) { throw "ISCC failed: $LASTEXITCODE" }
-          Get-ChildItem installer-out
-        env:
-          INSTALLER_NAME: ${{ matrix.installer-name }}
-          STEPS_VER_OUTPUTS_VERSION: ${{ steps.ver.outputs.version }}
-          STEPS_VER_OUTPUTS_NUMERIC: ${{ steps.ver.outputs.numeric }}
-
-      - name: upload installer
-        if: steps.gate.outputs.go == 'ok'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ${{ matrix.installer-name }}
-          path: installer-out/*.exe
-          if-no-files-found: error
-          retention-days: 30
-
-  bundle-ephemeral-artifacts:
-    name: bundle ephemeral continuous-build artifacts
-    needs: [build, windows-installer]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    # Partial success is useful as maintainer-only CI evidence. This job has no
-    # release/signing authority and its artifacts expire automatically.
-    if: always() && github.ref == 'refs/heads/master'
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: download all platform artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        continue-on-error: true # A totally failed matrix simply produces no aggregate artifact.
-        with:
-          path: artifacts
-
-      - name: flatten + manifest
-        if: always()
-        shell: bash
-        run: |
-          mkdir -p out
-          # Collect every distributable into out/: .zip portable
-          # bundles, .dmg macOS disk images, .AppImage Linux single-
-          # file executables, .exe Windows installers, plus the
-          # side-car .sha256 hashes for each.
-          if [ -d artifacts ]; then
-            find artifacts -name '*.zip' -exec cp {} out/ \;
-            find artifacts -name '*.dmg' -exec cp {} out/ \;
-            find artifacts -name '*.AppImage' -exec cp {} out/ \;
-            find artifacts -name '*.sha256' -exec cp {} out/ \;
-            find artifacts -name 'one-link-setup-*.exe' -exec cp {} out/ \;
-          fi
-          # Guard: if no zips landed (every leg failed/was queued out), there
-          # is no useful aggregate CI artifact to retain.
-          if ! ls out/*.zip > /dev/null 2>&1; then
-            echo "NO ZIPS to bundle — every build leg failed or was queued. Skipping."
-            echo "bundle=skip" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # Build a consolidated manifest mapping artifact → SHA256.
-          # This lets a maintainer cross-check every retained CI artifact.
-          cd out
-          # Hash everything a user might download — zips, dmgs,
-          # installer .exes. The side-car .sha256 files are per-file
-          # convenience; manifest.txt is the consolidated one.
-          for f in *.zip *.dmg *.AppImage one-link-setup-*.exe; do
-            [ -f "$f" ] || continue
-            if command -v sha256sum >/dev/null 2>&1; then
-              sha256sum "$f" >> manifest.txt
-            else
-              shasum -a 256 "$f" >> manifest.txt
-            fi
-          done
-          echo "bundle=ok" >> "$GITHUB_OUTPUT"
-          ls -la
-          cat manifest.txt
+      - name: prepare hash-verified diagnostic build-tool wheels
         id: prepare
+        if: steps.compile.outcome == 'success' && steps.openssl.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $candidateRoot = Join-Path $env:GITHUB_WORKSPACE "candidate"
+          $diagRoot = Join-Path $env:GITHUB_WORKSPACE "diagnostics"
+          $diagOutput = Join-Path $env:GITHUB_WORKSPACE "diagnostic-output"
+          & python "$diagRoot\scripts\prepare_arm64_stdio_diagnostic.py" --source $candidateRoot --output $diagOutput
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: retain consolidated CI bundle
-        if: steps.prepare.outputs.bundle == 'ok'
+      - name: probe the diagnostic venv under native PowerShell
+        id: probe_pwsh
+        if: steps.compile.outcome == 'success' && steps.prepare.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          $diagRoot = Join-Path $env:GITHUB_WORKSPACE "diagnostics"
+          $diagOutput = Join-Path $env:GITHUB_WORKSPACE "diagnostic-output"
+          & "$diagOutput\arm64_stdio_probe.exe" --python "$diagOutput\probe-env\Scripts\python.exe" --probe-script "$diagRoot\scripts\diagnose_arm64_stdio.py" --output "$diagOutput\evidence\probe-venv-pwsh.jsonl" --iterations 3
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: probe the same diagnostic venv under Git Bash
+        id: probe_bash
+        if: steps.compile.outcome == 'success' && steps.prepare.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          workspace_unix="$(cygpath -u "$GITHUB_WORKSPACE")"
+          "$workspace_unix/diagnostic-output/arm64_stdio_probe.exe" \
+            --python "$workspace_unix/diagnostic-output/probe-env/Scripts/python.exe" \
+            --probe-script "$workspace_unix/diagnostics/scripts/diagnose_arm64_stdio.py" \
+            --output "$workspace_unix/diagnostic-output/evidence/probe-venv-bash.jsonl" \
+            --iterations 3
+
+      - name: compare the base interpreter with the same diagnostic packages
+        id: probe_base
+        if: steps.compile.outcome == 'success' && steps.prepare.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          $diagRoot = Join-Path $env:GITHUB_WORKSPACE "diagnostics"
+          $diagOutput = Join-Path $env:GITHUB_WORKSPACE "diagnostic-output"
+          $basePython = Join-Path $env:pythonLocation "python.exe"
+          & "$diagOutput\arm64_stdio_probe.exe" --python $basePython --package-path "$diagOutput\probe-env\Lib\site-packages" --probe-script "$diagRoot\scripts\diagnose_arm64_stdio.py" --output "$diagOutput\evidence\probe-base-pwsh.jsonl" --iterations 3
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: run the original frozen dependency command once with verbose Actions logs
+        id: locked_sync
+        if: always() && steps.openssl.outcome == 'success' && steps.rust.outcome == 'success' && steps.uv.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 15
+        shell: bash
+        working-directory: candidate
+        run: |
+          workspace_unix="$(cygpath -u "$GITHUB_WORKSPACE")"
+          evidence="$workspace_unix/diagnostic-output/evidence"
+          mkdir -p "$evidence"
+          candidate_commit="$(git rev-parse HEAD)"
+          test "$candidate_commit" = "798026a8cb6af7cb45eedca4b2dec595ce4cb351"
+          git diff --exit-code HEAD --
+          set +e
+          uv sync --frozen --python python --extra release -vv
+          uv_status=$?
+          set -e
+          printf '{"uv_exit_code":%s,"logging":"ordinary_actions_job_log"}\n' "$uv_status" > "$evidence/locked-sync-result.json"
+          git diff --exit-code HEAD --
+          exit "$uv_status"
+
+      - name: retain bounded diagnostic evidence
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: one-link-continuous-build-${{ github.sha }}
-          path: out/
-          if-no-files-found: error
+          name: one-link-arm64-stdio-diagnostic-${{ github.run_id }}
+          # Explicit allowlist: no arbitrary uv output, environment, or cache.
+          path: |
+            diagnostic-output/evidence/preflight.json
+            diagnostic-output/evidence/probe-requirements.txt
+            diagnostic-output/evidence/probe-venv-pwsh.jsonl
+            diagnostic-output/evidence/probe-venv-bash.jsonl
+            diagnostic-output/evidence/probe-base-pwsh.jsonl
+            diagnostic-output/evidence/locked-sync-result.json
+          if-no-files-found: warn
           retention-days: 7
+
+      - name: preserve every probe and frozen-install failure
+        if: always()
+        shell: pwsh
+        env:
+          PREPARE_OUTCOME: ${{ steps.prepare.outcome }}
+          COMPILE_OUTCOME: ${{ steps.compile.outcome }}
+          PWSH_OUTCOME: ${{ steps.probe_pwsh.outcome }}
+          BASH_OUTCOME: ${{ steps.probe_bash.outcome }}
+          BASE_OUTCOME: ${{ steps.probe_base.outcome }}
+          SYNC_OUTCOME: ${{ steps.locked_sync.outcome }}
+        run: |
+          $outcomes = [ordered]@{
+            prepare = $env:PREPARE_OUTCOME
+            compile = $env:COMPILE_OUTCOME
+            probe_pwsh = $env:PWSH_OUTCOME
+            probe_bash = $env:BASH_OUTCOME
+            probe_base = $env:BASE_OUTCOME
+            original_frozen_sync = $env:SYNC_OUTCOME
+          }
+          $outcomes | ConvertTo-Json -Compress | Write-Output
+          $failed = @($outcomes.Values | Where-Object { $_ -ne "success" })
+          if ($failed.Count -ne 0) { throw "Diagnostic retained a failed or incomplete probe/build; inspect evidence" }

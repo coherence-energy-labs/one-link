@@ -169,6 +169,86 @@ def test_crafted_backport_verifies_offline_and_against_its_upstream_archive(craf
     assert report["inputs"]["workspace_manifests"] == ["ws/Cargo.toml"]
 
 
+@pytest.mark.parametrize("prefix,path", [
+    ("unchecked", "."),
+    ("unchecked/nested", ".."),
+    ("unchecked/nested", "../.."),
+])
+def test_unverified_self_or_ancestor_path_cannot_hide_a_tampered_workspace(crafted, tmp_path, prefix, path):
+    archive_path = tmp_path / "demo-1.0.0.crate"
+    _workspace(crafted, prefix, archive_path.read_bytes())
+    _write(crafted, f"{prefix}/vendor/demo-1.0.0/src/lib.rs", b"unreviewed bytes\n")
+    _write(crafted, f"{prefix}/Cargo.toml", WORKSPACE.replace(
+        "[patch.crates-io]", f'[patch.crates-io]\nunchecked = {{ path = "{path}" }}'))
+    _git(crafted, "add", "--all")
+    # The separate valid ws backport prevents an empty-package check from
+    # masking the exclusion bug: the bad workspace itself must be inspected.
+    code, report = verify(crafted, tmp_path, "--upstream-archive", f"demo@1.0.0={archive_path}")
+    assert code == 1 and report["status"] == "failed", report
+
+
+def test_unverified_sibling_paths_cannot_exclude_each_other(crafted, tmp_path):
+    for owner, target in (("one", "two"), ("two", "one")):
+        _write(crafted, f"{owner}/Cargo.toml",
+               f'[workspace]\n[patch.crates-io]\nunchecked = {{ path = "../{target}" }}\n')
+    _git(crafted, "add", "--all")
+    code, report = verify(crafted, tmp_path)
+    assert code == 1 and report["status"] == "failed", report
+    assert "self-containing or cyclic vendor exclusion" in report["error"]
+
+
+def _review_upstream_manifest(root: Path, manifest: bytes, archive_path: Path) -> None:
+    """Make an inactive dependency [patch] part of this synthetic upstream crate."""
+    archive = _archive({**UPSTREAM, "Cargo.toml": manifest})
+    archive_path.write_bytes(archive)
+    _write(root, "ws/vendor/demo-1.0.0/Cargo.toml", manifest)
+    proof = _provenance(archive)
+    for field in ("files", "upstream_files"):
+        proof[field]["Cargo.toml"] = _sha(manifest)
+    proof["source_tree_sha256"] = vendor.tree_hash(proof["files"])
+    proof["upstream"]["source_tree_sha256"] = vendor.tree_hash(proof["upstream_files"])
+    _write(root, "ws/patches/demo-1.0.0.json", json.dumps(proof))
+
+
+@pytest.mark.parametrize("hidden", ["tampered-source", "registry-lock"])
+def test_inactive_vendor_patch_cannot_hide_a_sibling_workspace(crafted, tmp_path, hidden):
+    archive_path = tmp_path / "demo-1.0.0.crate"
+    if hidden == "tampered-source":
+        _workspace(crafted, "unchecked", archive_path.read_bytes())
+        _write(crafted, "unchecked/vendor/demo-1.0.0/src/lib.rs", b"unreviewed bytes\n")
+    else:
+        _write(crafted, "unchecked/Cargo.toml", "[workspace]\n")
+        _write(crafted, "unchecked/Cargo.lock", LOCK + f'source = "{REGISTRY}"\n')
+    # This path is reviewed upstream data, but Cargo ignores it when demo is
+    # a dependency. It cannot confer trust on a separate workspace or lock.
+    _review_upstream_manifest(crafted, UPSTREAM["Cargo.toml"] +
+                              b'\n[patch.crates-io]\nunchecked = { path = "../../../unchecked" }\n',
+                              archive_path)
+    _git(crafted, "add", "--all")
+    code, report = verify(crafted, tmp_path, "--upstream-archive", f"demo@1.0.0={archive_path}")
+    assert code == 1 and report["status"] == "failed", report
+    expected = "vendored source differs" if hidden == "tampered-source" else "unchecked/Cargo.lock resolves"
+    assert expected in report["error"]
+
+
+def test_verified_vendor_is_excluded_even_when_its_manifest_sorts_before_its_owner(crafted, tmp_path):
+    archive_path = tmp_path / "demo-1.0.0.crate"
+    _review_upstream_manifest(crafted, UPSTREAM["Cargo.toml"] +
+                              b'\n[patch.crates-io]\nignored = { path = "unselected" }\n', archive_path)
+    (crafted / "ws").rename(crafted / "zzz")
+    (crafted / "zzz/vendor").rename(crafted / "aaa-vendor")
+    _write(crafted, "zzz/Cargo.toml", WORKSPACE.replace("vendor/demo-1.0.0", "../aaa-vendor/demo-1.0.0"))
+    proof_path = crafted / "zzz/patches/demo-1.0.0.json"
+    proof = json.loads(proof_path.read_text())
+    proof["package"]["path"] = "../aaa-vendor/demo-1.0.0"
+    proof_path.write_text(json.dumps(proof))
+    _git(crafted, "add", "--all")
+    code, report = verify(crafted, tmp_path, "--upstream-archive", f"demo@1.0.0={archive_path}")
+    assert code == 0, report
+    assert report["inputs"]["workspace_manifests"] == ["zzz/Cargo.toml"]
+    assert report["packages"][0]["upstream_archive_verified"] is True
+
+
 @pytest.mark.parametrize("name,content,message", [
     ("other/Cargo.toml", '[workspace]\n[patch.crates-io]\nfoo = { path = "foo" }\n', "provenance record"),
     ("other/Cargo.toml", '[workspace]\n[patch.crates-io]\nfoo = { git = "https://example.invalid/foo" }\n', "git patch"),

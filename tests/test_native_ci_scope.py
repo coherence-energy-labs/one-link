@@ -33,7 +33,7 @@ def repository(tmp_path):
     git(repo, "init", "-b", "main")
     git(repo, "config", "user.name", "Native CI fixture")
     git(repo, "config", "user.email", "native-ci@example.invalid")
-    for name in ("native/src/lib.rs", "docs/guide.md", "uv.lock"):
+    for name in ("native/ol_shell/src/lib.rs", "docs/guide.md", "uv.lock"):
         path = repo / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("baseline\n")
@@ -67,7 +67,7 @@ def dependencies(report):
                     "proof": json.dumps(scope.compact_proof(report))})
     needs = {"applicability": {"result": "success", "outputs": outputs}}
     for job in scope.WORK_JOBS[kind]:
-        success = report["applicable"] and (kind == "correctness" or
+        success = report["applicable"] and (kind != "performance" or
                    job == ("bench_gate" if report["event_name"] == "pull_request" else "drift_watch"))
         needs[job] = {"result": "success" if success else "skipped"}
     return needs
@@ -82,10 +82,10 @@ def decide(report, event, needs=None):
 @pytest.mark.parametrize("changes,applicable", [
     ({"docs/guide.md": "documentation\n"}, False),
     ({}, False),
-    ({"native/src/lib.rs": "changed code\n"}, True),
-    ({"native/src/lib.rs": None}, True),
-    ({"native/src/lib.rs": None, "docs/moved.rs": "baseline\n"}, True),
-    ({"native/src/space and newline.rs": "code\n"}, True),
+    ({"native/ol_shell/src/lib.rs": "changed code\n"}, True),
+    ({"native/ol_shell/src/lib.rs": None}, True),
+    ({"native/ol_shell/src/lib.rs": None, "docs/moved.rs": "baseline\n"}, True),
+    ({"native/ol_shell/src/space and newline.rs": "code\n"}, True),
     ({"uv.lock": "dependencies\n"}, True),
     ({"scripts/native_ci_scope.py": "policy\n"}, True),
 ])
@@ -103,7 +103,7 @@ def test_nul_diff_preserves_newline_paths_without_host_filename_restrictions(rep
     # Git can report paths created on another platform that Windows cannot
     # materialize. Exercise that raw diff contract without creating such a
     # filename; commit identity and ancestry checks still use the real repo.
-    path = "native/src/space and\nnewline.rs"
+    path = "native/ol_shell/src/space and\nnewline.rs"
     raw_diff = b"docs/guide.md\0" + path.encode("utf-8") + b"\0"
     real_git = scope._git
 
@@ -125,18 +125,46 @@ def test_nul_diff_preserves_newline_paths_without_host_filename_restrictions(rep
 
 def test_scope_inspects_the_entire_diff_without_github_path_filter_limits(repository):
     changes = {f"docs/note-{index:04}.md": "doc\n" for index in range(350)}
-    changes["native/src/lib.rs"] = "changed\n"
+    changes["native/ol_shell/src/lib.rs"] = "changed\n"
     _, report = candidate(repository, "performance", changes)
     assert report["changed_count"] == 351
-    assert report["matching_paths"] == ["native/src/lib.rs"]
+    assert report["matching_paths"] == ["native/ol_shell/src/lib.rs"]
     assert report["applicable"]
+
+
+@pytest.mark.parametrize("path", [
+    "native/ol_shell/Cargo.lock", "native/ol_shell/Cargo.toml", "native/ol_shell/src/main.rs",
+    "native/ol_shell/build.rs", "native/ol_shell/vendor/glib-0.18.5/src/variant_iter.rs",
+    "native/ol_shell/patches/glib-0.18.5.json", "native/ol_shell/regression/glib_variant_backport/src/lib.rs",
+    "src/one_link/web/index.html", "src/one_link/web/assets/one-glyph.ico",
+    "frontend/owner/main/transfer_facts.js", "scripts/build_owner_ui.py",
+    "scripts/build_native_shell.py", "scripts/build_binary.py", "scripts/smoke_native_shell.py",
+    "scripts/verify_vendor_patches.py", "scripts/audit_vendor_advisories.py",
+    ".gitattributes", ".cargo/config.toml", "native/.cargo/config.toml",
+    "rust-toolchain.toml", "native/rust-toolchain.toml", ".github/actions/toolchain/action.yml",
+    "pyproject.toml", "uv.lock", ".github/workflows/native_shell.yml",
+])
+def test_shell_scope_includes_build_ui_vendor_and_shared_execution_inputs(repository, path):
+    event, report = candidate(repository, "shell", {path: "changed input\n"})
+    assert report["applicable"] and report["matching_paths"] == [path]
+    assert "all applicable work succeeded" in decide(report, event)
+
+
+def test_shell_gate_requires_the_complete_declared_needs_object(repository):
+    event, report = candidate(repository, "shell", {"native/ol_shell/Cargo.lock": "lock\n"})
+    valid = dependencies(report)
+    assert set(valid) == {"applicability", "build"}
+    for altered in ({key: value for key, value in valid.items() if key != "build"},
+                    {**valid, "undeclared_shell_job": {"result": "success"}}):
+        with pytest.raises(scope.ScopeError, match="dependency"):
+            decide(report, event, altered)
 
 
 def test_real_merge_keeps_base_head_and_tested_candidate_distinct(repository):
     git(repository, "checkout", "-b", "feature")
     _, feature = candidate(repository, "performance", {"docs/guide.md": "feature docs\n"})
     git(repository, "checkout", "main")
-    _, main = candidate(repository, "performance", {"native/src/lib.rs": "base advanced\n"})
+    _, main = candidate(repository, "performance", {"native/ol_shell/src/lib.rs": "base advanced\n"})
     git(repository, "merge", "--no-ff", "feature", "-m", "test merge")
     merged = git(repository, "rev-parse", "HEAD")
     event = {"pull_request": {"base": {"sha": main["head_sha"]}, "head": {"sha": feature["head_sha"]}}}
@@ -177,10 +205,10 @@ def test_scope_failure_never_turns_skipped_jobs_into_a_passing_gate(repository, 
         decide(report, event, needs)
 
 
-@pytest.mark.parametrize("kind,job", [("correctness", "rust_workspace"), ("correctness", "python_binding"), ("performance", "bench_gate")])
+@pytest.mark.parametrize("kind,job", [("correctness", "rust_workspace"), ("correctness", "python_binding"), ("performance", "bench_gate"), ("shell", "build")])
 @pytest.mark.parametrize("result", ["failure", "cancelled", "skipped", None])
 def test_relevant_changes_require_every_work_job_success(repository, kind, job, result):
-    event, report = candidate(repository, kind, {"native/src/lib.rs": "changed\n"})
+    event, report = candidate(repository, kind, {"native/ol_shell/src/lib.rs": "changed\n"})
     needs = dependencies(report)
     needs[job]["result"] = result
     with pytest.raises(scope.ScopeError, match=f"{job} result"):
@@ -253,7 +281,7 @@ def test_scope_cli_retains_full_evidence_and_never_emits_clean_outputs_on_error(
     assert json.loads(evidence.read_text())["status"] == "error"
 
 
-@pytest.mark.parametrize("kind,filename", [("correctness", "native_build.yml"), ("performance", "native_bench_gate.yml")])
+@pytest.mark.parametrize("kind,filename", [("correctness", "native_build.yml"), ("performance", "native_bench_gate.yml"), ("shell", "native_shell.yml")])
 def test_every_pr_produces_exact_gate_and_preserves_required_work_dependencies(kind, filename):
     yaml = pytest.importorskip("yaml")
     spec = yaml.safe_load((ROOT / ".github/workflows" / filename).read_text())
@@ -281,8 +309,40 @@ def test_every_pr_produces_exact_gate_and_preserves_required_work_dependencies(k
                for step in job["steps"]) for job in jobs.values())
     if kind == "correctness":
         assert "rust_workspace" in jobs["python_binding"]["needs"]
-    else:
+    elif kind == "performance":
         assert "github.event_name == 'pull_request'" in jobs["bench_gate"]["if"]
         assert "github.event_name != 'pull_request'" in jobs["drift_watch"]["if"]
         commands = "\n".join(step.get("run", "") for step in jobs["bench_gate"]["steps"])
         assert 'test "$comparison_base" = "$COMPARISON_BASE"' in commands
+    else:
+        assert kind == "shell"
+        build = jobs["build"]
+        assert build["strategy"]["matrix"] == {"os": ["windows-latest", "ubuntu-latest", "macos-latest"]}
+        assert build["strategy"]["fail-fast"] is False
+        steps = build["steps"]
+        required = [
+            "verify the pinned owner page matches its canonical sources",
+            "verify reviewed vendor source and upstream patch",
+            "build the window", "the UI pin is baked into the binary",
+            "the window OPENS and LOADS the real interface",
+        ]
+        for name in required:
+            step = next(item for item in steps if item.get("name") == name)
+            assert "if" not in step
+        regression = next(item for item in steps if item.get("name") == "optimized GLib Variant iterator regression tests")
+        assert regression["if"] == "runner.os == 'Linux'"
+        assert "--locked --release" in regression["run"]
+        assert "-p ol_shell_glib_regression" in regression["run"]
+        assert any("--page owner --check" in item.get("run", "") for item in steps)
+        assert any("--fetch-upstream" in item.get("run", "") for item in steps)
+        assert any(item.get("if") == "always()" and "upload-artifact@" in item.get("uses", "") for item in steps)
+
+
+def test_desired_shell_context_is_producer_bound_and_documented():
+    policy = json.loads((ROOT / ".github/repository-policy.json").read_text(encoding="utf-8"))
+    checks = policy["required_status_checks"]
+    assert {"context": "native shell gate", "integration_id": 15368} in checks
+    assert len({check["context"] for check in checks}) == len(checks) == 10
+    documentation = (ROOT / "docs/REPOSITORY_POLICY.md").read_text(encoding="utf-8")
+    assert "`native shell gate`" in documentation
+    assert "must itself be observed on the exact intended candidate" in documentation

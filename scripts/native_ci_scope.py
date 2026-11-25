@@ -68,10 +68,37 @@ PATHS: dict[str, tuple[str, ...]] = {
         "scripts/native_ci_scope.py",
         "tests/test_native_ci_scope.py",
     ),
+    "shell": (
+        "native/ol_shell/**",
+        "src/one_link/web/**",
+        "frontend/owner/**",
+        "scripts/build_owner_ui.py",
+        "scripts/build_native_shell.py",
+        "scripts/build_binary.py",
+        "scripts/smoke_native_shell.py",
+        "scripts/verify_vendor_patches.py",
+        "scripts/audit_vendor_advisories.py",
+        "tests/test_vendor_patches.py",
+        "tests/test_vendor_advisories.py",
+        "tests/test_owner_ui_build.py",
+        "tests/test_delivery_evidence.py",
+        "pyproject.toml",
+        "uv.lock",
+        ".gitattributes",
+        ".cargo/**",
+        "native/.cargo/**",
+        "rust-toolchain*",
+        "native/rust-toolchain*",
+        ".github/actions/**",
+        ".github/workflows/native_shell.yml",
+        "scripts/native_ci_scope.py",
+        "tests/test_native_ci_scope.py",
+    ),
 }
 WORK_JOBS = {
     "correctness": ("rust_workspace", "python_binding"),
     "performance": ("bench_gate", "drift_watch"),
+    "shell": ("build",),
 }
 SCHEMA = "one-link-native-ci-scope/v1"
 
@@ -228,7 +255,7 @@ def gate_decision(
 
     expected_results = dict.fromkeys(WORK_JOBS[kind], "skipped")
     if applicable:
-        if kind == "correctness":
+        if kind != "performance":
             expected_results = dict.fromkeys(WORK_JOBS[kind], "success")
         else:
             selected = "bench_gate" if event_name == "pull_request" else "drift_watch"

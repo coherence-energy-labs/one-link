@@ -20,7 +20,8 @@
     {"context": "pip-audit + bandit + sbom", "integration_id": 15368},
     {"context": "RustSec cargo-audit", "integration_id": 15368},
     {"context": "native correctness gate", "integration_id": 15368},
-    {"context": "native performance gate", "integration_id": 15368}
+    {"context": "native performance gate", "integration_id": 15368},
+    {"context": "native shell gate", "integration_id": 15368}
   ],
   "qualification": "This file describes the desired policy; only a fresh authenticated ruleset API readback proves enforcement. Required contexts must be observed on an exact candidate commit before activation."
 }

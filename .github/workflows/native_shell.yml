@@ -17,26 +17,40 @@
 # usable. Proving the UI *runs* needs a live daemon and authenticated API traffic; that heavier
 # experiment has been done on Windows only. A green run here is the sentence above and nothing more.
 
+# Every PR emits native shell gate. Only a verified source diff can mark the
+# three-OS matrix not applicable; failed scope or skipped required work blocks.
 name: native shell builds
 
 on:
+  pull_request:
   push:
     branches: [master]
     paths:
-      - 'native/ol_shell/**'
-      - 'src/one_link/web/index.html'      # the pin's input: a change here must rebuild
-      - '.github/workflows/native_shell.yml'
-      - '.gitattributes'
-      - 'scripts/verify_vendor_patches.py'
-      - 'scripts/audit_vendor_advisories.py'
-  pull_request:
-    paths:
-      - 'native/ol_shell/**'
-      - 'src/one_link/web/index.html'
-      - '.github/workflows/native_shell.yml'
-      - '.gitattributes'
-      - 'scripts/verify_vendor_patches.py'
-      - 'scripts/audit_vendor_advisories.py'
+      - "native/ol_shell/**"
+      - "src/one_link/web/**"
+      - "frontend/owner/**"
+      - "scripts/build_owner_ui.py"
+      - "scripts/build_native_shell.py"
+      - "scripts/build_binary.py"
+      - "scripts/smoke_native_shell.py"
+      - "scripts/verify_vendor_patches.py"
+      - "scripts/audit_vendor_advisories.py"
+      - "tests/test_vendor_patches.py"
+      - "tests/test_vendor_advisories.py"
+      - "tests/test_owner_ui_build.py"
+      - "tests/test_delivery_evidence.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".gitattributes"
+      - ".cargo/**"
+      - "native/.cargo/**"
+      - "rust-toolchain*"
+      - "native/rust-toolchain*"
+      - ".github/actions/**"
+      - ".github/workflows/native_shell.yml"
+      - "scripts/native_ci_scope.py"
+      - "tests/test_native_ci_scope.py"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -46,8 +60,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  applicability:
+    name: native shell applicability
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      applicable: ${{ steps.scope.outputs.applicable }}
+      checkout_sha: ${{ steps.scope.outputs.checkout_sha }}
+      base_sha: ${{ steps.scope.outputs.base_sha }}
+      head_sha: ${{ steps.scope.outputs.head_sha }}
+      comparison_base_sha: ${{ steps.scope.outputs.comparison_base_sha }}
+      proof: ${{ steps.scope.outputs.proof }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify source identities and classify the complete diff
+        id: scope
+        run: python scripts/native_ci_scope.py scope --kind shell --report native-scope.json
+      - name: Preserve applicability evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-shell-scope-${{ github.run_id }}-${{ github.run_attempt }}
+          path: native-scope.json
+          if-no-files-found: warn
+
   build:
     name: ol_shell / ${{ matrix.os }}
+    needs: applicability
+    if: needs.applicability.outputs.applicable == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false          # one platform's break must not hide another's
@@ -56,6 +100,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.applicability.outputs.checkout_sha }}
           # Without this, checkout leaves the job's token in `.git/config` on the runner, where
           # any later step -- or an uploaded artifact -- can carry it off. This job only needs to
           # READ the tree to compile it. Matches every other workflow in this repo.
@@ -65,6 +110,9 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
+
+      - name: verify the pinned owner page matches its canonical sources
+        run: python scripts/build_owner_ui.py --page owner --check
 
       - name: install Rust toolchain
         shell: bash
@@ -160,3 +208,19 @@ jobs:
           name: native-shell-qualification-${{ matrix.os }}
           path: test-results/
           if-no-files-found: warn
+
+  aggregate:
+    name: native shell gate
+    if: always()
+    needs: [applicability, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require applicable work or a verified not-applicable diff
+        env:
+          NATIVE_CI_NEEDS: ${{ toJSON(needs) }}
+        run: python scripts/native_ci_scope.py gate --kind shell

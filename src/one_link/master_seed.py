@@ -528,6 +528,11 @@ def provision_seed_before_derived_authority(
             raise KeyMaterialIntegrityError(
                 "new data root key does not match the master seed"
             )
+    # Passphrase-mode recovery has one additional authority artifact. Publish
+    # it while the daemon still owns the bootstrap instance lock, before the
+    # observational convergence check and before opening application state.
+    # Existing envelopes are verified, never silently rebound by this step.
+    lockbox.prepare_bootstrap_recovery_envelope(root, seed=seed)
     return seed, created
 
 

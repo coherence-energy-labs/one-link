@@ -737,6 +737,59 @@ def requires_legacy_passphrase_recovery(data_dir: Path) -> bool:
     return artifact_exists(root / SALT_FILENAME, label="lockbox KDF salt")
 
 
+def prepare_bootstrap_recovery_envelope(data_dir: Path, *, seed: bytes) -> bool:
+    """Complete a new install's passphrase envelope before authority checks.
+
+    The daemon owns its instance lock while calling this.  This mutation is
+    deliberately separate from ``recovery_envelope_matches_seed``: inspection
+    remains read-only, and an existing envelope is never repaired or rebound
+    merely to make a startup check pass.  Atomic create plus the envelope lock
+    makes interrupted first boots replayable with the original seed and salt.
+
+    Existing application data without an envelope needs explicit migration.
+    In particular, setting a passphrase on a previously silent installation
+    must not replace the key that already encrypts its rows.
+    """
+    if not isinstance(seed, (bytes, bytearray)) or len(seed) != 32:
+        raise ValueError("seed must be 32 bytes")
+    from one_link.key_material import artifact_exists
+
+    root = Path(data_dir)
+    with _envelope_mutation_lock(root):
+        envelope = _load_envelope(root)
+        if envelope is None:
+            passphrase = os.environ.get(PASSPHRASE_ENV, "")
+            if not passphrase:
+                return False
+            for filename in ("state.db", "state.db-wal", "state.db-shm"):
+                if artifact_exists(root / filename, label="application database"):
+                    raise KeyMaterialProtectionError(
+                        "passphrase recovery envelope is missing for existing "
+                        "application data; explicit recovery migration is required"
+                    )
+            salt = load_or_create_salt(root)
+            dek = _derive_legacy_passphrase_dek(passphrase.encode("utf-8"), salt)
+            envelope = _publish_new_envelope(
+                root,
+                _new_envelope(
+                    dek=dek,
+                    salt=salt,
+                    passphrase_key=_passphrase_wrap_key(dek),
+                    seed=bytes(seed),
+                ),
+            )
+        recovered = _decrypt_dek_slot(
+            envelope,
+            wrapping_key=_seed_wrap_key(bytes(seed)),
+            seed_slot=True,
+        )
+        if recovered is None:
+            raise KeyMaterialIntegrityError(
+                "persisted lockbox DEK envelope does not match the master seed"
+            )
+        return True
+
+
 def ensure_recovery_envelope_for_backup(data_dir: Path, *, seed: bytes) -> bool:
     """Ensure passphrase-mode application rows are portable in a backup.
 

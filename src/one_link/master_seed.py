@@ -578,6 +578,17 @@ def provision_seed_before_derived_authority(
             return None, False
         seed, created = load_or_create_seed(root, identity_path=id_path)
 
+    # A passphrase-protected installation started without its passphrase, or
+    # with a wrong one, refuses here: before the identity is read (reading it
+    # re-encrypts a cleartext identity under whatever passphrase is set) and
+    # before State could fall back to running without persistence.
+    # An unfinished data-key migration is reported first: mid-migration the
+    # identity file may be under either protection.
+    refusal = lockbox.data_key_migration_refusal(root) or lockbox.passphrase_startup_refusal(
+        root, probe_database=True,
+    )
+    if refusal is not None:
+        raise refusal
     identity_match = identity.identity_file_matches_seed(id_path, seed)
     if identity_match is False:
         raise KeyMaterialIntegrityError(

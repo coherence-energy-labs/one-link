@@ -1297,7 +1297,17 @@ class State:
         from one_link import keychain as _kc
         from one_link import state_encryption as _se
 
+        from one_link import lockbox as _lockbox
+
         _kc.adopt_recovery_passphrase_for_database(Path(self.db_path))
+        # A passphrase-protected database started without its passphrase:
+        # refuse before the keychain mints a database key that opens nothing.
+        # KeyMaterialError: Daemon.start refuses instead of running stateless.
+        refusal = _lockbox.passphrase_startup_refusal(
+            Path(self.db_path).parent, probe_database=False,
+        )
+        if refusal is not None:
+            raise refusal
         passphrase = _kc.ensure_passphrase()
         # Stash for run_deferred_integrity_check(), which opens its OWN
         # read connection (so the multi-second check never blocks the
@@ -1360,6 +1370,11 @@ class State:
             # silently swapping the file for a plaintext one would
             # corrupt the user's data.
             if state == "encrypted":
+                refusal = _lockbox.passphrase_startup_refusal(
+                    Path(self.db_path).parent, probe_database=True,
+                )
+                if refusal is not None:
+                    raise refusal from e
                 raise RuntimeError(
                     f"state.db is encrypted but the current passphrase "
                     f"can't decrypt it. The most likely cause: the "

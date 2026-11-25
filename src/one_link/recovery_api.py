@@ -2452,11 +2452,12 @@ DATA_KEY_MIGRATION_INTENT_VERSION = 1
 MIGRATION_FAULT_POINTS = {
     "set_passphrase": (
         "intent_written", "staged", "files_carried", "fields_carried",
-        "database_rekeyed", "published", "verified",
+        "database_rekeyed", "identity_protected", "published", "verified",
     ),
     "remove_passphrase": (
         "intent_written", "files_carried", "fields_carried",
-        "database_rekeyed", "retired", "verified", "discarded",
+        "database_rekeyed", "identity_unprotected", "retired", "verified",
+        "discarded",
     ),
 }
 
@@ -2669,6 +2670,25 @@ def _require_converged(root: Path, *, id_path: Path, seed: bytes, passphrase: Op
         raise DataKeyMigrationError(f"verification failed: authority evidence {evidence}")
 
 
+def _store_identity(id_path: Path, seed: bytes, *, passphrase: Optional[str]) -> None:
+    """Re-store the seed-derived identity under ``passphrase`` (None: cleartext).
+
+    Deterministic from the seed and atomically replaced with read-back, so a
+    replay re-stores the same bytes' meaning; the caller proves convergence.
+    """
+    from one_link import identity
+
+    if passphrase:
+        identity.store_seed_derived_identity(
+            id_path, seed, passphrase=passphrase.encode("utf-8"),
+        )
+        return
+    # Cleartext is requested as "no passphrase", with the environment's
+    # passphrase scoped away (an empty one is a password to the PEM reader).
+    with _passphrase_environment(None):
+        identity.store_seed_derived_identity(id_path, seed)
+
+
 def _probe_same_key(box: Any, data_key: bytes, *, what: str) -> None:
     from one_link import lockbox
 
@@ -2770,6 +2790,12 @@ def _migrate_data_key(
                 current_mode_passphrase = (
                     passphrase if lockbox._load_envelope(root) is not None else None
                 )
+                if current_mode_passphrase is not None:
+                    # Prove the passphrase against the envelope first: an exact
+                    # AES-GCM verdict, before anything decodes with it.
+                    lockbox.open_live_passphrase_envelope(
+                        root, passphrase=passphrase, seed=seed,
+                    )
                 with _passphrase_environment(current_mode_passphrase):
                     evidence = _converged_evidence(root, id_path=id_path, seed=seed)
                 # The one unconverged state this command repairs: seeded legacy
@@ -2838,6 +2864,7 @@ def _set_passphrase_steps(
                     lockbox.acquire_lockbox(root), legacy_key, what="acquire_lockbox",
                 )
             _verify_under(root, data_key=legacy_key, seed=seed, database_keys=[passphrase])
+            _store_identity(id_path, seed, passphrase=passphrase)
             _require_converged(root, id_path=id_path, seed=seed, passphrase=passphrase)
             return {"changed": True, "mode": "passphrase", "legacy_envelope": True}
         _preflight(
@@ -2880,6 +2907,11 @@ def _set_passphrase_steps(
         db_path, source_keys=[stored_key], target_key=passphrase,
     )
     step("database_rekeyed")
+    # The identity file is the third passphrase-keyed artifact: protect it now
+    # rather than leave it to the daemon's first start, which would encrypt it
+    # under whatever passphrase that start happened to have.
+    _store_identity(id_path, seed, passphrase=passphrase)
+    step("identity_protected")
     _verify_under(root, data_key=target, seed=seed, database_keys=[passphrase])
     lockbox.publish_staged_passphrase_envelope(
         root, passphrase=passphrase, seed=seed, expected_dek=target,
@@ -2981,6 +3013,11 @@ def _remove_passphrase_steps(
         db_path, source_keys=[passphrase], target_key=target_db_key,
     )
     step("database_rekeyed")
+    # A silent install's identity file is cleartext (seed-derived, ACL- and
+    # DPAPI-scoped like the seed): left encrypted, the next start, without the
+    # passphrase, could not read it.
+    _store_identity(id_path, seed, passphrase=None)
+    step("identity_unprotected")
     _verify_under(root, data_key=silent_key, seed=seed, database_keys=[target_db_key])
     if previous is not None:
         lockbox.retire_passphrase_envelope(

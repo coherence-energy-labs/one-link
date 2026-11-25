@@ -646,6 +646,18 @@ def data_key_migration_in_progress(data_dir: Path) -> Optional[str]:
     return kind
 
 
+def data_key_migration_refusal(data_dir: Path) -> Optional[KeyMaterialProtectionError]:
+    """The refusal every key consumer gives while a migration is unfinished."""
+    kind = data_key_migration_in_progress(data_dir)
+    if kind is None:
+        return None
+    return KeyMaterialProtectionError(
+        f"a data-key migration ({kind.replace('_', '-')}) is unfinished on "
+        "this installation; nothing may use the data key until it completes. "
+        f"Run `{MIGRATION_COMMANDS[kind]}` again to finish it"
+    )
+
+
 @contextmanager
 def _envelope_mutation_lock(
     data_dir: Path,
@@ -685,14 +697,9 @@ def _envelope_mutation_lock(
         held.depth, held.purpose = 1, purpose
         try:
             if not migration:
-                kind = data_key_migration_in_progress(root)
-                if kind is not None:
-                    raise KeyMaterialProtectionError(
-                        f"a data-key migration ({kind.replace('_', '-')}) is "
-                        "unfinished on this installation; nothing may use the "
-                        "data key until it completes. Run "
-                        f"`{MIGRATION_COMMANDS[kind]}` again to finish it"
-                    )
+                refusal = data_key_migration_refusal(root)
+                if refusal is not None:
+                    raise refusal
             yield
         finally:
             held.depth, held.purpose = 0, ""
@@ -1009,7 +1016,10 @@ def _existing_data_refusal(
     re-wraps every protected artifact and field under the new key.
     """
     if seeded:
-        remedy = "stop One Link and run `one-link recovery set-passphrase`"
+        remedy = (
+            "start One Link without ONE_LINK_PASSPHRASE, or stop it and run "
+            "`one-link recovery set-passphrase`"
+        )
     else:
         remedy = (
             "this installation has no recovery seed: stop One Link, run "
@@ -1865,6 +1875,72 @@ def retire_passphrase_envelope(
         _durable_rename(live, root / RETIRED_ENVELOPE_FILENAME)
     if artifact_exists(root / SALT_FILENAME, label="lockbox KDF salt"):
         _durable_rename(root / SALT_FILENAME, root / RETIRED_SALT_FILENAME)
+
+
+def passphrase_startup_refusal(
+    data_dir: Path, *, probe_database: bool,
+) -> Optional[KeyMaterialProtectionError]:
+    """Why this process cannot open a passphrase-protected installation.
+
+    ``None`` means "not this case": the caller keeps its ordinary behaviour.
+    Read-only; never mints, rewraps or migrates anything.
+
+    * ``probe_database=True`` -- the daemon's bootstrap, before the identity
+      file is read (identity.load_or_create re-encrypts a cleartext identity
+      under whatever passphrase is set, so a wrong one must be refused
+      first), and State after its encrypted open failed.
+    * ``probe_database=False`` -- State before the keychain could mint a
+      database key: the cheap check, no KDF and no database open.
+
+    What it proves: a live DEK envelope exists (only a passphrase ever
+    creates one) and state.db is SQLCipher.  With ONE_LINK_PASSPHRASE set,
+    whether it authenticates the envelope's passphrase slot -- AES-GCM,
+    independent of the database, so a wrong passphrase is exact and a right
+    one hands any later failure back to the caller.  Without it, whether a
+    stored database key exists and (probing) opens state.db.  It cannot tell
+    a database keyed by the passphrase from a damaged one; both start by
+    supplying the passphrase.  A restored passphrase bundle whose database
+    key recovery adopted into the keychain opens with that key and is never
+    refused.  An installation without an envelope is never refused here.
+    """
+    root = Path(data_dir)
+    envelope = _load_envelope(root)
+    if envelope is None:
+        return None
+    from one_link import keychain, state_encryption
+
+    database = root / "state.db"
+    if state_encryption.detect_db_state(database) != "encrypted":
+        return None
+    fixes = (
+        "set ONE_LINK_PASSPHRASE to the passphrase that protects it, or run "
+        "`one-link recovery remove-passphrase` (which needs that passphrase)"
+    )
+    passphrase = os.environ.get(PASSPHRASE_ENV, "")
+    if passphrase:
+        if not probe_database:
+            return None
+        salt = _read_salt_file(root / SALT_FILENAME, label="lockbox KDF salt")
+        if salt is None:
+            return None  # cannot be checked here; acquire_lockbox re-salts
+        opened, _key = _passphrase_envelope_candidate(
+            envelope, passphrase=passphrase, salt=salt,
+        )
+        if opened is not None:
+            return None
+        return KeyMaterialProtectionError(
+            "ONE_LINK_PASSPHRASE is not the passphrase that protects this "
+            f"installation, so its state database cannot be opened; {fixes}"
+        )
+    stored = keychain._configured_passphrase_at(root)  # environment unset; never mints
+    if stored is not None and (
+        not probe_database or state_encryption.database_accepts_passphrase(database, stored)
+    ):
+        return None
+    return KeyMaterialProtectionError(
+        "this installation is protected by a passphrase and was started "
+        f"without ONE_LINK_PASSPHRASE, so its state database cannot be opened; {fixes}"
+    )
 
 
 def holds_data_key(box: "LockBox", data_key: bytes) -> bool:

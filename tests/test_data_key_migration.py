@@ -180,7 +180,14 @@ def test_silent_to_passphrase_to_silent_keeps_everything_readable(monkeypatch):
     assert not state_encryption.database_accepts_passphrase(root / "state.db", database_key)
     assert lockbox.recovery_envelope_matches_seed(root, seed) is True
     assert master_seed.load_seed(root) == phrase_seed
-    assert paths.key_path().read_bytes() == identity_before
+    # The same identity, now stored under the passphrase: a first start with a
+    # wrong passphrase can no longer be the one that encrypts it.
+    assert paths.key_path().read_bytes() != identity_before
+    assert identity.identity_file_matches_seed(
+        paths.key_path(), seed, passphrase=PASSPHRASE,
+    ) is True
+    with pytest.raises(Exception, match="could not be decoded"):
+        identity.identity_file_matches_seed(paths.key_path(), seed, passphrase="wrong")
     assert _undecryptable_everything(
         monkeypatch, root, seed, written, passphrase=PASSPHRASE,
     ) == []
@@ -198,6 +205,9 @@ def test_silent_to_passphrase_to_silent_keeps_everything_readable(monkeypatch):
     assert not (root / lockbox.SALT_FILENAME).exists()
     assert state_encryption.database_accepts_passphrase(root / "state.db", database_key)
     assert master_seed.load_seed(root) == phrase_seed
+    # Back to cleartext: a start without the passphrase reads it.
+    assert b"ENCRYPTED" not in paths.key_path().read_bytes()
+    assert identity.identity_file_matches_seed(paths.key_path(), seed) is True
     assert _undecryptable_everything(monkeypatch, root, seed, written, passphrase=None) == []
 
 

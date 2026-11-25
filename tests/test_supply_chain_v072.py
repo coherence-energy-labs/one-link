@@ -625,8 +625,8 @@ def test_rolling_archives_have_noncolliding_archive_sidecars():
 
 
 @pytest.mark.parametrize("runner", ["ubuntu-latest", "macos-latest"])
-@pytest.mark.parametrize("helper_present", [True, False])
-def test_continuous_zip_step_preserves_stamps_and_framework_links(tmp_path, runner, helper_present):
+@pytest.mark.parametrize("helper_kind", ["file", "missing", "directory", "symlink"])
+def test_continuous_zip_step_preserves_stamps_and_framework_links(tmp_path, runner, helper_kind):
     """Archive the finalized layout, including its helper and framework chain."""
     import hashlib
     import os
@@ -669,8 +669,13 @@ def test_continuous_zip_step_preserves_stamps_and_framework_links(tmp_path, runn
     executable.write_bytes(b"launcher fixture")
     executable.chmod(0o755)
     helper = executable.with_name("one-link-update-helper")
-    if helper_present:
+    if helper_kind == "file":
         helper.write_bytes(b"required finished helper")
+    elif helper_kind == "directory":
+        helper.mkdir()
+        (helper / "not-a-helper").write_bytes(b"directory with content")
+    elif helper_kind == "symlink":
+        helper.symlink_to(executable.name)
     stamp = runtime / "one_link_build_stamp.json"
     stamp.write_text(json.dumps({"schema": 1, "commit": "a" * 40, "channel": "rolling"}))
     if runner == "macos-latest":
@@ -703,7 +708,7 @@ def test_continuous_zip_step_preserves_stamps_and_framework_links(tmp_path, runn
                     for key, value in current["env"].items()}
         completed = subprocess.run(["bash", "-c", current["run"]], cwd=tmp_path, env=env | step_env,
                                    text=True, capture_output=True, check=False)
-        if step_name == step["name"] and not helper_present:
+        if step_name == step["name"] and helper_kind != "file":
             assert completed.returncode != 0
             assert not (tmp_path / "dist" / (matrix["artifact-name"] + ".zip")).exists()
             return

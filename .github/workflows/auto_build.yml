@@ -349,6 +349,7 @@ jobs:
           # Refuse an unfinalized intermediate without the external updater.
           helper="${BUNDLE_PATH}/$(dirname "${EXE_NAME}")/one-link-update-helper"
           if [[ "${EXE_NAME}" == *.exe ]]; then helper="${helper}.exe"; fi
+          test -f "${helper}"
           test -s "${helper}"
           test ! -L "${helper}"
           SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"

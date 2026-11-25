@@ -7,7 +7,9 @@ name: file-engine v2 bench gate
 
 on:
   pull_request:
-    paths: &benchmark_paths
+  push:
+    branches: [master]
+    paths:
       - "native/**"
       - "src/one_link/*native.py"
       - "src/one_link/native_cdc.py"
@@ -21,9 +23,8 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/native_bench_gate.yml"
-  push:
-    branches: [master]
-    paths: *benchmark_paths
+      - "scripts/native_ci_scope.py"
+      - "tests/test_native_ci_scope.py"
   workflow_dispatch:
 
 permissions:
@@ -34,14 +35,44 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  applicability:
+    name: native performance applicability
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      applicable: ${{ steps.scope.outputs.applicable }}
+      checkout_sha: ${{ steps.scope.outputs.checkout_sha }}
+      base_sha: ${{ steps.scope.outputs.base_sha }}
+      head_sha: ${{ steps.scope.outputs.head_sha }}
+      comparison_base_sha: ${{ steps.scope.outputs.comparison_base_sha }}
+      proof: ${{ steps.scope.outputs.proof }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify source identities and classify the complete diff
+        id: scope
+        run: python scripts/native_ci_scope.py scope --kind performance --report native-scope.json
+      - name: Preserve applicability evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-performance-scope-${{ github.run_id }}-${{ github.run_attempt }}
+          path: native-scope.json
+          if-no-files-found: warn
+
   bench_gate:
     name: native file-engine benchmark gate
-    if: github.event_name == 'pull_request'
+    needs: applicability
+    if: needs.applicability.outputs.applicable == 'true' && github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.applicability.outputs.checkout_sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Install Rust
@@ -60,10 +91,12 @@ jobs:
           workspaces: native
       - name: Prepare merge-base source without replacing candidate checkout
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ needs.applicability.outputs.base_sha }}
+          COMPARISON_BASE: ${{ needs.applicability.outputs.comparison_base_sha }}
           BASE_ROOT: ${{ runner.temp }}/one-link-bench-base
         run: |
           comparison_base="$(git merge-base HEAD "$BASE_SHA")"
+          test "$comparison_base" = "$COMPARISON_BASE"
           git worktree add --detach "$BASE_ROOT" "$comparison_base"
       - name: Install and build candidate artifact
         run: |
@@ -107,12 +140,14 @@ jobs:
 
   drift_watch:
     name: native throughput drift on master
-    if: github.event_name != 'pull_request'
+    needs: applicability
+    if: needs.applicability.outputs.applicable == 'true' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.applicability.outputs.checkout_sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Install Rust
@@ -174,3 +209,19 @@ jobs:
           name: bench-drift-${{ github.run_id }}-${{ github.run_attempt }}
           path: bench-results/
           if-no-files-found: warn
+
+  aggregate:
+    name: native performance gate
+    if: always()
+    needs: [applicability, bench_gate, drift_watch]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require applicable work or a verified not-applicable diff
+        env:
+          NATIVE_CI_NEEDS: ${{ toJSON(needs) }}
+        run: python scripts/native_ci_scope.py gate --kind performance

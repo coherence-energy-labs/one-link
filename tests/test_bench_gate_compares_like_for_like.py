@@ -136,8 +136,9 @@ def test_paired_runner_preserves_virtual_environment_python_symlink(tmp_path):
 def test_workflows_build_separately_and_require_complete_paired_evidence():
     yaml = pytest.importorskip("yaml")
     spec = yaml.safe_load(WORKFLOW.read_text())
-    assert set(spec["jobs"]) == {"bench_gate", "drift_watch"}
-    for job in spec["jobs"].values():
+    assert set(spec["jobs"]) == {"applicability", "bench_gate", "drift_watch", "aggregate"}
+    for name in ("bench_gate", "drift_watch"):
+        job = spec["jobs"][name]
         runs = "\n".join(step.get("run", "") for step in job["steps"])
         assert "git worktree add --detach" in runs
         assert "git checkout --force" not in runs
@@ -147,10 +148,12 @@ def test_workflows_build_separately_and_require_complete_paired_evidence():
         assert "bench_baselines/native_chunk.json" not in runs
         assert any(step.get("if") == "always()" and "upload-artifact@" in step.get("uses", "") for step in job["steps"])
     events = spec.get("on", spec.get(True))
-    for event in ("pull_request", "push"):
-        patterns = events[event]["paths"]
-        for changed in ("scripts/bench_gate.py", "scripts/bench_paired_native.py", "src/one_link/aead_native.py", "src/one_link/quic_native.py", "src/one_link/wal_native.py", "src/one_link/chunk_store_native.py", "src/one_link/benchmark_contract.py", "uv.lock"):
-            assert any(bench_gate.fnmatch.fnmatchcase(changed, pattern) for pattern in patterns), changed
+    # PRs always emit the required aggregate. The explicit, tested diff scope
+    # uses the same policy as this master push filter (test_native_ci_scope.py).
+    assert "pull_request" in events and not events["pull_request"]
+    patterns = events["push"]["paths"]
+    for changed in ("scripts/bench_gate.py", "scripts/bench_paired_native.py", "src/one_link/aead_native.py", "src/one_link/quic_native.py", "src/one_link/wal_native.py", "src/one_link/chunk_store_native.py", "src/one_link/benchmark_contract.py", "uv.lock"):
+        assert any(bench_gate.fnmatch.fnmatchcase(changed, pattern) for pattern in patterns), changed
 
 
 def test_json_cli_returns_nonzero_for_the_original_audit_fixture(tmp_path):

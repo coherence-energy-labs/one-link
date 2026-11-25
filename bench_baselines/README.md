@@ -2,6 +2,20 @@
 
 ## Relative native component gate
 
+Every pull request emits the stable `native correctness gate` and `native
+performance gate` contexts. A cheap applicability job verifies the event's
+base/head commits and the exact tested merge commit, then inspects the complete
+source diff. Native work runs for the reviewed implementation, dependency,
+benchmark and workflow paths in `scripts/native_ci_scope.py`. Unrelated
+documentation changes can pass the aggregate with an explicit, preserved
+not-applicable diff proof. Missing scope evidence, failed classification or
+skipped applicable work fails the aggregate. Each scope artifact retains all
+changed paths and source identities; native jobs use that exact checkout.
+Master pushes retain path filters; manual runs always execute native work.
+These emitted contexts are suitable for required checks; repository enforcement
+must be verified separately from the authenticated ruleset, not inferred from
+the presence of a workflow.
+
 The `file-engine v2 bench gate` builds the candidate and comparison revision
 into **separate virtual environments**. For a pull request the comparison is
 the merge base; on master it is the commit in `DRIFT_ANCHOR`. Both native

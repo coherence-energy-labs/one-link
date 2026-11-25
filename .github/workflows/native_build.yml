@@ -4,13 +4,14 @@
 # `maturin develop --release` succeeds on Linux + macOS + Windows in CI;
 # all test crates import without error; pyo3 binding integration tests pass.
 #
-# This workflow runs on every PR that touches `native/`, `src/one_link/chunk_native.py`,
-# or `tests/test_chunk_native_*.py`. Expand the path filter as new native
-# crates ship (one_link.aead_native.py, etc.).
+# Every PR receives the native correctness gate. A verified complete source
+# diff determines whether the native matrix is applicable. Missing scope
+# evidence or skipped required work fails the aggregate; see native_ci_scope.py.
 
 name: file-engine v2 native build
 
 on:
+  pull_request:
   push:
     branches: [master]
     paths:
@@ -37,33 +38,12 @@ on:
       - "tests/test_chunk_store_native_*.py"
       - "tests/test_quic_native_*.py"
       - "tests/unit/test_phase_c3_native_smoke.py"
+      - "pyproject.toml"
+      - "uv.lock"
       - ".github/workflows/native_build.yml"
-  pull_request:
-    paths:
-      - "native/**"
-      - "src/one_link/web/assets/argon2id-v1.wasm"
-      - "src/one_link/web/assets/argon2id-worker.js"
-      - "src/one_link/web/assets/ed25519-v1.wasm"
-      - "scripts/verify_browser_argon2_wasm.py"
-      - "scripts/verify_browser_ed25519_wasm.py"
-      - "tests/test_browser_argon2_identity.py"
-      - "tests/test_browser_ed25519_identity.py"
-      - "src/one_link/chunk_native.py"
-      - "src/one_link/aead_native.py"
-      - "src/one_link/wal_native.py"
-      - "src/one_link/chunk_store_native.py"
-      - "src/one_link/quic_native.py"
-      - "src/one_link/perf_lab_native.py"
-      - "src/one_link/capability_native.py"
-      - "src/one_link/crdt_native.py"
-      - "src/one_link/hwkey_native.py"
-      - "tests/test_chunk_native_*.py"
-      - "tests/test_aead_native_*.py"
-      - "tests/test_wal_native_*.py"
-      - "tests/test_chunk_store_native_*.py"
-      - "tests/test_quic_native_*.py"
-      - "tests/unit/test_phase_c3_native_smoke.py"
-      - ".github/workflows/native_build.yml"
+      - "scripts/native_ci_scope.py"
+      - "tests/test_native_ci_scope.py"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -73,8 +53,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  applicability:
+    name: native correctness applicability
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      applicable: ${{ steps.scope.outputs.applicable }}
+      checkout_sha: ${{ steps.scope.outputs.checkout_sha }}
+      base_sha: ${{ steps.scope.outputs.base_sha }}
+      head_sha: ${{ steps.scope.outputs.head_sha }}
+      comparison_base_sha: ${{ steps.scope.outputs.comparison_base_sha }}
+      proof: ${{ steps.scope.outputs.proof }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify source identities and classify the complete diff
+        id: scope
+        run: python scripts/native_ci_scope.py scope --kind correctness --report native-scope.json
+      - name: Preserve applicability evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-correctness-scope-${{ github.run_id }}-${{ github.run_attempt }}
+          path: native-scope.json
+          if-no-files-found: warn
+
   rust_workspace:
     name: cargo test (workspace)
+    needs: applicability
+    if: needs.applicability.outputs.applicable == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -88,6 +98,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.applicability.outputs.checkout_sha }}
           persist-credentials: false
 
       - name: Install Rust toolchain
@@ -155,7 +166,8 @@ jobs:
 
   python_binding:
     name: maturin build + python tests
-    needs: rust_workspace
+    needs: [applicability, rust_workspace]
+    if: needs.applicability.outputs.applicable == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -174,6 +186,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.applicability.outputs.checkout_sha }}
           persist-credentials: false
 
       - name: Install Rust
@@ -221,3 +234,19 @@ jobs:
         run: |
           uv run --frozen --extra dev --extra release python -c "from one_link.perf_lab_native import run_full_suite, render_report; \
             print(render_report(run_full_suite(size_mib=8, include_legacy=False)))"
+
+  aggregate:
+    name: native correctness gate
+    if: always()
+    needs: [applicability, rust_workspace, python_binding]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require applicable work or a verified not-applicable diff
+        env:
+          NATIVE_CI_NEEDS: ${{ toJSON(needs) }}
+        run: python scripts/native_ci_scope.py gate --kind correctness

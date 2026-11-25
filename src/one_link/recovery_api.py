@@ -1811,11 +1811,20 @@ def complete_pending_recovery(
                     overwrite=bool(intent.get("overwrite_files", True)),
                 )
 
+            from one_link import state as _state
+
             master_seed.install_seed_derived_authority(
                 root,
                 identity_path=id_path,
                 seed=seed,
                 previous_seed=previous_seed,
+                # A bundle-restored state.db is already keyed to this seed;
+                # only a state.db that survives the transaction is re-keyed.
+                state_db_restored=any(
+                    str(name).replace("\\", "/").casefold()
+                    == _state.DB_FILE.casefold()
+                    for name in written
+                ),
             )
             # A durable applied phase separates transaction work from cleanup.
             # If power fails after either stage file is removed, replay can

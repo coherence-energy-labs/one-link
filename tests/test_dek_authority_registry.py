@@ -615,10 +615,22 @@ def test_phrase_restore_over_another_identity_with_passphrase_carries_envelopes(
 ):
     """A different seed replaces the old DRK regardless, so the passphrase may
     mint the new data key -- and the envelopes are carried to it."""
+    from one_link.state import State
+
     root = tmp_path / "data"
     old_seed = _seeded_silent_install(root)
-    key = capsule_store.load_or_create_capsule_master_seed(root, lockbox.acquire_lockbox(root))
-    (root / "state.db").write_bytes(b"rows of the replaced identity")
+    silent = lockbox.acquire_lockbox(root)
+    key = capsule_store.load_or_create_capsule_master_seed(root, silent)
+    chain_key = os.urandom(32)
+    state = State(db_path=root / "state.db")
+    try:
+        state.set_lockbox(silent)
+        state.upsert_sender_chain(
+            group_id=b"g" * 16, sender_pub=b"s" * 32, direction="in",
+            epoch=1, chain_key=chain_key, counter=0,
+        )
+    finally:
+        state.close()
     new_seed = os.urandom(32)
     monkeypatch.setenv(lockbox.PASSPHRASE_ENV, "the restored install's passphrase")
     master_seed.install_seed_derived_authority(
@@ -626,13 +638,40 @@ def test_phrase_restore_over_another_identity_with_passphrase_carries_envelopes(
         previous_seed=old_seed,
     )
     assert lockbox.recovery_envelope_matches_seed(root, new_seed) is True
-    assert capsule_store.load_or_create_capsule_master_seed(
-        root, lockbox.acquire_lockbox(root),
-    ) == key
+    converged = lockbox.acquire_lockbox(root)
+    assert capsule_store.load_or_create_capsule_master_seed(root, converged) == key
+    # Reopened the way a passphrase-mode daemon opens it (the passphrase also
+    # keys SQLCipher, so it must be set for this open, as at every boot).
+    reopened = State(db_path=root / "state.db")
+    try:
+        reopened.set_lockbox(converged)
+        assert reopened.get_sender_chain(
+            group_id=b"g" * 16, sender_pub=b"s" * 32, direction="in", epoch=1,
+        )["chain_key"] == chain_key
+    finally:
+        reopened.close()
     monkeypatch.delenv(lockbox.PASSPHRASE_ENV)
     assert capsule_store.load_or_create_capsule_master_seed(
         root, lockbox.acquire_lockbox(root),
     ) == key
+
+
+def test_unopenable_state_db_keeps_the_replacement_pending(tmp_path):
+    """Re-keying cannot be skipped: publishing the new key while state.db is
+    unreadable would orphan its sealed rows once it becomes readable."""
+    from one_link.key_material import KeyMaterialProtectionError
+
+    root = tmp_path / "data"
+    seed = _seeded_silent_install(root)
+    (root / "state.db").write_bytes(b"not a database")
+    drk_before = (root / lockbox.DRK_FILENAME).read_bytes()
+    with pytest.raises(KeyMaterialProtectionError, match="stays pending"):
+        master_seed.install_seed_derived_authority(
+            root, identity_path=tmp_path / "identity.key", seed=os.urandom(32),
+            previous_seed=seed,
+        )
+    assert master_seed.load_seed(root) == seed
+    assert (root / lockbox.DRK_FILENAME).read_bytes() == drk_before
 
 
 # ─── Daemon.start: an existing capsule key the data key cannot open is fatal ──

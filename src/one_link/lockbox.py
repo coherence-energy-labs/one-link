@@ -650,6 +650,10 @@ class DekProtectedArtifact:
     max_bytes: int = 4096
     retirable: bool = False
     retire_with: tuple[str, ...] = ()
+    # Embedded artifacts cannot be re-wrapped at this layer.  ``carried_by``
+    # names the function that re-keys their sealed values during a confirmed
+    # key replacement, or the registry entry they are a sidecar of.
+    carried_by: str = ""
 
     @property
     def regenerable(self) -> bool:
@@ -662,12 +666,15 @@ class DekProtectedArtifact:
 DEK_PROTECTED_ARTIFACTS: tuple[DekProtectedArtifact, ...] = (
     DekProtectedArtifact(
         "state_db", "state.db", "one_link.state", PROTECTION_EMBEDDED,
+        carried_by="one_link.state:carry_key_protected_fields",
     ),
     DekProtectedArtifact(
         "state_wal", "state.db-wal", "one_link.state", PROTECTION_EMBEDDED,
+        carried_by="state_db",
     ),
     DekProtectedArtifact(
         "state_shm", "state.db-shm", "one_link.state", PROTECTION_EMBEDDED,
+        carried_by="state_db",
     ),
     DekProtectedArtifact(
         "capsule_master_key",

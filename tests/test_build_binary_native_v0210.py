@@ -566,6 +566,112 @@ def test_macos_gui_build_requires_application_bundle_layout(
     assert not (isolated_output_root / "dist").exists()
 
 
+def test_macos_finalization_rebinds_both_native_binaries_before_helper_and_manifest(
+    monkeypatch,
+    isolated_output_root: Path,
+):
+    """Model PyInstaller signing bytes after staged sidecars were written."""
+    import zipfile
+
+    from scripts.package_standalone_bundle import package_bundle
+    from one_link.update_transaction import _validate_zip_index
+
+    mod = _load_module()
+    commands, _ = _install_fake_runner(monkeypatch, mod, isolated_output_root)
+    original_run = mod.subprocess.run
+    monkeypatch.setattr(mod.platform, "system", lambda: "Darwin")
+    bundle = isolated_output_root / "dist" / "one-link.app"
+    executable = bundle / "Contents" / "MacOS" / "one-link"
+    native_pairs: list[tuple[Path, Path]] = []
+
+    def assert_final_hashes():
+        assert len(native_pairs) == 2
+        for binary, sidecar in native_pairs:
+            expected = f"{hashlib.sha256(binary.read_bytes()).hexdigest()}  {binary.name}\n"
+            assert sidecar.read_bytes() == expected.encode("ascii")
+
+    def fake_macos_run(cmd, *args, **kwargs):
+        if any("PyInstaller" in str(arg) for arg in cmd):
+            result = original_run(cmd, *args, **kwargs)
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"final app launcher")
+            executable.chmod(0o755)
+            for name in ("ol_shell", "ol_native_cdc.dylib"):
+                binary = bundle / "Contents" / "Frameworks" / name
+                sidecar = bundle / "Contents" / "Resources" / (name + ".sha256")
+                binary.parent.mkdir(parents=True, exist_ok=True)
+                sidecar.parent.mkdir(parents=True, exist_ok=True)
+                sidecar.write_text(f"{hashlib.sha256(b'staged').hexdigest()}  {name}\n", encoding="ascii")
+                binary.write_bytes(b"post-PyInstaller-signing:" + name.encode("ascii"))
+                native_pairs.append((binary, sidecar))
+            return result
+        if any("build_update_helper.py" in str(arg) for arg in cmd):
+            commands.append(list(cmd))
+            assert_final_hashes()
+            output = Path(cmd[cmd.index("--output") + 1])
+            assert output == executable.with_name("one-link-update-helper")
+            output.write_bytes(b"finished helper fixture")
+            return FakeCompleted()
+        if cmd and Path(str(cmd[0])) == executable:
+            commands.append(list(cmd))
+            assert cmd[1:] == ["--version"]
+            assert_final_hashes()
+            return FakeCompleted(stdout=_FAKE_SMOKE_STDOUT)
+        return original_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_macos_run)
+    assert mod.main(output_root=isolated_output_root) == 0
+    assert_final_hashes()
+    archive_path = isolated_output_root / "finished-app.zip"
+    package_bundle(bundle, archive_path, executable="Contents/MacOS/one-link", epoch=1700000001)
+    with zipfile.ZipFile(archive_path) as archive:
+        _, _, rows = _validate_zip_index(
+            archive, expected_executable="Contents/MacOS/one-link", expected_bundle_root="one-link.app",
+        )
+        assert archive.read("one-link.app/Contents/MacOS/one-link-update-helper") == b"finished helper fixture"
+        for binary, sidecar in native_pairs:
+            for member in (binary, sidecar):
+                name = "one-link.app/" + member.relative_to(bundle).as_posix()
+                assert archive.read(name) == member.read_bytes()
+                assert rows[name].digest == hashlib.sha256(member.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("target_platform", "cdc_name", "shell_name"),
+    [("win32", "ol_native_cdc.dll", "ol_shell.exe"),
+     ("linux", "ol_native_cdc.so", "ol_shell"),
+     ("darwin", "ol_native_cdc.dylib", "ol_shell")],
+)
+def test_final_native_sidecars_bind_bytes_on_each_platform(
+    monkeypatch, tmp_path, target_platform, cdc_name, shell_name,
+):
+    import one_link.native_cdc as native_cdc
+
+    mod = _load_module()
+    monkeypatch.setattr(mod, "sys", types.SimpleNamespace(path=sys.path, platform=target_platform))
+    monkeypatch.setattr(native_cdc, "native_library_name", lambda: cdc_name)
+    for name in (cdc_name, shell_name):
+        (tmp_path / name).write_bytes(b"finished:" + name.encode("ascii"))
+        (tmp_path / (name + ".sha256")).write_bytes(("0" * 64 + f"  {name}\n").encode("ascii"))
+    mod._rebind_bundled_native_sidecars(tmp_path)
+    for name in (cdc_name, shell_name):
+        digest = hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
+        assert (tmp_path / (name + ".sha256")).read_bytes() == f"{digest}  {name}\n".encode("ascii")
+
+
+@pytest.mark.parametrize("shape", ["orphan", "divergent"])
+def test_native_sidecar_rebinding_refuses_missing_or_divergent_shells(monkeypatch, tmp_path, shape):
+    mod = _load_module()
+    monkeypatch.setattr(mod, "sys", types.SimpleNamespace(path=sys.path, platform="darwin"))
+    (tmp_path / "ol_shell.sha256").write_text("0" * 64 + "  ol_shell\n", encoding="ascii")
+    if shape == "divergent":
+        (tmp_path / "ol_shell").write_bytes(b"first")
+        (tmp_path / "other").mkdir()
+        (tmp_path / "other" / "ol_shell").write_bytes(b"different")
+    with pytest.raises(RuntimeError, match="no native binary|divergent native binary"):
+        mod._rebind_bundled_native_sidecars(tmp_path)
+
+
 @pytest.mark.parametrize(
     ("smoke_rc", "smoke_failure"),
     [

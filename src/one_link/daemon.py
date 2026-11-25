@@ -109,6 +109,17 @@ from one_link import (
     wave_forecast_native,
 )
 from one_link.build_identity import runtime_build_identity
+from one_link.transfer_commit_guard import RemoteCommitGuard
+from one_link.file_source import (
+    DescriptorFileSource,
+    open_binary_file_no_follow as _open_binary_file_no_follow,
+    windows_open_file_identity as _windows_open_file_identity,
+)
+from one_link.file_preparation import (
+    FileIndexers, FileIndexPolicy, FilePreparationService, PeerIndexProfile,
+    PreparedFileIndex, fixed_chunk_size_for_peer,
+    version_at_least as _version_at_least,  # noqa: F401 - compatibility import
+)
 from one_link.transfer_routes import (
     PayloadRouteAccounting, peer_stream_transport, validate_file_transport,
 )
@@ -1115,14 +1126,6 @@ class FolderArchiveCommitError(RuntimeError):
         self.retryable = bool(retryable)
 
 
-@dataclass(frozen=True)
-class PreparedFileIndex:
-    """One descriptor-verified content identity and reusable wire manifest."""
-
-    file_index: FileIndex
-    signature: dict[str, Any]
-    index_kind: str
-    cache_hit: bool = False
 
 
 @dataclass(frozen=True)
@@ -1669,136 +1672,8 @@ def _hash_open_file(handle: IO[bytes], *, read_size: int = 4 * 1024 * 1024) -> s
     return digest.hexdigest()
 
 
-def _windows_open_file_identity(fd: int) -> tuple[str, int]:
-    """Return ``(volume:file-id, NT-change-time-ns)`` for one CRT fd.
-
-    ``Path.stat().st_ctime`` is creation time on Windows, not the NTFS change
-    time. The latter is what invalidates a cached hash after an in-place,
-    same-size rewrite whose last-write timestamp was restored.
-    """
-
-    if os.name != "nt":
-        return "", 0
-    try:
-        import ctypes
-        import msvcrt
-        from ctypes import wintypes
-
-        class _FileBasicInfo(ctypes.Structure):
-            _fields_ = [
-                ("creation_time", ctypes.c_longlong),
-                ("last_access_time", ctypes.c_longlong),
-                ("last_write_time", ctypes.c_longlong),
-                ("change_time", ctypes.c_longlong),
-                ("file_attributes", wintypes.DWORD),
-            ]
-
-        class _FileId128(ctypes.Structure):
-            _fields_ = [("identifier", ctypes.c_ubyte * 16)]
-
-        class _FileIdInfo(ctypes.Structure):
-            _fields_ = [
-                ("volume_serial_number", ctypes.c_ulonglong),
-                ("file_id", _FileId128),
-            ]
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        get_info = kernel32.GetFileInformationByHandleEx
-        get_info.argtypes = [
-            wintypes.HANDLE,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            wintypes.DWORD,
-        ]
-        get_info.restype = wintypes.BOOL
-        os_handle = msvcrt.get_osfhandle(int(fd))
-        if os_handle == -1:
-            return "", 0
-        basic = _FileBasicInfo()
-        file_id = _FileIdInfo()
-        if not get_info(
-            wintypes.HANDLE(os_handle),
-            0,  # FileBasicInfo
-            ctypes.byref(basic),
-            ctypes.sizeof(basic),
-        ):
-            return "", 0
-        if not get_info(
-            wintypes.HANDLE(os_handle),
-            18,  # FileIdInfo
-            ctypes.byref(file_id),
-            ctypes.sizeof(file_id),
-        ):
-            return "", 0
-        identifier = bytes(file_id.file_id.identifier).hex()
-        stable_id = f"{int(file_id.volume_serial_number):016x}:{identifier}"
-        # NT LARGE_INTEGER timestamps are 100-ns ticks since 1601. Keeping the
-        # epoch is harmless; only exact equality is used.
-        return stable_id, int(basic.change_time) * 100
-    except (ImportError, OSError, TypeError, ValueError, AttributeError):
-        return "", 0
 
 
-@contextlib.contextmanager
-def _open_binary_file_no_follow(path: Path) -> Iterator[BinaryIO]:
-    """Open one regular-file candidate without following its final link.
-
-    Windows additionally denies write/delete sharing for the lifetime of the
-    descriptor, so the identity proven before a scan/send cannot be renamed or
-    modified underneath that operation. POSIX uses ``O_NOFOLLOW`` and the
-    caller's before/after inode + ctime checks to detect mutation.
-    """
-
-    candidate = Path(path)
-    if os.name != "nt":
-        flags = os.O_RDONLY | int(getattr(os, "O_CLOEXEC", 0))
-        flags |= int(getattr(os, "O_NOFOLLOW", 0))
-        fd = os.open(candidate, flags)
-    else:
-        import ctypes
-        import msvcrt
-        from ctypes import wintypes
-
-        create_file = ctypes.windll.kernel32.CreateFileW
-        create_file.argtypes = (
-            wintypes.LPCWSTR,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            wintypes.HANDLE,
-        )
-        create_file.restype = wintypes.HANDLE
-        handle = create_file(
-            str(candidate),
-            0x80000000,  # GENERIC_READ
-            0x00000001,  # FILE_SHARE_READ (deny write/delete sharing)
-            None,
-            3,  # OPEN_EXISTING
-            (
-                0x00000080  # FILE_ATTRIBUTE_NORMAL
-                | 0x00200000  # FILE_FLAG_OPEN_REPARSE_POINT
-                | 0x08000000  # FILE_FLAG_SEQUENTIAL_SCAN
-            ),
-            None,
-        )
-        invalid_handle = ctypes.c_void_p(-1).value
-        if handle == invalid_handle:
-            raise ctypes.WinError()
-        try:
-            fd = msvcrt.open_osfhandle(
-                int(handle),
-                os.O_RDONLY | int(getattr(os, "O_BINARY", 0)),
-            )
-        except Exception:
-            ctypes.windll.kernel32.CloseHandle(handle)
-            raise
-    file_handle = os.fdopen(fd, "rb")
-    try:
-        yield file_handle
-    finally:
-        file_handle.close()
 
 
 def _zip_central_directory_declaration(
@@ -2106,49 +1981,27 @@ def _inter_chunk_ack_deadline(window_bytes: int) -> float:
     ))
 
 
-def _version_at_least(version: str | None, major: int, minor: int, patch: int) -> bool:
-    if not version:
-        return False
-    try:
-        nums = []
-        for part in str(version).strip().lstrip("v").split(".")[:3]:
-            digits = "".join(ch for ch in part if ch.isdigit())
-            nums.append(int(digits or 0))
-        while len(nums) < 3:
-            nums.append(0)
-        return tuple(nums[:3]) >= (major, minor, patch)
-    except Exception:
-        return False
 
 
 def _fast_fixed_chunk_size_for_peer(
-    peer_version: str | None,
-    *,
-    size: int = 0,
+    peer_version: str | None, *, size: int = 0,
     peer_features: list[str] | tuple[str, ...] | set[str] | None = None,
 ) -> int:
-    """Largest fixed-manifest chunk this peer can safely parse.
-
-    v0.12.5 receivers accept up to STREAM_MAX_CHUNK_SIZE in FILE_OFFER
-    manifests. Older receivers clamp CDC-ish offers around 512 KiB, so we use
-    the classic 256 KiB chunk when version is unknown/older to preserve
-    zero-chunk repeat sends instead of silently falling back to streaming.
-    """
-
-    features = set(normalize_caps(peer_features or ()))
-    modern_peer = (
-        _version_at_least(peer_version, 0, 12, 5)
-        or FILE_CDC_BINARY_FRAME in features
-        or FILE_SWARM in features
+    """Compatibility adapter for the explicit file-index policy service."""
+    return fixed_chunk_size_for_peer(
+        peer_version, size=size, peer_features=peer_features,
+        policy=_file_index_policy(),
     )
-    if modern_peer:
-        size = max(0, int(size or 0))
-        if size >= 2 * 1024 * 1024 * 1024:
-            return STREAM_MAX_CHUNK_SIZE
-        if size >= 512 * 1024 * 1024:
-            return 2 * 1024 * 1024
-        return FAST_FIXED_CHUNK_SIZE
-    return CDC_MAX_CHUNK_BYTES
+
+
+def _file_index_policy() -> FileIndexPolicy:
+    return FileIndexPolicy(
+        large_file_threshold=FAST_FIXED_INDEX_MIN_BYTES,
+        chunk_max=STREAM_MAX_CHUNK_SIZE,
+        modern_fixed=FAST_FIXED_CHUNK_SIZE,
+        legacy_fixed=CDC_MAX_CHUNK_BYTES,
+        manifest_chunks_max=MAX_CDC_MANIFEST_CHUNKS,
+    )
 
 
 def _encode_binary_frame(header: dict, data: bytes) -> bytes:
@@ -7120,181 +6973,25 @@ class Daemon:
             self._broadcast_transfer(rec)
         return rec
 
+    def _remote_commit_guard(self) -> RemoteCommitGuard:
+        return RemoteCommitGuard(
+            getattr(self, "state", None), sync_parent=_fsync_parent_directory,
+            replace=replace_path,
+        )
+
     def _remote_commit_failstop_path(self, transfer_id: str) -> Path:
-        if self.state is None:
-            raise OSError("transfer state is unavailable")
-        digest = hashlib.sha256(transfer_id.encode("utf-8")).hexdigest()
-        return Path(self.state.db_path).parent / "transfer_commit_failstop" / f"{digest}.json"
+        return self._remote_commit_guard().path(transfer_id)
 
-    def _write_remote_commit_failstop(
-        self,
-        transfer_id: str,
-        *,
-        receipt: dict | None = None,
-        delivery: dict | None = None,
+    def _write_remote_commit_failstop(self, transfer_id: str, *,
+        receipt: dict | None = None, delivery: dict | None = None,
     ) -> None:
-        """Durably prevent resend when remote commit outlives local SQLite."""
-
-        target = self._remote_commit_failstop_path(transfer_id)
-        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if os.name != "nt":
-            os.chmod(target.parent, 0o700)
-        temp = target.parent / f".{target.name}.{secrets.token_hex(8)}.tmp"
-        payload = {
-            "schema": 1,
-            "transfer_id": transfer_id,
-            "recorded_ms": int(time.time() * 1000),
-            "phase": "remote_committed" if receipt else "outcome_unknown",
-            "receipt": receipt or {},
-            "delivery": delivery or {},
-        }
-        try:
-            with open(temp, "x", encoding="utf-8", newline="\n") as handle:
-                json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            replace_path(temp, target)
-            _fsync_parent_directory(target)
-        finally:
-            with contextlib.suppress(OSError):
-                temp.unlink()
+        self._remote_commit_guard().write(transfer_id, receipt=receipt, delivery=delivery)
 
     def _remote_commit_is_failstopped(self, transfer_id: str) -> bool:
-        """Return whether automatic resend could create an untracked duplicate.
-
-        The FULL-synced SQLite offer boundary is authoritative even if the
-        redundant sidecar was deleted. ``outcome_unknown`` is safe to retry
-        only when that row carries a receipt-capable modern delivery and the
-        exact nonce/content/presentation contract recorded before the offer.
-        Legacy delivery, contract drift, proven receipt, or malformed sidecar
-        always fails closed.
-        """
-
-        try:
-            marker = self._remote_commit_failstop_path(transfer_id)
-
-            def _ledger_boundary_decision() -> bool | None:
-                """True=blocked, False=stable modern retry, None=no boundary."""
-
-                if self.state is None:
-                    return True
-                rec = self.state.get_transfer(transfer_id)
-                if rec is None:
-                    return True
-                metadata = dict(rec.metadata or {})
-                committed = metadata.get("offer_boundary_committed")
-                if committed is not True:
-                    # An explicit but malformed/false boundary flag is not a
-                    # safe retry grant. Absence is expected for a pristine row
-                    # that has never approached the wire.
-                    return True if "offer_boundary_committed" in metadata else None
-                contract = metadata.get("offer_boundary_contract")
-                if not isinstance(contract, dict):
-                    return True
-                contract_size = contract.get("size")
-                receipt_capable = metadata.get("receipt_capable")
-                if type(contract_size) is not int or type(receipt_capable) is not bool:
-                    return True
-                if contract.get("receipt_capable") is not receipt_capable:
-                    return True
-                if contract.get("schema") != 1:
-                    return True
-                if contract.get("transfer_id") != transfer_id:
-                    return True
-                if contract.get("delivery_id") != metadata.get("delivery_id"):
-                    return True
-                if contract.get("peer_fp") != rec.peer_fp:
-                    return True
-                if contract.get("blob") != rec.blob_hash:
-                    return True
-                if contract_size != int(rec.size):
-                    return True
-                if contract.get("name") != rec.name:
-                    return True
-                if contract.get("name") != metadata.get("delivery_name"):
-                    return True
-                if str(contract.get("rel_path") or "") != str(
-                    metadata.get("delivery_rel_path") or ""
-                ):
-                    return True
-                if str(contract.get("kind") or "file") != str(
-                    metadata.get("delivery_kind") or "file"
-                ):
-                    return True
-                if contract.get("mode") not in {"cdc", "stream"}:
-                    return True
-                # A stable delivery nonce is useful only when the receiver can
-                # attest and replay the durable commit. Legacy ACK-only peers
-                # can have already materialized a second path, so they stop.
-                return not receipt_capable
-
-            if not marker.exists():
-                ledger_decision = _ledger_boundary_decision()
-                return bool(ledger_decision) if ledger_decision is not None else False
-            if marker.is_symlink() or not marker.is_file():
-                return True
-            if marker.stat().st_size > 256 * 1024:
-                return True
-            payload = json.loads(marker.read_text(encoding="utf-8"))
-            if (
-                not isinstance(payload, dict)
-                or payload.get("schema") != 1
-                or payload.get("transfer_id") != transfer_id
-            ):
-                return True
-            phase = payload.get("phase")
-            if phase == "remote_committed":
-                return True
-            if phase != "outcome_unknown" or self.state is None:
-                return True
-            delivery = payload.get("delivery")
-            if not isinstance(delivery, dict):
-                return True
-            delivery_size = delivery.get("size")
-            if type(delivery_size) is not int:
-                return True
-            ledger_decision = _ledger_boundary_decision()
-            if ledger_decision is not False:
-                return True
-            rec = self.state.get_transfer(transfer_id)
-            if rec is None:
-                return True
-            metadata = dict(rec.metadata or {})
-            contract = metadata.get("offer_boundary_contract")
-            if not isinstance(contract, dict):
-                return True
-            return not (
-                rec.direction == "out"
-                and rec.peer_fp == str(delivery.get("peer_fp") or "")
-                and rec.blob_hash == str(delivery.get("blob") or "")
-                and int(rec.size) == delivery_size
-                and metadata.get("delivery_id") == delivery.get("delivery_id")
-                and metadata.get("delivery_name") == delivery.get("name")
-                and str(metadata.get("delivery_rel_path") or "")
-                == str(delivery.get("rel_path") or "")
-                and str(metadata.get("delivery_kind") or "file")
-                == str(delivery.get("kind") or "file")
-                and delivery.get("receipt_capable") is True
-                and delivery.get("delivery_id") == contract.get("delivery_id")
-                and delivery.get("peer_fp") == contract.get("peer_fp")
-                and delivery.get("blob") == contract.get("blob")
-                and delivery_size == contract.get("size")
-                and delivery.get("name") == contract.get("name")
-                and str(delivery.get("rel_path") or "") == str(contract.get("rel_path") or "")
-                and str(delivery.get("kind") or "file") == str(contract.get("kind") or "file")
-            )
-        except Exception:
-            # Unknown accounting state is never evidence that retry is safe.
-            return True
+        return self._remote_commit_guard().is_failstopped(transfer_id)
 
     def _clear_remote_commit_failstop(self, transfer_id: str) -> None:
-        try:
-            marker = self._remote_commit_failstop_path(transfer_id)
-            marker.unlink(missing_ok=True)
-            _fsync_parent_directory(marker)
-        except OSError:
-            pass
+        self._remote_commit_guard().clear(transfer_id)
 
     def _mark_transfer_waiting(
         self,
@@ -13498,325 +13195,72 @@ class Daemon:
 
     @staticmethod
     def _file_signature_fields() -> tuple[str, ...]:
-        return (
-            "path",
-            "size",
-            "mtime_ns",
-            "ctime_ns",
-            "dev",
-            "ino",
-            "file_id",
-            "change_ns",
+        return DescriptorFileSource.signature_fields()
+
+    @staticmethod
+    def _file_source_service() -> DescriptorFileSource:
+        return DescriptorFileSource(
+            opener=_open_binary_file_no_follow,
+            windows_identity=_windows_open_file_identity,
         )
 
-    def _file_signature_from_handle(self, path: Path,
-        handle: BinaryIO,
-    ) -> dict[str, Any]:
-        """Capture path + descriptor identity without trusting pathname stat."""
+    def _file_preparation_service(self) -> FilePreparationService:
+        # Take the current dependency snapshot: state is attached during boot
+        # and indexer hooks may be replaced by controlled instrumentation.
+        return FilePreparationService(
+            cache=getattr(self, "state", None),
+            source=self._file_source_service(),
+            indexers=FileIndexers(cdc=index_file, fixed=fixed_index_file),
+            policy=_file_index_policy(),
+        )
 
-        canonical = Path(path).expanduser().resolve(strict=True)
-        path_stat = canonical.lstat()
-        opened_stat = os.fstat(handle.fileno())
-        reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
-        if (
-            stat.S_ISLNK(path_stat.st_mode)
-            or not stat.S_ISREG(path_stat.st_mode)
-            or bool(int(getattr(path_stat, "st_file_attributes", 0) or 0) & reparse_flag)
-            or not stat.S_ISREG(opened_stat.st_mode)
-        ):
-            raise ValueError("outbound source must be a regular non-reparse file")
-        if any(
-            int(getattr(path_stat, field, 0) or 0) != int(getattr(opened_stat, field, 0) or 0)
-            for field in ("st_dev", "st_ino", "st_size")
-        ):
-            raise OSError("outbound source changed while opening")
-        dev = int(getattr(opened_stat, "st_dev", 0) or 0)
-        ino = int(getattr(opened_stat, "st_ino", 0) or 0)
-        if os.name == "nt":
-            file_id, change_ns = _windows_open_file_identity(handle.fileno())
-        else:
-            file_id = f"{dev:x}:{ino:x}" if dev and ino else ""
-            change_ns = int(opened_stat.st_ctime_ns)
-        return {
-            "path": str(canonical),
-            "size": int(opened_stat.st_size),
-            "mtime_ns": int(opened_stat.st_mtime_ns),
-            "ctime_ns": int(opened_stat.st_ctime_ns),
-            "dev": dev,
-            "ino": ino,
-            "file_id": file_id,
-            "change_ns": f"{int(change_ns):x}" if int(change_ns) > 0 else "",
-        }
+    def _file_signature_from_handle(self, path: Path, handle: BinaryIO) -> dict[str, Any]:
+        return self._file_source_service().signature_from_handle(path, handle)
 
     def _file_cache_signature(self, path: Path) -> dict[str, Any]:
-        raw = Path(path).expanduser()
-        with _open_binary_file_no_follow(raw) as handle:
-            canonical = raw.resolve(strict=True)
-            return self._file_signature_from_handle(canonical, handle)
+        return self._file_source_service().signature(path)
 
     def _cache_signature_is_strong(self, sig: dict[str, Any]) -> bool:
-        if not sig.get("file_id") or not str(sig.get("change_ns") or ""):
-            return False
-        return bool(int(sig.get("dev") or 0) and int(sig.get("ino") or 0))
+        return DescriptorFileSource.signature_is_strong(sig)
 
     def _assert_file_signature(self, path: Path, expected: dict) -> None:
-        """Fail closed if an outbound source changed after indexing.
-
-        A content hash and CDC map describe one exact byte sequence.  Reading
-        a mutable path later without revalidating its identity can send a
-        mixture of revisions, cause endless receiver hash failures, or make a
-        cached index address bytes it never hashed.  This check is repeated
-        immediately before publication, before disk reads, and before marking
-        completion.
-        """
-        try:
-            current = self._file_cache_signature(path)
-        except (OSError, ValueError) as exc:
-            raise RuntimeError("outbound source disappeared after indexing") from exc
-        fields = self._file_signature_fields()
-        if any(current.get(field) != expected.get(field) for field in fields):
-            raise RuntimeError("outbound source changed after indexing; choose the file again")
+        self._file_source_service().assert_signature(path, expected)
 
     @contextlib.contextmanager
-    def _open_verified_outbound_source(
-        self,
-        path: Path,
-        expected: dict[str, Any],
-    ) -> Iterator[BinaryIO]:
-        """Open the exact indexed file object and hold it through disk reads."""
-
-        canonical = Path(str(expected.get("path") or path))
-        with _open_binary_file_no_follow(canonical) as handle:
-            opened = self._file_signature_from_handle(canonical, handle)
-            fields = self._file_signature_fields()
-            if any(opened.get(field) != expected.get(field) for field in fields):
-                raise RuntimeError("outbound source changed after indexing; choose the file again")
+    def _open_verified_outbound_source(self, path: Path, expected: dict[str, Any]) -> Iterator[BinaryIO]:
+        with self._file_source_service().open_verified(path, expected) as handle:
             yield handle
-            final = self._file_signature_from_handle(canonical, handle)
-            if any(final.get(field) != expected.get(field) for field in fields):
-                raise RuntimeError("outbound source changed while sending; delivery aborted")
 
     def _cached_file_index(self, sig: dict) -> tuple[FileIndex, str] | None:
-        if self.state is None or not self._cache_signature_is_strong(sig):
-            return None
-        try:
-            row = self.state.get_file_index_cache(**sig)
-        except Exception as e:
-            log.debug("file index cache lookup skipped for %s: %s", sig.get("path"), e)
-            return None
-        if not row:
-            return None
-        try:
-            expected_size = int(sig["size"])
-            if int(row["size"]) != expected_size:
-                raise ValueError("cached file size does not match source identity")
-            blob_hash = str(row["blob_hash"])
-            if not self._valid_blob_hex(blob_hash):
-                raise ValueError("cached whole-file hash is invalid")
-            raw_chunks = row.get("chunks") or []
-            if not isinstance(raw_chunks, list):
-                raise ValueError("cached manifest is not a list")
-            if not 1 <= len(raw_chunks) <= MAX_CDC_MANIFEST_CHUNKS:
-                raise ValueError("cached manifest count is outside protocol bounds")
-            parsed_chunks: list[Chunk] = []
-            running_end = 0
-            for expected_index, raw_chunk in enumerate(raw_chunks):
-                if not isinstance(raw_chunk, dict):
-                    raise ValueError("cached manifest entry is not an object")
-                index = int(raw_chunk["index"])
-                start = int(raw_chunk["start"])
-                end = int(raw_chunk["end"])
-                chunk_hash = str(raw_chunk["hash"])
-                if (
-                    index != expected_index
-                    or start != running_end
-                    or start < 0
-                    or end < start
-                    or end > expected_size
-                    or end - start > STREAM_MAX_CHUNK_SIZE
-                    or not self._valid_blob_hex(chunk_hash)
-                ):
-                    raise ValueError("cached manifest violates contiguous bounds")
-                if expected_size > 0 and end == start:
-                    raise ValueError("cached manifest has an empty data chunk")
-                if expected_size == 0 and (
-                    len(raw_chunks) != 1
-                    or start != 0
-                    or end != 0
-                    or chunk_hash != blake3.blake3().hexdigest()
-                ):
-                    raise ValueError("cached empty-file manifest is invalid")
-                parsed_chunks.append(
-                    Chunk(
-                        index=index,
-                        start=start,
-                        end=end,
-                        hash=chunk_hash,
-                    )
-                )
-                running_end = end
-            if running_end != expected_size:
-                raise ValueError("cached manifest does not cover the whole file")
-            chunks = tuple(parsed_chunks)
-            return (
-                FileIndex(
-                    blob_hash=blob_hash,
-                    size=expected_size,
-                    chunks=chunks,
-                ),
-                str(row.get("index_mode") or row.get("index_kind") or "unknown"),
-            )
-        except Exception as e:
-            log.debug("file index cache decode skipped for %s: %s", sig.get("path"), e)
-            return None
+        return self._file_preparation_service().cached_index(sig)
 
-    def _record_file_index_cache(
-        self,
-        path: Path,
-        file_index: FileIndex,
-        *,
-        index_kind: str,
-        signature: dict[str, Any] | None = None,
+    def _record_file_index_cache(self, path: Path, file_index: FileIndex, *,
+        index_kind: str, signature: dict[str, Any] | None = None,
     ) -> None:
-        if self.state is None:
-            return
-        try:
-            sig = dict(signature or self._file_cache_signature(path))
-            if not self._cache_signature_is_strong(sig):
-                return
-            if int(sig["size"]) != int(file_index.size):
-                raise ValueError("file index size does not match source identity")
-            chunk_rows = [
-                {
-                    "index": c.index,
-                    "start": c.start,
-                    "end": c.end,
-                    "size": c.size,
-                    "hash": c.hash,
-                }
-                for c in file_index.chunks
-            ]
-            self.state.record_file_index_cache(
-                **sig,
-                blob_hash=file_index.blob_hash,
-                index_kind=index_kind,
-                index_mode=index_kind,
-                chunks=chunk_rows,
-            )
-            if chunk_rows:
-                self.state.record_chunk_sources_for_file(
-                    path=sig["path"],
-                    file_size=int(sig["size"]),
-                    mtime_ms=int(int(sig["mtime_ns"]) // 1_000_000),
-                    chunks=chunk_rows,
-                    source=f"file_index:{index_kind}",
-                )
-        except Exception as e:
-            log.debug("file index cache write skipped for %s: %s", path, e)
+        self._file_preparation_service().record_index(
+            path, file_index, index_kind=index_kind, signature=signature,
+        )
 
-    def prepare_file_for_transfer(
-        self,
-        path: Path,
-        *,
-        peer_fp: str | None = None,
+    def _peer_index_profile(self, peer_fp: str | None) -> PeerIndexProfile:
+        if not peer_fp:
+            return PeerIndexProfile()
+        session = getattr(self, "_outbound_sessions", {}).get(peer_fp)
+        caps = getattr(getattr(session, "channel", None), "peer_caps", None) or {}
+        features = list(caps.get("features") or [])
+        if not features and self.state is not None:
+            with contextlib.suppress(Exception):
+                features = self.state.get_peer_capabilities(peer_fp)
+        return PeerIndexProfile(caps.get("app_version"), tuple(features))
+
+    def prepare_file_for_transfer(self, path: Path, *, peer_fp: str | None = None,
         fixed_chunk_size: int | None = None,
     ) -> PreparedFileIndex:
-        """Build or reuse one descriptor-verified hash + wire manifest.
-
-        Large files use the peer-compatible fixed fast lane (one hash/index
-        pass, typically 1 MiB chunks); smaller files retain CDC dedup. The
-        exact strong identity is persisted so browser admission, durable queue,
-        and live send can reuse this proof without another whole-file read.
-        """
-
-        explicit_fixed_chunk_size = fixed_chunk_size is not None
-        if fixed_chunk_size is not None:
-            fixed_chunk_size = int(fixed_chunk_size)
-            if not 64 * 1024 <= fixed_chunk_size <= STREAM_MAX_CHUNK_SIZE:
-                raise ValueError("fixed_chunk_size is outside the resumable range")
-        signature = self._file_cache_signature(path)
-        size = int(signature["size"])
-        peer_features: list[str] = []
-        peer_version: str | None = None
-        if peer_fp:
-            session = getattr(self, "_outbound_sessions", {}).get(peer_fp)
-            caps = getattr(getattr(session, "channel", None), "peer_caps", None) or {}
-            peer_features = list(caps.get("features") or [])
-            peer_version = caps.get("app_version")
-            if not peer_features and self.state is not None:
-                with contextlib.suppress(Exception):
-                    peer_features = self.state.get_peer_capabilities(peer_fp)
-
-        effective_fixed_chunk_size = fixed_chunk_size
-        if effective_fixed_chunk_size is None and size >= FAST_FIXED_INDEX_MIN_BYTES:
-            effective_fixed_chunk_size = _fast_fixed_chunk_size_for_peer(
-                peer_version,
-                size=size,
-                peer_features=peer_features,
-            )
-            if peer_fp:
-                try:
-                    field_cadence = self.cadence_for_peer(peer_fp[:8])
-                    parsed_cadence = (
-                        None
-                        if field_cadence is None or isinstance(field_cadence, bool)
-                        else int(field_cadence)
-                    )
-                except (TypeError, ValueError, OverflowError):
-                    parsed_cadence = None
-                if parsed_cadence is not None and parsed_cadence < effective_fixed_chunk_size:
-                    effective_fixed_chunk_size = max(
-                        64 * 1024,
-                        parsed_cadence,
-                    )
-
-        required_index_mode = (
-            f"fixed:{effective_fixed_chunk_size}"
-            if effective_fixed_chunk_size is not None
-            else "cdc"
+        """Prepare one verified manifest through the isolated preparation service."""
+        return self._file_preparation_service().prepare(
+            path, peer=self._peer_index_profile(peer_fp),
+            cadence_provider=(lambda: self.cadence_for_peer(peer_fp[:8])) if peer_fp else None,
+            fixed_chunk_size=fixed_chunk_size,
         )
-        cached = self._cached_file_index(signature)
-        cached_is_compatible = False
-        if cached is not None and cached[0].chunks:
-            if explicit_fixed_chunk_size:
-                # A retry's explicit boundaries are its wire/resume contract.
-                cached_is_compatible = cached[1] == required_index_mode
-            elif effective_fixed_chunk_size is None:
-                # Small-file cached CDC/fixed maps are both valid and avoid a
-                # needless re-index solely because an older row used the
-                # legacy public ``fixed`` mode label.
-                cached_is_compatible = True
-            else:
-                # Automatic tuning is a maximum ratchet cadence, not a demand
-                # to inflate already-proven smaller chunks.  Reuse any safe
-                # manifest at or below the peer/field bound; reject a larger
-                # one because it would violate negotiated framing or cadence.
-                cached_is_compatible = (
-                    cached[1] == required_index_mode
-                    or max(int(chunk.size) for chunk in cached[0].chunks)
-                    <= effective_fixed_chunk_size
-                )
-        if cached is not None and cached[0].chunks and cached_is_compatible:
-            return PreparedFileIndex(cached[0], signature, cached[1], True)
-
-        with self._open_verified_outbound_source(path, signature) as handle:
-            if effective_fixed_chunk_size is not None:
-                file_index = fixed_index_file(
-                    handle,
-                    size=size,
-                    chunk_size=effective_fixed_chunk_size,
-                )
-                index_kind = f"fixed:{effective_fixed_chunk_size}"
-            else:
-                file_index = index_file(handle, size=size)
-                index_kind = "cdc"
-        self._record_file_index_cache(
-            path,
-            file_index,
-            index_kind=index_kind,
-            signature=signature,
-        )
-        return PreparedFileIndex(file_index, signature, index_kind, False)
 
     def _record_prior_file_sources(self, path: Path) -> dict:
         if self.state is None:

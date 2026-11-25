@@ -68,13 +68,16 @@ jobs:
           workspaces: native
       - name: Install locked native build tools
         run: uv sync --frozen --python python --only-group wheel-tools
+      - name: Exercise the documented source bootstrap in this clean checkout
+        run: python scripts/bootstrap_source.py --report acceptance-native/source-bootstrap.json
       - name: Build one source-matched native wheel for all acceptance lanes
         working-directory: native
         run: uv run --project .. --frozen --only-group wheel-tools maturin build --release --strip --locked --out ../acceptance-native/
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
         with:
           name: acceptance-native-${{ matrix.os }}
-          path: acceptance-native/*.whl
+          path: acceptance-native/
           if-no-files-found: error
 
   full_suite:

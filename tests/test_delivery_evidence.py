@@ -268,6 +268,12 @@ def test_required_contexts_are_defined_by_unfiltered_pr_workflows():
     assert "always()" in authority["if"]
     command = authority["steps"][0]["run"]
     assert 'test "$result" = success || exit 1' in command
+    native_steps = jobs["native_runtime"]["steps"]
+    assert any("python scripts/bootstrap_source.py --report" in step.get("run", "")
+               for step in native_steps)
+    upload = next(step for step in native_steps if "upload-artifact@" in step.get("uses", ""))
+    assert upload["if"] == "always()"
+    assert upload["with"]["path"] == "acceptance-native/"
 
 
 def test_browser_sessions_cannot_remove_prior_browser_or_native_evidence():

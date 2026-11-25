@@ -138,6 +138,55 @@ def _xml(frames: list[tuple[str, str, int]], kind: str = "UninitCondition", stat
     )
 
 
+@pytest.mark.parametrize("declaration", [
+    "<!DOCTYPE valgrindoutput>",
+    '<!DOCTYPE valgrindoutput SYSTEM "file:///untrusted.dtd">',
+    '<!DOCTYPE valgrindoutput PUBLIC "untrusted" "https://example.invalid/audit.dtd">',
+    '<!DOCTYPE valgrindoutput [<!ENTITY leak SYSTEM "file:///untrusted">]>',
+    '<!DOCTYPE valgrindoutput [<!ENTITY a "expanded"><!ENTITY b "&a;&a;&a;">]>',
+    '<!DOCTYPE valgrindoutput [<!ENTITY % p SYSTEM "file:///untrusted.dtd">%p;]>',
+])
+def test_memcheck_parser_rejects_every_dtd_before_entity_processing(declaration):
+    xml = declaration + '<valgrindoutput><status><state>FINISHED</state></status></valgrindoutput>'
+    with pytest.raises(audit.DefusedXmlException, match="DTDForbidden"):
+        audit.parse_memcheck_xml(xml)
+
+
+def test_memcheck_parser_preserves_xml_escapes_and_reports_malformed_input():
+    reports, status = audit.parse_memcheck_xml(_xml([]).replace("synthetic", "a &lt; b &amp; c"))
+    assert status == "FINISHED"
+    assert reports[0].what == "a < b & c"
+    with pytest.raises(audit.ET.ParseError):
+        audit.parse_memcheck_xml("<valgrindoutput>")
+
+
+@pytest.mark.parametrize("expect", ["clean", "flagged"])
+def test_memcheck_dtd_is_a_failed_case_with_preserved_evidence(tmp_path, monkeypatch, expect):
+    def fake_run(command, **_kwargs):
+        xml_path = Path(next(arg.split("=", 1)[1] for arg in command if arg.startswith("--xml-file=")))
+        xml_path.write_text(
+            '<!DOCTYPE valgrindoutput [<!ENTITY verdict "FINISHED">]>'
+            '<valgrindoutput><status><state>&verdict;</state></status></valgrindoutput>',
+            encoding="utf-8",
+        )
+        return audit.subprocess.CompletedProcess(
+            command, 0, f"{audit.COMPLETE_PREFIX}name=control valgrind=1\n", "retained stderr",
+        )
+
+    monkeypatch.setattr(audit.subprocess, "run", fake_run)
+    result = audit.run_case(
+        {"name": "control", "expect": expect}, tmp_path / "unused-binary", ["unused-valgrind"],
+        tmp_path, audit.SourceIndex(tmp_path), timeout=1,
+    )
+    assert result.completed and result.under_valgrind
+    assert not result.passed
+    assert len(result.problems) == 1
+    assert result.problems[0].startswith("unparseable Memcheck XML: DTDForbidden(")
+    assert result.reports == []
+    assert "<!DOCTYPE" in (tmp_path / "control.xml").read_text(encoding="utf-8")
+    assert (tmp_path / "control.stderr").read_text(encoding="utf-8") == "retained stderr"
+
+
 @pytest.fixture()
 def tree(tmp_path: Path) -> Path:
     src = tmp_path / "native" / "crate" / "src"

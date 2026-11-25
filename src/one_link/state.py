@@ -93,6 +93,10 @@ class KeyProtectedField:
     column: str
     family: str
     label: str
+    # Literal statements keep identifier selection in this reviewed registry.
+    # Row cursors, replacement values and row IDs are always bound parameters.
+    rekey_select_sql: str
+    rekey_update_sql: str
     json_key: str = ""
     aad: bytes = b""
     plaintext_len: int = 32
@@ -101,24 +105,49 @@ class KeyProtectedField:
 GROUP_SENDER_CHAIN_KEY = KeyProtectedField(
     "group_sender_chains.chain_key", "group_sender_chains", "chain_key",
     FIELD_FAMILY_DATA_KEY, label="chain_key",
+    rekey_select_sql=(
+        "SELECT rowid, chain_key FROM group_sender_chains "
+        "WHERE rowid > ? AND chain_key IS NOT NULL ORDER BY rowid LIMIT 512"
+    ),
+    rekey_update_sql="UPDATE OR REPLACE group_sender_chains SET chain_key = ? WHERE rowid = ?",
 )
 SELF_MESH_ROOT_SEED = KeyProtectedField(
     "self_mesh_roots.root_seed", "self_mesh_roots", "root_seed",
     FIELD_FAMILY_DATA_KEY, label="self-mesh root seed",
+    rekey_select_sql=(
+        "SELECT rowid, root_seed FROM self_mesh_roots "
+        "WHERE rowid > ? AND root_seed IS NOT NULL ORDER BY rowid LIMIT 512"
+    ),
+    rekey_update_sql="UPDATE OR REPLACE self_mesh_roots SET root_seed = ? WHERE rowid = ?",
 )
 TRANSFER_SOURCE_PATH = KeyProtectedField(
     "transfers.metadata_json.path", "transfers", "metadata_json",
     FIELD_FAMILY_PATH_PII, label="transfer source path",
+    rekey_select_sql=(
+        "SELECT rowid, metadata_json FROM transfers "
+        "WHERE rowid > ? AND metadata_json IS NOT NULL ORDER BY rowid LIMIT 512"
+    ),
+    rekey_update_sql="UPDATE OR REPLACE transfers SET metadata_json = ? WHERE rowid = ?",
     json_key="path", aad=b"OL/state/transfers/path|v1",
 )
 CHUNK_SOURCE_PATH = KeyProtectedField(
     "chunk_sources.path", "chunk_sources", "path",
     FIELD_FAMILY_PATH_PII, label="chunk source path",
+    rekey_select_sql=(
+        "SELECT rowid, path FROM chunk_sources "
+        "WHERE rowid > ? AND path IS NOT NULL ORDER BY rowid LIMIT 512"
+    ),
+    rekey_update_sql="UPDATE OR REPLACE chunk_sources SET path = ? WHERE rowid = ?",
     aad=b"OL/state/chunk_sources/path|v1",
 )
 FILE_INDEX_PATH = KeyProtectedField(
     "file_index_cache.path", "file_index_cache", "path",
     FIELD_FAMILY_PATH_PII, label="file index path",
+    rekey_select_sql=(
+        "SELECT rowid, path FROM file_index_cache "
+        "WHERE rowid > ? AND path IS NOT NULL ORDER BY rowid LIMIT 512"
+    ),
+    rekey_update_sql="UPDATE OR REPLACE file_index_cache SET path = ? WHERE rowid = ?",
     aad=b"OL/state/file_index_cache/path|v1",
 )
 KEY_PROTECTED_FIELDS: tuple[KeyProtectedField, ...] = (
@@ -985,9 +1014,7 @@ class State:
                 last_rowid = 0
                 while True:
                     rows = self._conn.execute(
-                        f"SELECT rowid, {field.column} FROM {field.table} "
-                        "WHERE rowid > ? AND "
-                        f"{field.column} IS NOT NULL ORDER BY rowid LIMIT 512",
+                        field.rekey_select_sql,
                         (last_rowid,),
                     ).fetchall()
                     if not rows:
@@ -1064,8 +1091,7 @@ class State:
                         # same plaintext path already has a current-key row,
                         # the two rows describe one path and one survives.
                         self._conn.execute(
-                            f"UPDATE OR REPLACE {field.table} SET {field.column} = ? "
-                            "WHERE rowid = ?",
+                            field.rekey_update_sql,
                             (sealed, rowid),
                         )
                         counts["rekeyed"] += 1

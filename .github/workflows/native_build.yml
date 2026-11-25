@@ -266,6 +266,20 @@ jobs:
         with:
           workspaces: native
 
+      - name: Install Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: setup uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.13.10"
+          enable-cache: true
+
+      - name: Install the locked CT audit parser
+        run: uv sync --frozen --python python --only-group ct-audit
+
       # The ct-audit profile inherits release (same optimisation, LTO, codegen
       # units and panic strategy) and keeps only symbols and line tables.
       - name: Build the audit binary with release code generation
@@ -274,7 +288,7 @@ jobs:
 
       - name: Run every audit case under Memcheck
         run: >-
-          python3 scripts/run_ct_audit.py
+          uv run --frozen --only-group ct-audit python scripts/run_ct_audit.py
           --binary native/target/ct-audit/ol_ct_audit
           --source-root native
           --report test-results/ct-audit/report.json

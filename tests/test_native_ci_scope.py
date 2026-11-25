@@ -603,7 +603,13 @@ def test_every_pr_produces_exact_gate_and_preserves_required_work_dependencies(k
         build = next(item for item in audit["steps"] if "cargo build" in item.get("run", ""))
         assert build["working-directory"] == "native"
         assert build["run"] == "cargo build --locked --profile ct-audit -p ol_ct_audit"
-        assert ("python3 scripts/run_ct_audit.py --binary native/target/ct-audit/ol_ct_audit "
+        assert "uv sync --frozen --python python --only-group ct-audit" in runs
+        pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        parser_dependencies = pyproject["dependency-groups"]["ct-audit"]
+        assert parser_dependencies == ["defusedxml>=0.7.1,<0.8"]
+        assert parser_dependencies[0] in pyproject["project"]["optional-dependencies"]["dev"]
+        assert ("uv run --frozen --only-group ct-audit python scripts/run_ct_audit.py "
+                "--binary native/target/ct-audit/ol_ct_audit "
                 "--source-root native --report test-results/ct-audit/report.json") in runs
         upload = audit["steps"][-1]
         assert upload["if"] == "always()" and "upload-artifact@" in upload["uses"]

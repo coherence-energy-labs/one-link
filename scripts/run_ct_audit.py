@@ -26,7 +26,8 @@ Verdicts:
 Usage (Linux x86-64)::
 
     cargo build --locked --profile ct-audit -p ol_ct_audit   # in native/
-    python scripts/run_ct_audit.py --binary native/target/ct-audit/ol_ct_audit \
+    uv run --frozen --only-group ct-audit python scripts/run_ct_audit.py \
+        --binary native/target/ct-audit/ol_ct_audit \
         --source-root native --report test-results/ct-audit/report.json
 """
 
@@ -38,8 +39,10 @@ import os
 import pathlib
 import subprocess
 import sys
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+
+from defusedxml import ElementTree as ET
+from defusedxml.common import DefusedXmlException
 
 MARKER = "ct-audit: declassify"
 SECRET_KINDS = frozenset({"UninitCondition", "UninitValue"})
@@ -104,8 +107,10 @@ class CaseResult:
 
 
 def parse_memcheck_xml(text: str) -> tuple[list[Report], str | None]:
-    """Parse Memcheck protocol-4 XML into reports (with occurrence counts)."""
-    root = ET.fromstring(text)
+    """Parse DTD-free Memcheck protocol-4 XML into reports and counts."""
+    # Memcheck protocol 4 needs none of these features. Reject declarations
+    # before entity expansion or access to an external resource is possible.
+    root = ET.fromstring(text, forbid_dtd=True, forbid_entities=True, forbid_external=True)
     status = None
     for st in root.iter("status"):
         state = st.findtext("state")
@@ -336,7 +341,7 @@ def run_case(
         return result
     try:
         reports, status = parse_memcheck_xml(xml_path.read_text(encoding="utf-8", errors="replace"))
-    except ET.ParseError as exc:
+    except (ET.ParseError, DefusedXmlException) as exc:
         result.problems.append(f"unparseable Memcheck XML: {exc}")
         return result
     if status != "FINISHED":

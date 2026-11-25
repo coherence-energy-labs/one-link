@@ -26,7 +26,7 @@ from one_link import (
     recovery_api,
 )
 from one_link.key_material import KeyMaterialPersistenceError
-from one_link.state import State
+from one_link.state import KEY_PROTECTED_FIELDS, State
 
 GROUP_ID = b"g" * 16
 SENDER = b"s" * 32
@@ -347,6 +347,47 @@ def test_rekey_is_idempotent_and_never_touches_foreign_or_cleartext_values(tmp_p
 
 
 # ─── the field registry is complete ─────────────────────────────────────────
+
+
+@pytest.mark.parametrize("field", KEY_PROTECTED_FIELDS, ids=lambda field: field.name)
+def test_registered_rekey_statements_target_only_the_declared_column(field):
+    """The literal statements and field metadata must describe the same cells.
+
+    Give each entry only its declared table and column, then exercise cursor
+    paging, null exclusion and bound replacement/row-ID parameters against
+    SQLite itself. A statement aimed at another registry entry cannot pass.
+    """
+    import sqlite3
+
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.execute(f'CREATE TABLE "{field.table}" ("{field.column}", untouched)')
+        connection.executemany(
+            f'INSERT INTO "{field.table}" (rowid, "{field.column}", untouched) VALUES (?, ?, ?)',
+            [(1, "old", "keep"), (2, None, "null row"), (3, "next", "also keep")],
+        )
+        assert connection.execute(field.rekey_select_sql, (1,)).fetchall() == [(3, "next")]
+        replacement = "value'); DROP TABLE unrelated; --"
+        connection.execute(field.rekey_update_sql, (replacement, 1))
+        assert connection.execute(field.rekey_select_sql, (0,)).fetchall() == [
+            (1, replacement), (3, "next"),
+        ]
+        assert connection.execute(
+            f'SELECT rowid, untouched FROM "{field.table}" ORDER BY rowid'
+        ).fetchall() == [(1, "keep"), (2, "null row"), (3, "also keep")]
+        connection.executemany(
+            f'INSERT INTO "{field.table}" (rowid, "{field.column}") VALUES (?, ?)',
+            [(rowid, "paged") for rowid in range(4, 604)],
+        )
+        first_page = connection.execute(field.rekey_select_sql, (0,)).fetchall()
+        assert len(first_page) == 512
+        assert first_page[0] == (1, replacement)
+        assert first_page[-1] == (513, "paged")
+        assert connection.execute(field.rekey_select_sql, (513,)).fetchall() == [
+            (rowid, "paged") for rowid in range(514, 604)
+        ]
+    finally:
+        connection.close()
 
 
 _PRIMITIVES = {"_wrap_path", "_unwrap_path", "maybe_wrap", "maybe_unwrap"}

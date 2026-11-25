@@ -1,29 +1,11 @@
 #!/usr/bin/env python3
-"""File engine v2 benchmark regression gate.
+"""Compare measured benchmark repetitions with explicit pass/fail/inconclusive outcomes.
 
-Compares two ``perf_lab_native --json`` result sets and fails if any tracked
-metric regresses by more than the threshold. The gate is one-way: regressions
-fail, improvements are silent.
-
-Both sides must be MEASURED, not remembered. Comparing a fresh run against a
-committed file of MB/s does not work, and the two ways it fails were both
-observed here:
-
-  * A baseline recorded on a 24-core Windows workstation, compared against
-    ubuntu-latest, reported ChaCha down 12% and AES up 293% in one run. That
-    is AES-NI and core count, not code.
-  * A baseline recorded on the SAME runner class one commit earlier reported
-    AES-256KiB down 37% on an unchanged tree. Same class is not the same
-    machine; shared CI has noisy neighbours.
-
-So callers benchmark both sides on one runner in one job, and pass repeated
-runs of each. ``--require-comparable-host`` refuses a mismatched comparison
-outright rather than reporting a meaningless delta.
-
-Repetition matters: even paired on one machine, a single run of a byte-
-identical tree showed AES-256KiB down 9.03%. Throughput noise is one-sided --
-interference only ever slows a run down -- so the fastest observation per
-metric is taken across repetitions.
+CI alternates matched native artifacts on one host using one benchmark harness.
+Every observation is retained. Median ratios and a deterministic percentile
+bootstrap interval enforce the chosen effect-size limit. An overlapping or
+missing result is INCONCLUSIVE (exit 2), never a silent pass. This relative gate
+is separate from production SLOs and does not establish end-to-end throughput.
 """
 
 from __future__ import annotations
@@ -31,6 +13,9 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import json
+import math
+import random
+import statistics
 import sys
 from pathlib import Path
 
@@ -44,14 +29,7 @@ def _index_results(payload: dict) -> dict[str, float]:
 
 
 def _samples(payloads: list[dict]) -> dict[str, list[float]]:
-    """Every observation of every metric, kept rather than collapsed.
-
-    Throughput noise on shared CI is one-sided: a neighbour can steal cycles
-    and slow a run down, but nothing makes it spuriously faster. The spread
-    between repetitions is therefore a direct measurement of the interference
-    on this machine right now, and it is what tells a real regression from a
-    bad neighbour.
-    """
+    """Retain every measured throughput observation."""
     out: dict[str, list[float]] = {}
     for payload in payloads:
         for name, value in _index_results(payload).items():
@@ -92,7 +70,7 @@ def _host_identity(host: dict) -> tuple[str, str, int | None, str]:
     """
     platform = str(host.get("platform", ""))
     family = platform.split("-", 1)[0] or "?"
-    lowered = platform.lower()
+    lowered = str(host.get("machine") or platform).lower()
     architecture = next((a for a in _ARCHITECTURES if a in lowered), "?")
     # x86_64 and amd64 are the same machine under two spellings.
     if architecture == "amd64":
@@ -101,7 +79,7 @@ def _host_identity(host: dict) -> tuple[str, str, int | None, str]:
         architecture = "arm64"
     cpu_count = host.get("cpu_count")
     python = ".".join(str(host.get("python", "")).split(".")[:2])
-    return family, architecture, cpu_count if isinstance(cpu_count, int) else None, python
+    return family, architecture, cpu_count if type(cpu_count) is int and cpu_count > 0 else None, python
 
 
 def _hosts_are_comparable(a: dict, b: dict) -> tuple[bool, str]:
@@ -120,6 +98,10 @@ def _hosts_are_comparable(a: dict, b: dict) -> tuple[bool, str]:
         )
     left = _host_identity(a)
     right = _host_identity(b)
+    if any(value in ("", "?", None) for value in (*left, *right)):
+        return False, "one or both hosts omit OS, architecture, CPU count or Python identity"
+    if a.get("host_id") and b.get("host_id") and a["host_id"] != b["host_id"]:
+        return False, "recorded host identities differ"
     if left != right:
         labels = ("os family", "architecture", "cpu count", "python")
         differences = [
@@ -137,232 +119,191 @@ def _read_json(path: Path) -> dict:
     # performance instead of failing on host console encoding.
     raw = path.read_bytes()
     if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
-        return json.loads(raw.decode("utf-16"))
-    return json.loads(raw.decode("utf-8-sig"))
+        payload = json.loads(raw.decode("utf-16"))
+    else:
+        payload = json.loads(raw.decode("utf-8-sig"))
+    if not isinstance(payload, dict):
+        raise ValueError("benchmark JSON must be an object")
+    return payload
+
+
+def _ratio_interval(fresh: list[float], baseline: list[float], *, paired: bool) -> tuple[float, float, float]:
+    """Median effect and deterministic percentile-bootstrap uncertainty.
+
+    The interval describes these observations; it is not a causal claim or a
+    distribution-free guarantee. CI uses alternating matched runs. Independent
+    resampling is retained for explicitly unpaired local comparisons.
+    """
+    if paired:
+        ratios = [a / b for a, b in zip(fresh, baseline)]
+        point = statistics.median(ratios)
+    else:
+        point = statistics.median(fresh) / statistics.median(baseline)
+    if len(fresh) == len(baseline) == 1:
+        return point, point, point
+    rng = random.Random(20261124)  # public deterministic resampling
+    estimates = []
+    for _ in range(4000):
+        if paired:
+            estimates.append(statistics.median(rng.choices(ratios, k=len(ratios))))
+        else:
+            estimates.append(statistics.median(rng.choices(fresh, k=len(fresh))) /
+                             statistics.median(rng.choices(baseline, k=len(baseline))))
+    estimates.sort()
+    return point, estimates[99], estimates[3900]
+
+
+def _validate_payloads(payloads: list[dict], minimum: int) -> None:
+    if len(payloads) < minimum:
+        raise ValueError(f"need at least {minimum} complete repetitions per arm")
+    names = set(_index_results(payloads[0]))
+    if not names:
+        raise ValueError("empty result set")
+    for payload in payloads:
+        rows = payload.get("results", [])
+        values = _index_results(payload)
+        if len(values) != len(rows):
+            raise ValueError("duplicate benchmark name")
+        if set(values) != names:
+            raise ValueError("metric missing from one repetition")
+        if any(not math.isfinite(v) or v <= 0 for v in values.values()):
+            raise ValueError("throughput must be finite and positive")
+
+
+def _paired_identity(fresh: list[dict], baseline: list[dict]) -> None:
+    if len(fresh) != len(baseline):
+        raise ValueError("paired arms must have equal repetition counts")
+    session = fresh[0].get("provenance", {}).get("session_id")
+    if not session:
+        raise ValueError("paired measurement session is unrecorded")
+    pair_ids = set()
+    for a, b in zip(fresh, baseline):
+        pa, pb = a.get("provenance", {}), b.get("provenance", {})
+        pair_id = pa.get("pair_index")
+        if pa.get("session_id") != session or pb.get("session_id") != session:
+            raise ValueError("paired measurements came from different sessions")
+        if pair_id is None or pair_id != pb.get("pair_index") or pair_id in pair_ids:
+            raise ValueError("missing, duplicated or mismatched pair index")
+        pair_ids.add(pair_id)
+        if pa.get("arm") != "candidate" or pb.get("arm") != "baseline":
+            raise ValueError("paired arm identity is invalid")
+        for provenance in (pa, pb):
+            if not provenance.get("native_source_revision"):
+                raise ValueError("native source identity is unrecorded")
+            if not provenance.get("native", {}).get("artifacts"):
+                raise ValueError("native artifact identity is unrecorded")
+        if pa.get("source_revision") != pb.get("source_revision"):
+            raise ValueError("paired benchmark harnesses differ")
+        ha, hb = pa.get("host", {}), pb.get("host", {})
+        if not ha.get("host_id") or ha.get("host_id") != hb.get("host_id"):
+            raise ValueError("paired physical host identities differ or are missing")
+    for arm in (fresh, baseline):
+        identities = {
+            json.dumps({k: p.get("provenance", {}).get(k) for k in
+                        ("native_source_revision", "native", "source_revision")}, sort_keys=True)
+            for p in arm
+        }
+        if len(identities) != 1:
+            raise ValueError("build identity changed within an arm")
 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument(
-        "--results",
-        required=True,
-        nargs="+",
-        help=(
-            "Fresh perf_lab_native JSON. Pass repeated runs of the SAME build "
-            "and the fastest observation per metric is used."
-        ),
-    )
-    p.add_argument(
-        "--baseline",
-        required=True,
-        nargs="+",
-        help="The other side's JSON, same repetition rule.",
-    )
-    p.add_argument(
-        "--max-regression-percent",
-        type=float,
-        default=5.0,
-        help="Maximum allowed regression vs baseline, in percent (default 5).",
-    )
-    p.add_argument(
-        "--metric-limit",
-        action="append",
-        default=[],
-        metavar="NAME_OR_GLOB=PERCENT",
-        help=(
-            "Per-metric tolerance override, repeatable. For metrics whose measured spread is "
-            "dominated by something other than the code under test -- see the block-collection "
-            "note in the comparison loop -- a global limit either fails constantly or has to be "
-            "loosened for everything. This keeps the strict limit where it means something."
-        ),
-    )
-    p.add_argument(
-        "--require-comparable-host",
-        action="store_true",
-        help=(
-            "Refuse to compare result sets measured on different machines. The "
-            "CI gate passes this: it benchmarks the PR head and its merge base "
-            "on the SAME runner, so a difference is attributable to the change."
-        ),
-    )
+    p.add_argument("--results", required=True, nargs="+", help="Candidate JSON repetitions in pair order.")
+    p.add_argument("--baseline", required=True, nargs="+", help="Baseline JSON repetitions in pair order.")
+    p.add_argument("--max-regression-percent", type=float, default=5.0)
+    p.add_argument("--metric-limit", action="append", default=[], metavar="NAME_OR_GLOB=PERCENT")
+    p.add_argument("--require-comparable-host", action="store_true")
+    p.add_argument("--require-paired-runs", action="store_true")
+    p.add_argument("--min-samples", type=int, default=1)
+    p.add_argument("--json", type=Path, help="Write every metric decision and retained observations.")
     args = p.parse_args(argv)
-
-    results_paths = [Path(p) for p in args.results]
-    baseline_paths = [Path(p) for p in args.baseline]
-
-    missing = [p for p in results_paths if not p.is_file()]
-    if missing:
-        print(f"FAIL: results file missing: {missing[0]}", file=sys.stderr)
-        return 2
-    absent = [p for p in baseline_paths if not p.is_file()]
-    if absent:
-        print(
-            f"NEUTRAL: baseline file missing ({absent[0]}); commit current "
-            f"results as the initial baseline.",
-            file=sys.stderr,
-        )
-        return 0
-
-    results_payloads = [_read_json(p) for p in results_paths]
-    baseline_payloads = [_read_json(p) for p in baseline_paths]
-    fresh_samples = _samples(results_payloads)
-    baseline_samples = _samples(baseline_payloads)
-    fresh = {name: max(values) for name, values in fresh_samples.items()}
-    baseline = {name: max(values) for name, values in baseline_samples.items()}
-
-    fresh_host = _host(results_payloads[0])
-    baseline_host = _host(baseline_payloads[0])
-    print(
-        f"  measured on: {_describe_host(fresh_host)} "
-        f"(best of {len(results_payloads)})"
-    )
-    print(
-        f"  compared to: {_describe_host(baseline_host)} "
-        f"(best of {len(baseline_payloads)})"
-    )
-
-    if args.require_comparable_host:
-        comparable, why = _hosts_are_comparable(fresh_host, baseline_host)
-        if not comparable:
-            print(
-                f"FAIL: refusing to compare throughput across machines -- {why}.\n"
-                "      A raw MB/s comparison between different hardware measures "
-                "the hardware, not the change.",
-                file=sys.stderr,
-            )
-            return 2
-
-    if not baseline:
-        print(f"FAIL: baseline empty: {baseline_paths[0]}", file=sys.stderr)
-        return 2
-
-    threshold = args.max_regression_percent / 100.0
-
-    # Per-metric overrides. Parsed strictly: a typo here would silently restore the global limit
-    # and the override would look applied while doing nothing.
-    metric_limits: dict[str, float] = {}
+    if not math.isfinite(args.max_regression_percent) or not 0 <= args.max_regression_percent < 100:
+        p.error("--max-regression-percent must be finite and in [0, 100)")
+    if args.min_samples < 1:
+        p.error("--min-samples must be positive")
+    metric_limits = {}
     for spec in args.metric_limit:
-        name, _, pct = str(spec).partition("=")
-        if not name or not pct:
-            raise SystemExit(f"--metric-limit expects NAME=PERCENT, got {spec!r}")
+        name, _, text = spec.partition("=")
         try:
-            metric_limits[name] = float(pct) / 100.0
+            value = float(text)
         except ValueError:
-            raise SystemExit(f"--metric-limit percent is not a number: {spec!r}") from None
+            p.error(f"--metric-limit expects NAME=PERCENT, got {spec!r}")
+        if not name or not math.isfinite(value) or not 0 <= value < 100:
+            p.error(f"--metric-limit expects a finite percent in [0, 100): {spec!r}")
+        metric_limits[name] = value / 100
 
-    def limit_for(metric: str) -> float:
-        """Exact name first, then glob. Patterns exist because the layout-sensitive metrics are a
-        CLASS, not a list: naming them one at a time is how you discover the next one in CI."""
-        if metric in metric_limits:
-            return metric_limits[metric]
-        # Most specific pattern wins, so a tighter rule can carve an exception out of a broad one
-        # rather than being silently overridden by whichever happened to be declared first.
-        matches = [(pat, lim) for pat, lim in metric_limits.items() if fnmatch.fnmatchcase(metric, pat)]
-        if not matches:
-            return threshold
-        return max(matches, key=lambda kv: len(kv[0]))[1]
+    def limit_for(name: str) -> float:
+        if name in metric_limits:
+            return metric_limits[name]
+        matches = [(pat, value) for pat, value in metric_limits.items() if fnmatch.fnmatchcase(name, pat)]
+        return max(matches, key=lambda item: len(item[0]))[1] if matches else args.max_regression_percent / 100
 
-    failures: list[str] = []
+    try:
+        fresh_payloads = [_read_json(Path(path)) for path in args.results]
+        base_payloads = [_read_json(Path(path)) for path in args.baseline]
+        _validate_payloads(fresh_payloads, args.min_samples)
+        _validate_payloads(base_payloads, args.min_samples)
+        if args.require_comparable_host:
+            expected = _host(base_payloads[0])
+            for payload in [*fresh_payloads, *base_payloads]:
+                comparable, reason = _hosts_are_comparable(_host(payload), expected)
+                if not comparable:
+                    raise ValueError(f"refusing comparison across machines: {reason}")
+        if args.require_paired_runs:
+            _paired_identity(fresh_payloads, base_payloads)
+        fresh = _samples(fresh_payloads)
+        baseline = _samples(base_payloads)
+        if set(fresh) != set(baseline):
+            raise ValueError(f"metric sets differ: {sorted(set(fresh) ^ set(baseline))}")
+        # Equal names alone do not establish equal work (different corpora,
+        # sizes, modes or operation counts must never generate a speedup).
+        for payload in [*fresh_payloads, *base_payloads]:
+            for row in payload["results"]:
+                reference = next(r for r in base_payloads[0]["results"] if r["name"] == row["name"])
+                for key in ("bytes_processed", "iterations", "metadata"):
+                    if row.get(key) != reference.get(key):
+                        raise ValueError(f"measurement contract differs for {row['name']}: {key}")
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        print(f"INCONCLUSIVE: {exc}", file=sys.stderr)
+        if args.json:
+            args.json.write_text(json.dumps({"status": "inconclusive", "error": str(exc)}, indent=2), encoding="utf-8")
+        return 2
 
-    for name, base_bps in baseline.items():
-        fresh_bps = fresh.get(name)
-        if fresh_bps is None:
-            failures.append(
-                f"  - {name}: baseline tracks but fresh results missing this metric"
-            )
-            continue
-        if base_bps <= 0:
-            continue
-        ratio = fresh_bps / base_bps
-        # Two conditions, both required.
-        #
-        # (1) EFFECT SIZE: the best head observation is worse than the best
-        #     base observation by more than the tolerance.
-        # (2) SEPARATION: the best head observation is worse than the WORST
-        #     base observation -- the two sample sets do not overlap at all.
-        #
-        # (1) alone is what failed three times running on byte-identical code:
-        # -9.03% AES, then -7.75% QUIC, then -6.20% AES and -25.37% QUIC. Every
-        # run put a different metric over whatever line was drawn, because a
-        # point estimate cannot tell a regression from a noisy neighbour.
-        #
-        # (2) asks the data instead of a constant. If the head's best run is
-        # still slower than every base run, the effect survived the machine's
-        # own measured variance. If the sets overlap, the spread explains the
-        # difference and there is nothing to report. A real regression is
-        # present in every repetition, so it separates; noise does not.
-        worst_base = min(baseline_samples.get(name, [base_bps]))
-        separated = fresh_bps < worst_base
-        # WHY SEPARATION IS NOT ENOUGH FOR EVERY METRIC, and why some carry their own limit.
-        #
-        # The two sample sets are collected in BLOCKS: five head runs, then five base runs, with a
-        # rebuild between. Inside a block the thermal state, page cache and CPU frequency are
-        # near-identical, so within-block spread is tiny; between blocks it is not. That makes the
-        # sets easy to separate for reasons that have nothing to do with the diff -- the criterion
-        # was meant to ask "did the effect survive the machine's variance", but a blocked design
-        # hides most of that variance inside each arm.
-        #
-        # Measured, 2026-08-08: `native_aead_aes_decrypt_16KiB` failed at 6.31% on master with
-        # `native/ol_aead/` UNCHANGED since the drift anchor -- byte-identical source on both
-        # sides -- while the gate's history flapped success/failure across unrelated commits on the
-        # same day. Small fixed-size AEAD blocks are dominated by code layout, which unrelated
-        # changes elsewhere in the binary move around.
-        #
-        # So: keep 5% where it means something, and give the layout-sensitive metrics their own
-        # limit rather than loosening the gate globally or deleting it.
+    print(f"  measured on: {_describe_host(_host(fresh_payloads[0]))}")
+    print(f"  {len(fresh_payloads)} candidate / {len(base_payloads)} baseline observations; median effect")
+    decisions = []
+    for name in sorted(baseline):
+        point, lower, upper = _ratio_interval(fresh[name], baseline[name], paired=args.require_paired_runs)
         limit = limit_for(name)
-        if ratio < (1.0 - limit) and separated:
-            regress_pct = (1.0 - ratio) * 100.0
-            failures.append(
-                f"  - {name}: regressed {regress_pct:.2f}% (limit {limit * 100.0:g}%) "
-                f"({base_bps / 1e6:.2f} MB/s -> {fresh_bps / 1e6:.2f} MB/s); "
-                f"every base run was faster (worst base "
-                f"{worst_base / 1e6:.2f} MB/s)"
-            )
-        elif ratio < (1.0 - limit):
-            # Over the line but inside the machine's own spread. Say so --
-            # silently passing a measured drop is how a real one hides.
-            print(
-                f"  noisy {name}: {(1.0 - ratio) * 100.0:.2f}% below best base, "
-                f"but base itself ranged down to {worst_base / 1e6:.2f} MB/s "
-                f"({len(baseline_samples.get(name, []))} runs); not separable"
-            )
-        elif ratio < (1.0 - threshold):
-            # Past the GLOBAL limit but inside this metric's own, wider one. Report it loudly.
-            # Adding the override without this line created exactly the failure the branch above
-            # exists to prevent: a measured 6.3% drop passing in silence, which is how a real
-            # regression hides behind a tolerance someone widened months ago.
-            print(
-                f"  TOLERATED {name}: {(1.0 - ratio) * 100.0:.2f}% below best base, over the "
-                f"global {args.max_regression_percent:g}% limit but inside this metric's "
-                f"documented {limit * 100.0:g}% tolerance"
-                + (" -- AND the sample sets separated, so this is not noise; if it persists "
-                   "across runners it is worth a look" if separated else "")
-            )
-        else:
-            delta_pct = (ratio - 1.0) * 100.0
-            sign = "+" if delta_pct >= 0 else ""
-            print(
-                f"  ok {name}: {sign}{delta_pct:.2f}% "
-                f"({base_bps / 1e6:.2f} MB/s -> {fresh_bps / 1e6:.2f} MB/s)"
-            )
-
-    if failures:
-        print(
-            f"\nFAIL: {len(failures)} benchmark(s) regressed past their limit:",
-            file=sys.stderr,
-        )
-        for f in failures:
-            print(f, file=sys.stderr)
-        print(
-            "\nIf this regression is intended, update bench_baselines/ in the "
-            "same PR with a justification commit message.",
-            file=sys.stderr,
-        )
-        return 1
-
-    print(f"\nPASS: all {len(baseline)} tracked metrics within threshold.")
-    return 0
+        boundary = 1 - limit
+        # Passing requires the lower uncertainty bound to meet the limit.
+        # Overlap is inconclusive, never a successful regression gate.
+        status = "fail" if upper < boundary else "pass" if lower >= boundary else "inconclusive"
+        decision = {
+            "name": name, "status": status, "ratio_median": point,
+            "ratio_interval_95": [lower, upper], "limit_percent": limit * 100,
+            "candidate_bps": fresh[name], "baseline_bps": baseline[name],
+            "interval_method": "percentile bootstrap, 4000 deterministic resamples" if len(fresh[name]) > 1 or len(baseline[name]) > 1 else "single observation; descriptive only",
+        }
+        decisions.append(decision)
+        prefix = "TOLERATED" if status == "pass" and point < 1 - args.max_regression_percent / 100 else status.upper()
+        print(f"  {prefix} {name}: {(point-1)*100:+.2f}% median change; "
+              f"ratio interval [{lower:.4f}, {upper:.4f}], limit {limit*100:g}%")
+    status = "fail" if any(d["status"] == "fail" for d in decisions) else "inconclusive" if any(d["status"] == "inconclusive" for d in decisions) else "pass"
+    report = {
+        "schema": "one-link-benchmark-gate-v2", "status": status,
+        "paired": args.require_paired_runs, "decisions": decisions,
+        "interpretation": "Observed performance acceptance, not causal attribution or a product throughput guarantee.",
+    }
+    if args.json:
+        args.json.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
+    if status != "pass":
+        print(f"\n{status.upper()}: throughput regressed or uncertainty crosses the allowed boundary; "
+              "preserve these observations and investigate before collecting a new complete paired study.", file=sys.stderr)
+    else:
+        print(f"\nPASS: all {len(decisions)} tracked metrics meet the stated measurement acceptance rule.")
+    return {"pass": 0, "fail": 1, "inconclusive": 2}[status]
 
 
 if __name__ == "__main__":

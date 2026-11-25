@@ -40,11 +40,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 
 def _bench(name: str, fn: Callable[[], object], iters: int = 10_000) -> dict:
+    if iters < 1:
+        raise ValueError("iters must be positive")
     # Warm up — JIT-y caches, importing AEAD backend, etc.
     for _ in range(min(200, iters)):
         fn()
     durations: list[float] = []
-    # Repeat the sample run a few times so we can report median + p95.
+    # Repeat the sample run a few times so we can report median and worst batch-average.
     for _ in range(5):
         t0 = time.perf_counter_ns()
         for _ in range(iters):
@@ -52,12 +54,14 @@ def _bench(name: str, fn: Callable[[], object], iters: int = 10_000) -> dict:
         t1 = time.perf_counter_ns()
         durations.append((t1 - t0) / iters)
     median = statistics.median(durations)
-    p95 = sorted(durations)[-1]  # 5 runs → max ≈ p95
+    worst_batch_average = max(durations)  # maximum batch-average; not an operation percentile
     return {
         "name": name,
         "iters": iters,
         "ns_per_op_median": median,
-        "ns_per_op_p95": p95,
+        "ns_per_op_worst_batch_average": worst_batch_average,
+        "batch_mean_ns_per_op_samples": durations,
+        "sample_kind": "batch means; not individual-operation tail latency",
         "ops_per_sec_median": 1e9 / median if median > 0 else float("inf"),
     }
 
@@ -515,7 +519,7 @@ def main() -> int:
         _bench_native_aead_t1b_candidate,
         _bench_native_transfer_e2e,
     ]
-    print(f"{'name':<46} {'ns/op (med)':>14} {'ns/op (p95)':>14} {'ops/sec':>14}")
+    print(f"{'name':<46} {'ns/op (med)':>14} {'worst batch avg':>14} {'ops/sec':>14}")
     print("-" * 92)
     for b in benchmarks:
         try:
@@ -526,7 +530,7 @@ def main() -> int:
         print(
             f"{r['name']:<46}"
             f" {r['ns_per_op_median']:>14,.0f}"
-            f" {r['ns_per_op_p95']:>14,.0f}"
+            f" {r['ns_per_op_worst_batch_average']:>14,.0f}"
             f" {r['ops_per_sec_median']:>14,.0f}"
         )
     return 0

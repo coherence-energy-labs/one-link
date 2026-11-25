@@ -25,17 +25,20 @@ import statistics
 import tempfile
 import time
 import zlib
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
+from unittest.mock import patch
 
 from .platform_guard import install_windows_platform_fastpath
 
 install_windows_platform_fastpath()
 
 from .cdc import build_dedup_plan, fixed_index_path, hash_path, index_path
-from .daemon import _stream_transfer_profile
-from .native_cdc import native_cdc_status
+from .daemon import Daemon, _stream_transfer_profile
+from .native_cdc import get_native_cdc_scanner
+from .benchmark_contract import comparison_issues, corpus_bytes, provenance
 from .state import State
 from .swarm_plan import plan_swarm_sources, source_from_hashes
 from .transfer_brain import (
@@ -52,7 +55,7 @@ MiB = 1024 * 1024
 @dataclass(frozen=True)
 class BenchResult:
     name: str
-    metrics: dict[str, float | int | str | bool]
+    metrics: dict[str, Any]
     seconds: float
     notes: str = ""
 
@@ -81,70 +84,87 @@ def _time(fn: Callable[[], dict]) -> BenchResult:
     )
 
 
-def bench_hash_only(*, size_mib: int, seed: int) -> BenchResult:
-    def run() -> dict:
-        rng = random.Random(seed)  # nosec B311
-        with tempfile.TemporaryDirectory(prefix="ol_perf_hash_") as td:
-            path = Path(td) / "payload.bin"
-            path.write_bytes(rng.randbytes(size_mib * MiB))
-            t0 = time.perf_counter()
-            blob = hash_path(path)
-            elapsed = time.perf_counter() - t0
-        return {
-            "name": "hash_only_manifest",
-            "size_bytes": size_mib * MiB,
-            "mib_per_s": _mb_per_s(size_mib * MiB, elapsed),
-            "blob_hash_prefix": blob[:12],
-            "notes": "baseline/old-version peers now pay this cost instead of CDC indexing",
-        }
+def _index_benchmark(*, name: str, size_mib: int, seed: int, mode: str, repeats: int = 5) -> BenchResult:
+    if size_mib < 1 or repeats < 1:
+        raise ValueError("size_mib and repeats must be positive")
+    size = size_mib * MiB
+    durations = []
+    scanner = get_native_cdc_scanner() if mode in {"cdc", "daemon"} else None
+    scan_calls = 0
+    with tempfile.TemporaryDirectory(prefix="ol_perf_index_") as td:
+        path = Path(td) / "payload.bin"
+        path.write_bytes(corpus_bytes(size, seed=seed))
+        expected_hash = hash_path(path)
+        daemon = Daemon.__new__(Daemon)
+        daemon.state = None  # explicitly measure an uncached production preparation
+        daemon._outbound_sessions = {}
+        index_kind = mode
+        last = None
+        # Observe the actual dispatch, not just native availability. The small
+        # wrapper overhead is included in the measured region and disclosed.
+        original_scan = scanner.scan if scanner is not None else None
 
-    return _time(run)
+        def observed_scan(*args, **kwargs):
+            nonlocal scan_calls
+            scan_calls += 1
+            assert original_scan is not None
+            return original_scan(*args, **kwargs)
+
+        observer = patch.object(scanner, "scan", observed_scan) if scanner is not None else nullcontext()
+        with observer:
+            for _ in range(repeats):
+                started = time.perf_counter()
+                if mode == "hash":
+                    observed_hash = hash_path(path)
+                elif mode == "fixed":
+                    last = fixed_index_path(path)
+                    observed_hash = last.blob_hash
+                elif mode == "cdc":
+                    last = index_path(path)
+                    observed_hash = last.blob_hash
+                else:
+                    prepared = daemon.prepare_file_for_transfer(path)
+                    last = prepared.file_index
+                    index_kind = prepared.index_kind
+                    observed_hash = last.blob_hash
+                    if prepared.cache_hit:
+                        raise RuntimeError("uncached preparation unexpectedly reused an index")
+                durations.append(time.perf_counter() - started)
+                if observed_hash != expected_hash:
+                    raise RuntimeError("index/hash result differs from verified input")
+                if last is not None and (last.size != size or sum(c.size for c in last.chunks) != size):
+                    raise RuntimeError("index does not cover the complete source")
+    elapsed = statistics.median(durations)
+    engine = getattr(last, "engine", None) or ("ctypes-c" if scan_calls else "blake3" if mode == "hash" else "python-boundaries+blake3")
+    return BenchResult(
+        name=name, seconds=elapsed,
+        metrics={
+            "size_bytes": size, "chunks": len(last.chunks) if last is not None else 0,
+            "mib_per_s": _mb_per_s(size, elapsed), "blob_hash": expected_hash,
+            "engine": engine, "index_kind": index_kind,
+            "native_scan_calls": scan_calls, "samples_sec": durations,
+            "samples": repeats, "verified_samples": repeats,
+            "measurement_scope": "production_descriptor_preparation_no_persistent_cache" if mode == "daemon" else "indexing_component",
+            "storage_state": "freshly written OS-cache-warm regular file",
+        },
+        notes="Input generation excluded; actual dispatch observer included; output hash/coverage verification outside timing.",
+    )
+
+
+def bench_hash_only(*, size_mib: int, seed: int) -> BenchResult:
+    return _index_benchmark(name="hash_only_manifest", size_mib=size_mib, seed=seed, mode="hash")
 
 
 def bench_fixed_indexing(*, size_mib: int, seed: int) -> BenchResult:
-    def run() -> dict:
-        rng = random.Random(seed)  # nosec B311
-        with tempfile.TemporaryDirectory(prefix="ol_perf_fixed_") as td:
-            path = Path(td) / "payload.bin"
-            path.write_bytes(rng.randbytes(size_mib * MiB))
-            t0 = time.perf_counter()
-            idx = fixed_index_path(path)
-            elapsed = time.perf_counter() - t0
-        return {
-            "name": "fixed_indexing",
-            "size_bytes": size_mib * MiB,
-            "chunks": len(idx.chunks),
-            "mib_per_s": _mb_per_s(size_mib * MiB, elapsed),
-            "avg_chunk_bytes": round((size_mib * MiB) / max(1, len(idx.chunks)), 3),
-            "blob_hash_prefix": idx.blob_hash[:12],
-            "notes": "high-throughput aligned-block manifest lane for large media",
-        }
-
-    return _time(run)
+    return _index_benchmark(name="fixed_indexing", size_mib=size_mib, seed=seed, mode="fixed")
 
 
 def bench_cdc_indexing(*, size_mib: int, seed: int) -> BenchResult:
-    def run() -> dict:
-        rng = random.Random(seed)  # nosec B311
-        with tempfile.TemporaryDirectory(prefix="ol_perf_cdc_") as td:
-            path = Path(td) / "payload.bin"
-            path.write_bytes(rng.randbytes(size_mib * MiB))
-            status = native_cdc_status()
-            t0 = time.perf_counter()
-            idx = index_path(path)
-            elapsed = time.perf_counter() - t0
-        return {
-            "name": "cdc_indexing",
-            "size_bytes": size_mib * MiB,
-            "chunks": len(idx.chunks),
-            "mib_per_s": _mb_per_s(size_mib * MiB, elapsed),
-            "avg_chunk_bytes": round((size_mib * MiB) / max(1, len(idx.chunks)), 3),
-            "blob_hash_prefix": idx.blob_hash[:12],
-            "engine": status.engine if status.available else "python",
-            "native_available": status.available,
-        }
+    return _index_benchmark(name="cdc_indexing", size_mib=size_mib, seed=seed, mode="cdc")
 
-    return _time(run)
+
+def bench_daemon_preparation(*, size_mib: int, seed: int) -> BenchResult:
+    return _index_benchmark(name="daemon_source_preparation", size_mib=size_mib, seed=seed, mode="daemon")
 
 
 def bench_prior_knowledge(*, size_mib: int, mutation_bytes: int, seed: int) -> BenchResult:
@@ -442,6 +462,7 @@ def run_perf_lab(
         bench_hash_only(size_mib=cfg["cdc_mib"], seed=seed),
         bench_fixed_indexing(size_mib=cfg["cdc_mib"], seed=seed),
         bench_cdc_indexing(size_mib=cfg["cdc_mib"], seed=seed),
+        bench_daemon_preparation(size_mib=cfg["cdc_mib"], seed=seed),
         bench_prior_knowledge(size_mib=cfg["prior_mib"], mutation_bytes=4096, seed=seed + 1),
         bench_swarm_scheduler(chunks=cfg["scheduler_chunks"], sources=12, seed=seed + 2),
         bench_torture_sim(size_mib=cfg["sim_mib"], seed=seed + 3),
@@ -454,6 +475,8 @@ def run_perf_lab(
     return {
         "schema": "one-link-perf-lab-v1",
         "scale": scale,
+        "measurement_contract": {"index_repetitions": 5, "corpus": "seeded-randbytes-v1", "storage_state": "OS-cache-warm", "scope": "local-components-and-descriptor-preparation"},
+        "provenance": provenance(),
         "seed": seed,
         "started_unix": started,
         "duration_s": round(time.time() - started, 6),
@@ -480,13 +503,20 @@ def compare_reports(old: dict, new: dict) -> dict:
     better depends on the metric, so we keep this as raw math for now.
     """
 
+    issues = comparison_issues(old, new)
     old_by_name = {b["name"]: b for b in old.get("benchmarks", [])}
     new_by_name = {b["name"]: b for b in new.get("benchmarks", [])}
     benches: dict[str, dict] = {}
+    all_issues = list(issues)
     for name in sorted(set(old_by_name) & set(new_by_name)):
         old_metrics = old_by_name[name].get("metrics", {})
         new_metrics = new_by_name[name].get("metrics", {})
         metrics: dict[str, dict] = {}
+        bench_issues = list(issues)
+        for contract_key in ("engine", "index_kind", "measurement_scope", "size_bytes", "storage_state"):
+            if old_metrics.get(contract_key) != new_metrics.get(contract_key):
+                bench_issues.append(f"different {name}.{contract_key}")
+        all_issues.extend(issue for issue in bench_issues if issue not in all_issues)
         for key in sorted(set(old_metrics) & set(new_metrics)):
             old_v = old_metrics[key]
             new_v = new_metrics[key]
@@ -494,18 +524,22 @@ def compare_reports(old: dict, new: dict) -> dict:
                 metrics[key] = {"old": old_v, "new": new_v, "changed": old_v != new_v}
             elif isinstance(old_v, (int, float)) and isinstance(new_v, (int, float)):
                 delta = float(new_v) - float(old_v)
-                ratio = None if float(old_v) == 0 else float(new_v) / float(old_v)
+                ratio = None if float(old_v) == 0 or bench_issues else float(new_v) / float(old_v)
                 metrics[key] = {
                     "old": old_v,
                     "new": new_v,
                     "delta": round(delta, 6),
                     "ratio": round(ratio, 6) if ratio is not None else None,
+                    "comparable": not bench_issues,
+                    "comparison_issues": bench_issues,
                 }
             elif old_v != new_v:
                 metrics[key] = {"old": old_v, "new": new_v, "changed": True}
         benches[name] = metrics
     return {
         "schema": "one-link-perf-compare-v1",
+        "status": "inconclusive" if all_issues else "comparable",
+        "comparison_issues": all_issues,
         "old_scale": old.get("scale"),
         "new_scale": new.get("scale"),
         "benchmarks": benches,

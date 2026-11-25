@@ -1,15 +1,38 @@
 # File-engine benchmark results
 
+## Current measurement contract — November 24, 2026
+
+The benchmark implementation now records every attempt, verifies receiver bytes
+and application completion, and uses explicit representative corpora. Transport
+comparisons require requested routes and actual payload-accounting receipts.
+Unavailable or unverified routes produce an inconclusive result and no speedup.
+The current desktop file channel may be authenticated TCP; peer pinning does
+not identify its payload transport.
+
+See [benchmark acceptance policy](../bench_baselines/README.md) for current
+commands, the alternating native-artifact gate, production-preparation profiles,
+raw-sample/provenance fields, and pass/fail/inconclusive semantics.
+
+## Historical measurements below — retained, not requalified
+
+All numerical tables and original interpretations below describe the dated
+May 2026 experiments. Their repetitive corpus, incomplete attempt accounting
+and unverified transport selection prevent their use as current unique-data,
+LAN/WAN, transport-comparison or release-acceptance evidence. They remain a
+historical record; run the corrected harness to make a new qualified claim.
+A loopback observation does not establish LAN line rate, and sampled RSS at
+a few sizes does not prove a constant-memory bound.
+
+
 > Run with `python scripts/bench_file_engine.py --json results.json`.
 > The numbers below are from a Windows 11 laptop on loopback (no
 > real network), Python 3.14, native crate built in release mode.
-> Use as a baseline for regression detection; absolute numbers
-> will vary by hardware. Updated 2026-05-19 on
+> Historical observation only. Updated 2026-05-19 on
 > commit b03fbe0 (`push-relay-health`).
 
 ## Headline numbers
 
-| Metric | Value | What this proves |
+| Metric | Value | Original interpretation (historical, unqualified) |
 |---|---|---|
 | **256 MiB receiver RSS peak** | 90.6 MiB | Stream-to-disk works. Pre-Wave-1d this would have been ~340 MiB (full file in heap + base RSS). Overhead ratio **0.354×** — receiver uses LESS memory than the file size. |
 | **256 MiB sender RSS peak** | 94.0 MiB | Sender also streams; overhead ratio **0.367×**. Symmetric memory hygiene end-to-end. |

@@ -6,31 +6,34 @@ for the native FastCDC v2020 + BLAKE3 + ADR-0006 derivation kernels:
 - CDC scan throughput (target ≥ 2 GiB/s/core scalar; ≥ 5 GiB/s/core SIMD).
 - BLAKE3 raw + convergent chunk-address throughput.
 - AEAD key / ratchet_key_id / stripe_seed derivation throughput.
-- Comparison against the legacy ``cdc.py`` Python kernel for context.
+- Explicit Python Gear-CDC context and an equivalent native-C Gear-CDC pair.
 
 Per ADR-0008 these benchmarks are JSON-serializable and feed the per-PR
-benchmark gate. CI rejects PRs that regress any reported throughput by >5%.
+benchmark gate. CI uses alternating artifact pairs, per-class limits, and an
+explicit inconclusive outcome when measurement uncertainty crosses a limit.
 The CI workflow lives at ``.github/workflows/native_bench_gate.yml``.
 """
 
 from __future__ import annotations
 
 import argparse
+import blake3
 import json
-import os
 import platform
 import statistics
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Callable
+from unittest.mock import patch
 
 import secrets
 import tempfile
 import threading
 
 from . import aead_native, chunk_native, chunk_store_native, quic_native, wal_native
-from .cdc import chunk_bytes as legacy_chunk_bytes
+from . import cdc
+from .benchmark_contract import corpus_bytes, provenance
 
 
 MiB = 1024 * 1024
@@ -38,14 +41,9 @@ GiB = 1024 * 1024 * 1024
 
 
 def _xorshift_buf(seed: int, size: int) -> bytes:
-    state = seed & 0xFFFF_FFFF_FFFF_FFFF
-    out = bytearray(size)
-    for i in range(size):
-        state ^= (state << 13) & 0xFFFF_FFFF_FFFF_FFFF
-        state ^= state >> 7
-        state ^= (state << 17) & 0xFFFF_FFFF_FFFF_FFFF
-        out[i] = state & 0xFF
-    return bytes(out)
+    # Preserve the private helper name for callers, but generate the versioned
+    # public corpus outside timing with randbytes rather than a Python loop.
+    return corpus_bytes(size, seed=seed, kind="random")
 
 
 @dataclass
@@ -63,6 +61,9 @@ class BenchResult:
     seconds_per_iter_median: float
     bytes_per_second_median: float
     metadata: dict[str, object]
+    seconds_per_iteration: list[float] = field(default_factory=list)
+    bytes_per_iteration: list[int] = field(default_factory=list)
+    warmup_iterations: int = 0
 
 
 def _bench(
@@ -76,15 +77,23 @@ def _bench(
 
     Reports median to suppress outliers from cold caches and OS scheduling.
     """
-    for _ in range(max(0, warmup_iterations)):
+    if iterations < 1 or warmup_iterations < 0:
+        raise ValueError("iterations must be positive and warmup nonnegative")
+    for _ in range(warmup_iterations):
         fn()
     durations: list[float] = []
+    byte_counts: list[int] = []
     bytes_one_iter = 0
     for _ in range(iterations):
         start = time.perf_counter_ns()
         bytes_one_iter = fn()
         elapsed_ns = time.perf_counter_ns() - start
+        if type(bytes_one_iter) is not int or bytes_one_iter < 0:
+            raise ValueError("benchmark must return a nonnegative byte count")
+        byte_counts.append(bytes_one_iter)
         durations.append(elapsed_ns / 1e9)
+    if len(set(byte_counts)) != 1:
+        raise ValueError("benchmark work changed across repetitions")
     median_s = statistics.median(durations)
     return BenchResult(
         name=name,
@@ -93,7 +102,10 @@ def _bench(
         seconds_total=sum(durations),
         seconds_per_iter_median=median_s,
         bytes_per_second_median=(bytes_one_iter / median_s) if median_s > 0 else 0.0,
-        metadata=metadata or {},
+        metadata={"measurement_scope": "component", "corpus_version": "native-component-inputs-v2", **(metadata or {})},
+        seconds_per_iteration=durations,
+        bytes_per_iteration=byte_counts,
+        warmup_iterations=warmup_iterations,
     )
 
 
@@ -102,36 +114,84 @@ def bench_native_cdc_scan(size_mib: int = 256, iterations: int = 5) -> BenchResu
         raise RuntimeError("native chunk module unavailable")
     n = size_mib * MiB
     buf = _xorshift_buf(0x1234_5678_DEAD_BEEF + size_mib, n)
+    reference = tuple(chunk_native.cdc_iter(buf))
+    cursor = 0
+    for boundary in reference:
+        if boundary.start != cursor or not cursor < boundary.end <= n:
+            raise RuntimeError("native CDC output does not form a complete partition")
+        if boundary.raw_address != blake3.blake3(buf[boundary.start:boundary.end]).digest():
+            raise RuntimeError("native CDC chunk hash differs from verified input")
+        cursor = boundary.end
+    if cursor != n:
+        raise RuntimeError("native CDC output is truncated")
 
     def go() -> int:
-        count = 0
-        for _b in chunk_native.cdc_iter(buf):
-            count += 1
+        if tuple(chunk_native.cdc_iter(buf)) != reference:
+            raise RuntimeError("native CDC output changed across repetitions")
         return n
 
     return _bench(
         f"native_cdc_scan_{size_mib}MiB",
         go,
         iterations=iterations,
-        metadata={"input_bytes": n, "kernel": "FastCDC v2020 + Gear-256"},
+        metadata={"input_bytes": n, "kernel": "FastCDC v2020 + Gear-256",
+                  "output_verification": "preflight independent BLAKE3 and complete partition; exact outputs each iteration"},
     )
 
 
 def bench_legacy_cdc_scan(size_mib: int = 256, iterations: int = 3) -> BenchResult:
-    """Benchmark the legacy Gear-CDC for context. Slow; small iterations."""
+    """Explicit Python Gear-CDC; not algorithm-equivalent to Rust FastCDC."""
     n = size_mib * MiB
     buf = _xorshift_buf(0x1234_5678_DEAD_BEEF + size_mib, n)
 
     def go() -> int:
-        chunks = legacy_chunk_bytes(buf)
+        cdc.chunk_bytes(buf)
         return n
 
-    return _bench(
-        f"legacy_cdc_scan_{size_mib}MiB",
-        go,
-        iterations=iterations,
-        metadata={"input_bytes": n, "kernel": "legacy Gear-CDC (16/64/256 KiB)"},
-    )
+    # The benchmark runs synchronously. Patching only this private dispatch
+    # boundary avoids mutating the native loader's process-wide cache/status.
+    with patch.object(cdc, "_chunk_bytes_native", return_value=None):
+        return _bench(
+            f"legacy_cdc_scan_{size_mib}MiB", go, iterations=iterations,
+            metadata={"input_bytes": n, "kernel": "Gear-CDC (16/64/256 KiB)",
+                      "engine": "python", "equivalent_to_rust_fastcdc": False},
+        )
+
+
+def bench_equivalent_gear_cdc(size_mib: int = 4, iterations: int = 5) -> list[BenchResult]:
+    """Compare exact Python/C Gear boundaries and hashes before measuring.
+
+    A native failure is explicit; fallback can never masquerade as native C.
+    Both sides include boundary scanning, BLAKE3 hashes and Chunk construction.
+    """
+    buf = corpus_bytes(size_mib * MiB, seed=0xCDC)
+    with patch.object(cdc, "_chunk_bytes_native", return_value=None):
+        reference = cdc.chunk_bytes(buf)
+    native = cdc._chunk_bytes_native(buf)
+    if native is None:
+        raise RuntimeError("native C Gear-CDC unavailable; cannot run equivalent pair")
+    if native != reference:
+        raise RuntimeError("native/Python Gear-CDC boundaries or hashes differ")
+
+    def native_go() -> int:
+        result = cdc._chunk_bytes_native(buf)
+        if result is None or result != reference:
+            raise RuntimeError("native Gear-CDC dispatch/equivalence failed")
+        return len(buf)
+
+    def python_go() -> int:
+        if cdc.chunk_bytes(buf) != reference:
+            raise RuntimeError("Python Gear-CDC equivalence failed")
+        return len(buf)
+
+    meta = {"input_bytes": len(buf), "kernel": "Gear-CDC (16/64/256 KiB)",
+            "output_verified": "exact boundaries and hashes on every iteration"}
+    out = [_bench(f"gear_cdc_c_{size_mib}MiB", native_go, iterations,
+                  {**meta, "engine": "ctypes-c"})]
+    with patch.object(cdc, "_chunk_bytes_native", return_value=None):
+        out.append(_bench(f"gear_cdc_python_{size_mib}MiB", python_go, iterations,
+                          {**meta, "engine": "python"}))
+    return out
 
 
 def bench_native_chunk_address_raw(size_kib: int = 64, iterations: int = 1000) -> BenchResult:
@@ -217,14 +277,17 @@ def bench_native_aead(
     cipher = aead_native.AeadCipher.with_kind(key, kind)  # type: ignore[arg-type]
     # warm-up
     ct = cipher.encrypt_chunk(chunk_id, plaintext)
-    cipher.decrypt_chunk(chunk_id, len(plaintext), ct)
+    if cipher.decrypt_chunk(chunk_id, len(plaintext), ct) != plaintext:
+        raise RuntimeError("native AEAD did not round-trip the benchmark input")
 
     def enc() -> int:
-        ct = cipher.encrypt_chunk(chunk_id, plaintext)
+        if len(cipher.encrypt_chunk(chunk_id, plaintext)) != len(ct):
+            raise RuntimeError("native AEAD ciphertext length changed")
         return len(plaintext)
 
     def dec() -> int:
-        cipher.decrypt_chunk(chunk_id, len(plaintext), ct)
+        if cipher.decrypt_chunk(chunk_id, len(plaintext), ct) != plaintext:
+            raise RuntimeError("native AEAD decrypt returned incorrect bytes")
         return len(plaintext)
 
     enc_res = _bench(
@@ -421,11 +484,14 @@ def _bench_quic_loopback_round_trip(
     )
     conn = client.connect_blocking(addr, alice.fingerprint, timeout_ms=10_000)
     cids = [bytes([i & 0xFF] * 32) for i in range(iterations)]
+    selected_api = next((name for name in (
+        "send_frame_stream_round_trips_count", "send_frame_stream_round_trips",
+        "send_frame_round_trips", "send_frame_round_trip"
+    ) if hasattr(conn, name)), "unavailable")
 
     def go() -> int:
-        # Native bulk streams remove both Python/Rust call overhead and
-        # per-chunk QUIC stream setup. This is the intended fast path for
-        # large file chunk sessions.
+        # This component helper excludes daemon orchestration and receipts.
+        # Its selected API and validation scope are part of the report.
         if hasattr(conn, "send_frame_stream_round_trips_count"):
             received = conn.send_frame_stream_round_trips_count(
                 quic_native.FRAME_CHUNK_REQUEST,
@@ -451,16 +517,20 @@ def _bench_quic_loopback_round_trip(
                 conn.send_frame_round_trip(quic_native.FRAME_CHUNK_REQUEST, cid)
                 for cid in cids
             ]
-        for kind, _payload in replies:
-            if kind != quic_native.FRAME_CHUNK_RESPONSE:
-                raise RuntimeError(f"unexpected response kind {kind:#x}")
+        if len(replies) != iterations:
+            raise RuntimeError("QUIC component returned an incomplete response set")
+        for kind, response_payload in replies:
+            if kind != quic_native.FRAME_CHUNK_RESPONSE or response_payload != bulk_response:
+                raise RuntimeError("QUIC component returned an incorrect response")
         return iterations * payload_bytes
 
     result = _bench(
         f"native_quic_round_trip_{payload_kib}KiB_x{iterations}",
         go,
         iterations=bench_iterations,
-        metadata={"payload_kib": payload_kib, "round_trips": iterations},
+        metadata={"payload_kib": payload_kib, "round_trips": iterations,
+                  "api": selected_api, "measurement_scope": "native_loopback_helper_excludes_daemon",
+                  "payload_validation": "response kind and byte count" if "count" in selected_api else "exact response bytes"},
     )
     done.wait(timeout=5)
     conn.close()
@@ -559,6 +629,10 @@ def _bench_quic_parallel_streams(
         for worker_id in range(parallelism)
         for i in range(iterations_per_stream)
     ]
+    selected_api = next((name for name in (
+        "send_frame_stream_round_trips_count_parallel", "send_frame_stream_round_trips_parallel",
+        "send_frame_round_trips_parallel", "send_frame_round_trip"
+    ) if hasattr(conn, name)), "unavailable")
 
     def go() -> int:
         # Parallel native bulk streams avoid spinning Python worker threads
@@ -615,9 +689,9 @@ def _bench_quic_parallel_streams(
                 f"QUIC parallel benchmark expected {total_round_trips} replies, "
                 f"got {len(replies)}"
             )
-        for kind, _payload in replies:
-            if kind != quic_native.FRAME_CHUNK_RESPONSE:
-                raise RuntimeError(f"unexpected response kind {kind:#x}")
+        for kind, response_payload in replies:
+            if kind != quic_native.FRAME_CHUNK_RESPONSE or response_payload != bulk_response:
+                raise RuntimeError("QUIC component returned an incorrect response")
         return total_round_trips * payload_bytes
 
     result = _bench(
@@ -630,6 +704,9 @@ def _bench_quic_parallel_streams(
             "iterations_per_stream": iterations_per_stream,
             "stream_lanes": stream_lanes,
             "requests_per_stream": requests_per_stream,
+            "api": selected_api,
+            "measurement_scope": "native_loopback_helper_excludes_daemon",
+            "payload_validation": "response kind and byte count" if "count" in selected_api else "exact response bytes",
         },
     )
     done.wait(timeout=10)
@@ -659,6 +736,7 @@ def run_full_suite(size_mib: int = 256, include_legacy: bool = True) -> list[Ben
     if include_legacy:
         # Legacy is slow (~8 MiB/s); use 32 MiB so the run finishes quickly.
         results.append(bench_legacy_cdc_scan(size_mib=min(size_mib, 32)))
+        results.extend(bench_equivalent_gear_cdc(size_mib=min(size_mib, 4)))
     results.append(bench_native_chunk_address_raw(size_kib=64))
     results.append(bench_native_chunk_address_convergent(size_kib=64))
     results.append(bench_native_aead_key_derivation())
@@ -742,13 +820,13 @@ def main(argv: list[str] | None = None) -> int:
 
     results = run_full_suite(size_mib=args.size_mib, include_legacy=not args.no_legacy)
     if args.json:
+        identity = provenance()
         out = {
+            "schema": "one-link-native-benchmark-v2",
+            "measurement_contract": {"scope": "components", "corpus": "seeded-randbytes-v1", "size_mib": args.size_mib},
+            "provenance": identity,
             "diagnostics": chunk_native.diagnostics(),
-            "host": {
-                "platform": platform.platform(),
-                "python": platform.python_version(),
-                "cpu_count": os.cpu_count(),
-            },
+            "host": identity["host"],
             "results": [asdict(r) for r in results],
         }
         json.dump(out, sys.stdout, indent=2)

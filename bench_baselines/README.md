@@ -1,120 +1,113 @@
-# Benchmark baselines
+# Benchmark evidence and acceptance policy
 
-This directory holds benchmark artifacts for the file-engine v2.
+## Relative native component gate
 
-**`native_chunk.json` is NOT a CI gate and must not become one again.** It
-records `host: Windows-11-10.0.26200-SP0, cpu_count 24` -- a 24-core Windows
-workstation -- while the gate runs on `ubuntu-latest`, a 2-4 core Linux VM.
-Gating on it meant judging every PR that touched `native/**` against a
-desktop, and it failed every PR it ever ran on. One run reported ChaCha
-regressing 12% and `chunk_store_locate` 41% while AES improved 293% and
-`quic_round_trip` 184%: that is AES-NI and core count, not code. The file is
-retained for local laboratory comparison on that same workstation.
+The `file-engine v2 bench gate` builds the candidate and comparison revision
+into **separate virtual environments**. For a pull request the comparison is
+the merge base; on master it is the commit in `DRIFT_ANCHOR`. Both native
+artifacts run on one host under the candidate's **same Python measurement
+harness and adapters**. Five pairs run in alternating order: candidate/base,
+base/candidate, and so on. Building does not occur between timed observations.
+Native wheel hashes, native source revisions, harness revision, host identity,
+measurement session, pair index, input contract and all raw timings are retained.
+This comparison includes changes to the native artifact and its environment;
+it does not measure historical Python-adapter behavior or entire user transfers.
 
-The observation the old note below made about `coherence_field.json` -- that a
-baseline which cannot establish its own CPU identity is not a portable gate --
-was exactly right, and applied to `native_chunk.json` too. It just was not
-carried across.
+`scripts/bench_gate.py` validates every repetition before comparing. Missing
+files, duplicate/missing metrics, non-finite/zero throughput, unlike workloads,
+changed builds within an arm and mismatched paired identities are **inconclusive**.
+A same-class CPU/OS description by itself is insufficient proof of one host;
+CI additionally requires the paired session and recorded host identity.
 
-Throughput is now compared like for like, and `scripts/bench_gate.py` takes
-`--require-comparable-host` so it REFUSES a mismatched comparison instead of
-reporting a meaningless delta:
+The effect estimate is the median of matched candidate/base throughput ratios.
+A deterministic 4,000-resample percentile bootstrap retains paired observations
+and estimates a 95% interval. This is an uncertainty estimate for these samples,
+not a distribution-free guarantee, causal proof, or correction for testing many
+metrics. The outcomes are:
 
-- **Per PR** (`bench_gate`): the PR head and its merge base are built and
-  benchmarked in the same job on the same runner. Hardware is constant by
-  construction, so a difference is attributable to the change.
-- **Per master push** (`drift_watch`): builds and benchmarks both the commit
-  named in `DRIFT_ANCHOR` and master, in one job on one machine, and compares
-  those. This is the coverage the paired PR check cannot give -- twenty merged
-  PRs each taking 4% all pass against their own base while throughput halves.
+- **PASS (exit 0):** the interval's lower bound meets the allowed ratio for every metric.
+- **FAIL (exit 1):** a metric's upper bound is below its allowed ratio.
+- **INCONCLUSIVE (exit 2):** an interval crosses the allowed ratio, or the measurement
+  contract is incomplete. This is not a successful CI gate.
 
-**Recording a baseline on the right runner class does not work either**, and
-that was tried and measured. A `drift_watch` run comparing an unchanged tree
-against a baseline captured on the same class one commit earlier reported
-`native_aead_aes_encrypt_256KiB` down 37% (3574 -> 2251 MB/s). Same runner
-class is not the same machine: shared CI has noisy neighbours, and that
-variance swamps any 5% threshold. So a committed file of MB/s numbers can only
-ever be flaky or meaningless, and there is no longer one. Both gates measure
-both sides themselves.
+The default limit is a **5% throughput reduction**. The explicitly configured
+`native_aead_*`, `native_blake3_*` and `native_derive_*` classes permit **12%**.
+A result accepted only by a wider class limit is printed as `TOLERATED`.
+These are documented relative acceptance limits, not universal performance
+requirements. Production completion rates, latency and resource budgets remain
+separate SLOs for specified devices, networks and workloads.
 
-`DRIFT_ANCHOR` names a commit, not a number. Move it deliberately, after
-reviewing an intended throughput change, with the justification in the commit
-message -- never to silence a red gate.
+A single-observation local comparison is supported for diagnosis but has no
+statistical interpretation; CI requires five complete pairs. Never collect
+runs repeatedly until one passes. Retain an inconclusive or failed study,
+investigate workload/host variability or the implementation, then capture a new
+complete study with its own identity. Changing a limit or `DRIFT_ANCHOR` requires
+an explicit rationale and review of the preserved measurements.
 
-`coherence_field.json` is a historical Python-FFI microbenchmark captured on
-one local workstation. It is retained for controlled laboratory comparisons,
-but it is not a portable release gate. It predates the schema-v2 provenance
-fields and therefore cannot establish its own CPU, Python, native-artifact, or
-build identity.
-
-## How baselines are produced
-
-After Phase A1 Step Zero lands and the first reference CI run completes:
-
-1. CI runs `python -m one_link.perf_lab_native --json --no-legacy --size-mib 64`
-2. The `bench_gate.py --baseline` argument points here. With no file present,
-   the gate exits NEUTRAL and prints the fresh JSON.
-3. The maintainer reviews the fresh JSON, commits it to
-   `native_chunk.json` (this directory) as the initial baseline.
-4. From the next PR onward, the gate enforces no >5% regression.
-
-## Updating a baseline
-
-Baselines are *only* updated by a maintainer in the same PR that intentionally
-changes the kernel (e.g., switching from FastCDC v2020 to a future kernel).
-The commit message must include:
-
-- The reason for the regression / change.
-- The ADR amendment that covers it.
-- The expected throughput delta and rationale.
-
-The gate has no auto-update path on purpose.
-
-## Hardware drift
-
-Baselines are tied to the GitHub-hosted runner class (Ubuntu latest, x86-64).
-If the runner class changes substantially (e.g., GitHub upgrades default
-runner CPUs), the baselines will need to be re-pinned. This is a manual
-maintenance step.
-
-## Coherence-field baseline qualification
-
-The coherence-field snapshot measures very short Python-to-Rust calls and
-list/vector conversions. Its results vary materially with all of the
-following:
-
-- CPU model, heterogeneous-core placement, power state, and concurrent load.
-- Operating system and architecture.
-- Python implementation and minor version.
-- Rust toolchain, PyO3 version, release profile, and native build flags.
-
-Only compare `coherence_field.json` with a fresh result when every item above
-is pinned to the reference environment and the runner is dedicated. The
-explicit lab command remains available:
+## Full transfer measurements
 
 ```text
-python scripts/coherence_field_perf_snapshot.py --out perf.json --quiet
-python scripts/bench_gate.py --results perf.json \
-  --baseline bench_baselines/coherence_field.json \
-  --max-regression-percent 10
+python scripts/bench_file_engine.py --scenario cold --corpus all --repeat 3 --quick --json cold.json
+python scripts/bench_file_engine.py --scenario mixed_tree --json tree.json
+python scripts/bench_file_engine.py --scenario related --json related.json
+python scripts/bench_file_engine.py --scenario quic_vs_webrtc --transports quic tcp --repeat 3 --json routes.json
 ```
 
-Schema-v2 snapshots record the measurement contract, clock resolution,
-sample count, OS/architecture, Python version, native version, and the native
-artifact's size and SHA-256. Preserve that snapshot with any lab conclusion;
-the metadata makes a comparison auditable but does not make unlike machines
-comparable.
+The input families are unique seeded random bytes, independently compressed
+blocks, deliberately repetitive bytes, and controlled related-file edits. Input
+creation occurs before timing. Sources are newly written and OS-cache warm;
+these are not cold-disk measurements. Cold-transfer runs start fresh daemons
+and chunk caches. Every attempt, including setup failures, rejected requests,
+timeouts and missing files, remains in the report.
 
-Do not rebase this file from a busy workstation or to make a release audit
-pass. The portable operator/release check is
-`scripts/coherence_field_slo_gate.py`; it enforces absolute end-to-end FFI
-latency budgets derived from the five-second production field tick and the
-Phase E solve allowance. Native solver regressions remain the responsibility
-of the Criterion suite on a pinned benchmark runner.
+Successful transfer timing ends only after an independently verified receiver
+file and matching application commit/hash/size response. Reports preserve
+logical bytes separately from application payload counters. Those counters do
+not include every packet/header and are not packet-capture wire measurements.
+Warm/related runs require a new delivered file, so a pre-existing inbox copy
+cannot satisfy the second observation. Mixed-tree and concurrent profiles
+report per-file outcomes and calculate aggregate throughput only after all
+requested deliveries verify.
 
-## Files
+Transport labels come from an explicit request and actual payload accounting,
+never from peer trust or endpoint availability. A route which is disabled,
+unavailable, falls back or lacks a receipt makes that comparison inconclusive;
+no speedup is published. The historical `quic_vs_webrtc` scenario name remains
+as a CLI alias and must not be read as a claim that both file payload routes are
+currently supported. The shipped QUIC file gate remains intact until its own
+qualification is complete. A normal peer channel may use authenticated TCP.
 
-- `native_chunk.json` — pinned native CDC + BLAKE3 + derivation throughputs
-  (created on first reference run).
-- `coherence_field.json` — historical, environment-qualified Python-FFI
-  microbenchmark; dedicated-runner tooling only.
+## Local component and production-preparation profiles
+
+`one_link.perf_lab` preserves repeated timing samples and checks every indexing
+result's whole-file hash and coverage. `daemon_source_preparation` calls the
+actual descriptor-verified `Daemon.prepare_file_for_transfer` path with no
+persistent index cache, including its size-based fixed/CDC choice. Its scope
+excludes daemon startup, persistence-cache cost and network transfer. Native
+scanner calls are observed, and the small observer overhead is included in the
+timed region. Engine availability alone is never reported as actual dispatch.
+Report comparisons suppress ratios when workload, host or engine identities
+are missing or incompatible.
+
+`one_link.perf_lab_native` records every iteration and native binary identity.
+The legacy Gear benchmark explicitly forces Python. The separate equivalent
+Gear pair verifies exact native-C/Python boundaries and hashes on every
+iteration. Rust FastCDC and Gear-CDC have different algorithm contracts; their
+numbers are not an equivalent-algorithm Python-to-Rust speedup. Native QUIC
+microbenchmarks measure component helpers, not the daemon's end-to-end route.
+The two dated primitive benchmark scripts label the maximum of batch-average
+latencies as `ns_per_op_worst_batch_average`, not an individual-operation p95.
+
+## Historical artifacts and the drift anchor
+
+`native_chunk.json` and `coherence_field.json` are historical workstation
+measurements. Neither is the portable native CI gate. A missing baseline is
+inconclusive, never a command to commit the candidate's measured numbers as a
+passing reference. `DRIFT_ANCHOR` names a source commit which is built and
+measured afresh; changing it does not alter or delete older evidence.
+
+The coherence-field snapshot has its own provenance contract and absolute
+five-second-tick-derived SLO gate in `scripts/coherence_field_slo_gate.py`.
+Native solver regressions still require a controlled Criterion runner. OS,
+CPU model/power state, Python/native ABI, compiler flags, storage and competing
+load all affect measurement; a JSON report does not make unlike hosts comparable.

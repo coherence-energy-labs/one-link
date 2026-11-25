@@ -5,18 +5,11 @@ reports throughput / memory / chunk-count / cache-hit metrics so we
 can answer the question "is it actually fast and lean?" with
 numbers instead of vibes.
 
-Scenarios:
-
-  1. Cold transfer at 5 sizes (1 KiB → 256 MiB). Wall-clock + MB/s.
-  2. Receiver RSS peak during the 256 MiB transfer. psutil sample
-     loop while the transfer runs.
-  3. Warm transfer (same file again). Should be near-instant because
-     every chunk is cache-hit; verifies the dedup path.
-  4. Resume effectiveness: 32 MiB transfer, kill receiver at the
-     first cached chunk, restart, verify completion + measure how
-     many chunks needed re-fetch.
-  5. Chunk cache GC: fill cache to 100 MiB, evict to 50 MiB, time.
-  6. Resume sidecar lifecycle: persist + load 1000 sidecars, time.
+Scenarios include cold transfers across explicit corpora, sender/receiver RSS,
+warm and edited-file reuse, mixed-size trees, concurrency, verified transport
+comparisons, restart delivery, metadata persistence and cache eviction.
+Every attempt has an outcome. Failed or inconclusive scenarios return nonzero;
+successful-only latency summaries never replace the completion rate.
 
 Run::
 
@@ -30,9 +23,10 @@ Pass --json to emit machine-readable results::
 from __future__ import annotations
 
 import argparse
+import hashlib
+import blake3
 import http.client
 import json
-import logging
 import os
 import statistics
 import sys
@@ -42,6 +36,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
+from unittest.mock import patch
 
 # Make the project's tests/ harness importable.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -51,16 +46,16 @@ import psutil  # noqa: E402  (must come after sys.path mutation)
 
 from one_link import app as app_mod  # noqa: E402
 from one_link import control_ipc  # noqa: E402
-from one_link.fault_observability import report_best_effort_failure  # noqa: E402
+from one_link.benchmark_contract import CORPORA, corpus_bytes, file_sha256, provenance  # noqa: E402
 from tests.harness import (  # noqa: E402
     LIVE_INTEGRATION_ENV,
     _bring_up,
+    _stop,
+    private_mdns_type,
     daemon_pair as _daemon_pair,
     inbox_files,
     request,
 )
-
-log = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -139,7 +134,9 @@ def _wait_api_peer(home: Path, short_id: str, *, timeout_s: float = 20.0) -> dic
 def daemon_pair() -> Iterator[Any]:
     """Yield an isolated pair with explicit file capability policy."""
 
-    with _daemon_pair() as pair:
+    scope = private_mdns_type()
+    with patch("tests.harness.private_mdns_type", return_value=scope), _daemon_pair() as pair:
+        pair.benchmark_mdns_type = scope
         peer_a = _wait_api_peer(pair.b.home, pair.a.short_id)
         peer_b = _wait_api_peer(pair.a.home, pair.b.short_id)
         for home, peer in ((pair.a.home, peer_b), (pair.b.home, peer_a)):
@@ -176,18 +173,111 @@ def _human_throughput(bytes_: int, seconds: float) -> str:
     return f"{bps / 1024 ** 3:.2f} GiB/s"
 
 
-def _wait_for_payload(home: Path, payload: bytes, timeout: float) -> tuple[Path | None, float]:
-    end = time.time() + timeout
-    while time.time() < end:
-        for f in inbox_files(home):
+def _wait_for_payload(home: Path, payload: bytes, timeout: float, *, exclude: set[Path] | None = None) -> tuple[Path | None, float]:
+    """Independently verify a newly delivered file with bounded-memory hashing."""
+    expected = hashlib.sha256(payload).hexdigest()
+    excluded = exclude or set()
+    checked: set[tuple[str, int, int]] = set()
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        for path in inbox_files(home):
+            if path in excluded:
+                continue
             try:
-                if f.stat().st_size == len(payload):
-                    if f.read_bytes() == payload:
-                        return f, time.time()
+                stat = path.stat()
+                identity = (str(path), stat.st_mtime_ns, stat.st_size)
+                if stat.st_size != len(payload) or identity in checked:
+                    continue
+                checked.add(identity)
+                if file_sha256(path) == expected:
+                    return path, time.perf_counter()
             except OSError:
-                pass
+                continue
         time.sleep(0.05)
-    return None, time.time()
+    return None, time.perf_counter()
+
+
+def _transfer_attempt(pair: Any, src: Path, payload: bytes, *, transport: str = "auto", timeout: float = 300.0) -> dict:
+    """One request-to-verified-receiver observation; no failed attempt disappears."""
+    expected_sha256 = hashlib.sha256(payload).hexdigest()
+    expected_blake3 = blake3.blake3(payload).hexdigest()
+    previous = set(inbox_files(pair.b.home))
+    row: dict[str, Any] = {
+        "status": "failed", "logical_bytes": len(payload),
+        "source_sha256": expected_sha256, "source_blake3": expected_blake3,
+        "transport_requested": transport, "payload_transport": None,
+        "payload_transport_verified": False, "receiver_verified": False,
+        "application_wire_bytes": None, "wire_accounting_scope": "application payload; not packet capture",
+    }
+    started = time.perf_counter()
+    try:
+        response = request(pair.a.control_port, cmd="send_file", peer=pair.b.short_id,
+                           path=str(src), transport=transport, timeout=timeout)
+        row["request_seconds"] = time.perf_counter() - started
+        row["request_ok"] = response.get("ok") is True
+        if not row["request_ok"]:
+            error = str(response.get("error") or "send request rejected")
+            row.update(error=error, error_class=str(response.get("error_class") or "SendRejected"))
+            if "transport" in error.lower() and any(word in error.lower() for word in ("unsupported", "unavailable", "disabled", "not supported")):
+                row["status"] = "inconclusive"
+            return row
+        result = response.get("result")
+        if not isinstance(result, dict):
+            row["error"] = "send response omitted its result"
+            return row
+        row["application_confirmed"] = result.get("confirmed") is True
+        row["application_size_matches"] = result.get("size") == len(payload)
+        row["application_hash_matches"] = result.get("blob") == expected_blake3
+        row["application_wire_bytes"] = result.get("wire_bytes_sent")
+        row["application_raw_bytes"] = result.get("raw_bytes_sent")
+        row["skipped_chunks"] = result.get("cdc_skipped")
+        row["transfer_report"] = result.get("transfer_report")
+        row["performance_summary"] = result.get("performance_summary")
+        for key in ("payload_transport", "payload_bytes_by_transport", "payload_chunks_by_transport", "payload_fallbacks"):
+            row[key] = result.get(key)
+        byte_counts = result.get("payload_bytes_by_transport")
+        chunk_counts = result.get("payload_chunks_by_transport")
+        row["payload_transport_verified"] = (
+            isinstance(byte_counts, dict) and isinstance(chunk_counts, dict)
+            and bool(result.get("payload_transport"))
+            and all(type(v) is int and v >= 0 for v in [*byte_counts.values(), *chunk_counts.values()])
+        )
+        remaining = max(0.0, timeout - (time.perf_counter() - started))
+        landed, _ = _wait_for_payload(pair.b.home, payload, remaining, exclude=previous)
+        row["receiver_verified"] = landed is not None
+        row["verified_completion_seconds"] = time.perf_counter() - started
+        if landed is None:
+            row["error"] = "verified receiver file did not arrive before the deadline"
+        elif not all(row[key] for key in ("application_confirmed", "application_size_matches", "application_hash_matches")):
+            row["error"] = "receiver bytes arrived but application commit/hash/size receipt was not confirmed"
+        elif transport != "auto" and (
+            not row["payload_transport_verified"] or row["payload_transport"] != transport
+            or result.get("payload_fallbacks", 0) != 0
+            or (len(payload) > 0 and (not byte_counts or int(byte_counts.get(transport, 0)) <= 0))
+        ):
+            row.update(status="inconclusive", error="forced transport was not verified by payload accounting")
+        else:
+            row["status"] = "passed"
+            row["logical_goodput_bps"] = len(payload) / max(row["verified_completion_seconds"], 1e-9)
+        return row
+    except Exception as exc:
+        row.update(error=str(exc), error_class=type(exc).__name__)
+        return row
+    finally:
+        row["attempt_seconds"] = time.perf_counter() - started
+
+
+def _attempt_summary(attempts: list[dict]) -> dict:
+    successful = [row for row in attempts if row.get("status") == "passed"]
+    times = [float(row["verified_completion_seconds"]) for row in successful]
+    status = "passed" if attempts and len(successful) == len(attempts) else "failed" if any(row.get("status") == "failed" for row in attempts) else "inconclusive"
+    return {
+        "status": status, "attempted": len(attempts), "completed": len(successful),
+        "completion_rate": len(successful) / len(attempts) if attempts else 0.0,
+        "successful_elapsed_samples_sec": times,
+        "successful_elapsed_median_sec": statistics.median(times) if times else None,
+        "attempts": attempts,
+    }
 
 
 class _RssTracker:
@@ -231,21 +321,9 @@ class _RssTracker:
         }
 
 
-def _build_payload(size: int, seed: int = 0) -> bytes:
-    """Build a deterministic, CDC-friendly payload of ``size`` bytes.
-
-    We use a repeating 4 KiB block of pseudo-random data so the
-    benchmark is reproducible across runs but the payload is
-    realistic enough that the compressor doesn't collapse it to
-    near-zero (which would distort wire-time measurements)."""
-    import random
-    rng = random.Random(seed)
-    block = bytes(rng.randint(0, 255) for _ in range(4096))
-    if size <= len(block):
-        return block[:size]
-    repeat = size // len(block)
-    tail = size % len(block)
-    return block * repeat + block[:tail]
+def _build_payload(size: int, seed: int = 0, *, kind: str = "random") -> bytes:
+    """Build a versioned deterministic corpus; random is the default."""
+    return corpus_bytes(size, seed=seed, kind=kind)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -263,193 +341,117 @@ SIZES_DEFAULT = [
 # How many times to repeat each ``--scenario cold`` size; we
 # report the median so a single hiccup doesn't skew the headline
 # numbers. Override via ``--repeat`` on the command line.
-REPEAT_DEFAULT = 1
+REPEAT_DEFAULT = 3
 
 
-def bench_cold_transfer(sizes: list[tuple[str, int]], *, repeat: int = REPEAT_DEFAULT) -> list[dict]:
-    """Time + throughput at each size, fresh daemons each run so
-    the chunk cache is empty (cold path). When ``repeat`` > 1 we
-    report the median; wall-clock variance on loopback can be
-    ±10 %, so a single sample can mislead."""
+def bench_cold_transfer(sizes: list[tuple[str, int]], *, repeat: int = REPEAT_DEFAULT, corpus: str = "random") -> list[dict]:
+    """Measure every requested attempt on fresh daemons and fresh chunk caches."""
+    if repeat < 1:
+        raise ValueError("repeat must be positive")
     results = []
-    for label, size in sizes:
-        payload = _build_payload(size)
-        elapsed_samples: list[float] = []
-        for _ in range(max(1, repeat)):
-            with tempfile.TemporaryDirectory() as td:
-                src = Path(td) / f"cold_{label.replace(' ', '_')}.bin"
-                src.write_bytes(payload)
-                with daemon_pair() as p:
-                    t0 = time.time()
-                    res = request(
-                        p.a.control_port, cmd="send_file",
-                        peer=p.b.short_id, path=str(src), timeout=300,
-                    )
-                    if not res.get("ok"):
-                        results.append({
-                            "scenario": "cold_transfer", "size_label": label,
-                            "size_bytes": size, "error": res,
-                        })
-                        break
-                    landed, _ = _wait_for_payload(p.b.home, payload, timeout=300.0)
-                    elapsed = time.time() - t0
-                    if landed:
-                        elapsed_samples.append(elapsed)
-        if not elapsed_samples:
-            continue
-        elapsed_median = statistics.median(elapsed_samples)
-        elapsed_min = min(elapsed_samples)
-        results.append({
-            "scenario": "cold_transfer",
-            "size_label": label,
-            "size_bytes": size,
-            "elapsed_median_sec": round(elapsed_median, 4),
-            "elapsed_min_sec": round(elapsed_min, 4),
-            "throughput_median_bps": round(size / elapsed_median, 2) if elapsed_median > 0 else 0,
-            "throughput_best_bps": round(size / elapsed_min, 2) if elapsed_min > 0 else 0,
-            "samples": len(elapsed_samples),
-        })
-        print(f"  cold {label:>9}: {_human_bytes(size)} "
-              f"median {elapsed_median:6.3f}s "
-              f"-> {_human_throughput(size, elapsed_median)} "
-              f"(best {_human_throughput(size, elapsed_min)}, n={len(elapsed_samples)})")
+    kinds = CORPORA if corpus == "all" else (corpus,)
+    for kind in kinds:
+        for label, size in sizes:
+            payload = _build_payload(size, kind=kind)
+            attempts = []
+            for trial in range(repeat):
+                started = time.perf_counter()
+                try:
+                    with tempfile.TemporaryDirectory() as td:
+                        src = Path(td) / "cold.bin"
+                        src.write_bytes(payload)
+                        with daemon_pair() as pair:
+                            row = _transfer_attempt(pair, src, payload)
+                except Exception as exc:
+                    row = {"status": "failed", "error": str(exc), "error_class": type(exc).__name__, "stage": "setup", "attempt_seconds": time.perf_counter() - started}
+                row["trial"] = trial + 1
+                attempts.append(row)
+            summary = _attempt_summary(attempts)
+            median = summary["successful_elapsed_median_sec"]
+            times = summary["successful_elapsed_samples_sec"]
+            results.append({
+                "scenario": "cold_transfer", "size_label": label, "size_bytes": size,
+                "corpus": kind, "seed": 0, **summary,
+                "elapsed_median_sec": median,
+                "elapsed_min_sec": min(times) if times else None,
+                "throughput_median_bps": size / median if summary["status"] == "passed" and median else None,
+                "samples": len(times),
+            })
+            print(f"  cold {kind}/{label}: {summary['status']} {summary['completed']}/{repeat} verified; median={median}")
     return results
 
 
-def bench_sender_memory(size: int) -> dict:
-    """RSS peak on the SENDER during a single transfer. Symmetric
-    counterpart to bench_receiver_memory — proves the sender's
-    streaming-encode path doesn't read the whole file into heap.
-
-    The sender's send_file uses ``with open(path, 'rb') as f`` +
-    seek/read per chunk, so the only file-data in heap at any
-    moment is the current chunk's plaintext + the encoded
-    wire-frame. RSS should stay bounded regardless of file size.
-    """
-    payload = _build_payload(size, seed=11)
+def _bench_memory(size: int, *, sender: bool) -> dict:
+    payload = _build_payload(size, seed=11 if sender else 1)
     with tempfile.TemporaryDirectory() as td:
-        src = Path(td) / "sender_mem.bin"
+        src = Path(td) / "memory.bin"
         src.write_bytes(payload)
-        with daemon_pair() as p:
-            tracker = _RssTracker(p.a.proc.pid)
+        with daemon_pair() as pair:
+            pid = pair.a.proc.pid if sender else pair.b.proc.pid
+            baseline_rss = psutil.Process(pid).memory_info().rss
+            tracker = _RssTracker(pid)
             tracker.start()
-            t0 = time.time()
-            request(p.a.control_port, cmd="send_file",
-                    peer=p.b.short_id, path=str(src), timeout=300)
-            landed, _ = _wait_for_payload(p.b.home, payload, timeout=300.0)
-            elapsed = time.time() - t0
-            mem = tracker.stop()
-    out = {
-        "scenario": "sender_memory",
-        "size_bytes": size,
-        "elapsed_sec": round(elapsed, 4),
-        "rss_peak_bytes": mem["peak_bytes"],
-        "rss_mean_bytes": mem["mean_bytes"],
-        "rss_samples": mem["samples"],
-        "rss_overhead_ratio": (
-            round(mem["peak_bytes"] / size, 3) if size > 0 else None
-        ),
-        "landed": landed is not None,
+            try:
+                attempt = _transfer_attempt(pair, src, payload)
+            finally:
+                memory = tracker.stop()
+    summary = _attempt_summary([attempt])
+    if memory["samples"] == 0 and summary["status"] == "passed":
+        summary.update(status="inconclusive", error="RSS sampler collected no observations")
+    return {
+        "scenario": "sender_memory" if sender else "receiver_memory", "size_bytes": size,
+        **summary, "rss_baseline_bytes": baseline_rss,
+        "rss_peak_bytes": memory["peak_bytes"], "rss_mean_bytes": memory["mean_bytes"],
+        "rss_growth_bytes": max(0, memory["peak_bytes"] - baseline_rss), "rss_samples": memory["samples"],
+        "rss_sample_interval_sec": tracker.interval,
+        "qualification": "One process at one file size; not a proof of asymptotic memory bounds.",
     }
-    print(f"  sender RSS during {_human_bytes(size)}: "
-          f"peak {_human_bytes(mem['peak_bytes'])} "
-          f"(mean {_human_bytes(mem['mean_bytes'])}, "
-          f"overhead ratio {out['rss_overhead_ratio']}×)")
-    return out
+
+
+def bench_sender_memory(size: int) -> dict:
+    return _bench_memory(size, sender=True)
 
 
 def bench_receiver_memory(size: int) -> dict:
-    """RSS peak on the receiver during a single transfer of
-    ``size`` bytes. Validates Wave 1d's stream-to-disk: receiver
-    memory must stay bounded regardless of file size."""
-    payload = _build_payload(size, seed=1)
+    return _bench_memory(size, sender=False)
+
+
+def _bench_file_set(payloads: list[bytes], *, scenario: str, concurrency: int = 1) -> dict:
+    from concurrent.futures import ThreadPoolExecutor
+    if not payloads or concurrency < 1:
+        raise ValueError("at least one file and positive concurrency are required")
     with tempfile.TemporaryDirectory() as td:
-        src = Path(td) / "mem.bin"
-        src.write_bytes(payload)
-        with daemon_pair() as p:
-            tracker = _RssTracker(p.b.proc.pid)
-            tracker.start()
-            t0 = time.time()
-            request(p.a.control_port, cmd="send_file",
-                    peer=p.b.short_id, path=str(src), timeout=300)
-            landed, _ = _wait_for_payload(p.b.home, payload, timeout=300.0)
-            elapsed = time.time() - t0
-            mem = tracker.stop()
-    out = {
-        "scenario": "receiver_memory",
-        "size_bytes": size,
-        "elapsed_sec": round(elapsed, 4),
-        "rss_peak_bytes": mem["peak_bytes"],
-        "rss_mean_bytes": mem["mean_bytes"],
-        "rss_samples": mem["samples"],
-        "rss_overhead_ratio": (
-            round(mem["peak_bytes"] / size, 3) if size > 0 else None
-        ),
-        "landed": landed is not None,
+        paths = []
+        for i, payload in enumerate(payloads):
+            path = Path(td) / f"group-{i % 3}" / f"file-{i}.bin"
+            path.parent.mkdir(exist_ok=True)
+            path.write_bytes(payload)
+            paths.append(path)
+        with daemon_pair() as pair:
+            started = time.perf_counter()
+            def send(i: int) -> dict:
+                return {"file_index": i, **_transfer_attempt(pair, paths[i], payloads[i])}
+            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                attempts = list(pool.map(send, range(len(paths))))
+            elapsed = time.perf_counter() - started
+    summary = _attempt_summary(attempts)
+    delivered_bytes = sum(row["logical_bytes"] for row in attempts if row["status"] == "passed")
+    return {
+        "scenario": scenario, "n": len(paths), "concurrency": concurrency,
+        "total_bytes": sum(map(len, payloads)), "verified_bytes": delivered_bytes,
+        "elapsed_sec": elapsed, "aggregate_throughput_bps": delivered_bytes / max(elapsed, 1e-9) if summary["status"] == "passed" else None,
+        **summary,
     }
-    print(f"  receiver RSS during {_human_bytes(size)}: "
-          f"peak {_human_bytes(mem['peak_bytes'])} "
-          f"(mean {_human_bytes(mem['mean_bytes'])}, "
-          f"overhead ratio {out['rss_overhead_ratio']}×)")
-    return out
 
 
 def bench_many_small_files(n: int = 20, per_size: int = 4096) -> dict:
-    """A/B compare sending N small files via the existing
-    per-file send_file (each pays its own FILE_OFFER round-trip)
-    vs the future FILE_OFFER_BATCH path. Wave 2b's receiver
-    handler exists; the sender-side batcher is still a follow-up,
-    so this bench currently establishes only the BASELINE — the
-    cost-of-many-small-files that batching would optimize.
-    """
-    payloads = [_build_payload(per_size, seed=200 + i) for i in range(n)]
-    with tempfile.TemporaryDirectory() as td:
-        td_path = Path(td)
-        srcs = []
-        for i, payload in enumerate(payloads):
-            sp = td_path / f"small_{i}.bin"
-            sp.write_bytes(payload)
-            srcs.append(sp)
-        with daemon_pair() as p:
-            request(p.a.control_port, cmd="send",
-                    peer=p.b.short_id, body="warm")
-            time.sleep(0.2)
-            t0 = time.time()
-            for src in srcs:
-                request(p.a.control_port, cmd="send_file",
-                        peer=p.b.short_id, path=str(src), timeout=60)
-            # Wait for all payloads to land.
-            end = time.time() + 60.0
-            seen = set()
-            while time.time() < end:
-                for f in inbox_files(p.b.home):
-                    try:
-                        data = f.read_bytes()
-                        for i, payload in enumerate(payloads):
-                            if i not in seen and data == payload:
-                                seen.add(i)
-                    except OSError:
-                        pass
-                if len(seen) >= n:
-                    break
-                time.sleep(0.1)
-            elapsed = time.time() - t0
-    total_bytes = n * per_size
-    per_file_sec = elapsed / n if n > 0 else 0.0
-    out = {
-        "scenario": "many_small_files",
-        "n": n,
-        "per_size_bytes": per_size,
-        "total_bytes": total_bytes,
-        "elapsed_sec": round(elapsed, 4),
-        "per_file_sec": round(per_file_sec, 4) if n > 0 else None,
-        "aggregate_throughput_bps": round(total_bytes / elapsed, 2) if elapsed > 0 else 0,
-        "completed": len(seen),
-    }
-    print(f"  many-small: {n}×{_human_bytes(per_size)} ({total_bytes} bytes) "
-          f"sequentially -> {elapsed:.3f}s "
-          f"({per_file_sec * 1000:.1f} ms/file avg)")
-    return out
+    return _bench_file_set([_build_payload(per_size, seed=200 + i) for i in range(n)], scenario="many_small_files")
+
+
+def bench_mixed_tree(n: int = 20) -> dict:
+    sizes = (0, 128, 4096, 65536, 1024 * 1024)
+    payloads = [_build_payload(sizes[i % len(sizes)], seed=500 + i, kind=CORPORA[i % len(CORPORA)]) for i in range(n)]
+    return _bench_file_set(payloads, scenario="mixed_tree")
 
 
 def bench_share_link_round_trip(size: int = 1 * 1024 * 1024) -> dict:
@@ -503,7 +505,8 @@ def bench_share_link_round_trip(size: int = 1 * 1024 * 1024) -> dict:
         "mint_elapsed_sec": round(mint_elapsed, 4),
         "total_elapsed_sec": round(total_elapsed, 4),
         "delivery_elapsed_sec": round(total_elapsed - mint_elapsed, 4),
-        "throughput_bps": round(size / total_elapsed, 2) if total_elapsed > 0 else 0,
+        "throughput_bps": size / total_elapsed if landed and total_elapsed > 0 else None,
+        "status": "passed" if landed else "failed",
         "completed": landed,
     }
     print(f"  share-link round-trip {_human_bytes(size)}: "
@@ -513,325 +516,140 @@ def bench_share_link_round_trip(size: int = 1 * 1024 * 1024) -> dict:
     return out
 
 
-def bench_quic_vs_webrtc(size: int = 16 * 1024 * 1024) -> dict:
-    """A/B compare a paired-pinned transfer (rides Wave 2e+2f
-    QUIC batch path) vs the same transfer between unpinned peers
-    (existing WebRTC pipeline). Both peers in each phase are
-    fresh daemon pairs so the chunk cache is empty.
+def bench_quic_vs_webrtc(size: int = 16 * 1024 * 1024, *, repeat: int = 3, transports: tuple[str, str] = ("quic", "webrtc")) -> dict:
+    """Compare explicitly requested payload routes with receipt verification.
 
-    The QUIC phase pins the peers + polls quic_status until both
-    sides have learned the other's QUIC port + then runs send_file.
-    The WebRTC baseline skips pinning entirely.
+    A pinned peer is an authorization state, not a transport observation.
+    Unavailable routes and fallback produce an inconclusive row and no ratio.
+    Both arms have identical trust, capability, input and preparation policies.
     """
+    if repeat < 1 or len(set(transports)) != 2:
+        raise ValueError("positive repeat and two distinct transports are required")
     payload = _build_payload(size, seed=42)
-
-    def _phase_pinned() -> float:
-        with tempfile.TemporaryDirectory() as td:
-            src = Path(td) / "quic.bin"
-            src.write_bytes(payload)
-            with daemon_pair() as p:
-                a_pin = request(p.a.control_port, cmd="pin_peer",
-                                peer=p.b.short_id)
-                b_pin = request(p.b.control_port, cmd="pin_peer",
-                                peer=p.a.short_id)
-                if not (a_pin.get("ok") and b_pin.get("ok")):
-                    return float("nan")
-                request(p.a.control_port, cmd="send",
-                        peer=p.b.short_id, body="warm")
-                # Wait for both sides to learn each other's QUIC port.
-                b_fp_prefix = a_pin["peer_fp"][:16]
-                a_fp_prefix = b_pin["peer_fp"][:16]
-                ready_end = time.time() + 30.0
-                a_ready = b_ready = False
-                while time.time() < ready_end:
-                    if not a_ready:
-                        st = request(p.a.control_port, cmd="quic_status")
-                        if any(k.startswith(b_fp_prefix)
-                               for k in (st.get("advertised_ports") or {})):
-                            a_ready = True
-                    if not b_ready:
-                        st = request(p.b.control_port, cmd="quic_status")
-                        if any(k.startswith(a_fp_prefix)
-                               for k in (st.get("advertised_ports") or {})):
-                            b_ready = True
-                    if a_ready and b_ready:
-                        break
-                    time.sleep(0.1)
-                if not (a_ready and b_ready):
-                    return float("nan")
-                # Time the actual transfer.
-                t0 = time.time()
-                request(p.a.control_port, cmd="send_file",
-                        peer=p.b.short_id, path=str(src), timeout=300)
-                _wait_for_payload(p.b.home, payload, timeout=300.0)
-                return time.time() - t0
-
-    def _phase_unpinned() -> float:
-        with tempfile.TemporaryDirectory() as td:
-            src = Path(td) / "wrtc.bin"
-            src.write_bytes(payload)
-            with daemon_pair() as p:
-                request(p.a.control_port, cmd="send",
-                        peer=p.b.short_id, body="warm")
-                time.sleep(0.5)
-                t0 = time.time()
-                request(p.a.control_port, cmd="send_file",
-                        peer=p.b.short_id, path=str(src), timeout=300)
-                _wait_for_payload(p.b.home, payload, timeout=300.0)
-                return time.time() - t0
-
-    pinned_runs = []
-    for _ in range(2):
-        elapsed = _phase_pinned()
-        if elapsed == elapsed:  # not NaN
-            pinned_runs.append(elapsed)
-    unpinned_runs = []
-    for _ in range(2):
-        elapsed = _phase_unpinned()
-        if elapsed == elapsed:
-            unpinned_runs.append(elapsed)
-    pinned_med = statistics.median(pinned_runs) if pinned_runs else float("nan")
-    unpinned_med = statistics.median(unpinned_runs) if unpinned_runs else float("nan")
-    speedup = (
-        unpinned_med / pinned_med
-        if pinned_med == pinned_med and unpinned_med == unpinned_med and pinned_med > 0
-        else float("nan")
-    )
-    out = {
-        "scenario": "quic_vs_webrtc",
-        "size_bytes": size,
-        "pinned_quic_median_sec": round(pinned_med, 4) if pinned_med == pinned_med else None,
-        "pinned_quic_throughput_bps": round(size / pinned_med, 2) if pinned_med == pinned_med and pinned_med > 0 else None,
-        "unpinned_webrtc_median_sec": round(unpinned_med, 4) if unpinned_med == unpinned_med else None,
-        "unpinned_webrtc_throughput_bps": round(size / unpinned_med, 2) if unpinned_med == unpinned_med and unpinned_med > 0 else None,
-        "quic_speedup_x": round(speedup, 3) if speedup == speedup else None,
-        "samples_pinned": len(pinned_runs),
-        "samples_unpinned": len(unpinned_runs),
+    attempts = []
+    for trial in range(repeat):
+        order = transports if trial % 2 == 0 else tuple(reversed(transports))
+        for transport in order:
+            try:
+                with tempfile.TemporaryDirectory() as td:
+                    src = Path(td) / "route.bin"
+                    src.write_bytes(payload)
+                    with daemon_pair() as pair:
+                        row = _transfer_attempt(pair, src, payload, transport=transport)
+            except Exception as exc:
+                row = {"status": "failed", "error": str(exc), "error_class": type(exc).__name__, "stage": "setup"}
+            row.update(pair_index=trial, transport_requested=transport)
+            attempts.append(row)
+    summary = _attempt_summary(attempts)
+    arms = {route: _attempt_summary([row for row in attempts if row["transport_requested"] == route]) for route in transports}
+    ratios = []
+    for trial in range(repeat):
+        pair = {row["transport_requested"]: row for row in attempts if row["pair_index"] == trial}
+        if all(pair[route]["status"] == "passed" for route in transports):
+            ratios.append(pair[transports[1]]["verified_completion_seconds"] / pair[transports[0]]["verified_completion_seconds"])
+    return {
+        "scenario": "transport_comparison", "size_bytes": size, "corpus": "random", "seed": 42,
+        "transports": list(transports), "arms": arms, **summary,
+        "paired_speedup_first_over_second": statistics.median(ratios) if summary["status"] == "passed" and len(ratios) == repeat else None,
+        "paired_ratio_samples": ratios, "ratio_published_only_when_every_pair_verified": True,
     }
-    print(
-        f"  QUIC vs WebRTC at {_human_bytes(size)}: "
-        f"pinned/QUIC {pinned_med:.3f}s ({_human_throughput(size, pinned_med)}) "
-        f"vs unpinned/WebRTC {unpinned_med:.3f}s ({_human_throughput(size, unpinned_med)}) "
-        f"= {speedup:.2f}× speedup"
-    )
-    return out
 
 
 def bench_concurrent_transfers(n: int = 4, size: int = 32 * 1024 * 1024) -> dict:
-    """Send ``n`` distinct files in parallel from A to B. Measures
-    aggregate throughput vs. the per-file baseline; if the engine
-    serializes badly somewhere (e.g., a single per-channel send
-    lock for files), aggregate stays near per-file. If it scales
-    well, aggregate approaches n × per-file."""
-    payloads = [_build_payload(size, seed=100 + i) for i in range(n)]
+    return _bench_file_set([_build_payload(size, seed=100 + i) for i in range(n)], scenario="concurrent_transfers", concurrency=min(n, 16))
+
+
+def _bench_related_pair(size: int, *, edited: bool) -> dict:
+    payloads = [_build_payload(size, seed=2), _build_payload(size, seed=2, kind="related" if edited else "random")]
     with tempfile.TemporaryDirectory() as td:
-        td_path = Path(td)
-        srcs = []
-        for i, payload in enumerate(payloads):
-            p = td_path / f"concurrent_{i}.bin"
-            p.write_bytes(payload)
-            srcs.append(p)
-        with daemon_pair() as p:
-            t0 = time.time()
-            threads = []
-            results: list[bool] = [False] * n
-
-            def _send_one(idx: int) -> None:
-                try:
-                    res = request(
-                        p.a.control_port, cmd="send_file",
-                        peer=p.b.short_id, path=str(srcs[idx]),
-                        timeout=300,
-                    )
-                    results[idx] = bool(res.get("ok"))
-                except Exception:
-                    results[idx] = False
-
-            for i in range(n):
-                t = threading.Thread(target=_send_one, args=(i,), daemon=True)
-                threads.append(t)
-                t.start()
-            for t in threads:
-                t.join(timeout=300.0)
-            # Wait for all payloads to land.
-            end = time.time() + 120.0
-            seen = set()
-            while time.time() < end:
-                for f in inbox_files(p.b.home):
-                    try:
-                        if f.stat().st_size == size:
-                            data = f.read_bytes()
-                            for i, expected in enumerate(payloads):
-                                if i in seen:
-                                    continue
-                                if data == expected:
-                                    seen.add(i)
-                                    break
-                    except OSError:
-                        pass
-                if len(seen) >= n:
-                    break
-                time.sleep(0.2)
-            elapsed = time.time() - t0
-    total_bytes = n * size
-    out = {
-        "scenario": "concurrent_transfers",
-        "n": n,
-        "size_bytes": size,
-        "total_bytes": total_bytes,
-        "elapsed_sec": round(elapsed, 4),
-        "aggregate_throughput_bps": round(total_bytes / elapsed, 2) if elapsed > 0 else 0,
-        "per_transfer_throughput_bps": round(size / elapsed, 2) if elapsed > 0 else 0,
-        "completed": len(seen),
+        paths = [Path(td) / "base.bin", Path(td) / "second.bin"]
+        for path, payload in zip(paths, payloads):
+            path.write_bytes(payload)
+        with daemon_pair() as pair:
+            attempts = [_transfer_attempt(pair, path, payload) for path, payload in zip(paths, payloads)]
+    summary = _attempt_summary(attempts)
+    return {
+        "scenario": "related_file" if edited else "warm_dedup", "size_bytes": size,
+        "second_edit_bytes": min(4096, size - size // 2) if edited else 0,
+        **summary,
+        "speedup_x": attempts[0]["verified_completion_seconds"] / max(attempts[1]["verified_completion_seconds"], 1e-9) if summary["status"] == "passed" else None,
+        "qualification": "Two sequential observations; includes request, receiver verification and completion. No tail-latency inference.",
     }
-    print(f"  concurrent {n}×{_human_bytes(size)}: "
-          f"{out['completed']}/{n} landed in {elapsed:.3f}s "
-          f"-> aggregate {_human_throughput(total_bytes, elapsed)}")
-    return out
 
 
 def bench_warm_dedup(size: int = 64 * 1024 * 1024) -> dict:
-    """Send the same file twice on the same daemon pair. Second
-    send should be near-instant: every chunk hash hits the
-    receiver's cache, FILE_WANTS comes back empty."""
-    payload = _build_payload(size, seed=2)
-    with tempfile.TemporaryDirectory() as td:
-        src = Path(td) / "warm.bin"
-        src.write_bytes(payload)
-        with daemon_pair() as p:
-            # Cold pass
-            t0 = time.time()
-            request(p.a.control_port, cmd="send_file",
-                    peer=p.b.short_id, path=str(src), timeout=300)
-            _wait_for_payload(p.b.home, payload, timeout=300.0)
-            cold_elapsed = time.time() - t0
-            # Warm pass — same blob.
-            t0 = time.time()
-            request(p.a.control_port, cmd="send_file",
-                    peer=p.b.short_id, path=str(src), timeout=300)
-            # The receiver writes to a NEW unique path because
-            # _unique_inbox_path adds " (1)" on collision; wait
-            # for two payload-matching inbox files. Sub-10 ms poll
-            # so wall-clock granularity doesn't drown the
-            # hardlink-fast-path measurement (Wave 2a).
-            end = time.time() + 60.0
-            count = 0
-            while time.time() < end:
-                count = sum(
-                    1 for f in inbox_files(p.b.home)
-                    if f.stat().st_size == size and f.read_bytes() == payload
-                )
-                if count >= 2:
-                    break
-                time.sleep(0.005)
-            warm_elapsed = time.time() - t0
-    out = {
-        "scenario": "warm_dedup",
-        "size_bytes": size,
-        "cold_elapsed_sec": round(cold_elapsed, 4),
-        "warm_elapsed_sec": round(warm_elapsed, 4),
-        "speedup_x": (
-            round(cold_elapsed / warm_elapsed, 2) if warm_elapsed > 0 else None
-        ),
-    }
-    print(f"  warm dedup at {_human_bytes(size)}: "
-          f"cold {cold_elapsed:.3f}s -> warm {warm_elapsed:.3f}s "
-          f"= {out['speedup_x']}× speedup")
-    return out
+    return _bench_related_pair(size, edited=False)
+
+
+def bench_related_file(size: int = 16 * 1024 * 1024) -> dict:
+    return _bench_related_pair(size, edited=True)
 
 
 def bench_resume_effectiveness(size: int = 32 * 1024 * 1024) -> dict:
-    """Send a moderate file, kill receiver after ~50 % of chunks
-    have landed in its cache, restart receiver, observe how many
-    chunks the resumed transfer needs from the wire (vs already
-    cached). Wave 1a + 1d + 1g all flow through this."""
+    """Interrupt an owned receiver, retain its private discovery scope, verify restart delivery."""
     payload = _build_payload(size, seed=3)
+    sender_outcomes: list[dict] = []
     with tempfile.TemporaryDirectory() as td:
         src = Path(td) / "resume.bin"
         src.write_bytes(payload)
-        with daemon_pair() as p:
-            def _do_send():
+        with daemon_pair() as pair:
+            def send() -> None:
                 try:
-                    request(p.a.control_port, cmd="send_file",
-                            peer=p.b.short_id, path=str(src), timeout=120)
+                    sender_outcomes.append(request(pair.a.control_port, cmd="send_file", peer=pair.b.short_id, path=str(src), timeout=120))
                 except Exception as exc:
-                    report_best_effort_failure(log, "benchmark_resume_sender", exc)
-            sender = threading.Thread(target=_do_send, daemon=True)
+                    sender_outcomes.append({"ok": False, "error": str(exc), "error_class": type(exc).__name__})
+            sender = threading.Thread(target=send, daemon=True)
             sender.start()
-            # Wait for at least 5 chunks to land in B's cache —
-            # killing after just one chunk under-measures the
-            # resume win because the receiver would barely have
-            # cached anything to start with.
-            chunk_cache = p.b.home / "data" / "file_chunks"
-            ready = time.time() + 30.0
-            chunks_before_kill = 0
-            while time.time() < ready:
-                if chunk_cache.is_dir():
-                    chunks_before_kill = sum(
-                        1 for e in chunk_cache.rglob("*") if e.is_file()
-                    )
-                    if chunks_before_kill >= 5:
-                        break
-                time.sleep(0.05)
-            # Hard kill receiver mid-transfer.
-            p.b.proc.kill()
-            try:
-                p.b.proc.wait(timeout=5.0)
-            except Exception as exc:
-                report_best_effort_failure(log, "benchmark_resume_receiver_wait", exc)
-            try:
-                if p.b.log_fh is not None:
-                    p.b.log_fh.close()
-            except Exception as exc:
-                report_best_effort_failure(log, "benchmark_resume_log_close", exc)
-            sender.join(timeout=30.0)
-            # Restart B on the same home dir.  Delete the stale
-            # port files first so the harness's _read_port waits
-            # for the NEW daemon's bind instead of reading the
-            # dead daemon's port and connecting nowhere.
-            for stale in ("control.port", "peer.port", "instance.lock"):
-                p_stale = p.b.home / "data" / stale
+            cache = pair.b.home / "data" / "file_chunks"
+            deadline = time.monotonic() + 30
+            cached = 0
+            while time.monotonic() < deadline and sender.is_alive():
+                if cache.is_dir():
+                    cached = sum(1 for path in cache.rglob("*") if path.is_file())
+                if cached >= 5:
+                    break
+                time.sleep(0.02)
+            if cached < 5 or not sender.is_alive():
+                sender.join(timeout=120)
+                return {"scenario": "resume_effectiveness", "status": "inconclusive",
+                        "error": "could not observe an in-progress transfer at the requested cache checkpoint",
+                        "size_bytes": size, "cache_files_observed": cached, "initial_sender_outcomes": sender_outcomes}
+            pair.b.proc.kill()
+            pair.b.proc.wait(timeout=5)
+            if pair.b.log_fh is not None:
+                pair.b.log_fh.close()
+            sender.join(timeout=125)
+            if sender.is_alive():
+                return {"scenario": "resume_effectiveness", "status": "failed", "error": "sender request did not terminate after receiver stop"}
+            for name in ("control.port", "peer.port", "instance.lock"):
                 try:
-                    p_stale.unlink()
-                except OSError:
+                    (pair.b.home / "data" / name).unlink()
+                except FileNotFoundError:
                     pass
-            t_resume = time.time()
-            new_b = _bring_up(p.b.home, p.b.log, "B-resume")
-            p.b = new_b
-            # Wait for cross-discovery.
-            deadline = time.time() + 30.0
-            while time.time() < deadline:
-                ra = request(p.a.control_port, cmd="peers")
-                rb = request(p.b.control_port, cmd="peers")
-                a_sees_b = any(pp["short_id"] == p.b.short_id for pp in ra.get("peers", []))
-                b_sees_a = any(pp["short_id"] == p.a.short_id for pp in rb.get("peers", []))
-                if a_sees_b and b_sees_a:
-                    break
-                time.sleep(0.2)
-            # Wait up to 120 s for sender's auto-retry to complete.
-            end = time.time() + 120.0
-            landed = None
-            while time.time() < end:
-                for f in inbox_files(p.b.home):
-                    if f.stat().st_size == size and f.read_bytes() == payload:
-                        landed = f
-                        break
-                if landed:
-                    break
-                time.sleep(0.3)
-            elapsed_after_resume = time.time() - t_resume
-    out = {
-        "scenario": "resume_effectiveness",
-        "size_bytes": size,
-        "chunks_cached_at_kill": chunks_before_kill,
-        "completed_after_resume": landed is not None,
-        "elapsed_after_restart_sec": round(elapsed_after_resume, 4),
-    }
-    print(f"  resume {_human_bytes(size)}: "
-          f"{chunks_before_kill} chunk(s) cached at kill, "
-          f"completion={'OK' if landed else 'FAIL'} "
-          f"in {elapsed_after_resume:.1f}s")
-    return out
+            started = time.perf_counter()
+            replacement = None
+            try:
+                replacement = _bring_up(pair.b.home, pair.b.log, "B-resume", mdns_type=pair.benchmark_mdns_type)
+                landed, _ = _wait_for_payload(replacement.home, payload, 120.0)
+                elapsed = time.perf_counter() - started
+                return {
+                    "scenario": "resume_effectiveness", "status": "passed" if landed is not None else "failed",
+                    "size_bytes": size, "cache_files_observed_at_kill": cached,
+                    "completed_after_resume": landed is not None, "receiver_verified": landed is not None,
+                    "elapsed_after_restart_sec": elapsed, "source_sha256": hashlib.sha256(payload).hexdigest(),
+                    "initial_sender_outcomes": sender_outcomes,
+                    "resume_wire_bytes": None,
+                    "qualification": "Restart plus independently verified delivery; cache-file count is not an acknowledged-byte or re-fetch count.",
+                }
+            finally:
+                # The harness's context owns the original captured handle,
+                # not this replacement. Explicitly stop and close our new one.
+                if replacement is not None:
+                    try:
+                        _stop(replacement.proc, home=replacement.home, control_port=replacement.control_port, control_secret=replacement.control_secret)
+                    finally:
+                        if replacement.log_fh is not None:
+                            replacement.log_fh.close()
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -843,12 +661,15 @@ def bench_resume_sidecar(n: int = 1000) -> dict:
     inbox. Resume sidecar reads happen at startup; writes happen
     once per chunk-touch debounce window (Wave 1d's every-64-chunks
     cadence)."""
+    if n < 1:
+        raise ValueError("n must be positive")
     from one_link.resume import (
         ResumeSidecar, persist_sidecar, load_sidecar,
     )
     with tempfile.TemporaryDirectory() as td:
         inbox = Path(td) / "inbox"
         inbox.mkdir()
+        metadata_root = Path(td) / "private-metadata"
         partial = inbox / "x.bin"
         partial.write_bytes(b"x" * 64)
         # Build n distinct sidecars.
@@ -865,14 +686,18 @@ def bench_resume_sidecar(n: int = 1000) -> dict:
             ))
         t0 = time.perf_counter()
         for sc in sidecars:
-            persist_sidecar(inbox, sc)
+            persist_sidecar(inbox, sc, metadata_root=metadata_root)
         write_elapsed = time.perf_counter() - t0
         t0 = time.perf_counter()
         for sc in sidecars:
-            load_sidecar(inbox, sc.blob_hex)
+            loaded = load_sidecar(inbox, sc.blob_hex, metadata_root=metadata_root)
+            if loaded is None or (loaded.blob_hex, loaded.size, loaded.out_path, loaded.cdc_chunks) != (sc.blob_hex, sc.size, sc.out_path, sc.cdc_chunks):
+                raise RuntimeError("persisted sidecar did not round-trip its manifest")
         read_elapsed = time.perf_counter() - t0
     out = {
         "scenario": "resume_sidecar_microbench",
+        "status": "passed",
+        "measurement_scope": "metadata persistence with fsync and verified loads",
         "n": n,
         "write_total_sec": round(write_elapsed, 4),
         "write_per_op_us": round(write_elapsed * 1e6 / n, 2),
@@ -890,6 +715,8 @@ def bench_chunk_cache_gc(n_chunks: int = 1000, chunk_size: int = 65536) -> dict:
     ~``n_chunks * chunk_size`` bytes. Backstops the assertion that
     cache GC is fast enough to run synchronously at startup even
     on a cache that's grown to thousands of entries."""
+    if n_chunks < 1 or chunk_size < 1:
+        raise ValueError("chunk count and size must be positive")
     from one_link.chunk_cache_gc import evict_to_target
     with tempfile.TemporaryDirectory() as td:
         cache = Path(td) / "file_chunks"
@@ -921,8 +748,13 @@ def bench_chunk_cache_gc(n_chunks: int = 1000, chunk_size: int = 65536) -> dict:
             now=now + 86400,  # all entries past min_age
         )
         elapsed = time.perf_counter() - t0
+        remaining = sum(path.stat().st_size for path in cache.rglob("*") if path.is_file())
+        verified = report.errors == 0 and remaining <= target and remaining + report.evicted_bytes == n_chunks * chunk_size and len(state.forgotten) == report.evicted_files
     out = {
         "scenario": "chunk_cache_gc_microbench",
+        "status": "passed" if verified else "failed",
+        "remaining_bytes": remaining,
+        "eviction_errors": report.errors,
         "n_chunks": n_chunks,
         "chunk_size_bytes": chunk_size,
         "evicted_files": report.evicted_files,
@@ -967,7 +799,7 @@ def main() -> int:
         choices=[
             "cold", "memory", "sender_memory", "warm", "resume",
             "sidecar", "cache", "concurrent", "quic_vs_webrtc",
-            "many_small", "share_link", "all",
+            "many_small", "mixed_tree", "related", "share_link", "all",
         ],
         default="all",
         help="Run only the named scenario family",
@@ -977,24 +809,51 @@ def main() -> int:
         type=int,
         default=REPEAT_DEFAULT,
         help=("How many times to repeat each cold-transfer size. "
-              "Reports median + best — useful for separating real "
-              "regressions from wall-clock noise."),
+              "Retains every attempt and reports verified-success medians; "
+              "failures and unavailable measurements return nonzero."),
     )
+    parser.add_argument("--corpus", choices=[*CORPORA, "all"], default="random", help="Cold-transfer corpus (default: unique random bytes).")
+    parser.add_argument("--transports", nargs=2, choices=["tcp", "relay", "quic", "webrtc"], default=["quic", "webrtc"], help="Explicit payload routes for the transport-comparison scenario.")
     args = parser.parse_args()
+    if args.repeat < 1:
+        parser.error("--repeat must be positive")
 
     sizes = SIZES_DEFAULT
     if args.quick:
         sizes = [(l, s) for (l, s) in sizes if s <= 16 * 1024 * 1024]
 
-    results: dict[str, Any] = {"started_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    results: dict[str, Any] = {
+        "schema": "one-link-file-benchmark-v2", "started_unix": time.time(),
+        "provenance": provenance(PROJECT_ROOT),
+        "measurement_contract": {
+            "timer": "perf_counter; request through independent receiver verification",
+            "scope": "same-host isolated daemon pair", "storage_state": "freshly written OS-cache-warm source",
+            "corpus_version": "seeded-randbytes-v1", "corpus": args.corpus,
+            "wire_accounting": "application payload counters; no packet capture",
+            "daemon_fixture": "paired/trusted peers, automatic file acceptance; fixture settings are not normal-user qualification",
+        },
+    }
+    section_outcomes: list[str] = []
 
     def run_section(name: str, fn) -> None:
         if args.scenario not in (name, "all"):
             return
         print(f"\n--- {name} ---")
-        results[name] = fn()
+        try:
+            result = fn()
+        except Exception as exc:
+            result = {"status": "failed", "error": str(exc), "error_class": type(exc).__name__}
+        rows = result if isinstance(result, list) else [result]
+        if not rows:
+            rows = [{"status": "inconclusive", "error": "scenario returned no observations"}]
+            result = rows
+        for row in rows:
+            if "status" not in row:
+                row["status"] = "failed" if row.get("error") or row.get("landed") is False or row.get("completed") is False else "passed"
+            section_outcomes.append(row["status"])
+        results[name] = result
 
-    run_section("cold", lambda: bench_cold_transfer(sizes, repeat=args.repeat))
+    run_section("cold", lambda: bench_cold_transfer(sizes, repeat=args.repeat, corpus=args.corpus))
     run_section("memory", lambda: bench_receiver_memory(
         64 * 1024 * 1024 if args.quick else 256 * 1024 * 1024
     ))
@@ -1006,12 +865,14 @@ def main() -> int:
         size=8 * 1024 * 1024 if args.quick else 32 * 1024 * 1024,
     ))
     run_section("quic_vs_webrtc", lambda: bench_quic_vs_webrtc(
-        size=8 * 1024 * 1024 if args.quick else 16 * 1024 * 1024,
+        size=8 * 1024 * 1024 if args.quick else 16 * 1024 * 1024, repeat=args.repeat, transports=tuple(args.transports),
     ))
     run_section("many_small", lambda: bench_many_small_files(
         n=10 if args.quick else 20,
         per_size=4096,
     ))
+    run_section("mixed_tree", lambda: bench_mixed_tree(n=10 if args.quick else 20))
+    run_section("related", lambda: bench_related_file(size=4 * 1024 * 1024 if args.quick else 16 * 1024 * 1024))
     run_section("share_link", lambda: bench_share_link_round_trip(
         size=256 * 1024 if args.quick else 1 * 1024 * 1024,
     ))
@@ -1024,11 +885,13 @@ def main() -> int:
     run_section("sidecar", lambda: bench_resume_sidecar(1000))
     run_section("cache", lambda: bench_chunk_cache_gc(1000, 65536))
 
-    results["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    results["finished_unix"] = time.time()
+    results["status"] = "failed" if "failed" in section_outcomes else "inconclusive" if "inconclusive" in section_outcomes else "passed"
     if args.json:
-        args.json.write_text(json.dumps(results, indent=2))
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps(results, indent=2, allow_nan=False), encoding="utf-8")
         print(f"\nResults written to {args.json}")
-    return 0
+    return {"passed": 0, "failed": 1, "inconclusive": 2}[results["status"]]
 
 
 if __name__ == "__main__":

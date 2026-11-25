@@ -18,8 +18,8 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "src" / "one_link" / "web" / "owner_ui"
-OUTPUT = SOURCE.parent / "index.html"
+SOURCE = ROOT / "frontend" / "owner"
+OUTPUT = ROOT / "src" / "one_link" / "web" / "index.html"
 FINGERPRINT = "__ONE_LINK_SOURCE_FINGERPRINT__"
 GROUP_WRAPPERS = {
     "owner": ("(() => {\n", "})();\n"),

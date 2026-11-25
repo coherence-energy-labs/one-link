@@ -101,3 +101,7 @@ Markup and CSS belong in `index.template.html`. The two script markers are
 build-time insertion points, not browser requests. The call script remains
 after its existing call-surface markup. Peer browser assets and server routes
 are separate responsibilities and are not rewritten by this builder.
+
+Canonical authoring sources live outside the Python package. Only the generated
+`src/one_link/web/index.html` is served and packaged, preserving the exact offline
+asset contract without distributing a second editable application copy.

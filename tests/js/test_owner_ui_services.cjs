@@ -9,7 +9,7 @@ const test = require("node:test");
 const vm = require("node:vm");
 
 const root = path.resolve(__dirname, "../..");
-const source = path.join(root, "src/one_link/web/owner_ui");
+const source = path.join(root, "frontend/owner");
 const manifest = JSON.parse(fs.readFileSync(path.join(source, "manifest.json"), "utf8"));
 
 function service(name, globals = {}) {
@@ -26,7 +26,7 @@ test("every canonical module and both shipped closures parse independently", () 
       new vm.Script("(function () {\n" + body + "\n})();", { filename: module.path });
     }
   }
-  const html = fs.readFileSync(path.join(source, "../index.html"), "utf8");
+  const html = fs.readFileSync(path.join(root, "src/one_link/web/index.html"), "utf8");
   const blocks = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)];
   assert.equal(blocks.length, 2);
   blocks.forEach((match, index) => new vm.Script(match[1], { filename: `owner-inline-${index}.js` }));

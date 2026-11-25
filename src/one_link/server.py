@@ -30,7 +30,7 @@ import base64
 from collections import deque
 from collections.abc import Callable, Mapping
 import contextlib
-from functools import wraps
+from functools import partial, wraps
 import hashlib
 import hmac
 import ipaddress
@@ -59,6 +59,7 @@ from aiohttp import WSMsgType, web
 from one_link import certified_surface, control_ipc
 from one_link.build_identity import runtime_build_identity
 from one_link.call_routes import CallRouter
+from one_link.owner_auth_note import note_refused_owner_request
 from one_link.courier_files import (
     COURIER_FILE_MAX_BYTES, CourierDirectoryMonitor, CourierFileCatalog, CourierFileInfo,
 )
@@ -1392,6 +1393,11 @@ COOKIE_NAME = "ol_ui"
 # it; just "yes a session cookie exists") so the access-denied page
 # can decide to auto-reload silently instead of dead-ending.
 SESSION_COOKIE_NAME = "ol_session"
+# One line, at most once a minute per client, saying what a refused owner
+# request presented (never the credential). See one_link.owner_auth_note.
+_note_refused_owner_request = partial(
+    note_refused_owner_request, log=log, cookie_names=(SESSION_COOKIE_NAME, COOKIE_NAME),
+)
 SESSION_PRESENT_MARKER_COOKIE = "ol_session_present"
 SESSION_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 30  # 30 days
 SESSION_ABSOLUTE_MAX_AGE_SECONDS = SESSION_COOKIE_MAX_AGE_SECONDS
@@ -4809,61 +4815,10 @@ class UIServer:
             return False
         return self._origin_matches_request(request, origin)
 
-    def _note_owner_auth_refusal(self, request: web.Request) -> None:
-        """Log, at most once a minute per client, what a refused owner request presented.
-
-        On 2026-11-25 an open window was answered 401 around a daemon restart
-        and nothing recorded it, so whether the window held a per-process
-        owner token (expected to die with the process) or a persistent session
-        (expected to survive) could not be recovered afterwards. This line
-        answers that question the next time. It never contains a credential:
-        only where one was presented and whether it has the shape of a
-        persistent session bearer. The path is the route pattern, so peer
-        fingerprints in URLs are not copied into the log.
-        """
-
-        try:
-            if self._rate_limited(
-                "auth_refusal_note",
-                self._client_rate_key(request),
-                limit=1,
-            ):
-                return
-            if self._authorization_bearer(request):
-                presented, token = "header", self._authorization_bearer(request)
-            elif self._websocket_bearer(request):
-                presented, token = "websocket", self._websocket_bearer(request)
-            elif request.cookies.get(SESSION_COOKIE_NAME, "") or request.cookies.get(COOKIE_NAME, ""):
-                presented = "cookie"
-                token = request.cookies.get(SESSION_COOKIE_NAME, "")
-            else:
-                presented, token = "none", ""
-            state = getattr(self.daemon, "state", None)
-            if not token:
-                shape = "none"
-            elif state is None:
-                shape = "unchecked"
-            elif state.ui_session_token_id(token) is not None:
-                shape = "session"
-            else:
-                shape = "other"
-            route = getattr(getattr(request.match_info, "route", None), "resource", None)
-            pattern = getattr(route, "canonical", None) or request.path
-            log.info(
-                "owner request refused (401): %s %s presented=%s shape=%s transport_ok=%s",
-                request.method,
-                pattern,
-                presented,
-                shape,
-                self._owner_auth_transport_ok(request),
-            )
-        except Exception as exc:  # a diagnostic must never change the answer
-            log.debug("owner auth refusal note failed: %s", exc)
-
     def _guarded(self, handler):
         async def wrap(request: web.Request) -> web.StreamResponse:
             if not self._check_token(request):
-                self._note_owner_auth_refusal(request)
+                _note_refused_owner_request(self, request)
                 if self._rate_limited(
                     "auth_fail",
                     self._client_rate_key(request),
@@ -4896,7 +4851,7 @@ class UIServer:
     def _guarded_ws(self, handler):
         async def wrap(request: web.Request) -> web.StreamResponse:
             if not self._check_token(request):
-                self._note_owner_auth_refusal(request)
+                _note_refused_owner_request(self, request)
                 if self._rate_limited(
                     "auth_fail",
                     self._client_rate_key(request),

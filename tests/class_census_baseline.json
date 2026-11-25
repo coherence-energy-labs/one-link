@@ -53,7 +53,7 @@
       "self_attributes_assigned": 190
     },
     "UIServer": {
-      "class_lines": 25842,
+      "class_lines": 25844,
       "domains": {
         "call": {
           "lines": 537,
@@ -80,7 +80,7 @@
           "methods": 19
         },
         "other": {
-          "lines": 11357,
+          "lines": 11359,
           "methods": 214
         },
         "peer": {
@@ -100,7 +100,7 @@
           "methods": 26
         }
       },
-      "method_lines": 25032,
+      "method_lines": 25034,
       "methods": 445,
       "self_attributes_assigned": 52
     }
@@ -170,6 +170,20 @@
         },
         "UIServer": {
           "method_lines": 25032,
+          "methods": 445
+        }
+      }
+    },
+    {
+      "growth_reason": "UIServer +2 lines: one call line in each of the two auth guards (_guarded, _guarded_ws) to note_refused_owner_request, which is a module function behind an explicit port; no method added. The method added in 0875392 (+1 method, +52 lines) is removed again.",
+      "label": "owner-auth refusal note: the logic lives in one_link.owner_auth_note; the two guards call it",
+      "totals": {
+        "Daemon": {
+          "method_lines": 33200,
+          "methods": 499
+        },
+        "UIServer": {
+          "method_lines": 25034,
           "methods": 445
         }
       }

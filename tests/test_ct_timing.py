@@ -265,6 +265,52 @@ def test_quiet_machine_claim_is_checked_not_assumed():
     assert len(problems) == 2 and all("unverified" in p for p in problems)
 
 
+def test_committed_timing_evidence_names_no_process_and_no_absolute_path():
+    """Every report under docs/audit/evidence obeys the publishing rules above."""
+    reports = sorted((ROOT / "docs" / "audit" / "evidence").glob("ct-timing-*.json"))
+    assert reports, "no timing evidence found; the check would be blind"
+    for path in reports:
+        report = json.loads(path.read_text(encoding="utf-8"))
+
+        def walk(node, trail="", name=path.name):
+            if isinstance(node, dict):
+                if "processes" in node:
+                    for row in node["processes"]:
+                        assert "name" not in row and "pid" not in row, f"{name}{trail}: names a process"
+                for key, value in node.items():
+                    walk(value, f"{trail}.{key}")
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item, trail)
+            elif isinstance(node, str):
+                assert not re.search(r"(?i)\b[a-z]:[\\/]|/(?:home|Users|root|mnt)/", node), (
+                    f"{name}{trail}: absolute path {node[:80]!r}"
+                )
+
+        walk(report)
+        assert not Path(report["source"]["binary"]).is_absolute()
+
+
+def test_committed_timing_evidence_says_what_it_shows():
+    """The current reports pass with both controls working; the kept pre-fix reports show the leak they found."""
+    evidence = ROOT / "docs" / "audit" / "evidence"
+    for host in ("linux", "windows"):
+        current = json.loads((evidence / f"ct-timing-{host}.json").read_text(encoding="utf-8"))
+        assert current["status"] == "passed" and current["failures"] == [] and current["inconclusive"] == []
+        summary = current["summary"]
+        assert summary["constant_time"]["LEAK"] == 0 and summary["constant_time"]["PASS"] >= 20
+        assert summary["leak_controls"] == {"total": 2, "detected": 2}
+        assert summary["null_controls"]["flagged"] == 0 and summary["errors"] == 0
+        # Not a quiet machine, and the report must say so rather than imply otherwise.
+        assert current["quiet_machine"] is False and "NOT a quiet machine" in current["statement"]
+        before = json.loads(
+            (evidence / f"ct-timing-{host}-fb35d18-duress-open-leak.json").read_text(encoding="utf-8")
+        )
+        assert before["status"] == "failed"
+        assert before["failures"] == ["duress_real_vs_duress: leak (LEAK)"]
+        assert "republished" in before
+
+
 def test_controlled_runner_workflow_runs_the_statistical_test_as_a_checked_quiet_machine():
     text = (ROOT / ".github" / "workflows" / "native_timing.yml").read_text(encoding="utf-8")
     step = text[text.index("- name: Statistical timing-leak test (dudect)") :]

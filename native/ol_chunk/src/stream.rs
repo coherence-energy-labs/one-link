@@ -15,7 +15,8 @@
 //! H.264 Annex B) are read whole up to `in_memory_limit`; above it the scan
 //! reports [`StreamScanError::NeedsWholeFile`] and the caller decides. Header
 //! candidates are consumed online: dense records do not create an auxiliary
-//! vector proportional to record count. Header read-ahead is 64 KiB. The
+//! vector proportional to record count. Header read-ahead and short-segment
+//! batches are 64 KiB; dense walks also retain a bounded unhashed span. The
 //! parallel CDC kernel has additional candidate workspace bounded by the
 //! payload window, not by the file length. This is not a constant-total-memory
 //! API: its returned boundaries and format flags occupy O(output chunks).
@@ -182,7 +183,7 @@ struct Headers<'a, R> {
 }
 
 /// Bytes appended when a dense walk slides the window.
-const SEQUENTIAL_READ: usize = 16 << 20;
+const SEQUENTIAL_READ: usize = 64 << 10;
 
 impl<'a, R: Read + Seek> Headers<'a, R> {
     fn new(source: &'a mut R, len: usize) -> Self {
@@ -194,6 +195,21 @@ impl<'a, R: Read + Seek> Headers<'a, R> {
             retain_from: usize::MAX,
             retain_limit: 0,
         }
+    }
+
+    fn for_segments(source: &'a mut R, len: usize, params: CdcParams) -> Self {
+        let mut headers = Self::new(source, len);
+        headers.retain_from = 0;
+        headers.retain_limit = SEGMENT_BATCH
+            + 2 * params.max_size as usize
+            + 2 * crate::select::horizon(params)
+            + HEADER_READ_AHEAD;
+        headers
+    }
+
+    fn release_window(&mut self) {
+        self.window = Vec::new();
+        self.window_start = 0;
     }
 
     /// `[start, end)` if the window holds it.
@@ -257,11 +273,9 @@ impl<R: Read + Seek> Headers<'_, R> {
             };
             self.window_start = self.retain_from;
             let held = self.window.len();
-            // One allocation for the whole walk, sized to the window's bound
-            // (the retained span plus one read-ahead block, never more than
-            // the source). Left to grow on demand the buffer doubles, which
-            // overshoots that bound and, on allocators that cannot extend a
-            // large block in place, briefly holds the old and the new copy.
+            // Reserve the bounded capacity once, without Vec's geometric
+            // growth. read_to_end can grow even at the end of a Take reader;
+            // an exact-sized initialized slice avoids that extra allocation.
             let needed = held + (new_end - append_from);
             let bound = self
                 .retain_limit
@@ -271,20 +285,15 @@ impl<R: Read + Seek> Headers<'_, R> {
             if self.window.capacity() < capacity {
                 self.window.reserve_exact(capacity - held);
             }
+            self.window.resize(new_end - self.window_start, 0);
             self.source.seek(SeekFrom::Start(append_from as u64))?;
-            // Read into spare capacity: no zero-fill of the appended block.
-            (&mut *self.source)
-                .take((new_end - append_from) as u64)
-                .read_to_end(&mut self.window)?;
-            if self.window.len() - held != new_end - append_from {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "source shrank while its record headers were read",
-                ));
-            }
+            self.source.read_exact(&mut self.window[held..])?;
         } else {
             let want = HEADER_READ_AHEAD.max(n).min(self.len - pos);
             self.source.seek(SeekFrom::Start(pos as u64))?;
+            if self.window.capacity() < want {
+                self.window.reserve_exact(want - self.window.len());
+            }
             self.window.resize(want, 0);
             self.source.read_exact(&mut self.window)?;
             self.window_start = pos;
@@ -354,12 +363,16 @@ fn verify_source_length<R: Seek>(source: &mut R, len: usize) -> io::Result<()> {
     Ok(())
 }
 
-/// Short segments (at most `max_size`) are hashed together, in parallel, once
-/// this many bytes of them are pending.
-const SEGMENT_BATCH: usize = 8 << 20;
+/// Flush short segments (at most `max_size`) after this many pending bytes.
+/// A small batch lets dense walks retain their input without a large payload
+/// allocation that sparse header walks do not need.
+const SEGMENT_BATCH: usize = 64 << 10;
+
+/// Small batches cost less to hash directly than to dispatch to the pool.
+const PARALLEL_HASH_BYTES: usize = 1 << 20;
 
 /// Turns accepted cuts into chunks over a seekable source, in order. Short
-/// segments are batched and hashed in parallel, from the header window when it
+/// segments are batched and hashed from the header window when it
 /// holds them and otherwise after one read of the batch (at most
 /// `SEGMENT_BATCH + max_size` bytes); a segment longer than `max_size` is
 /// chunked by [`scan_stream`] over its own byte range.
@@ -426,7 +439,7 @@ impl SegmentWriter {
         Ok(())
     }
 
-    /// Hash the pending short segments in parallel.
+    /// Hash pending short segments, using the pool only for large profiles.
     fn flush<R: Read + Seek>(&mut self, headers: &mut Headers<'_, R>) -> io::Result<()> {
         let Some(&end) = self.batch_ends.last() else {
             return Ok(());
@@ -435,6 +448,10 @@ impl SegmentWriter {
         let bytes = if let Some(held) = headers.held(start, end) {
             held
         } else {
+            let capacity = (SEGMENT_BATCH + self.params.max_size as usize).min(headers.len);
+            if self.buffer.capacity() < capacity {
+                self.buffer.reserve_exact(capacity - self.buffer.len());
+            }
             self.buffer.resize(end - start, 0);
             headers.source.seek(SeekFrom::Start(start as u64))?;
             headers.source.read_exact(&mut self.buffer)?;
@@ -444,10 +461,13 @@ impl SegmentWriter {
             .chain(self.batch_ends.iter().copied())
             .zip(self.batch_ends.iter().copied())
             .collect();
-        let addresses: Vec<[u8; 32]> = ranges
-            .par_iter()
-            .map(|&(s, e)| blake3_wrap::chunk_address_raw(&bytes[s - start..e - start]))
-            .collect();
+        let address =
+            |&(s, e): &(usize, usize)| blake3_wrap::chunk_address_raw(&bytes[s - start..e - start]);
+        let addresses: Vec<[u8; 32]> = if bytes.len() < PARALLEL_HASH_BYTES {
+            ranges.iter().map(address).collect()
+        } else {
+            ranges.par_iter().map(address).collect()
+        };
         for (&(s, e), raw_address) in ranges.iter().zip(addresses) {
             self.out.boundaries.push(Boundary {
                 start: s,
@@ -470,11 +490,11 @@ impl SegmentWriter {
 /// Record headers feed the same v2 cut selector as the in-memory scanner
 /// (`select.rs`), online: no candidate, accepted-cut or segment list is
 /// retained. Held workspace is the header window (64 KiB for a walk that jumps;
-/// for a dense walk, the unhashed bytes, at most 8 MiB + `max_size` + the
-/// horizon + 64 KiB, plus a 16 MiB read-ahead block), the selector's horizon of
+/// for a dense walk, at most 192 KiB + `2 * max_size` + twice the horizon,
+/// including the unhashed bytes and 64 KiB read-ahead), the selector's horizon of
 /// candidates (at most `max(avg_size / 2, min_size) / 4 + 1`), a short-segment
 /// batch buffer used only when the window does not hold the batch (at most
-/// 8 MiB + `max_size`) and the plain-CDC window for long segments, all
+/// 64 KiB + `max_size`) and the plain-CDC window for long segments, all
 /// independent of source size; returned boundaries and flags still require
 /// O(output chunks) memory. ZIP/H264 retain the explicit whole-file limit (see
 /// the module documentation).
@@ -507,12 +527,7 @@ pub fn scan_format_aware_seekable<R: Read + Seek>(
     verify_source_length(source, len)?;
     let mut selector = CutSelector::new(len, params);
     let mut writer = SegmentWriter::new(params);
-    let mut headers = Headers::new(source, len);
-    headers.retain_from = 0;
-    headers.retain_limit = SEGMENT_BATCH
-        + 2 * params.max_size as usize
-        + 2 * crate::select::horizon(params)
-        + HEADER_READ_AHEAD;
+    let mut headers = Headers::for_segments(source, len, params);
     let walk = match format {
         Some(ContainerFormat::Mcap) => Some(RecordWalk::mcap()),
         Some(ContainerFormat::Mp4) => Some(RecordWalk::mp4()),
@@ -543,6 +558,8 @@ pub fn scan_format_aware_seekable<R: Read + Seek>(
         // No accepted cut: plain CDC of the whole source, including natural
         // cuts in inputs shorter than max_size (a forced segment that short is
         // one chunk, matching the in-memory scanner).
+        // The completed header walk will not use its allocation again.
+        headers.release_window();
         headers.source.seek(SeekFrom::Start(0))?;
         let boundaries = scan_stream(&mut *headers.source, len, params)?;
         let format_aware = vec![false; boundaries.len()];
@@ -584,6 +601,92 @@ mod tests {
             min_size: 1024,
             avg_size: 4096,
             max_size: 16384,
+        }
+    }
+
+    #[test]
+    fn dense_header_capacity_stays_small_through_reuse_and_jumps() {
+        let params = CdcParams::default();
+        for len in [2 << 20, 8 << 20] {
+            let data = bytes(len, 3);
+            let mut source = Cursor::new(&data);
+            let mut headers = Headers::for_segments(&mut source, len, params);
+            // Keep a pending batch plus a maximum segment and the selector's
+            // lookahead. Repeated slides must reuse a small allocation, even
+            // when the logical window grows a little beyond its last length.
+            let pending =
+                SEGMENT_BATCH - 1 + params.max_size as usize + crate::select::horizon(params);
+            let mut peak = 0;
+            for pos in (0..len - HEAD_BYTES).step_by(HEAD_BYTES) {
+                headers.retain_from = pos.saturating_sub(pending);
+                assert_eq!(
+                    headers.at(pos, HEAD_BYTES).unwrap().unwrap(),
+                    &data[pos..pos + HEAD_BYTES]
+                );
+                peak = peak.max(headers.window.capacity());
+                assert!(peak <= 768 << 10, "{len}-byte source retained {peak} bytes");
+            }
+            assert!(peak > HEADER_READ_AHEAD, "the dense sliding path ran");
+            for pos in [0, len - HEAD_BYTES, len / 2] {
+                assert_eq!(
+                    headers.at(pos, HEAD_BYTES).unwrap().unwrap(),
+                    &data[pos..pos + HEAD_BYTES]
+                );
+                assert!(headers.window.capacity() <= 768 << 10);
+            }
+            // No-cut fallback must be able to release this workspace before
+            // allocating its plain-CDC payload window. A later refill still
+            // has a coherent start offset and returns the requested bytes.
+            headers.release_window();
+            assert_eq!(headers.window.capacity(), 0);
+            assert_eq!(
+                headers.at(123, HEAD_BYTES).unwrap().unwrap(),
+                &data[123..123 + HEAD_BYTES]
+            );
+        }
+    }
+
+    #[test]
+    fn segment_buffer_capacity_is_bounded_across_larger_reused_batches() {
+        let data = bytes(8 << 20, 7);
+        for max_size in [256 << 10, 2 << 20] {
+            let params = CdcParams {
+                max_size,
+                ..CdcParams::default()
+            };
+            let mut source = Cursor::new(&data);
+            let mut headers = Headers::for_segments(&mut source, data.len(), params);
+            let mut writer = SegmentWriter::new(params);
+            let limit = (64 << 10) + max_size as usize;
+            let mut end = 0;
+            for tail in [128, 64, 0] {
+                // The prefix alone does not flush; the next segment creates
+                // a successively larger fallback batch. Geometric resize
+                // growth used to retain nearly twice the needed capacity.
+                end += SEGMENT_BATCH - 1;
+                writer.segment_to(&mut headers, end).unwrap();
+                end += max_size as usize - tail;
+                writer.segment_to(&mut headers, end).unwrap();
+                assert!(
+                    writer.buffer.capacity() <= limit,
+                    "{} > {limit}",
+                    writer.buffer.capacity()
+                );
+                assert!(writer.batch_ends.is_empty());
+            }
+            // A long segment uses plain CDC after draining the batch. The
+            // old batch allocation remains small through this transition.
+            writer.segment_to(&mut headers, data.len()).unwrap();
+            writer.flush(&mut headers).unwrap();
+            assert!(writer.buffer.capacity() <= limit);
+            assert_eq!(writer.out.boundaries.first().unwrap().start, 0);
+            assert_eq!(writer.out.boundaries.last().unwrap().end, data.len());
+            for boundary in writer.out.boundaries {
+                assert_eq!(
+                    boundary.raw_address,
+                    *blake3::hash(&data[boundary.start..boundary.end]).as_bytes()
+                );
+            }
         }
     }
 
@@ -813,16 +916,15 @@ mod tests {
     /// doubles past the bound and can briefly hold two copies of itself.
     #[test]
     fn a_dense_walk_allocates_its_window_once_within_the_documented_bound() {
-        let len = 5 * SEQUENTIAL_READ + 12_345;
+        let params = CdcParams::default();
+        let len = (2 << 20) + 5 * SEQUENTIAL_READ + 12_345;
         let mut source = Zeros {
             len: len as u64,
             pos: 0,
         };
-        let mut headers = Headers::new(&mut source, len);
-        headers.retain_from = 0;
-        headers.retain_limit = (8 << 20) + HEADER_READ_AHEAD;
+        let mut headers = Headers::for_segments(&mut source, len, params);
         let bound = headers.retain_limit + SEQUENTIAL_READ;
-        let trail = 1 << 20; // the walk keeps its last MiB unhashed
+        let trail = SEGMENT_BATCH + params.max_size as usize + crate::select::horizon(params);
         let mut capacities = Vec::new();
         let mut pos = 0;
         while pos + 32 <= len {
@@ -839,7 +941,7 @@ mod tests {
             pos += 32;
         }
         // First the 64 KiB header window, then the one allocation the first
-        // slide makes; five more slides reuse it.
+        // slide makes; all later slides reuse it.
         assert_eq!(capacities, vec![HEADER_READ_AHEAD, bound]);
     }
 
@@ -919,14 +1021,22 @@ mod tests {
         }
     }
 
-    /// Content that repeats with the scanner's own batch size (8 MiB), or out
+    /// Content that repeats with the scanner's own batch size, or out
     /// of step with it, is still read once. With such a period every slide of
     /// the window meets the pending batch at the same phase, so a boundary
     /// case in what the window retains would repeat for the whole source and
     /// send every batch back to the source for a second read.
     #[test]
     fn a_dense_source_that_repeats_with_the_batch_period_is_read_once() {
-        for period in [SEGMENT_BATCH, SEGMENT_BATCH + 4096, 5 << 20] {
+        // Keep the original 8 MiB period cases as well as the smaller current
+        // batch period. Both aligned and misaligned layouts remain read-once.
+        for period in [
+            SEGMENT_BATCH,
+            SEGMENT_BATCH + 4096,
+            5 << 20,
+            8 << 20,
+            (8 << 20) + 4096,
+        ] {
             let records = (72usize << 20) / PERIODIC_RECORD;
             let mut source = PeriodicDense::new(records, period);
             let len = source.len;
@@ -963,9 +1073,7 @@ mod tests {
             len: len as u64,
             pos: 0,
         };
-        let mut headers = Headers::new(&mut source, len);
-        headers.retain_from = 0;
-        headers.retain_limit = (8 << 20) + HEADER_READ_AHEAD;
+        let mut headers = Headers::for_segments(&mut source, len, CdcParams::default());
         let mut pos = 0;
         while pos + 32 <= len {
             assert!(headers.at(pos, 32).unwrap().is_some());

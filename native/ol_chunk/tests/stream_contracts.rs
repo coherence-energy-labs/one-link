@@ -329,7 +329,13 @@ fn millions_of_dense_records_are_chunked_online_reading_the_source_once() {
         len + 2 * (64 << 10) + 8,
         "bytes read from a {len}-byte source"
     );
-    assert!(source.largest_read <= 16 << 20, "{}", source.largest_read);
+    // A dense refill can reload the header window once (starting just past
+    // the magic) and append its 64 KiB block. Later reads append one block.
+    assert!(
+        source.largest_read <= 2 * (64 << 10) + MCAP_MAGIC.len(),
+        "{}",
+        source.largest_read
+    );
     // About one chunk per avg_size bytes, each forced chunk on a record start.
     assert!(
         (len / (128 << 10)..len / (32 << 10)).contains(&result.boundaries.len()),
@@ -392,7 +398,7 @@ fn every_payload_path_of_the_file_scanner_equals_the_in_memory_scanner() {
     // a dense walk has slid the window over them, and reads them itself when
     // the walk jumped (sparse records) or a segment outgrew the retention
     // (one huge record inside a dense run). Each layout below exercises one of
-    // those paths, past the 16 MiB slide and 8 MiB batch sizes, through
+    // those paths, past the 64 KiB slide and batch sizes, through
     // fragmented and interrupted reads; the in-memory scanner is the oracle.
     let dense = dense_mcap_bytes(2_500_000); // 42.5 MB: several slides and batches
     let mut sparse = MCAP_MAGIC.to_vec();
@@ -443,7 +449,33 @@ fn every_payload_path_of_the_file_scanner_equals_the_in_memory_scanner() {
     }
 }
 
-/// Truncates itself to `new_len` at the first read that starts past `at`.
+#[test]
+fn identical_dense_records_use_plain_cdc_after_the_header_walk() {
+    let mut data = MCAP_MAGIC.to_vec();
+    data.extend(mcap_record(1, b"ros2"));
+    let record = mcap_record(5, &[0; 8]);
+    for _ in 0..2_000_000 {
+        data.extend_from_slice(&record);
+    }
+    data.extend_from_slice(&MCAP_MAGIC);
+    // Equal fingerprints do not select a dense cut. This exercises the
+    // completed dense walk followed by a full plain-CDC window, without
+    // retaining the header payload during that fallback.
+    let expected = scan_format_aware(&data, None, CdcParams::default()).unwrap();
+    let actual = scan_format_aware_seekable(
+        &mut Cursor::new(&data),
+        data.len(),
+        Some(ContainerFormat::Mcap),
+        CdcParams::default(),
+        0,
+    )
+    .unwrap();
+    assert_eq!(actual.boundaries, expected.boundaries);
+    assert!(actual.format_aware.iter().all(|forced| !forced));
+}
+
+/// Truncates itself during a forward payload read, not the initial trailing
+/// magic probe beyond `new_len`.
 struct ShrinksMidway {
     inner: Cursor<Vec<u8>>,
     at: u64,
@@ -452,7 +484,10 @@ struct ShrinksMidway {
 
 impl Read for ShrinksMidway {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.inner.position() > self.at && self.inner.get_ref().len() > self.new_len {
+        if self.inner.position() > self.at
+            && self.inner.position() < self.new_len as u64
+            && self.inner.get_ref().len() > self.new_len
+        {
             self.inner.get_mut().truncate(self.new_len);
         }
         self.inner.read(buf)
@@ -467,10 +502,9 @@ impl Seek for ShrinksMidway {
 
 #[test]
 fn a_source_that_shrinks_during_a_dense_slide_is_an_error() {
-    // The header window slides forward in 16 MiB blocks. The leading header
-    // and trailing magic are read first; the truncation lands on the second
-    // slide, at about 16 MiB, and must surface as UnexpectedEof, never as a
-    // short chunk set.
+    // The header window slides forward in 64 KiB blocks. Truncation after
+    // the first MiB must surface as UnexpectedEof when a later refill reaches
+    // the new end, never as a successful short chunk set.
     let data = dense_mcap_bytes(2_000_000);
     let mut source = ShrinksMidway {
         inner: Cursor::new(data.clone()),

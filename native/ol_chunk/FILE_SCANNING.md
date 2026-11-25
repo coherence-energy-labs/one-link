@@ -130,7 +130,8 @@ inside a segment longer than `max_size` plain `FastCDC` resynchronises within on
 chunk, and on average about one chunk; the derivation is in
 `tests/dense_resync.rs`.
 
-Measured (default profile, release build, one inserted record):
+Recorded with the original v2 change `5fdd9f7` (default profile, release build,
+one inserted record):
 
 | 64 MiB MCAP, record size | v1 re-sent | v2 re-sent | plain FastCDC |
 | --- | --- | --- | --- |
@@ -149,13 +150,21 @@ in-place edit there re-sent about 8 KiB; v2 makes `avg_size`-scale chunks
 | --- | --- |
 | Plain CDC payload window | `min(file_length, max(32 MiB, 4 * max_size))` |
 | Header window for MCAP/MP4/WAV, walk that jumps (sparse records) | 64 KiB |
-| Header window, sequential walk (dense records) | the unhashed span, at most `8 MiB + 2 * max_size + 2h + 64 KiB`, plus one 16 MiB read-ahead block; short segments are hashed from it, so a dense source is read once |
+| Header window, sequential walk (dense records) | capacity at most `192 KiB + 2 * max_size + 2h` (768 KiB at default parameters), including the unhashed span and a 64 KiB read-ahead block; short segments are hashed from it, so a dense source is read once |
 | v2 cut selector | dense candidates within the last `h = max(avg_size / 2, min_size)` bytes (at most `h / 4 + 1`) and the structural cuts waiting behind them |
 | Forced-cut candidate/accepted/segment lists in the seekable scanner | None: online selection and immediate segment hashing |
 | Parallel CDC candidate workspace | O(payload window); depends on bytes and sizing, not total file length |
-| Short-segment batch buffer, used only when the header window does not hold the batch | At most `8 MiB + max_size` |
+| Short-segment batch buffer, used only when the header window does not hold the batch | Capacity at most `64 KiB + max_size` (320 KiB at default parameters) |
 | Returned boundaries/hashes/format flags | O(output chunks), including corresponding Python objects |
 | ZIP/H.264 whole-buffer path | Input up to the explicit limit, plus in-memory scanner/output workspace |
+
+Payload buffers reserve their bounded capacities explicitly, rather than
+growing geometrically as a batch becomes slightly larger. The header window is
+released before a no-cut fallback allocates its plain-CDC window. During a long
+segment, the bounded header and batch buffers can coexist with the plain-CDC
+window. Short batches below 1 MiB are hashed directly; larger custom profiles
+can still use parallel hashing. These scheduling choices do not alter cuts,
+addresses, or format flags.
 
 The API does **not** promise constant total RAM or a 32 MiB total process RSS
 ceiling. A low minimum chunk size can produce a large output. The separate
@@ -165,9 +174,11 @@ space; the file chunk scanner does not use those list-returning APIs.
 
 The dense header window is allocated once, at its bound, on the first slide
 (`stream::tests::a_dense_walk_allocates_its_window_once_within_the_documented_bound`).
-Left to grow on demand it doubled to 32 MiB and, on an allocator that cannot
-extend a large block in place, briefly held the old and the new copy: macOS
-measured 48.7 MiB for a 256 MiB dense log before this was fixed.
+With the previous 8 MiB batch and 16 MiB read-ahead, growth on demand could
+double it to 32 MiB and briefly retain both allocations when the old block
+could not be extended in place. The recorded macOS peak was 48.7 MiB for a
+256 MiB dense log. The scanner now both reserves explicitly and uses the
+smaller capacities in the table above.
 
 `scripts/bench_scan_memory.py` qualifies this table on real files (in CI:
 256 MiB and 1 GiB, dense, sparse and plain, on Linux, Windows and macOS). Each
@@ -181,15 +192,17 @@ requires:
 - repeat-to-repeat spread small enough to see one retained bit per record
   (otherwise the run fails as underpowered).
 
-Its logs are random throughout. A log that tiles one 8 MiB block repeats with
-the scanner's batch size, which locks the dense window to one phase for the
-whole file (about 16 or 24 MiB touched, by where the first cut falls), and a
+Its logs are random throughout. Previously, a log that tiled one 8 MiB block
+repeated with the scanner's then 8 MiB batch size, locking the dense window to
+one phase for the whole file (about 16 or 24 MiB touched, by where the first cut falls), and a
 run of identical records is the tie case handed to plain CDC with a buffer of
 its own; both make the measured peak a property of the corpus.
 
-Measured on Windows, 256 MiB to 1 GiB: dense 25.6 to 26.8 MiB while records
-went from 8.4 M to 33.6 M (the growth is the 12,272 additional returned
-chunks), sparse 9.4 to 9.7 MiB, plain 33.8 to 34.9 MiB; `b_record` -0.005.
+Historical Windows measurements for commit `bde25be`, before the smaller
+batch/window change: from 256 MiB to 1 GiB, dense 25.6 to 26.8 MiB while records
+went from 8.4 M to 33.6 M and returned chunks increased by 12,272; sparse 9.4
+to 9.7 MiB, plain 33.8 to 34.9 MiB; `b_record` -0.005. These are not measurements
+of the current smaller buffers.
 
 Python exposes `CDC_FILE_WINDOW_BYTES` and `FORMAT_AWARE_IN_MEMORY_LIMIT` so
 callers can inspect the declared limits. These are payload limits, not full
@@ -211,8 +224,10 @@ first header window twice and the trailing magic): collecting candidates or
 segments before hashing would read the payload a second time. It also checks
 every payload path of the file scanner (hashed from the header window, read by
 the writer after a jump, retention exceeded by one huge record) against the
-in-memory scanner under fragmented and interrupted reads, and truncation during
-a 16 MiB slide.
+in-memory scanner under fragmented and interrupted reads, truncation during
+64 KiB sliding reads, and an identical-record input that falls back to plain
+CDC. Unit tests check actual retained capacities through repeated dense slides,
+sparse jumps, progressively larger batches, and the transition to long segments.
 
 `tests/dense_resync.rs` is the dense-resync witness as a Rust test (64 MiB of
 32-byte records, one inserted) plus insert, delete and edit on dense MCAP of
@@ -277,10 +292,12 @@ It prints the witness table above and best-of-three MiB/s over a 256 MiB MCAP
 of 32-byte records for the in-memory, `Cursor` and real-file paths, format-aware
 and plain, and checks in-memory == seekable. Compare builds only within one
 batch, interleaved: load from other processes moved unchanged code by 2x
-between runs. Measured that way (three interleaved rounds, medians, v1 -> v2):
+between runs. The original `5fdd9f7` report recorded (three interleaved rounds,
+medians, v1 -> v2):
 in-memory format-aware 1,073 -> 2,341 MiB/s; real file (`format_aware_file`)
 754 -> 1,207 MiB/s; seekable over a `Cursor` 2,041 -> 1,759 MiB/s. That last
 path is 14% slower: v1 did no per-record work beyond the walk (its cut choice
 was the defect), v2 spends about 6 ns per record on the fingerprint and
 selection, and a `Cursor` source has no read-syscall cost for v2's read-once
-window to save.
+window to save. These historical timing figures predate the current 64 KiB
+batch/read-ahead configuration; they do not qualify its throughput.

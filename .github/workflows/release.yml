@@ -63,7 +63,7 @@ jobs:
       - name: setup uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.31"
+          version: "0.13.10"
           enable-cache: false
 
       - name: install
@@ -107,7 +107,7 @@ jobs:
       - name: setup uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.31"
+          version: "0.13.10"
           enable-cache: false
 
       - name: install checksummed Node.js LTS without a shared package cache
@@ -140,7 +140,7 @@ jobs:
 
       - name: build tagged native Python binding
         working-directory: native
-        run: uv run --project .. --frozen --extra dev --extra release maturin develop --release --locked
+        run: uv run --project .. --no-sync maturin develop --release --locked
 
       - name: native formatting and lint gates
         working-directory: native
@@ -165,21 +165,24 @@ jobs:
         run: python scripts/verify_browser_ed25519_wasm.py --rebuild
 
       - name: Python correctness lint
-        run: uv run --frozen --extra dev ruff check src/one_link
+        run: uv run --no-sync ruff check src/one_link
 
       - name: full Python suite for tagged source
         env:
           ONE_LINK_RUN_LIVE_INTEGRATION: "1"
           PYTHONUNBUFFERED: "1"
         run: |
-          # Extras match the canonical full-suite workflow exactly: uv run
-          # re-syncs the env to the extras NAMED HERE, so a bare --extra dev
-          # pruned the security tooling (cyclonedx) the SBOM-authority tests
-          # import, failing them only in this workflow.
-          uv run --frozen --extra dev --extra release --extra security python -m pytest tests/ \
+          # Keep the frozen environment and freshly built native binding intact.
+          uv run --no-sync python -m pytest tests/ \
             --ignore=tests/e2e \
             --ignore=tests/test_call_reliability_soak.py \
-            -q --tb=short --maxfail=20 --reruns 2 --reruns-delay 5
+            -p no:playwright -m "not live_daemon" -q --tb=short --maxfail=20 --reruns 2 --reruns-delay 5 --junitxml=test-results/full-suite.xml
+
+      - name: Strict live-daemon acceptance for tagged source
+        env:
+          ONE_LINK_RUN_LIVE_INTEGRATION: "1"
+          PYTHONUNBUFFERED: "1"
+        run: uv run --no-sync python scripts/live_suite.py --run --report test-results/live-suite.json
 
       # --timeout is LOAD-BEARING, not tidiness. A hung browser test eats the
       # remainder of the JOB budget and is then reported as "cancelled",
@@ -192,9 +195,12 @@ jobs:
         env:
           ONE_LINK_RUN_BROWSER_E2E: "1"
         run: |
-          uv run --frozen --extra e2e playwright install --with-deps chromium firefox
-          uv run --frozen --extra e2e python -m pytest tests/e2e/ -v --tb=short --browser chromium --timeout=600 --timeout-method=thread
-          uv run --frozen --extra e2e python -m pytest tests/e2e/test_peer_live_transport.py::test_two_isolated_peer_pages_complete_manual_webrtc_and_exchange_probe tests/e2e/test_browser_identity_possession_live.py::test_required_mode_live_pair_owner_request_and_immediate_revoke tests/e2e/test_call_local_candidate_live.py::test_call_media_local_candidate_augmentation_uses_real_browser_ice -v --tb=short --browser firefox --timeout=600 --timeout-method=thread
+          uv run --no-sync playwright install --with-deps chromium firefox
+          uv run --no-sync python -m pytest tests/e2e/ -v --tb=short --browser chromium --output=test-results/playwright-chromium --junitxml=test-results/browser-chromium.xml --timeout=600 --timeout-method=thread
+          uv run --no-sync python -m pytest tests/e2e/test_peer_live_transport.py::test_two_isolated_peer_pages_complete_manual_webrtc_and_exchange_probe tests/e2e/test_browser_identity_possession_live.py::test_required_mode_live_pair_owner_request_and_immediate_revoke tests/e2e/test_call_local_candidate_live.py::test_call_media_local_candidate_augmentation_uses_real_browser_ice -v --tb=short --browser firefox --output=test-results/playwright-firefox --junitxml=test-results/browser-firefox.xml --timeout=600 --timeout-method=thread
+
+      - name: Verify generated owner UI matches its reviewed source modules
+        run: python scripts/build_owner_ui.py --check
 
       - name: exact JavaScript dependency and static-contract gates
         working-directory: tests/js
@@ -205,7 +211,7 @@ jobs:
 
       - name: GitHub Actions security gate
         run: >-
-          uv run --frozen --extra security zizmor
+          uv run --no-sync zizmor
           --pedantic --strict-collection .github
 
       - name: Python dependency and source security gates
@@ -214,12 +220,12 @@ jobs:
           # locked RustSec gates below; audit every registry-backed Python extra
           # and dependency group without invoking pip's resolver.
           uv export --frozen --all-extras --all-groups --no-extra native --no-emit-project --output-file "$RUNNER_TEMP/requirements.lock"
-          uv run --frozen --extra security python -m pip_audit \
+          uv run --no-sync python -m pip_audit \
             --requirement "$RUNNER_TEMP/requirements.lock" --no-deps --disable-pip
-          uv run --frozen --extra security python -m pip_audit \
+          uv run --no-sync python -m pip_audit \
             --requirement "$RUNNER_TEMP/requirements.lock" --no-deps --disable-pip \
             --vulnerability-service osv
-          uv run --frozen --extra security bandit -c pyproject.toml -r src/one_link scripts --severity-level medium
+          uv run --no-sync bandit -c pyproject.toml -r src/one_link scripts --severity-level medium
 
       - name: install pinned cargo-audit and gate both Rust lockfiles
         run: |
@@ -246,6 +252,14 @@ jobs:
           ./gitleaks git . --no-banner --no-color --redact=100
           --max-decode-depth=5 --max-archive-depth=2 --timeout=300
 
+      - name: Preserve tagged Linux qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tagged-quality-linux-evidence
+          path: test-results/
+          if-no-files-found: warn
+
   release_quality_windows:
     name: tagged commit quality / Windows
     runs-on: windows-latest
@@ -270,7 +284,7 @@ jobs:
       - name: setup uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.31"
+          version: "0.13.10"
           enable-cache: false
 
       # Live-tier daemons self-build the native CDC scanner at runtime; on
@@ -317,31 +331,36 @@ jobs:
       - name: verify lock and install the reviewed Windows toolchain
         run: |
           uv lock --check
-          uv sync --frozen --python python --extra dev --extra e2e --extra release
+          uv sync --frozen --python python --extra dev --extra e2e --extra release --extra security
 
       - name: build tagged native Python binding
         working-directory: native
-        run: uv run --project .. --frozen --extra dev --extra release maturin develop --release --locked
+        run: uv run --project .. --no-sync maturin develop --release --locked
 
       - name: canonical Windows type gate
-        run: uv run --frozen --extra dev mypy src/one_link
+        run: uv run --no-sync mypy src/one_link
 
       - name: operator pre-release, native SLO, fuzz, and live-demo gates
         run: >-
-          uv run --frozen --extra dev --extra release python
+          uv run --no-sync python
           scripts/pre_release_audit.py --skip-cargo --skip-pytest
 
       - name: full Python suite for tagged source
         env:
           ONE_LINK_RUN_LIVE_INTEGRATION: "1"
           PYTHONUNBUFFERED: "1"
-        # Extras mirror the canonical full-suite workflow; see the Linux
-        # quality job for why a bare --extra dev fails the SBOM tests here.
+        # Preserve the frozen environment and the tagged native binding.
         run: >-
-          uv run --frozen --extra dev --extra release --extra security python -m pytest tests/
+          uv run --no-sync python -m pytest tests/
           --ignore=tests/e2e
           --ignore=tests/test_call_reliability_soak.py
-          -q --tb=short --maxfail=20 --reruns 2 --reruns-delay 5
+          -p no:playwright -m "not live_daemon" -q --tb=short --maxfail=20 --reruns 2 --reruns-delay 5 --junitxml=test-results/full-suite.xml
+
+      - name: Strict live-daemon acceptance for tagged source
+        env:
+          ONE_LINK_RUN_LIVE_INTEGRATION: "1"
+          PYTHONUNBUFFERED: "1"
+        run: uv run --no-sync python scripts/live_suite.py --run --report test-results/live-suite.json
 
       # --timeout is LOAD-BEARING, not tidiness. A hung browser test eats the
       # remainder of the JOB budget and is then reported as "cancelled",
@@ -354,9 +373,17 @@ jobs:
         env:
           ONE_LINK_RUN_BROWSER_E2E: "1"
         run: |
-          uv run --frozen --extra e2e playwright install chromium firefox
-          uv run --frozen --extra e2e python -m pytest tests/e2e/ -v --tb=short --browser chromium --timeout=600 --timeout-method=thread
-          uv run --frozen --extra e2e python -m pytest tests/e2e/test_peer_live_transport.py::test_two_isolated_peer_pages_complete_manual_webrtc_and_exchange_probe tests/e2e/test_browser_identity_possession_live.py::test_required_mode_live_pair_owner_request_and_immediate_revoke tests/e2e/test_call_local_candidate_live.py::test_call_media_local_candidate_augmentation_uses_real_browser_ice -v --tb=short --browser firefox --timeout=600 --timeout-method=thread
+          uv run --no-sync playwright install chromium firefox
+          uv run --no-sync python -m pytest tests/e2e/ -v --tb=short --browser chromium --output=test-results/playwright-chromium --junitxml=test-results/browser-chromium.xml --timeout=600 --timeout-method=thread
+          uv run --no-sync python -m pytest tests/e2e/test_peer_live_transport.py::test_two_isolated_peer_pages_complete_manual_webrtc_and_exchange_probe tests/e2e/test_browser_identity_possession_live.py::test_required_mode_live_pair_owner_request_and_immediate_revoke tests/e2e/test_call_local_candidate_live.py::test_call_media_local_candidate_augmentation_uses_real_browser_ice -v --tb=short --browser firefox --output=test-results/playwright-firefox --junitxml=test-results/browser-firefox.xml --timeout=600 --timeout-method=thread
+
+      - name: Preserve tagged Windows qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tagged-quality-windows-evidence
+          path: test-results/
+          if-no-files-found: warn
 
   # Branch checks do not automatically follow a tag. Re-run the complete,
   # checksum-pinned TLA+ model inventory at this exact publication commit and
@@ -411,7 +438,7 @@ jobs:
       - name: setup uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.31"
+          version: "0.13.10"
           enable-cache: false
 
       - name: read version + source-date-epoch
@@ -530,7 +557,7 @@ jobs:
       - name: setup uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.31"
+          version: "0.13.10"
           enable-cache: false
 
       - name: install locked build tooling
@@ -613,7 +640,7 @@ jobs:
       - name: setup uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.31"
+          version: "0.13.10"
           enable-cache: false
 
       # The standalone bundle build compiles the native CDC scanner and
@@ -782,9 +809,63 @@ jobs:
           name: ${{ matrix.artifact }}
           path: staged/${{ matrix.asset_name }}
 
+  verify_reproducibility:
+    name: released Linux wheel byte-equivalent rebuild
+    needs: [build, native_wheels]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the release Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+      - name: setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: setup uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.13.10"
+          enable-cache: false
+      - name: install the release native build tooling
+        run: uv sync --frozen --python python --only-group wheel-tools
+      - name: Download the actual wheel selected for publication
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-wheel-linux-x86_64
+          path: reproducibility/candidate/
+      - name: Independently rebuild the same source on a fresh runner
+        working-directory: native
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.build.outputs.source_date_epoch }}
+        run: >-
+          uv run --project .. --frozen --only-group wheel-tools maturin build
+          --release --strip --locked --out ../reproducibility/rebuilt/
+      - name: Compare exact candidate and rebuilt wheel bytes
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+        run: >-
+          python scripts/verify_reproducible_wheels.py
+          --candidate reproducibility/candidate --rebuilt reproducibility/rebuilt
+          --source-revision "$SOURCE_REVISION"
+          --report reproducibility/comparison.json
+      - name: Preserve reproducibility result and both compared artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-reproducibility-evidence
+          path: reproducibility/
+          if-no-files-found: error
+
   sign:
     name: sigstore-attest dist
-    needs: [release_quality_gate, build, native_wheels, binaries]
+    needs: [release_quality_gate, build, native_wheels, binaries, verify_reproducibility]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -828,7 +909,7 @@ jobs:
       - name: setup uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.31"
+          version: "0.13.10"
           enable-cache: false
 
       - name: install locked SBOM and signing clients
@@ -945,7 +1026,7 @@ jobs:
 
   publish:
     name: publish tagged release
-    needs: [release_quality_gate, build, sign]
+    needs: [release_quality_gate, build, sign, verify_reproducibility]
     runs-on: ubuntu-latest
     permissions:
       contents: write # Required only for `gh release` publication below.

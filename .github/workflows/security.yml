@@ -64,20 +64,23 @@ jobs:
       - name: setup uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.31"
+          version: "0.13.10"
           enable-cache: true
 
       - name: verify universal lock + install audit tools
+        id: audit_tools
         run: |
           uv lock --check
           uv sync --frozen --extra dev --extra security
 
       - name: zizmor (GitHub Actions security gate)
+        if: ${{ !cancelled() && steps.audit_tools.outcome == 'success' }}
         run: >-
           uv run --frozen --extra security zizmor
           --pedantic --strict-collection .github
 
       - name: export audited runtime requirements
+        if: ${{ !cancelled() && steps.audit_tools.outcome == 'success' }}
         run: |
           # `native` is a local path dependency audited by RustSec below. Exclude
           # that unhashed path while retaining every registry-backed extra and
@@ -85,16 +88,14 @@ jobs:
           uv export --frozen --all-extras --all-groups --no-extra native --no-emit-project --output-file requirements.lock
 
       - name: pip-audit (PyPI and OSV vulnerability scans)
+        if: ${{ !cancelled() && steps.audit_tools.outcome == 'success' }}
         # Audit the freshly-resolved lockfile (so TRANSITIVE vulns are
         # caught too, not just declared deps). 2026-06-16: this is now a
         # HARD GATE — the external audit flagged the old report-only
         # `|| true` as "supply-chain not enforceable." First line writes
-        # the JSON artifact (kept non-fatal so the artifact always
-        # uploads). Second line FAILS the build on any known
-        # vulnerability. The current resolved tree is clean (verified
-        # locally: pip-audit exit 0). If a future transitive advisory
-        # has no fix yet, add a documented `--ignore-vuln <ID>` here
-        # rather than reinstating a blanket `|| true`.
+        # both JSON reports before either enforcing command runs. A failed
+        # advisory check still permits the independent Bandit/SBOM steps, and
+        # the job remains failed. No unchecked advisory exception is added.
         run: |
           uv run --frozen --extra security python -m pip_audit --requirement requirements.lock --no-deps --disable-pip --format json --output pip-audit.json || true
           uv run --frozen --extra security python -m pip_audit --requirement requirements.lock --no-deps --disable-pip --vulnerability-service osv --format json --output pip-audit-osv.json || true
@@ -102,6 +103,7 @@ jobs:
           uv run --frozen --extra security python -m pip_audit --requirement requirements.lock --no-deps --disable-pip --vulnerability-service osv
 
       - name: bandit (SAST)
+        if: ${{ !cancelled() && steps.audit_tools.outcome == 'success' }}
         # Excludes + skip-list configured in pyproject.toml [tool.bandit].
         # First line archives the FULL findings (all severities) as the
         # bandit.json artifact for review. Second line is the GATE: it
@@ -115,10 +117,12 @@ jobs:
           uv run --frozen --extra security bandit -c pyproject.toml -r src/one_link scripts --severity-level medium
 
       - name: generate SBOM
+        if: ${{ !cancelled() && steps.audit_tools.outcome == 'success' }}
         run: |
           uv run --frozen --extra security python scripts/gen_sbom.py --from requirements --output dist/sbom.cdx.json
 
       - name: upload supply-chain artifacts
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: supply-chain

@@ -174,16 +174,18 @@
 
   <h2>Release status</h2>
   <p>
-    <strong>No verified production download is currently published.</strong>
-    As checked against GitHub on 2026-07-24, the only release is the mutable
-    <code>auto-latest</code> prerelease. Its rolling binaries and checksum files
-    were refreshed on 2026-07-22, but it has no Sigstore bundles, published
-    SBOM, or provenance assets and is not an approved install source.
+    <strong>Published release; qualification incomplete.</strong>
+    As reviewed on 2026-11-24, v0.21.0 is published with platform archives,
+    Sigstore bundles, an SBOM and checksum assets. Its publication succeeded
+    while its independent reproducibility comparison failed. Signature and
+    provenance verification of downloaded bytes and fresh-device qualification
+    remain separate required checks. Mutable <code>auto-latest</code> is not a
+    trust baseline.
   </p>
   <p>
-    The release workflow is implemented, but it has not yet produced a
-    production tag. This page therefore does not redirect to a mutable release
-    or guess an artifact from your operating system.
+    The <a href="https://github.com/coherence-energy-labs/one-link/blob/master/docs/RELEASE_EVIDENCE.json">dated release evidence ledger</a>
+    records exact publication and verification status. This page does not
+    redirect to a mutable release or infer qualification from an artifact name.
   </p>
 
   <a class="download-primary" id="download-primary"
@@ -201,8 +203,8 @@
     <pre><code>git clone https://github.com/coherence-energy-labs/one-link
 cd one-link
 git checkout &lt;reviewed-commit-sha&gt;
-uv sync --frozen --extra dev
-uv run --frozen one-link app</code></pre>
+python scripts/bootstrap_source.py
+uv run --no-sync one-link app</code></pre>
   </details>
 
   <h2>Future release verification contract</h2>
@@ -213,7 +215,7 @@ uv run --frozen one-link app</code></pre>
   </p>
   <pre><code>bash scripts/verify-release.sh ./&lt;artifact&gt; vX.Y.Z</code></pre>
   <p>
-    The verifier is tooling, not evidence that those assets exist today. It
+    Published filenames alone do not authenticate downloaded bytes. The verifier
     checks the checksum and Sigstore identities and fails on missing or
     mismatched evidence. Never substitute <code>latest</code>,
     <code>master</code>, or <code>auto-latest</code> for the exact tag.
@@ -261,8 +263,8 @@ uv run --frozen one-link app</code></pre>
         external A/B helper validate. The helper independently authenticates,
         activates, health-checks, and rolls back the exact release. Source,
         pip, development, incomplete, moved, or modified installs fail closed;
-        Unattended/background automatic installation remains disabled, and no
-        verified public stable tagged release exists yet.</li>
+        Unattended/background automatic installation remains disabled; published
+        release assets require the verification and qualification described above.</li>
     <li>BLAKE3-verified content-defined chunking for fast
         large-file sync. Native-code accelerator with SHA-256
         sidecar integrity check.</li>

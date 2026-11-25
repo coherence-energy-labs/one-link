@@ -343,6 +343,7 @@ def test_file_bubble_uses_transfer_record_for_status():
 
 # ─── Live smoke check against a running daemon ─────────────────────────
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_daemon_serves_v07x_ui():
     """Boot a real daemon and verify the served / contains the expected

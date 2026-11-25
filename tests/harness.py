@@ -63,6 +63,18 @@ def live_integration_enabled() -> bool:
 def require_live_daemon() -> None:
     """Skip the calling test unless the live-daemon lane is enabled.
     Call this from any code path that spawns a real daemon subprocess."""
+    current = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
+    if current:
+        import pytest
+
+        nodeid = current.split("[", 1)[0].replace("\\", "/")
+        manifest = Path(__file__).with_name("live_daemon_manifest.json")
+        registered = json.loads(manifest.read_text(encoding="utf-8"))["nodeids"]
+        if nodeid not in registered:
+            pytest.fail(
+                "unregistered live-daemon test: add @pytest.mark.live_daemon and "
+                "regenerate scripts/live_suite.py --write-manifest before spawning"
+            )
     if not live_integration_enabled():
         import pytest
 

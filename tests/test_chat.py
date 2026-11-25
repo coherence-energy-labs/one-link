@@ -108,6 +108,7 @@ def test_format_file_done_bad():
 
 # ───────────────────── end-to-end REPL test ────────────────────────
 
+@pytest.mark.live_daemon
 def test_chat_command_runs_and_exits_cleanly():
     """Pipe `/quit` into `one-link chat`. Verify auto-starts daemon, prints
     welcome, and exits."""

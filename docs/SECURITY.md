@@ -6,17 +6,16 @@ Status: living document. The companion to
 real security primitive corporations provide, and document every
 threat model with the countermeasure that addresses it."
 
-Last release-truth audit: 2026-07-21.
+Last release-evidence review: 2026-11-24; see `RELEASE_EVIDENCE.json`.
 
 ## Evidence boundary
 
-This is a threat model and hardening plan, not a security certification. One
-Link is alpha software and has **no verified production release**. At the audit
-date, GitHub exposed only the old, mutable `auto-latest` prerelease. That entry
-has no Sigstore bundles, published SBOM, or provenance assets. The repository
-contains release, signing, reproducibility, and verification workflows, but
-`release.yml` has not produced a production tagged release. Workflow source is
-an intended control; a successful immutable run and its published evidence are
+This is a threat model and hardening plan, not a security certification. The
+published v0.21.0 release includes Sigstore bundles, an SBOM and checksum assets.
+The 2026-11-24 review observed successful publication but a failed independent
+reproducibility run; no independent production sign-off is asserted. Mutable
+`auto-latest` remains outside the trust baseline. Workflow source is an intended
+control; authenticated exact artifacts, provenance and completed qualification are
 the proof.
 
 Unless a section explicitly says **current implementation**, its defenses are
@@ -24,8 +23,8 @@ design requirements or roadmap targets. A check mark in an older version of
 this document must not be used as release evidence. Before trusting binary
 bytes, require an immutable version tag, green tag-scoped gates, a signed
 checksum manifest, per-artifact Sigstore bundles, provenance, an SBOM, and a
-fresh-device smoke result. None is currently available as a complete public
-release set.
+fresh-device smoke result. The dated release ledger records which of these
+checks were observed and which remain unverified.
 
 ---
 
@@ -256,12 +255,12 @@ canonical install URL. Could push a backdoored bundle.
   intended workflow identity and immutable tag.
 - The verification script fails closed when a checksum manifest, manifest
   signature, artifact signature, or exact tag binding is missing.
-- Those controls have not yet produced a complete public production release
-  evidence set.
+- v0.21.0 published signature/SBOM/checksum assets; their existence does not
+  replace independent verification of the downloaded release bytes.
 
-**Planned release controls:** signed checksum manifest, per-artifact Sigstore
+**Required release controls:** signed checksum manifest, per-artifact Sigstore
 bundles, provenance, published SBOM, independently compared Linux native wheel,
-pinned-update verification, and mirror diversity. Whole-product
+and pinned-update verification. Mirror diversity remains a roadmap item. Whole-product
 byte-for-byte reproducibility is not claimed.
 
 **Status:** ⚠️ not currently defeated for public binary distribution. The
@@ -665,17 +664,19 @@ operations through the worker API.
 
 Where the bytes come from is as important as how they're written.
 
-**Current evidence (2026-07-21):** source, frozen dependency locks, a
-least-privilege release workflow, an exact-tag verifier, and security workflow
-definitions exist in the repository. There is no immutable production release
-run proving the pipeline end to end, and the only extant prerelease has no
-Sigstore, SBOM, or provenance assets.
+**Current evidence (2026-11-24):** source and frozen dependency locks are
+available. Published v0.21.0 completed the release workflow and exposes Sigstore,
+SBOM and checksum assets. Its independent reproducibility comparison failed;
+artifact signature/provenance validation and fresh-device qualification remain
+unverified by that audit. See `RELEASE_EVIDENCE.json` for exact identities.
 
 **Release gate (not yet satisfied):** an immutable `v*` tag must run the full
 tag-scoped gates and publish exact-byte checksums, signed manifest and artifact
 bundles, build provenance, an SBOM, and fresh-device smoke evidence. The
-separate reproducibility workflow compares one Linux native wheel twice; it
-does not establish reproducibility of Windows, macOS, standalone archives, or
+release workflow requires an independent rebuild of its actual Linux native
+wheel before signing and publishing. The separate diagnostic workflow also
+compares Linux native-wheel bytes. Neither establishes reproducibility of
+Windows, macOS, standalone archives, or
 the entire product.
 
 **Roadmap, not current guarantees:** SLSA-level certification,
@@ -712,9 +713,9 @@ only after their enforcement and public evidence are independently verified.
   refuse silent plaintext fallback; an operator can explicitly opt into
   plaintext. Identity keys, received blobs, runtime memory, and OS account
   security have separate limits documented above.
-- Automated test, security, release, and verification workflows exist. Their
-  configuration is reviewable, but there is no production-tag run or published
-  release evidence set to rely on today.
+- Automated test, security, release, and verification workflows exist. The
+  published v0.21.0 evidence set and its unresolved qualification gaps are
+  recorded in `RELEASE_EVIDENCE.json`; publication alone is not sign-off.
 
 **We do not promise:**
 - Production readiness, independent security certification, complete code-path

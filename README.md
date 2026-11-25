@@ -21,12 +21,15 @@ I am One. You are One. We are One.
 
 ## Current install status
 
-> **Alpha / no verified production release.** As checked on 2026-07-24,
-> the only GitHub release is the mutable `auto-latest` prerelease. Its rolling
-> binaries and checksum files were refreshed on 2026-07-22, but it has no
-> Sigstore bundles, published SBOM, or provenance assets and is not an approved
-> install source. The tagged-release workflow exists in this repository but has
-> not yet produced a production release.
+> **Published release; production qualification incomplete.** The
+> [v0.21.0 release](https://github.com/coherence-energy-labs/one-link/releases/tag/v0.21.0)
+> was published on 2026-08-01 with 30 assets, including platform archives,
+> native/Python wheels, Sigstore bundles, an SBOM and checksum/update metadata.
+> The 2026-11-24 review found that publication succeeded while its independent
+> reproducibility comparison failed. Asset presence is not independent signature
+> or provenance verification. See the dated [release evidence ledger](docs/RELEASE_EVIDENCE.json).
+> The current source is 0.22.1; neither it nor mutable `auto-latest` is a completed
+> high-assurance production qualification.
 
 For development evaluation, run a reviewed source commit with the frozen lock:
 
@@ -34,22 +37,25 @@ For development evaluation, run a reviewed source commit with the frozen lock:
 git clone https://github.com/coherence-energy-labs/one-link
 cd one-link
 git checkout <reviewed-commit-sha>
-uv sync --frozen --extra dev
-uv run --frozen one-link app
+# Requires uv >=0.13.4, Rust 1.96.0 and a platform C compiler.
+python scripts/bootstrap_source.py
+uv run --no-sync one-link app
 ```
 
-Do not treat the development tree or `auto-latest` binaries as production
-software. A public binary install path will be enabled only after an immutable
-`v*` tag completes the release gates and publishes verifiable assets.
+The bootstrap builds the matching native backend, verifies its package/module
+versions and live ML-KEM ABI, and records the loaded binary hash. Use
+`python scripts/bootstrap_source.py --check-only` to diagnose an existing source
+environment. A source build is an evaluation path; production sign-off additionally
+requires the exact artifact checks in the release checklist.
 
 ## Releases
 
-The table below is the **planned artifact contract**, not a list of downloads
-available today. A candidate does not become a user release merely because a
-workflow or release entry exists. Publication requires an immutable version
-tag, green release gates, `SHA256SUMS`, per-artifact Sigstore bundles,
-provenance, an SBOM, and a fresh-device smoke test. Until that evidence exists,
-the project fails closed and offers no production binary download.
+The table below describes the portable archive formats published for v0.21.0
+and retained in the current build contract. Publication and qualification are
+separate records. Evaluate one exact release using `SHA256SUMS`, per-artifact
+Sigstore bundles, provenance, its SBOM, independent rebuild evidence for the
+Linux native wheel, and fresh-device smoke tests. The dated evidence ledger
+identifies the checks that have and have not been independently completed.
 
 Per-platform install notes:
 
@@ -61,7 +67,7 @@ Per-platform install notes:
 | Linux | x86_64 | **`one-link-linux-x86_64.zip`** | Extract, then run `chmod +x one-link/one-link && ./one-link/one-link`. |
 | Linux | arm64 (Raspberry Pi 4/5 64-bit, ARM cloud) | **`one-link-linux-arm64.zip`** | Extract, then run `chmod +x one-link/one-link && ./one-link/one-link`. |
 
-Once a verified tagged release exists, download the artifact plus
+For an exact tagged release, download the artifact plus
 `SHA256SUMS`, `SHA256SUMS.sigstore`, and `<artifact>.sigstore`, then run the
 repository's fail-closed verifier with that exact immutable tag:
 
@@ -69,7 +75,7 @@ repository's fail-closed verifier with that exact immutable tag:
 bash scripts/verify-release.sh ./<artifact> vX.Y.Z
 ```
 
-The verifier is tooling, not evidence that those assets have been published.
+The verifier must succeed on the downloaded bytes; published filenames alone do not authenticate them.
 Never substitute `latest`, `master`, or `auto-latest` for the exact tag.
 
 ---
@@ -120,8 +126,8 @@ Never substitute `latest`, `master`, or `auto-latest` for the exact tag.
   independently authenticates the exact release, performs A/B activation and
   health checks, and rolls back on failure. Source, pip, development,
   incomplete, moved, or modified installs fail closed. Unattended/background
-  automatic installation remains disabled, and there is no verified public
-  stable tagged release to install.
+  automatic installation remains disabled. Published v0.21.0 assets still require
+  independent exact-artifact verification and the qualification ledger above.
 
 ---
 
@@ -133,7 +139,7 @@ For developers, or to run the daemon as a service:
 git clone https://github.com/coherence-energy-labs/one-link
 cd one-link
 git checkout <reviewed-commit-sha>
-uv sync --frozen --extra dev
+python scripts/bootstrap_source.py
 uv run --frozen one-link daemon --open
 ```
 

@@ -182,6 +182,7 @@ def test_stale_runtime_publication_is_removed_without_following_paths(
     assert publication.is_dir()
 
 
+@pytest.mark.live_daemon
 @pytest.mark.timeout(60)
 def test_owner_bootstrap_token_rotates_across_daemon_restart():
     """A bearer leaked by an old plaintext cookie dies on restart."""
@@ -219,6 +220,7 @@ def test_owner_bootstrap_token_rotates_across_daemon_restart():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+@pytest.mark.live_daemon
 @pytest.mark.timeout(60)
 def test_ui_port_is_in_well_known_range():
     """The daemon must prefer the well-known range when a slot is free.
@@ -241,6 +243,7 @@ def test_ui_port_is_in_well_known_range():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+@pytest.mark.live_daemon
 @pytest.mark.timeout(60)
 def test_control_status_and_shutdown_contract(monkeypatch):
     """The launcher depends on status/shutdown to self-heal stale daemons."""
@@ -298,6 +301,7 @@ def test_control_status_and_shutdown_contract(monkeypatch):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+@pytest.mark.live_daemon
 @pytest.mark.timeout(60)
 def test_harness_stop_reaps_serving_interpreter_and_launcher():
     """Teardown must not leak the socket-owning child behind a venv launcher."""
@@ -509,6 +513,7 @@ def test_launcher_prefers_control_reported_ui_port(monkeypatch):
     assert info.server_port == 7999
 
 
+@pytest.mark.live_daemon
 @pytest.mark.timeout(60)
 def test_corrupt_token_file_is_replaced_safely():
     """If the persisted token file is garbage, daemon generates a fresh one

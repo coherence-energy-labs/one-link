@@ -9,12 +9,13 @@ separately at [`docs/SECURITY.md`](docs/SECURITY.md).
 
 ## Release-security status
 
-One Link is alpha software and has **no verified production release**. As last
-checked on 2026-07-24, the only GitHub release is the old, mutable
-`auto-latest` prerelease, with no Sigstore bundles, published SBOM, or
-provenance assets. Do not treat that prerelease as trusted distribution
-evidence. The signing and provenance workflows in the repository describe
-release gates; they do not prove a release has passed them.
+The published v0.21.0 release exists, but One Link has **no independently
+verified production sign-off**. The 2026-11-24 review observed Sigstore bundles,
+an SBOM and a successful publication workflow, alongside a failed independent
+reproducibility comparison. Published assets still require cryptographic
+signature/provenance verification and fresh-device qualification. The dated
+[`docs/RELEASE_EVIDENCE.json`](docs/RELEASE_EVIDENCE.json) records the exact
+release and evidence limits. Mutable `auto-latest` is not a trust baseline.
 
 ## Reporting a vulnerability
 

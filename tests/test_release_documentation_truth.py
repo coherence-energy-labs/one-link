@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 
@@ -16,15 +17,31 @@ def _normalized(relative: str) -> str:
     return " ".join(_read(relative).lower().split())
 
 
-def test_public_entry_points_disclose_no_verified_production_release():
-    assert "no verified production release" in _normalized("README.md")
-    assert "no verified production release" in _normalized("SECURITY.md")
-    assert "no verified production release" in _normalized("docs/SECURITY.md")
-    assert "no verified production release" in _normalized("docs/TESTING.md")
-    assert "no verified production download" in _normalized("docs/site/index.html")
-    assert "current status (verified 2026-07-21): not satisfied" in _normalized(
-        "docs/RELEASE_CHECKLIST.md"
-    )
+def test_public_entry_points_disclose_publication_and_incomplete_qualification():
+    for relative in ("README.md", "SECURITY.md", "docs/SECURITY.md", "docs/TESTING.md",
+                     "docs/site/index.html", "docs/RELEASE_CHECKLIST.md"):
+        text = _normalized(relative)
+        assert "v0.21.0" in text, relative
+        assert "release_evidence.json" in text, relative
+        assert "qualification" in text, relative
+        assert "only release is" not in text, relative
+        assert "no production tag has completed" not in text, relative
+
+
+def test_dated_release_ledger_distinguishes_observed_metadata_from_verified_bytes():
+    evidence = json.loads(_read("docs/RELEASE_EVIDENCE.json"))
+    assert evidence["schema"] == "one-link-release-evidence/v1"
+    assert evidence["observed_on"] == "2026-11-24"
+    release = evidence["release"]
+    assert release["tag"] == "v0.21.0"
+    assert release["source_revision"] == "0e90c8dd821d41030cb20e73ea1e523366e7d594"
+    assert release["release_workflow"]["conclusion"] == "success"
+    assert release["independent_reproducibility_workflow"]["conclusion"] == "failure"
+    assets = {asset["name"] for asset in release["assets"]}
+    assert {"SHA256SUMS", "sbom.cdx.json"} <= assets
+    assert any(asset.endswith(".sigstore") for asset in assets)
+    assert "not_performed" in evidence["verification"]["sigstore_bundles"]
+    assert evidence["verification"]["production_signoff"] == "not_granted"
 
 
 def test_release_evidence_gap_is_named_not_implied():
@@ -66,9 +83,10 @@ def test_release_checklist_distinguishes_required_controls_from_evidence():
     text = _normalized("docs/RELEASE_CHECKLIST.md")
     assert "future release decision" in text
     assert "presence is not evidence" in text
-    assert "ruleset is a current blocker" in text
-    assert "no production tag" in text
-    assert "has completed `release.yml`" in text
+    assert "verify the live server policy" in text
+    assert "published v0.21.0 completed `release.yml`" in text
+    assert "current qualification status" in text
+    assert "required `release.yml::verify_reproducibility` job" in text
     assert "must instead be covered by provenance" in text
 
 
@@ -94,7 +112,8 @@ def test_release_checklist_names_actual_platform_coverage():
 def test_launch_checklist_separates_portable_zips_from_future_installers():
     text = _normalized("docs/LAUNCH_CHECKLIST.md")
     assert "architecture-labeled portable zip archives" in text
-    assert "no production tag has completed that workflow yet" in text
+    assert "published v0.21.0" in text
+    assert "qualification gaps" in text
     assert "does **not** include a windows installer" in text
     assert "future packaging gates (not current shipping claims)" in text
     assert "no windows installer currently ships" in text

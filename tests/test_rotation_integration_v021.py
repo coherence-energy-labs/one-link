@@ -128,6 +128,7 @@ async def _pair_a_and_b(p):
         pytest.fail("pair did not settle to mutual pinned within 6s")
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 @pytest.mark.timeout(180)
 async def test_rotation_propagates_to_paired_peer_over_real_wire():

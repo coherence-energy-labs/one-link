@@ -197,6 +197,7 @@ async def _wait_file(path: Path, payload: bytes, timeout=30) -> bool:
     return path.is_file() and path.read_bytes() == payload
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_full_duplex_both_directions_one_connection():
     """A and B each drop a DIFFERENT file into the same shared folder.
@@ -265,6 +266,7 @@ async def test_full_duplex_both_directions_one_connection():
             )
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_full_duplex_forward_only():
     """Only A has a file. One bidirectional sync delivers it to B
@@ -309,6 +311,7 @@ async def test_full_duplex_forward_only():
             )
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_full_duplex_reverse_only():
     """Only B has a file. A initiates a bidirectional sync; the file

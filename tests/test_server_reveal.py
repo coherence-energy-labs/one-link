@@ -268,6 +268,7 @@ async def test_inbox_reveal_invokes_correct_platform_command(tmp_path: Path, mon
 
 # ─── End-to-end auth tests against a real daemon ───────────────────────
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_file_reveal_requires_auth():
     """Reveal endpoints must be token-gated like the rest of the UI API."""
@@ -281,6 +282,7 @@ async def test_file_reveal_requires_auth():
                 assert r.status == 401
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_inbox_reveal_authorized_returns_ok(monkeypatch):
     """With a valid token, /api/inbox/reveal returns ok+path. We can't

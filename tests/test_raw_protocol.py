@@ -173,6 +173,7 @@ async def _send_file_with_arbitrary_name(
 # ───────────────────── Path traversal attacks ──────────────────────
 
 
+@pytest.mark.live_daemon
 @pytest.mark.parametrize(
     "evil_name",
     [
@@ -224,6 +225,7 @@ def test_malicious_filename_stays_in_inbox(evil_name: str):
             assert not bad.exists(), f"attack succeeded: {bad}"
 
 
+@pytest.mark.live_daemon
 def test_invalid_file_offer_blob_is_rejected_without_file():
     with daemon_pair(pin_trust=True) as p:
         attacker_key = p.tmp / "attacker.key"
@@ -253,6 +255,7 @@ def test_invalid_file_offer_blob_is_rejected_without_file():
         assert inbox_files(p.b.home) == []
 
 
+@pytest.mark.live_daemon
 def test_file_chunk_sequence_mismatch_deletes_partial_file():
     with daemon_pair(pin_trust=True) as p:
         attacker_key = p.tmp / "attacker.key"
@@ -294,6 +297,7 @@ def test_file_chunk_sequence_mismatch_deletes_partial_file():
         assert inbox_files(p.b.home) == []
 
 
+@pytest.mark.live_daemon
 def test_file_chunk_declared_size_overrun_deletes_partial_file():
     with daemon_pair(pin_trust=True) as p:
         attacker_key = p.tmp / "attacker.key"
@@ -338,6 +342,7 @@ def test_file_chunk_declared_size_overrun_deletes_partial_file():
 # ─────────────────── Frame-size / oversize attacks ─────────────────
 
 
+@pytest.mark.live_daemon
 def test_oversize_frame_header_drops_connection():
     """Send a frame whose declared length exceeds MAX_FRAME. The daemon's
     read_frame must raise; we expect the connection to be closed cleanly
@@ -366,6 +371,7 @@ def test_oversize_frame_header_drops_connection():
         assert ok["ok"]
 
 
+@pytest.mark.live_daemon
 def test_garbage_handshake_drops_connection():
     """Open a connection and send random bytes instead of a HELLO. Daemon
     must reject the connection without crashing."""
@@ -391,6 +397,7 @@ def test_garbage_handshake_drops_connection():
         assert ok["ok"]
 
 
+@pytest.mark.live_daemon
 def test_truncated_handshake_drops_connection():
     """Connect and immediately close, mid-handshake. Daemon must not leak."""
     with daemon_pair(pin_trust=True) as p:

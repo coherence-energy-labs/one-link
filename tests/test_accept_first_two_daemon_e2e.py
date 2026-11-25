@@ -38,6 +38,7 @@ def _offer_frame(name: str, payload: bytes) -> dict:
     }
 
 
+@pytest.mark.live_daemon
 def test_incoming_file_is_held_pending_accept_by_default(monkeypatch):
     # The harness defaults accept-first OFF for its daemons; opt back IN
     # here so the spawned pair runs the production default behaviour.

@@ -49,25 +49,42 @@ its regression test).
 | Workflow | Trigger | What it gates |
 |---|---|---|
 | `tests.yml` | every push + PR | Focused unit/integration subset on Linux + Windows for fast feedback. |
-| `full_suite_and_e2e.yml` | every push + PR | Main pytest suite + separate Playwright E2E on Linux + Windows + real-OS platform probes. The broad safety-net gate. |
-| `release.yml` | `v*` tag + manual | Tag-scoped quality gates, builds, exact-byte checksums, Sigstore bundles, provenance, and publication. It is a release-candidate mechanism, not evidence by itself. |
+| `full_suite_and_e2e.yml` | every push + PR | Main pytest suite, manifest-checked live-daemon shards, separate browser E2E on Linux + Windows, and real-OS probes. One source-matched native wheel per OS is shared by its acceptance lanes. |
+| `release.yml` | `v*` tag + manual | Tag-scoped quality gates, mandatory independent rebuild of the actual Linux native wheel, exact-byte checksums, Sigstore bundles, provenance, and publication. It is a release-candidate mechanism, not evidence by itself. |
 | `reproducible_release.yml` | `v*` tag + manual | Unsigned comparison evidence; byte equality is enforced only for two Linux native-wheel builds. |
-| `security.yml` | every push/PR + weekly | Lock drift, secret/history scan, workflow lint, Python/Rust/JavaScript advisories, SAST, and SBOM generation. |
+| `security.yml` | every push/PR + weekly | Lock drift, secret/history scan, workflow lint, Python/Rust advisories, SAST, and SBOM generation. JavaScript advisories are checked by `lint.yml`. |
 | `fuzz_nightly.yml` | daily + manual | Budgeted native parser/state-machine fuzz targets and crash-artifact upload. |
+| `native_timing.yml` | manual | Bounded strict timing diagnostics on a separately provisioned, controlled Linux runner; retains failures/timeouts and raw target logs. This does not certify constant-time execution. |
 
 The `tests.yml` matrix is intentionally narrow for fast PR feedback.
 `full_suite_and_e2e.yml` is the broad source-level gate. Neither workflow can
 prove that every UI, platform, timing, hardware, or network regression is
 covered.
 
+The live lane checks `tests/live_daemon_manifest.json` against explicit
+`@pytest.mark.live_daemon` declarations and records collection counts, every
+parameterized case, phase outcomes, elapsed time, and JUnit. A skipped,
+uncollected, retried, failed or incomplete selected case fails this lane.
+New real-daemon tests must carry the marker; regenerate the manifest with
+`python scripts/live_suite.py --write-manifest`. `tests/harness.py` rejects
+unregistered live calls within pytest. The main lane retains ordinary platform
+skips and excludes only this declared live set, including the hermetic pairing
+tests in its regular coverage.
+
+`continuous acceptance gate` requires all of these source-level acceptance
+lanes to finish successfully. See [`REPOSITORY_POLICY.md`](REPOSITORY_POLICY.md)
+for the exact required-check configuration and its separate live-enforcement
+verification procedure. A checked-in ruleset proposal is not an enforced rule.
+
 ## Current release-evidence status
 
-As last checked on 2026-07-24, One Link has **no verified production
-release**. GitHub contains only the old, mutable `auto-latest` prerelease; it
-has no Sigstore bundles, published SBOM, or provenance assets. `release.yml`
-has not produced a production tagged release. The workflow table above
-describes required mechanisms, not a claim that their latest runs are green or
-that public release evidence exists.
+The 2026-11-24 review observed the published v0.21.0 release and its Sigstore,
+SBOM and checksum assets. Its publication workflow succeeded while the separate
+reproducibility comparison failed. Independent signature/provenance verification
+and full fresh-device qualification remain incomplete. See
+[`RELEASE_EVIDENCE.json`](RELEASE_EVIDENCE.json). The workflow table above
+describes required mechanisms, not a claim that their latest runs are green.
+Mutable `auto-latest` is not a qualification baseline.
 
 Do not use the presence of a workflow file, a passing local subset, or the
 `auto-latest` entry as production-readiness evidence. Release evaluation must
@@ -110,31 +127,40 @@ live-daemon assertion catches that case.
 ## Running tests locally
 
 ```bash
+# One-time source build with the locked matching native backend.
+python scripts/bootstrap_source.py --e2e
+
 # Fast: the same subset CI runs first.
-uv run --frozen --extra dev python -m pytest \
+uv run --no-sync python -m pytest \
   tests/test_identity.py tests/test_wire.py tests/test_paths.py \
   tests/test_channel.py tests/test_discovery.py tests/test_cli.py
 
 # Main unit + integration suite (matches the full-suite exclusions).
-uv run --frozen --extra dev python -m pytest tests/ \
+uv run --no-sync python -m pytest tests/ \
+  -p no:playwright \
   --ignore=tests/e2e \
   --ignore=tests/test_call_reliability_soak.py \
-  --deselect tests/test_pairing.py \
+  -m "not live_daemon" \
   -q --tb=short --maxfail=20
 
-# Browser E2E (one-time: uv sync --frozen --extra e2e, then install engines).
-uv run --frozen --extra e2e playwright install chromium firefox
+# Complete live acceptance lane (every attempt, no skipped success).
+uv run --no-sync python scripts/live_suite.py --run
+
+# Browser E2E (the bootstrap above installs its locked Python packages).
+uv run --no-sync playwright install chromium firefox
 ONE_LINK_RUN_BROWSER_E2E=1 \
-  uv run --frozen --extra e2e python -m pytest tests/e2e/ -q --browser chromium
+  uv run --no-sync python -m pytest tests/e2e/ -q --browser chromium \
+  --output=test-results/playwright-chromium --junitxml=test-results/browser-chromium.xml
 ONE_LINK_RUN_BROWSER_E2E=1 \
-  uv run --frozen --extra e2e python -m pytest \
+  uv run --no-sync python -m pytest \
   tests/e2e/test_peer_live_transport.py::test_two_isolated_peer_pages_complete_manual_webrtc_and_exchange_probe \
   tests/e2e/test_browser_identity_possession_live.py::test_required_mode_live_pair_owner_request_and_immediate_revoke \
   tests/e2e/test_call_local_candidate_live.py::test_call_media_local_candidate_augmentation_uses_real_browser_ice \
-  -q --browser firefox
+  -q --browser firefox --output=test-results/playwright-firefox \
+  --junitxml=test-results/browser-firefox.xml
 
 # Windows-only: real folder-picker COM probe.
-uv run --frozen --extra dev python scripts/ci_probe_modern_folder_picker.py
+uv run --no-sync python scripts/ci_probe_modern_folder_picker.py
 ```
 
 **IMPORTANT — invocation isolation:** `pytest tests/e2e/` and
@@ -145,6 +171,12 @@ conflicts with the async fixtures in the integration tests
 The CI `full_suite_and_e2e.yml` workflow runs them as separate
 jobs for this reason. If you see that error locally, you ran
 both in one `pytest` command.
+
+Playwright deletes its configured output directory at the start of a test
+session. Use a distinct leaf directory for each browser invocation as above;
+do not use the common `test-results` root for browser output. The live runner
+disables that unrelated plugin so its native identity and partial outcome
+evidence remain available after a failure.
 
 ### Browser review captures
 

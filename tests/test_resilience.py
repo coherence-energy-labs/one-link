@@ -44,6 +44,7 @@ def test_cli_import_has_no_windows_wmi_startup_hang():
     assert "ok" in proc.stdout
 
 
+@pytest.mark.live_daemon
 def test_stale_port_files_dont_break_daemon():
     """Drop a port file from a 'previous' daemon run, then start a new daemon
     in the same home. The new daemon must overwrite cleanly."""
@@ -161,6 +162,7 @@ def test_control_liveness_requires_status_protocol():
     asyncio.run(_run())
 
 
+@pytest.mark.live_daemon
 def test_daemon_survives_garbage_on_peer_port():
     """Hammer the peer port with garbage from many clients; daemon stays up."""
     with daemon_pair(pin_trust=True) as p:
@@ -179,6 +181,7 @@ def test_daemon_survives_garbage_on_peer_port():
         assert res["ok"]
 
 
+@pytest.mark.live_daemon
 def test_daemon_survives_burst_of_disconnects():
     """Open then immediately close the peer port many times. Daemon must
     not leak descriptors or hang."""
@@ -202,6 +205,7 @@ def test_daemon_survives_burst_of_disconnects():
         assert ok["ok"], ok
 
 
+@pytest.mark.live_daemon
 def test_two_daemons_in_same_home_second_fails_gracefully():
     """Spinning a second daemon at the same ONE_LINK_HOME — what happens?
 
@@ -264,6 +268,7 @@ def test_two_daemons_in_same_home_second_fails_gracefully():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+@pytest.mark.live_daemon
 def test_peer_disconnects_during_chunk_does_not_break_daemon():
     """Initiator opens a connection, sends a partial offer, drops mid-stream.
     Receiver daemon should clean up and continue serving good peers."""
@@ -285,6 +290,7 @@ def test_peer_disconnects_during_chunk_does_not_break_daemon():
         assert res["ok"], res
 
 
+@pytest.mark.live_daemon
 def test_burst_load_50_messages_no_silent_fallback():
     """2026-05-22 audit Batch LL: 50 messages back-to-back stress
     the per-peer send pipeline + ACK plumbing harder than the 10-
@@ -350,6 +356,7 @@ def test_burst_load_50_messages_no_silent_fallback():
             )
 
 
+@pytest.mark.live_daemon
 def test_bidi_concurrent_sends_no_deadlock():
     """2026-05-22 audit Batch LL: stress per-peer send-lock contention.
     Spawn 20 concurrent sends in BOTH directions simultaneously

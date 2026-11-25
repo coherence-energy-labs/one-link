@@ -5,7 +5,7 @@
 pip-audit/CycloneDX and is never independently resolved.
 
 Usage:
-    pip install "uv>=0.11.23"
+    pip install "uv>=0.13.4,<0.14"
     python scripts/lock_deps.py            # writes requirements.lock
     python scripts/lock_deps.py --upgrade  # bump to latest within bounds
     python scripts/lock_deps.py --check    # fail if pyproject ahead of lock

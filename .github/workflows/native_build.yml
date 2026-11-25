@@ -148,17 +148,10 @@ jobs:
           cargo test --locked --workspace --all-targets --all-features
           --exclude one_link_native --release
 
-      # Non-blocking strict pass: enforce the wall-clock timing gates
-      # (OL_TIMING_GATES=1) + the ignored property-test slow paths. Surfaces
-      # a timing regression as a visible (continue-on-error) signal without
-      # failing the build on runner jitter. Run them strictly + reliably on
-      # a quiet/pinned machine, or promote to a dedicated nightly job later.
-      - name: cargo test (strict timing gates + property slow paths)
-        timeout-minutes: 20
-        env:
-          OL_TIMING_GATES: "1"
-        run: cargo test --locked --workspace --exclude one_link_native --release -- --include-ignored
-        continue-on-error: true # timing gates are noisy on shared runners; property-tests still alpha
+      # This required lane proves default correctness only. Strict wall-clock
+      # timing runs in native_timing.yml on a deliberately provisioned runner.
+      # Ignored TPM/corpus/research cases remain external qualification work;
+      # they are never silently folded into a green optional timing step.
 
   python_binding:
     name: maturin build + python tests
@@ -196,7 +189,7 @@ jobs:
       - name: setup uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.31"
+          version: "0.13.10"
           enable-cache: true
 
       - name: Cache cargo target

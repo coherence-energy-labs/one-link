@@ -278,6 +278,7 @@ def four_peer_swarm():
             pass
 
 
+@pytest.mark.live_daemon
 def test_four_peer_swarm_converges(four_peer_swarm):
     """The mDNS convergence itself is the test — every daemon must
     see all 3 others. Fixture raises if convergence fails within
@@ -293,6 +294,7 @@ def test_four_peer_swarm_converges(four_peer_swarm):
         )
 
 
+@pytest.mark.live_daemon
 def test_four_peer_swarm_all_advertise_phase_e_caps(four_peer_swarm):
     """Every daemon in the swarm must report Phase D/E + Bloom-init +
     QUIC capabilities as advertised via /api/status.native_status."""
@@ -336,6 +338,7 @@ def test_four_peer_swarm_all_advertise_phase_e_caps(four_peer_swarm):
                 )
 
 
+@pytest.mark.live_daemon
 def test_four_peer_swarm_text_messages_route(four_peer_swarm):
     """Send a text message from A to each of B, C, D and verify
     every send returns ok."""
@@ -355,6 +358,7 @@ def test_four_peer_swarm_text_messages_route(four_peer_swarm):
         )
 
 
+@pytest.mark.live_daemon
 def test_four_peer_swarm_field_snapshot_solves_over_time(four_peer_swarm):
     """With 4 peers in the swarm, the FieldSnapshotManager's topology
     feeder + tick loop should produce at least one successful

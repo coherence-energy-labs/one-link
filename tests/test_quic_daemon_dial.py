@@ -30,6 +30,7 @@ from one_link.daemon import Daemon
 pytestmark = [pytest.mark.timeout(120), pytest.mark.soak]
 
 
+@pytest.mark.live_daemon
 def test_quic_connection_alive_accepts_native_conn_without_state_flag() -> None:
     """2026-05-22 audit Batch DD: previously this used a hand-rolled
     ``NativeConnLike`` mock with only ``send_frame_round_trip``,
@@ -113,6 +114,7 @@ async def test_quic_ping_drops_stale_cached_connection_fast(monkeypatch) -> None
     assert peer_fp not in daemon._quic_outbound
 
 
+@pytest.mark.live_daemon
 def test_quic_status_endpoint_returns_state() -> None:
     """The ``quic_status`` control command must return a clean
     state snapshot after the daemon's QUIC server endpoint is
@@ -137,6 +139,7 @@ def test_quic_status_endpoint_returns_state() -> None:
         assert isinstance(status.get("recent_paired_count"), int)
 
 
+@pytest.mark.live_daemon
 def test_quic_connection_exposes_peer_fingerprint_t1h() -> None:
     """2026-05-22 audit T1-H full-fix regression test.
 
@@ -210,6 +213,7 @@ def test_quic_connection_exposes_peer_fingerprint_t1h() -> None:
         )
 
 
+@pytest.mark.live_daemon
 def test_daemon_brings_up_quic_endpoint() -> None:
     """After daemon_pair settles, both daemons must have a
     QUIC server endpoint up on a non-zero port. Without this the
@@ -277,6 +281,7 @@ def _wait_for_quic_peer_port(ctrl_port: int, target_fp_prefix: str, timeout: flo
     return False
 
 
+@pytest.mark.live_daemon
 def test_quic_ping_round_trip_between_daemons() -> None:
     """Headline Wave 2e proof: control-API ``quic_ping`` against
     a paired peer returns ok with a real RTT. This exercises:
@@ -355,6 +360,7 @@ def test_quic_ping_round_trip_between_daemons() -> None:
         assert result.get("response_len", 0) >= len(b"hello-quic")
 
 
+@pytest.mark.live_daemon
 def test_send_file_stream_mode_survives_with_quic_route_available() -> None:
     """Wave 2f integration end-to-end. Pin both directions, send
     a small file (small enough to skip CDC and route via the
@@ -434,6 +440,7 @@ def test_send_file_stream_mode_survives_with_quic_route_available() -> None:
         )
 
 
+@pytest.mark.live_daemon
 def test_endpoint_announcement_carries_quic_port() -> None:
     """The ENDPOINT_UPDATE frame must include ``quic_port`` once
     the daemon has a QUIC endpoint up - paired peers consume

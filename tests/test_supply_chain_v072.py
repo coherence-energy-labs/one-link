@@ -419,10 +419,16 @@ def test_workflows_use_frozen_uv_and_explicit_root_for_native_builds():
                 run = str(step.get("run", ""))
                 if step.get("working-directory") == "native" and "maturin" in run:
                     nested_maturin_count += 1
-                    assert "uv run --project .. --frozen" in run, (
+                    assert any(command in run for command in (
+                        "uv run --project .. --frozen", "uv run --project .. --no-sync")), (
                         f"{path.name}: nested maturin build would discover native/pyproject "
                         "instead of the root uv.lock"
                     )
+                    if "uv run --project .. --no-sync" in run:
+                        earlier = job["steps"][:job["steps"].index(step)]
+                        assert any("uv sync --frozen" in item.get("run", "") for item in earlier), (
+                            f"{path.name}: no-sync requires an earlier frozen environment install"
+                        )
     assert sync_count >= 15
     # 10th audited site 2026-07-25: full_suite_and_e2e.yml builds the native
     # engine so the suite exercises the real fail-closed PQ channel path.
@@ -442,7 +448,8 @@ def test_workflows_use_frozen_uv_and_explicit_root_for_native_builds():
     # builds made on ONE runner because the old gate compared a 4-core cloud
     # VM against a baseline recorded on a 24-core Windows desktop, and failed
     # every PR it ever ran on.
-    assert nested_maturin_count == 16
+    # The tagged publisher now independently rebuilds its actual Linux wheel.
+    assert nested_maturin_count == 17
 
 
 def test_windows_native_binding_uses_shell_matching_its_commands():
@@ -545,7 +552,7 @@ def test_tagged_release_separates_signing_from_release_mutation():
         "attestations": "write",
     }
     assert publish["permissions"] == {"contents": "write"}
-    assert set(publish["needs"]) == {"release_quality_gate", "build", "sign"}
+    assert set(publish["needs"]) == {"release_quality_gate", "build", "sign", "verify_reproducibility"}
     publish_actions = [
         step["uses"]
         for step in publish["steps"]

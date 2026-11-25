@@ -215,6 +215,7 @@ async def _pair_two_daemons(s, base_a, tok_a, base_b, tok_b, p):
     )
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_folder_sync_round_trip():
     """A pairs with B, A creates a folder shared with B, A drops a file.
@@ -335,6 +336,7 @@ async def test_folder_sync_round_trip():
             )
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_folder_sync_blocked_for_unpaired_peer():
     """Without pairing, MANIFEST_PUSH should be ignored on the receive side

@@ -54,6 +54,7 @@ def _control_request(control_port: int, **req) -> dict:
     return request(control_port, timeout=10.0, **req)
 
 
+@pytest.mark.live_daemon
 def test_daemon_reports_coherence_field_available():
     """A real daemon subprocess must report coherence_field.available=True
     in the `status` control response. Verifies that ol_coherence_field
@@ -102,6 +103,7 @@ def test_daemon_reports_coherence_field_available():
             assert cal.get("apparent_horizon_anchor", 0) > 0
 
 
+@pytest.mark.live_daemon
 def test_daemon_pair_field_calibration_matches_across_daemons():
     """Two daemons running the same build must report identical
     calibration constants — the calibration is compile-time in
@@ -118,6 +120,7 @@ def test_daemon_pair_field_calibration_matches_across_daemons():
         )
 
 
+@pytest.mark.live_daemon
 def test_daemon_pair_routing_homology_prefetch_also_reported():
     """All four Phase D/E native subsystems must show available=True
     on a real daemon: routing, homology, prefetch, coherence_field.
@@ -140,6 +143,7 @@ def test_daemon_pair_routing_homology_prefetch_also_reported():
             )
 
 
+@pytest.mark.live_daemon
 def test_daemon_pair_bloom_init_capability_advertised_in_status():
     """BLOOM_INIT_V1 must show up in the live daemon's status surface.
     The cap is what gates the entire Phase B handshake."""
@@ -156,6 +160,7 @@ def test_daemon_pair_bloom_init_capability_advertised_in_status():
         assert bi.get("advertised") is True
 
 
+@pytest.mark.live_daemon
 def test_daemon_pair_quic_transport_capability_advertised_in_status():
     """QUIC_TRANSPORT_V1 must show up in the live daemon's status."""
     with daemon_pair() as p:

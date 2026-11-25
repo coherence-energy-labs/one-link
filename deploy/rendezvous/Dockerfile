@@ -7,12 +7,12 @@
 #   * the final image contains neither uv/pip nor the desktop application's
 #     unrelated dependency and source surface.
 
-# uv 0.11.31. The tag documents the version; the digest is authoritative and
+# uv 0.13.10. The tag documents the version; the digest is authoritative and
 # preserves the multi-architecture index (linux/amd64 + linux/arm64 included).
-FROM ghcr.io/astral-sh/uv:0.11.31@sha256:ecd4de2f060c64bea0ff8ecb182ddf46ba3fcccdc8a60cfdbaf20d1a047d7437 AS uv-bin
+FROM ghcr.io/astral-sh/uv:0.13.10@sha256:a3ea1357342c1a4bf9a0c53a3deb1b55379aefa037338d8113d5771efa01774f AS uv-bin
 
-# CPython 3.12.13 on Debian bookworm-slim, official multi-architecture index.
-FROM python:3.12.13-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b AS dependencies
+# CPython 3.12.14 on Debian bookworm-slim, official multi-architecture index.
+FROM python:3.12.14-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e AS dependencies
 
 COPY --from=uv-bin /uv /usr/local/bin/uv
 COPY deploy/rendezvous/requirements.lock /tmp/requirements.lock
@@ -35,7 +35,7 @@ RUN uv venv \
       "import aiohttp, cryptography; print(aiohttp.__version__, cryptography.__version__)"
 
 
-FROM python:3.12.13-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b AS runtime
+FROM python:3.12.14-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e AS runtime
 
 ARG ONE_LINK_VERSION=0.22.1
 ARG VCS_REF=unknown

@@ -2,12 +2,13 @@
 # desktop application graph; update exact versions together with uv.lock, then
 # regenerate requirements.lock with:
 #
-#   uv pip compile deploy/rendezvous/requirements.in \
-#     --python-version 3.12 --universal --generate-hashes \
-#     --output-file deploy/rendezvous/requirements.lock
+#   python scripts/lock_rendezvous.py
+#
+# This resolves the minimal closure with constraints exported from uv.lock,
+# retaining the same reviewed versions and real registry artifact hashes.
 #
 # The generated lock is consumed with `uv pip install --require-hashes
 # --no-build`, so an index mutation or platform without an audited wheel fails
 # the image build instead of compiling or selecting an unreviewed artifact.
-aiohttp==3.14.3
+aiohttp==3.14.5
 cryptography==50.0.0

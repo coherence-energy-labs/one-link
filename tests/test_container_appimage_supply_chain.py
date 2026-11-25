@@ -88,7 +88,7 @@ def test_rendezvous_requirements_are_exact_hashed_lock_subset():
     versions = _requirements_versions()
     uv_versions = _uv_versions()
 
-    assert "aiohttp==3.14.3" in direct
+    assert "aiohttp==3.14.5" in direct
     assert "cryptography==50.0.0" in direct
     assert "!deploy/rendezvous/requirements.lock" in _read(".gitignore")
     assert len(versions) == 13
@@ -118,8 +118,8 @@ def test_dockerfile_external_inputs_and_installs_fail_closed():
         image = line.split()[1]
         assert re.fullmatch(r"[^\s@]+:[^\s@]+@sha256:[0-9a-f]{64}", image), line
 
-    assert "python:3.12.13-slim-bookworm@sha256:" in dockerfile
-    assert "ghcr.io/astral-sh/uv:0.11.31@sha256:" in dockerfile
+    assert "python:3.12.14-slim-bookworm@sha256:" in dockerfile
+    assert "ghcr.io/astral-sh/uv:0.13.10@sha256:" in dockerfile
     assert "apt-get" not in dockerfile
     assert "--require-hashes" in dockerfile
     assert "--no-build" in dockerfile

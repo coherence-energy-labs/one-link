@@ -303,7 +303,7 @@ def test_core_wheel_configuration_is_genuinely_universal() -> None:
         "NOTICE",
     ]
     assert project["build-system"]["requires"] == [
-        "setuptools>=83,<84",
+        "setuptools>=84.1,<85",
         "wheel>=0.47,<0.48",
     ]
     assert project["tool"]["setuptools"]["include-package-data"] is False
@@ -509,7 +509,7 @@ def test_fresh_wheel_and_sdist_pass_two_clean_install_probes(tmp_path: Path) -> 
     assert result["source_python_file_count"] == sum(
         name.endswith(".py") for name in staged_contract.payload_hashes
     )
-    assert result["declared_requirement_count"] == 48
+    assert result["declared_requirement_count"] == 52
     assert result["declared_extra_count"] == 9
     assert result["wheel_bytes"] > 0
     assert result["sdist_bytes"] > 0

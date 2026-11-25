@@ -35,7 +35,12 @@ dependencies = [
   "psutil>=7.2.2,<8",
   # aiohttp >=3.14.1 clears 11 CVEs (CVE-2026-34993 .. 54280) in the
   # 3.13.x line that the daemon's HTTP UI server is exposed to.
-  "aiohttp>=3.14.1",
+  "aiohttp>=3.14.4",
+  # Floors cover affected transitive runtime packages for both pip and uv.
+  "multidict>=6.9.1",
+  "dnspython>=2.9.2",
+  "certifi>=2026.10.19",
+  "pyasn1>=0.6.5",
   "watchdog>=4.0",
   # v0.15.4: QR code rendering for the LAN-pairing flow. Pure-Python,
   # BSD-licensed (Lincoln Loop), SVG output without Pillow.
@@ -87,13 +92,13 @@ dependencies = [
 #
 # Or download the OS+arch-matching wheel from the release page and
 # `pip install <wheel.whl>`. Source builds via `cd native && maturin build --release`.
-native = ["one_link_native>=0.21.0a0,<1.0"]
+native = ["one_link_native==0.22.1"]
 window = ["pywebview>=5.0"]  # optional native-window wrapper (Tier 2)
 # v0.10.5 system tray icon. Lets the daemon live in the OS tray
 # instead of always-needing-a-browser-tab. Optional — fresh
 # installs without these packages fall back to headless daemon
 # mode automatically.
-tray = ["pystray>=0.19", "pillow>=12.2.0"]
+tray = ["pystray>=0.19", "pillow>=13.0.0,<14"]
 # v0.20.7 (sovereignty pack): route outbound rendezvous traffic
 # through a SOCKS proxy when ONE_LINK_TOR_PROXY is set. Optional
 # because pulling aiohttp-socks adds the python-socks transitive
@@ -115,7 +120,7 @@ dev = [
   "PyYAML>=6.0.3,<7",
   # Distribution-contract tests build from an isolated source snapshot using
   # the reviewed backend rather than resolving mutable build tools at runtime.
-  "setuptools>=83,<84",
+  "setuptools>=84.1,<85",
   "wheel>=0.47,<0.48",
   # v0.21.x property-based testing for invariants that span
   # huge input spaces (e.g. 'every BIP-39 seed round-trips';
@@ -167,7 +172,7 @@ release = [
   "build>=1.5,<2",
   "maturin>=1.14.1,<2",
   "pyinstaller>=6.21,<7",
-  "setuptools>=83,<84",
+  "setuptools>=84.1,<85",
   "sigstore>=4.5.0,<5",
   "wheel>=0.47,<0.48",
 ]
@@ -181,7 +186,7 @@ security = [
   "pip-audit>=2.7",
   "bandit>=1.7",
   "cyclonedx-bom>=4.4",
-  "uv>=0.12.1,<0.13",
+  "uv>=0.13.4,<0.14",
   "zizmor>=1.27,<2",
 ]
 
@@ -207,7 +212,7 @@ release-tools = [
   # Parse wheel/sdist filenames and normalize the PEP 440 project version in
   # the independent distribution contract gate.
   "packaging>=26.2,<27",
-  "setuptools>=83,<84",
+  "setuptools>=84.1,<85",
   "sigstore>=4.5.0,<5",
   "wheel>=0.47,<0.48",
 ]
@@ -216,7 +221,7 @@ release-tools = [
 one-link = "one_link.cli:main"
 
 [build-system]
-requires = ["setuptools>=83,<84", "wheel>=0.47,<0.48"]
+requires = ["setuptools>=84.1,<85", "wheel>=0.47,<0.48"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -287,6 +292,7 @@ addopts = "-p no:benchmark -p no:hypothesispytest"
 # two-device regression gate (tests/test_two_device_soak.py) from
 # the fast unit suite. Run with `pytest -m soak` before each ship.
 markers = [
+    "live_daemon: real daemon subprocess acceptance test; required in the explicit live manifest",
     "soak: slower two-device regression tests (run with -m soak)",
 ]
 
@@ -334,6 +340,10 @@ check_untyped_defs = true
 # from this repository for development/CI and replaced by release wheels for
 # distribution; declaring the source lets uv lock every optional dependency
 # instead of failing on the intentionally unpublished alpha package.
+[tool.uv]
+# Audit/build tools are resolved with fixed transitive security floors.
+constraint-dependencies = ["filelock>=4.2.1", "msgpack>=1.2.3"]
+
 [tool.uv.sources]
 one_link_native = { path = "native" }
 

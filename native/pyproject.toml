@@ -6,7 +6,7 @@
 # `one_link_native/` package.
 
 [build-system]
-requires      = ["maturin>=1.5,<2.0"]
+requires      = ["maturin>=1.14.1,<2.0"]
 build-backend = "maturin"
 
 [project]
@@ -32,9 +32,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage      = "https://github.com/IamOne1/One_Link"
-Documentation = "https://github.com/IamOne1/One_Link/tree/master/docs/decisions"
-"Source Code" = "https://github.com/IamOne1/One_Link"
+Homepage      = "https://github.com/coherence-energy-labs/one-link"
+Documentation = "https://github.com/coherence-energy-labs/one-link/tree/master/docs/decisions"
+"Source Code" = "https://github.com/coherence-energy-labs/one-link"
 
 [tool.maturin]
 # This is the pyo3 binding crate (matches the [package].name in

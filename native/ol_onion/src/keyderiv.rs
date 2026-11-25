@@ -84,8 +84,27 @@ pub fn derive_layer_key_relay(
 /// Check if a [`SharedSecret`]'s bytes are all-zero (small-order
 /// pubkey defense). Both `x25519-dalek` paths fold small-order
 /// inputs to zero, so this check catches them downstream.
+///
+/// Constant-time in the secret bytes: see [`is_all_zero_ct`].
 pub fn is_zero_shared(shared: &SharedSecret) -> bool {
-    shared.as_bytes().iter().all(|&b| b == 0)
+    is_all_zero_ct(shared.as_bytes())
+}
+
+/// Constant-time all-zero test for secret bytes (shared secrets, compressed
+/// shared points).
+///
+/// `bytes.iter().all(|&b| b == 0)` stops at the first non-zero byte, so its
+/// running time depends on the secret; whether the compiler keeps that
+/// early exit depends on the call site (`ol_ct_audit` found it kept in the
+/// Sphinx and obfs paths). This folds every byte with OR, so no branch or
+/// address depends on the data, and converts once through `subtle`. Only
+/// the returned verdict (small-order input or not) is public, and callers
+/// branch on it at a line marked for the constant-time audit.
+#[must_use]
+pub fn is_all_zero_ct(bytes: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    let folded = bytes.iter().fold(0u8, |acc, &b| acc | b);
+    bool::from(folded.ct_eq(&0u8))
 }
 
 fn finalize(shared: &SharedSecret, sender_ephemeral_pk: &PublicKey) -> LayerKey {

@@ -143,6 +143,7 @@ impl Capability {
             expected = derive_step_signature(&expected, &caveat_bytes);
         }
         // Constant-time compare.
+        // ct-audit: declassify (accept/reject verdict)
         if expected.ct_eq(&self.signature).unwrap_u8() != 1 {
             return Err(CapError::SignatureMismatch);
         }

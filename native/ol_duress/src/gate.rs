@@ -132,6 +132,9 @@ impl DuressGate {
         // Constant-time compare against expected.
         let real_match = real_check.ct_eq(expected_real_check).unwrap_u8() == 1;
         let duress_match = duress_check.ct_eq(expected_duress_check).unwrap_u8() == 1;
+        // Every derivation above runs on every call; only the classification
+        // below is the gate's output.
+        // ct-audit: declassify (real/duress/rejected verdict)
         match (real_match, duress_match) {
             (true, _) => Ok(DuressOutcome::Real(Zeroizing::new(real_volume))),
             (false, true) => Ok(DuressOutcome::Duress {

@@ -1115,8 +1115,6 @@ dependencies = [
 [[package]]
 name = "ml-kem"
 version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8de49b3df74c35498c0232031bb7e85f9389f913e2796169c8ab47a53993a18f"
 dependencies = [
  "hybrid-array 0.2.3",
  "kem",
@@ -1384,6 +1382,24 @@ dependencies = [
  "proptest",
  "rand 0.9.5",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "ol_ct_audit"
+version = "0.22.1"
+dependencies = [
+ "blake3",
+ "curve25519-dalek",
+ "ol_capability",
+ "ol_confidential",
+ "ol_duress",
+ "ol_onion",
+ "ol_pair_qr",
+ "ol_pqkem",
+ "ol_threshold_recovery",
+ "rand_chacha 0.3.1",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

@@ -245,7 +245,9 @@ impl ClientHandshake {
         // server side mirrors via bridge_secret * client_ephem.)
         let ephem = self.ephem.take().ok_or(HandshakeError::SmallOrderPubkey)?;
         let shared = ephem.diffie_hellman(&self.bridge_pubkey);
-        if shared.as_bytes().iter().all(|&b| b == 0) {
+        // `was_contributory` is x25519-dalek's constant-time all-zero test.
+        // ct-audit: declassify (small-order verdict is the public result)
+        if !shared.was_contributory() {
             return Err(HandshakeError::SmallOrderPubkey);
         }
         let _ = server_pk;
@@ -291,6 +293,7 @@ impl ServerHandshake {
         let mut matched_epoch = None;
         for candidate in [current_epoch, current_epoch.saturating_sub(1)] {
             let expected = compute_handshake_tag(&bridge.id, candidate, &client_pk_bytes);
+            // ct-audit: declassify (MAC verdict per public epoch)
             if bool::from(expected.ct_eq(&client_tag)) {
                 matched_epoch = Some(candidate);
                 break;
@@ -306,7 +309,9 @@ impl ServerHandshake {
         // ECDH: shared = bridge_secret * client_ephem_pk.
         let client_pk = PublicKey::from(client_pk_bytes);
         let shared = bridge.secret.diffie_hellman(&client_pk);
-        if shared.as_bytes().iter().all(|&b| b == 0) {
+        // `was_contributory` is x25519-dalek's constant-time all-zero test.
+        // ct-audit: declassify (small-order verdict is the public result)
+        if !shared.was_contributory() {
             return Err(HandshakeError::SmallOrderPubkey);
         }
         // Server's auth tag binds the transcript: client_ephem + server_ephem.

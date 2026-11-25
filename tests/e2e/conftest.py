@@ -222,22 +222,45 @@ def ui_page(live_daemon, page):
     return page
 
 
-# Browser sessions (by id) already past their startup-cache write.
+# Session browsers (by id) whose startup cache has been checked.
 _STARTUP_CACHE_SETTLED: set[int] = set()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def firefox_startup_cache_disabled_by_default():
+    """Every Firefox this session launches gets a startup cache that cannot be written (RUN-01).
+
+    A Firefox writes its startup cache about 2-10 s and again about 120 s
+    after launch. While a write runs, its parent stops servicing navigation,
+    createOffer() and Playwright's own commands, for as long as the write
+    takes: up to minutes on a loaded host. Relocating the cache into a
+    directory that does not exist makes those writes fail at once (see
+    tests/e2e/browser_readiness.py).
+
+    This is set in the test process environment before Playwright starts its
+    driver, so a Firefox launched without an explicit ``env`` inherits it:
+    the session ``browser`` and any ``browser_type.launch()`` in a test. Only
+    Mozilla programs read the variable; other browsers ignore it.
+    """
+    from tests.e2e.browser_readiness import STARTUP_CACHE_ENV, startup_cache_disabled_env
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv(STARTUP_CACHE_ENV, startup_cache_disabled_env({})[STARTUP_CACHE_ENV])
+        yield
 
 
 @pytest.fixture(autouse=True)
 def firefox_past_startup_cache_write(request):
-    """Run every browser test after Firefox's one-time startup-cache write (RUN-01).
+    """Check, before its first test, that the session's Firefox cannot write its startup cache.
 
-    While a freshly launched Firefox writes its startup cache, its parent
-    process can stop answering content for as long as the write takes (seconds
-    to minutes on a loaded host), which holds createOffer() and Playwright's
-    own commands. A WebRTC test that starts inside that window fails in a way
-    that looks like a product defect. This waits the write out once per
-    browser session, for whichever browser test runs first. It is a no-op for
-    tests that use no browser and for other browsers; a browser that never
-    settles fails the test with BrowserNotReady, never a pass or a skip.
+    It checks every Firefox running under this test process, so it is also
+    the proof that the session default above took effect. A test that
+    launches its own browsers should use ``browser_readiness.launch_settled``
+    (or ``launch_settled_many``), which checks the new processes too and keeps
+    the relocation when the test passes its own ``env``. This is a no-op for
+    tests without ``browser`` and for other browsers. A Firefox whose cache is
+    still writable fails the test with BrowserNotReady naming the stage, never
+    a pass or a skip.
     """
     if "browser" not in request.fixturenames:
         return

@@ -1,57 +1,93 @@
-"""Browser readiness gate for live WebRTC pairing tests (audit finding RUN-01).
+"""Browser readiness for live WebRTC tests (audit finding RUN-01).
 
 Why this exists
 ---------------
-A freshly launched Playwright Firefox writes its startup cache
-(``<profile>/startupCache/startupCache.<word>.<endian>``) once per session,
-on a background thread, about 7-35 s after launch. On a loaded Windows host
-that write was measured to take from seconds to more than 12 minutes. While it
-is in progress, the parent process stops servicing content -> parent IPC.
-That means createOffer()'s permission round trip, same-origin fetches,
-WebSocket delivery, and Playwright's own commands all wait. Two measurements
-show this. Holding that one file's write open by fault injection froze parent
-IPC for exactly the hold (3 of 3 runs). In a natural run, a 14.5 s createOffer
-hold ended 6 ms after the cache file's final write. The required-identity scenario starts
-its 90 s pairing clock inside that window. When the hold lasted longer than
-the clock, pairing failed in exactly the RUN-01 shape: the page showed
-"negotiating" and no offer reached the daemon. Hosted CI never hit it, because
-its Firefox step runs another WebRTC test first, and that test sits in the
-window instead.
+Every Firefox that Playwright launches gets a fresh profile, and that Firefox
+process writes its startup cache
+(``<profile>/startupCache/startupCache.<word>.<endian>``) twice during its
+life. These are Windows measurements under competing load:
 
-What the gate proves, in order, before the caller starts any pairing clock
--------------------------------------------------------------------------
-1. Firefox only: the session's single startup-cache write has finished.
-   Content cannot see that write, and a write that starts after an in-page
-   check passes can still freeze the parent mid-pairing. So the gate observes
-   it directly. The file must exist, be non-empty, and be open for writing by
-   nobody. On Windows, a deny-write open must not hit a sharing violation. On
-   Linux, the browser parent must hold no descriptor on it with write access.
-   Where neither can be asked, the size must be stable for 2 s.
-2. Every browser: the parent process answers now. A fresh RTCPeerConnection's
-   createOffer() (which waits on the parent) and a same-origin fetch must both
-   settle within ``probe_bound_ms``, for ``stable_probes`` consecutive probes.
+* The first write begins 2-10 s after launch, without waiting for any
+  navigation. The second begins about 120 s after launch (3 of 3 runs, at
+  120.1-120.6 s). Each write took from 3 s to about 3 minutes.
+* The writing thread runs in background mode (very low I/O priority). That
+  competing disk load is what stretches the write is inferred from this, not
+  measured.
+* While a write is in progress, the parent process stops servicing content
+  and Playwright as soon as its main thread touches that cache: a navigation,
+  a new context or page, or the first WebRTC use. It stays stopped until the
+  write ends. Over the write, an in-page fetch in another context of the same
+  browser and Playwright's own new_context()/new_page() were held
+  (7-175 s), and the parent's main thread used no CPU. The daemon's HTTPS
+  listener meanwhile answered a direct TLS + GET in under 2 s.
+* A page.goto() with a 30 s clock started inside a first write failed in
+  every run where that write lasted longer than about 30 s.
+
+Because the second write comes about two minutes in, waiting for "the" write
+once per session cannot work. This module removes the cause instead. Firefox
+reads the cache location from the ``MOZ_STARTUP_CACHE`` environment variable.
+Pointing it at a file in a directory that does not exist makes every cache
+write fail immediately. With that setting, under the same load (4 of 4 runs):
+no cache file was written and the directory was never created. In both former
+write windows a new context and page took under 0.6 s, a navigation under
+0.5 s and createOffer() under 30 ms, with no parent hold over 1.5 s. Without
+it, interleaved, the same steps were held for 7-152 s. Firefox runs normally
+without a persistent startup cache.
+
+What the gate proves
+--------------------
+1. Firefox only, per process: the startup cache of every Firefox running
+   under this test process is disabled. Its environment carries the
+   relocation, the target directory does not exist, and its profile holds no
+   cache file. A Firefox launched any other way fails this stage, because it
+   is exposed to both write windows.
+   * The e2e conftest sets the relocation in the test process environment
+     before Playwright starts, so every Firefox launched without its own
+     ``env`` inherits it. It checks the session ``browser`` before its first
+     test.
+   * ``launch_settled`` and ``launch_settled_many`` relocate and check the
+     browsers a test launches itself, including with a caller's ``env``.
+2. Every browser, immediately before a pairing clock: the parent answers now
+   (``wait_for_browser_ready``). A fresh RTCPeerConnection's createOffer()
+   (which waits on the parent) and a same-origin fetch must both settle within
+   ``probe_bound_ms``, for ``stable_probes`` consecutive probes.
 
 A gate failure raises BrowserNotReady, which is never a pass, a skip or a
-pairing verdict. It names the stage that was not ready and what was measured.
-Once the gate passes, the caller's unchanged pairing assertions and their
-90 s budget apply. The gate does not touch the daemon, the pairing code, or
-any of their timeouts.
+product verdict. It names the stage and what was measured. Once the gate
+passes, the caller's unchanged assertions and budgets apply. Nothing here
+touches the daemon, the product code, or any of their timeouts.
 """
 
 from __future__ import annotations
 
 import os
-import sys
+import tempfile
 import time
+import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import psutil
-from playwright.sync_api import Browser, Page, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import Browser, BrowserType, Page, TimeoutError as PlaywrightTimeoutError
+
+STARTUP_CACHE_ENV = "MOZ_STARTUP_CACHE"
 
 
 class BrowserNotReady(AssertionError):
-    """The browser could not prove readiness. This is not a pairing result."""
+    """The browser could not prove readiness. This is not a product result."""
+
+
+def startup_cache_disabled_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
+    """A Firefox launch environment whose startup cache can never be written.
+
+    The cache file is placed in a fresh, never-created directory, so each
+    write Firefox attempts fails at once instead of holding its parent.
+    """
+    env = dict(os.environ if base is None else base)
+    absent = Path(tempfile.gettempdir()) / f"one-link-e2e-no-startup-cache-{uuid.uuid4().hex}"
+    env[STARTUP_CACHE_ENV] = str(absent / "startupCache.disabled")
+    return env
 
 
 def _firefox_parents() -> dict[Path, psutil.Process]:
@@ -77,97 +113,59 @@ def _firefox_profile_dirs() -> set[Path]:
     return set(_firefox_parents())
 
 
-def _held_for_write_by(path: Path, holders: list[psutil.Process]) -> bool | None:
-    """Linux: True if one of ``holders`` has ``path`` open for writing.
-
-    Read from /proc/<pid>/fd, where an open descriptor carries its access
-    mode. None means the question could not be answered (no holder to ask, or
-    one whose descriptors are unreadable), so the caller must not treat it as
-    "nobody is writing".
-    """
-    if not holders:
+def _process_environ(process: psutil.Process) -> Mapping[str, str] | None:
+    try:
+        return process.environ()
+    except psutil.Error:
         return None
-    target = os.path.realpath(path)
-    for holder in holders:
-        try:
-            files = holder.open_files()
-        except psutil.Error:
-            return None
-        for entry in files:
-            mode = getattr(entry, "mode", None)
-            if mode is None:
-                return None
-            if mode != "r" and os.path.realpath(entry.path) == target:
-                return True
-    return False
 
 
-def _open_for_write_elsewhere(path: Path) -> bool | None:
-    """True if the browser still holds ``path`` open for writing; None if unknowable.
+def _startup_cache_problem(profile: Path, environ: Mapping[str, str] | None) -> str | None:
+    """Why this Firefox's startup cache is not disabled, or None when it is."""
+    if environ is None:
+        return "its environment could not be read, so the relocation cannot be confirmed"
+    target = environ.get(STARTUP_CACHE_ENV)
+    if not target:
+        return f"it was launched without {STARTUP_CACHE_ENV}, so it will write its startup cache twice"
+    if Path(target).parent.exists():
+        return f"{STARTUP_CACHE_ENV} points into a directory that exists, so the cache can still be written"
+    written = sorted(p.name for p in (profile / "startupCache").glob("startupCache.*"))
+    if written:
+        return f"its profile holds {written}, so the relocation did not take effect"
+    return None
 
-    Windows asks the kernel with a deny-write open. Linux reads the access mode
-    of the browser parent's own descriptors. Elsewhere there is no direct
-    answer and the caller falls back to a stable size.
+
+def _wait_for_startup_cache(
+    deadline: float, report: dict[str, Any], profiles: set[Path] | None = None,
+) -> None:
+    """Stage 1: every Firefox in ``profiles`` (default: all running) has its startup cache disabled.
+
+    The relocation is decided at launch, so there is nothing to wait for. The
+    deadline only bounds the wait for the process to show up and expose its
+    environment. A Firefox exposed to the startup-cache writes fails at once.
     """
-    if sys.platform.startswith("linux"):
-        profile = path.parent.parent
-        return _held_for_write_by(path, [p for d, p in _firefox_parents().items() if d == profile])
-    if sys.platform != "win32":
-        return None
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    create = kernel32.CreateFileW
-    create.argtypes = [
-        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
-        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
-    ]
-    create.restype = wintypes.HANDLE
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    generic_read, file_share_read, open_existing, attribute_normal = 0x80000000, 0x1, 3, 0x80
-    # Deny-write sharing: this fails with a sharing violation exactly when an
-    # existing handle has write access. Read-only, closed immediately.
-    handle = create(str(path), generic_read, file_share_read, None, open_existing, attribute_normal, None)
-    if handle in (None, wintypes.HANDLE(-1).value):
-        # A sharing violation means a writer still holds the file. Any other
-        # failure proves nothing, so it is treated as "not finished" as well.
-        return True
-    kernel32.CloseHandle(handle)
-    return False
-
-
-def _wait_for_startup_cache(deadline: float, report: dict[str, Any]) -> None:
     started = time.monotonic()
-    profiles = _firefox_profile_dirs()
-    if len(profiles) != 1:
-        raise BrowserNotReady(
-            f"browser not ready: expected one Firefox profile under this test process, found {sorted(map(str, profiles))}"
-        )
-    cache_dir = next(iter(profiles)) / "startupCache"
-    report["startup_cache_dir"] = str(cache_dir)
-    last_size: int | None = None
-    stable_since = started
     while True:
-        candidates = sorted(p for p in cache_dir.glob("startupCache.*") if p.is_file())
-        size = candidates[0].stat().st_size if candidates else None
-        now = time.monotonic()
-        if size != last_size:
-            last_size, stable_since = size, now
-        if candidates and size:
-            held = _open_for_write_elsewhere(candidates[0])
-            if held is False or (held is None and now - stable_since >= 2.0):
-                report["startup_cache"] = {
-                    "file": candidates[0].name, "bytes": size,
-                    "waited_s": round(now - started, 1),
-                }
-                return
-        if now >= deadline:
+        parents = _firefox_parents()
+        selected = parents if profiles is None else {p: parents[p] for p in profiles if p in parents}
+        missing = set() if profiles is None else set(profiles) - set(selected)
+        if not selected and profiles is None:
+            problems = {"(none)": "expected at least one Firefox process under this test process, found none"}
+        else:
+            problems = {p.name: why for p, proc in selected.items()
+                        if (why := _startup_cache_problem(p, _process_environ(proc))) is not None}
+            problems.update({p.name: "its process is not running under this test process" for p in missing})
+        if not problems:
+            report["startup_cache"] = {p.name: "disabled" for p in selected}
+            report["startup_cache_checked_s"] = round(time.monotonic() - started, 1)
+            return
+        unreadable = all("could not be read" in why or "not running" in why for why in problems.values())
+        if not unreadable or time.monotonic() >= deadline:
             raise BrowserNotReady(
-                f"browser not ready: Firefox's startup-cache write had not finished after "
-                f"{now - started:.0f}s (file={candidates[0].name if candidates else None}, bytes={size}). "
-                "Its parent process cannot be trusted to answer during pairing; this is a "
-                "browser/host condition, not a pairing failure."
+                f"browser not ready: stage 'startup cache disabled' failed: {problems}. A Firefox "
+                "with a writable startup cache stops servicing navigation, WebRTC and Playwright "
+                "while it writes (about 2-10 s and 120 s after launch); this is a browser/host "
+                "condition, not a product failure."
             )
         time.sleep(0.25)
 
@@ -229,26 +227,68 @@ _PARENT_PROBES = """(cfg) => {
   return state.done ? state : false;
 }"""
 
-# The release workflow runs this test under pytest-timeout --timeout=600. The
+# The release workflow runs these tests under pytest-timeout --timeout=600. The
 # gate's default budget leaves room for the rest of the test, so a browser that
 # is not ready fails with BrowserNotReady rather than an anonymous timeout.
 DEFAULT_TIMEOUT_S = 420.0
+# Stage 1 only waits for a just-launched process to become visible.
+STAGE1_TIMEOUT_S = 30.0
 
 
-def wait_for_startup_cache_write(browser: Browser, *, timeout_s: float = DEFAULT_TIMEOUT_S) -> dict[str, Any]:
-    """Stage 1 alone: block until a Firefox session's one-time startup-cache write is done.
+def wait_for_startup_cache_write(browser: Browser, *, timeout_s: float = STAGE1_TIMEOUT_S) -> dict[str, Any]:
+    """Stage 1 for every Firefox already running under this test process.
 
-    Needs no page, so the e2e conftest runs it once per browser session before
-    the first browser test. Every WebRTC test of the session then starts after
-    the window in which the parent process can stall, whichever test runs
-    first. A no-op that reports ``skipped`` for other browsers.
+    The e2e conftest calls it before the first test that uses the session's
+    ``browser``. Returns a report with ``skipped`` set, doing nothing, for
+    other browsers.
     """
     report: dict[str, Any] = {"browser": browser.browser_type.name}
     if browser.browser_type.name != "firefox":
-        report["skipped"] = "only Firefox writes this cache on a background thread"
+        report["skipped"] = "only Firefox has this startup-cache write"
         return report
     _wait_for_startup_cache(time.monotonic() + timeout_s, report)
     return report
+
+
+def launch_settled_many(
+    browser_type: BrowserType, count: int, *, timeout_s: float = STAGE1_TIMEOUT_S, **launch_kwargs: Any,
+) -> list[Browser]:
+    """Launch ``count`` browsers for a test, Firefox with its startup cache disabled.
+
+    Use this wherever a test launches its own browsers. A bare
+    ``browser_type.launch()`` relies on the e2e session default and nothing
+    checks it, and one given its own ``env`` loses the relocation. Each new
+    process passes stage 1 before it is returned. If stage 1 fails, every
+    browser launched here is closed and BrowserNotReady names the stage.
+    """
+    firefox = browser_type.name == "firefox"
+    if firefox:
+        launch_kwargs["env"] = startup_cache_disabled_env(launch_kwargs.get("env"))
+    before = _firefox_profile_dirs() if firefox else set()
+    browsers: list[Browser] = []
+    try:
+        for _ in range(count):
+            browsers.append(browser_type.launch(**launch_kwargs))
+        if firefox:
+            new = _firefox_profile_dirs() - before
+            if len(new) != count:
+                raise BrowserNotReady(
+                    f"browser not ready: could not identify the {count} Firefox processes these launches "
+                    f"started ({len(new)} new profiles under this test process)"
+                )
+            _wait_for_startup_cache(time.monotonic() + timeout_s, {}, profiles=new)
+    except BaseException:
+        for launched in browsers:
+            launched.close()
+        raise
+    return browsers
+
+
+def launch_settled(
+    browser_type: BrowserType, *, timeout_s: float = STAGE1_TIMEOUT_S, **launch_kwargs: Any,
+) -> Browser:
+    """Launch one browser for a test, Firefox with its startup cache disabled."""
+    return launch_settled_many(browser_type, 1, timeout_s=timeout_s, **launch_kwargs)[0]
 
 
 def wait_for_browser_ready(
@@ -261,19 +301,19 @@ def wait_for_browser_ready(
     probe_path: str = "/api/v1/peer-rtc/ice-config",
     require_startup_cache: bool | None = None,
 ) -> dict[str, Any]:
-    """Block until ``browser`` is past its startup-cache write and its parent answers.
+    """Block until ``browser`` passes stage 1 and its parent answers now.
 
     ``page`` must already be on the daemon origin that the pairing will use.
-    Returns what was measured. Raises BrowserNotReady, never a pairing
+    Returns what was measured. Raises BrowserNotReady, never a product
     verdict, when readiness is not proven within ``timeout_s``.
     """
     started = time.monotonic()
     deadline = started + timeout_s
-    report: dict[str, Any] = {"browser": browser.browser_type.name, "gate_version": 2}
+    report: dict[str, Any] = {"browser": browser.browser_type.name, "gate_version": 3}
     if require_startup_cache is None:
         require_startup_cache = browser.browser_type.name == "firefox"
     if require_startup_cache:
-        _wait_for_startup_cache(deadline, report)
+        _wait_for_startup_cache(min(deadline, started + STAGE1_TIMEOUT_S), report)
     remaining_ms = max(1_000, int((deadline - time.monotonic()) * 1000))
     cfg = {"boundMs": probe_bound_ms, "stable": stable_probes, "overallMs": remaining_ms,
            "pauseMs": 250, "path": probe_path}
@@ -282,17 +322,17 @@ def wait_for_browser_ready(
         state = handle.json_value()
     except PlaywrightTimeoutError as exc:
         raise BrowserNotReady(
-            f"browser not ready: the parent process did not complete readiness probes within "
+            f"browser not ready: stage 'parent answers' did not complete its probes within "
             f"{time.monotonic() - started:.0f}s (Playwright could not even read the result); "
-            "this is a browser/host condition, not a pairing failure"
+            "this is a browser/host condition, not a product failure"
         ) from exc
     report["parent_probes"] = state["probes"]
     report["parent_waited_s"] = round(state["waited_ms"] / 1000, 1)
     report["waited_s"] = round(time.monotonic() - started, 1)
     if not state["ok"]:
         raise BrowserNotReady(
-            f"browser not ready: the parent process did not answer {stable_probes} consecutive "
+            f"browser not ready: stage 'parent answers' failed. The parent did not answer {stable_probes} consecutive "
             f"createOffer()+fetch probes within {probe_bound_ms} ms each in {report['waited_s']}s; "
-            f"last probes={state['probes'][-3:]}; this is a browser/host condition, not a pairing failure"
+            f"last probes={state['probes'][-3:]}; this is a browser/host condition, not a product failure"
         )
     return report

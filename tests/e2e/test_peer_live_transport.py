@@ -47,6 +47,7 @@ from playwright.sync_api import (
 
 from one_link.peer_https import build_ssl_context
 from one_link.rendezvous_server import RendezvousApp, ServerConfig
+from tests.e2e.browser_readiness import launch_settled_many
 
 
 _PEER_CSP_PARTS = (
@@ -964,8 +965,12 @@ def test_two_isolated_peer_pages_complete_manual_webrtc_and_exchange_probe(
     """Two real peer pages exchange one-blob SDP and open the control DC."""
 
     peer_origin = _wait_for_daemon_https(live_daemon)
-    browser_a = browser_type.launch()
-    browser_b = browser_type.launch()
+    # Each launch is a new Firefox process that would write its own startup
+    # cache twice, holding every navigation and Playwright command while it
+    # writes (RUN-01). The first goto below has a 30 s clock. Both browsers are
+    # returned with that cache disabled and checked, or the test fails with a
+    # named BrowserNotReady. No timeout here changes.
+    browser_a, browser_b = launch_settled_many(browser_type, 2)
     context_a = _new_browser_context(browser_a)
     context_b = _new_browser_context(browser_b)
     context_a.add_init_script(_RTC_CAPTURE_INIT)

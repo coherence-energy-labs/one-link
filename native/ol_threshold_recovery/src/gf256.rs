@@ -74,25 +74,24 @@ pub fn gf_pow(base: u32, exp: u32) -> u32 {
 
 /// GF(2^8) multiplicative inverse via Fermat: a^(2^8 - 2) = a^254.
 /// Returns 0 for input 0 (undefined; caller must avoid by construction).
+///
+/// Constant-time in `a`: the exponent 254 is public, every multiply is the
+/// constant-time [`gf_mul`], and 0^254 = 0 already, so no zero test (which
+/// would be a branch on the secret) is needed. `ol_ct_audit` checks this.
 #[inline]
 #[must_use]
 pub fn gf_inv(a: u32) -> u32 {
-    if a as u8 == 0 {
-        0
-    } else {
-        gf_pow(a, 254)
-    }
+    gf_pow(a & 0xFF, 254)
 }
 
 /// GF(2^8) division a / b = a * b^{-1}. Returns 0 when b == 0.
+///
+/// Constant-time in both operands: `gf_inv(0) = 0` and `gf_mul(a, 0) = 0`,
+/// so the b == 0 convention needs no branch.
 #[inline]
 #[must_use]
 pub fn gf_div(a: u32, b: u32) -> u32 {
-    if b as u8 == 0 {
-        0
-    } else {
-        gf_mul(a, gf_inv(b))
-    }
+    gf_mul(a, gf_inv(b))
 }
 
 // ── Optimized table-based multiplication ────────────────────────────

@@ -57,6 +57,7 @@ class PlatformContract:
     key: str
     filename: str
     executable: str
+    bundle_root: str = "one-link"
 
 
 PLATFORM_CONTRACTS: Mapping[str, PlatformContract] = {
@@ -84,6 +85,7 @@ PLATFORM_CONTRACTS: Mapping[str, PlatformContract] = {
         "macos-arm64",
         "one-link-macos-arm64.zip",
         "Contents/MacOS/one-link",
+        bundle_root="one-link.app",
     ),
 }
 
@@ -373,7 +375,9 @@ def parse_authenticated_update_manifest(
             raise UpdateMetadataError(f"artifact filename violates platform contract: {filename}")
         if executable != contract.executable:
             raise UpdateMetadataError(f"artifact executable violates platform contract: {filename}")
-        if bundle_root != "one-link" or kind != "standalone-zip-v1":
+        # Retain legacy signed one-link layouts. New macOS releases use .app;
+        # the extractor still requires exact equality with this signed value.
+        if bundle_root not in {"one-link", contract.bundle_root} or kind != "standalone-zip-v1":
             raise UpdateMetadataError(f"artifact layout violates standalone contract: {filename}")
         filenames.add(filename)
         artifacts[platform_key] = StandaloneArtifact(

@@ -144,7 +144,7 @@ def build_update_document(
                 "filename": contract.filename,
                 "size": size,
                 "sha256": digest,
-                "bundle_root": "one-link",
+                "bundle_root": contract.bundle_root,
                 "executable": contract.executable,
                 "kind": "standalone-zip-v1",
             }

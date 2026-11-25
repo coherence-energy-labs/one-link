@@ -27,7 +27,12 @@
 //! Usage: `ol_ct_audit --list` prints one JSON object per case;
 //! `ol_ct_audit <case>` runs one case and must run under Valgrind
 //! (`--native-smoke` runs it natively, as a functional check only).
+//!
+//! `ol_ct_audit --dudect <target>` (or `--dudect-all`, `--dudect-list`) runs
+//! the statistical timing-leak test of the same secret dataflow natively
+//! instead; see the `timing` module and `scripts/run_ct_timing.py`.
 
+mod timing;
 mod valgrind;
 
 use std::fmt::Write as _;
@@ -43,6 +48,10 @@ use valgrind::{declassify, error_count, mark_secret, public, running_on_valgrind
 enum Expect {
     /// No undeclassified secret-dependent branch or address may be reported.
     Clean,
+    /// Stricter than `Clean`: no secret-dependent branch or address at all,
+    /// not even at a declassification marker. For code whose result must not
+    /// depend on the outcome in shape or control flow (a uniform decision).
+    Uniform,
     /// Known-leaky control: at least one report is required.
     Flagged,
 }
@@ -393,6 +402,57 @@ fn duress_open_rejected() {
     duress_open(2);
 }
 
+/// The gate's uniform decision core. Everything is secret, including which
+/// passphrase was presented, and nothing may branch or index on it: the case
+/// is `Expect::Uniform`, so even a declassification marker would fail it.
+fn duress_decide(which: u8) {
+    let real_root: [u8; 32] = bytes(70);
+    let duress_root: [u8; 32] = bytes(71);
+    let pair_secret: [u8; 32] = bytes(72);
+    let real_pw = *b"correct horse battery staple 01";
+    let duress_pw = *b"coerced passphrase for decoy 02";
+    let wrong_pw = *b"neither of the enrolled phrases";
+    let real_check = duress_check("ol-duress-real-check-v1", &real_root, &real_pw);
+    let duress_check_hash = duress_check("ol-duress-decoy-check-v1", &duress_root, &duress_pw);
+    let gate = ol_duress::DuressGate::new(real_root, duress_root, pair_secret);
+    let presented = match which {
+        0 => real_pw,
+        1 => duress_pw,
+        _ => wrong_pw,
+    };
+    mark_secret(&gate);
+    mark_secret(&presented);
+    mark_secret(&real_check);
+    mark_secret(&duress_check_hash);
+    let decision = black_box(&gate)
+        .decide(black_box(&presented), &real_check, &duress_check_hash)
+        .expect("a non-empty passphrase is always decided");
+    // Reading the fields does not branch; the harness declassifies copies
+    // only to check the case reached the outcome it was built for.
+    let code = public(decision.kind_code());
+    let volume_first = public(decision.volume()[0]);
+    let signal_first = public(decision.covert_signal()[0]);
+    black_box((volume_first, signal_first));
+    assert_eq!(
+        code,
+        which.min(2),
+        "the case must reach its intended outcome"
+    );
+    drop(decision);
+}
+
+fn duress_decide_real() {
+    duress_decide(0);
+}
+
+fn duress_decide_duress() {
+    duress_decide(1);
+}
+
+fn duress_decide_rejected() {
+    duress_decide(2);
+}
+
 // ------------------------------------------------------------ confidential
 
 fn confidential_unseal_tampered() {
@@ -591,6 +651,27 @@ const CASES: &[Case] = &[
         run: duress_open_rejected,
     },
     Case {
+        name: "duress_decide_real",
+        expect: Expect::Uniform,
+        covers: &["ol_duress/tests/constant_time.rs::duress_open_timing_variance_under_120_percent_real_vs_duress"],
+        what: "uniform duress decision for the real passphrase: no secret-dependent branch at all",
+        run: duress_decide_real,
+    },
+    Case {
+        name: "duress_decide_duress",
+        expect: Expect::Uniform,
+        covers: &["ol_duress/tests/constant_time.rs::duress_open_timing_variance_under_120_percent_real_vs_duress"],
+        what: "uniform duress decision for the duress passphrase: no secret-dependent branch at all",
+        run: duress_decide_duress,
+    },
+    Case {
+        name: "duress_decide_rejected",
+        expect: Expect::Uniform,
+        covers: &["ol_duress/tests/constant_time.rs::duress_open_timing_variance_under_120_percent_real_vs_duress"],
+        what: "uniform duress decision for an unenrolled passphrase: no secret-dependent branch at all",
+        run: duress_decide_rejected,
+    },
+    Case {
         name: "confidential_unseal_tampered",
         expect: Expect::Clean,
         covers: &["ol_confidential/tests/constant_time_gate.rs::ct_unseal_uniform_over_tamper_position"],
@@ -637,6 +718,7 @@ fn list() {
             .collect();
         let expect = match case.expect {
             Expect::Clean => "clean",
+            Expect::Uniform => "uniform",
             Expect::Flagged => "flagged",
         };
         println!(
@@ -651,6 +733,9 @@ fn list() {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a.starts_with("--dudect")) {
+        return timing::main(&args);
+    }
     let native_smoke = args.iter().any(|a| a == "--native-smoke");
     let names: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     if args.iter().any(|a| a == "--list") {

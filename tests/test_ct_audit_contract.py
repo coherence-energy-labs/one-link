@@ -50,11 +50,16 @@ def audit_cases() -> dict[str, dict]:
     table = source[source.index("const CASES: &[Case] = &[") :]
     cases = {}
     for block in re.finditer(
-        r"Case \{\s*name: \"([a-z0-9_]+)\",\s*expect: Expect::(Clean|Flagged),\s*covers: &\[([^\]]*)\]", table
+        r"Case \{\s*name: \"([a-z0-9_]+)\",\s*expect: Expect::(\w+),\s*covers: &\[([^\]]*)\]", table
     ):
         covers = re.findall(r"\"([^\"]+)\"", block.group(3))
         cases[block.group(1)] = {"expect": block.group(2).lower(), "covers": covers}
     assert cases, "no ol_ct_audit cases parsed"
+    # The parse must see every case, whatever expectation it declares: a
+    # pattern that named the expectations would silently skip a new kind.
+    assert len(cases) == len(re.findall(r"\bCase \{", table)), "a Case entry did not parse"
+    unknown = {case["expect"] for case in cases.values()} - {"clean", "uniform", "flagged"}
+    assert not unknown, f"unknown expectation kinds: {unknown}"
     return cases
 
 
@@ -88,7 +93,7 @@ def test_secret_sites_and_audit_cases_cover_each_other():
             continue
         for name in entry["audit_cases"]:
             assert name in cases, f"{entry['site']} names missing case {name}"
-            assert cases[name]["expect"] == "clean", name
+            assert cases[name]["expect"] in ("clean", "uniform"), name
             assert entry["site"] in cases[name]["covers"], f"case {name} does not list {entry['site']}"
     by_site = {entry["site"]: entry for entry in INVENTORY["sites"]}
     for name, case in cases.items():

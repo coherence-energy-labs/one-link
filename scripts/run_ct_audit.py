@@ -93,6 +93,10 @@ class CaseResult:
             return False
         if self.expect == "clean":
             return not self.violations
+        if self.expect == "uniform":
+            # No secret-dependent branch or address at all: a report at a
+            # declassification marker fails a uniform case too.
+            return not self.reports
         if self.expect == "flagged":
             return bool(self.violations)
         return False

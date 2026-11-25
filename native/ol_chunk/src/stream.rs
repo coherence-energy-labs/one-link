@@ -257,6 +257,20 @@ impl<R: Read + Seek> Headers<'_, R> {
             };
             self.window_start = self.retain_from;
             let held = self.window.len();
+            // One allocation for the whole walk, sized to the window's bound
+            // (the retained span plus one read-ahead block, never more than
+            // the source). Left to grow on demand the buffer doubles, which
+            // overshoots that bound and, on allocators that cannot extend a
+            // large block in place, briefly holds the old and the new copy.
+            let needed = held + (new_end - append_from);
+            let bound = self
+                .retain_limit
+                .saturating_add(SEQUENTIAL_READ)
+                .min(self.len - self.window_start);
+            let capacity = needed.max(bound);
+            if self.window.capacity() < capacity {
+                self.window.reserve_exact(capacity - held);
+            }
             self.source.seek(SeekFrom::Start(append_from as u64))?;
             // Read into spare capacity: no zero-fill of the appended block.
             (&mut *self.source)
@@ -763,6 +777,200 @@ mod tests {
             // any boundaries it did return cover only bytes that exist
             assert!(set.boundaries.iter().all(|b| b.end <= data.len()));
             panic!("a shrunken source must not produce a complete chunk set");
+        }
+    }
+
+    /// A seekable source of zeros that holds no bytes of its own, so the
+    /// test's memory cannot be mistaken for the window's.
+    struct Zeros {
+        len: u64,
+        pos: u64,
+    }
+
+    impl Read for Zeros {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = (self.len - self.pos).min(buf.len() as u64) as usize;
+            buf[..n].fill(0);
+            self.pos += n as u64;
+            Ok(n)
+        }
+    }
+
+    impl Seek for Zeros {
+        fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+            self.pos = match to {
+                SeekFrom::Start(pos) => pos,
+                SeekFrom::End(delta) => self.len.checked_add_signed(delta).unwrap(),
+                SeekFrom::Current(delta) => self.pos.checked_add_signed(delta).unwrap(),
+            };
+            Ok(self.pos)
+        }
+    }
+
+    /// The dense walk's window is documented as the retained span plus one
+    /// read-ahead block (`FILE_SCANNING.md`, "Memory behavior"). Its buffer
+    /// must be allocated once, at that size: a buffer left to grow on demand
+    /// doubles past the bound and can briefly hold two copies of itself.
+    #[test]
+    fn a_dense_walk_allocates_its_window_once_within_the_documented_bound() {
+        let len = 5 * SEQUENTIAL_READ + 12_345;
+        let mut source = Zeros {
+            len: len as u64,
+            pos: 0,
+        };
+        let mut headers = Headers::new(&mut source, len);
+        headers.retain_from = 0;
+        headers.retain_limit = (8 << 20) + HEADER_READ_AHEAD;
+        let bound = headers.retain_limit + SEQUENTIAL_READ;
+        let trail = 1 << 20; // the walk keeps its last MiB unhashed
+        let mut capacities = Vec::new();
+        let mut pos = 0;
+        while pos + 32 <= len {
+            assert!(headers.at(pos, 32).unwrap().is_some());
+            headers.retain_from = pos.saturating_sub(trail);
+            let capacity = headers.window.capacity();
+            if capacities.last() != Some(&capacity) {
+                capacities.push(capacity);
+            }
+            assert!(
+                capacity <= bound,
+                "window capacity {capacity} exceeds its bound {bound}"
+            );
+            pos += 32;
+        }
+        // First the 64 KiB header window, then the one allocation the first
+        // slide makes; five more slides reuse it.
+        assert_eq!(capacities, vec![HEADER_READ_AHEAD, bound]);
+    }
+
+    /// A dense MCAP generated on demand whose records repeat with a period of
+    /// exactly `period` bytes: 32-byte Message records (9-byte header, 23-byte
+    /// payload drawn from the record's index within the period).
+    struct PeriodicDense {
+        len: usize,
+        pos: usize,
+        period_records: usize,
+        bytes_read: usize,
+    }
+
+    const PERIODIC_RECORD: usize = 32;
+    const PERIODIC_HEAD: usize = 8 + 13;
+
+    impl PeriodicDense {
+        fn new(records: usize, period: usize) -> Self {
+            Self {
+                len: PERIODIC_HEAD + records * PERIODIC_RECORD + 8,
+                pos: 0,
+                period_records: period / PERIODIC_RECORD,
+                bytes_read: 0,
+            }
+        }
+
+        fn byte(&self, p: usize) -> u8 {
+            if p < 8 {
+                return MCAP_MAGIC[p];
+            }
+            if p >= self.len - 8 {
+                return MCAP_MAGIC[p - (self.len - 8)];
+            }
+            if p < PERIODIC_HEAD {
+                return [1, 4, 0, 0, 0, 0, 0, 0, 0, b'r', b'o', b's', b'2'][p - 8];
+            }
+            let record = (p - PERIODIC_HEAD) / PERIODIC_RECORD;
+            let at = (p - PERIODIC_HEAD) % PERIODIC_RECORD;
+            match at {
+                0 => 5,
+                1 => 23,
+                2..=8 => 0,
+                _ => {
+                    // splitmix64 of the record's index within the period
+                    let mut x = ((record % self.period_records) as u64)
+                        .wrapping_add(1)
+                        .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                    x ^= x >> 31;
+                    x.to_le_bytes()[(at - 9) % 8] ^ ((at - 9) / 8) as u8
+                }
+            }
+        }
+    }
+
+    impl Read for PeriodicDense {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let count = buf.len().min(self.len.saturating_sub(self.pos));
+            for (i, out) in buf[..count].iter_mut().enumerate() {
+                *out = self.byte(self.pos + i);
+            }
+            self.pos += count;
+            self.bytes_read += count;
+            Ok(count)
+        }
+    }
+
+    impl Seek for PeriodicDense {
+        fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+            self.pos = match to {
+                SeekFrom::Start(pos) => usize::try_from(pos).unwrap(),
+                SeekFrom::End(delta) => self.len.checked_add_signed(delta as isize).unwrap(),
+                SeekFrom::Current(delta) => self.pos.checked_add_signed(delta as isize).unwrap(),
+            };
+            Ok(self.pos as u64)
+        }
+    }
+
+    /// Content that repeats with the scanner's own batch size (8 MiB), or out
+    /// of step with it, is still read once. With such a period every slide of
+    /// the window meets the pending batch at the same phase, so a boundary
+    /// case in what the window retains would repeat for the whole source and
+    /// send every batch back to the source for a second read.
+    #[test]
+    fn a_dense_source_that_repeats_with_the_batch_period_is_read_once() {
+        for period in [SEGMENT_BATCH, SEGMENT_BATCH + 4096, 5 << 20] {
+            let records = (72usize << 20) / PERIODIC_RECORD;
+            let mut source = PeriodicDense::new(records, period);
+            let len = source.len;
+            let set = scan_format_aware_seekable(
+                &mut source,
+                len,
+                Some(ContainerFormat::Mcap),
+                CdcParams::default(),
+                0,
+            )
+            .unwrap();
+            // Once, plus the first 64 KiB header window twice and the 8-byte
+            // trailing magic (the same constant as the two-million-record
+            // contract test in tests/stream_contracts.rs).
+            assert_eq!(
+                source.bytes_read,
+                len + 2 * HEADER_READ_AHEAD + 8,
+                "period {period}: bytes read from a {len}-byte source"
+            );
+            assert_eq!(set.boundaries.last().unwrap().end, len);
+            assert!(
+                (len / (128 << 10)..len / (32 << 10)).contains(&set.boundaries.len()),
+                "period {period}: {} chunks",
+                set.boundaries.len()
+            );
+        }
+    }
+
+    /// A source shorter than the bound never reserves more than it holds.
+    #[test]
+    fn a_short_dense_walk_does_not_reserve_past_the_source() {
+        let len = HEADER_READ_AHEAD + 300_000;
+        let mut source = Zeros {
+            len: len as u64,
+            pos: 0,
+        };
+        let mut headers = Headers::new(&mut source, len);
+        headers.retain_from = 0;
+        headers.retain_limit = (8 << 20) + HEADER_READ_AHEAD;
+        let mut pos = 0;
+        while pos + 32 <= len {
+            assert!(headers.at(pos, 32).unwrap().is_some());
+            assert!(headers.window.capacity() <= len);
+            pos += 32;
         }
     }
 }

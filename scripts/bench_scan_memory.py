@@ -7,14 +7,31 @@ O(returned chunks), and never O(records) -- except the in-memory compatibility
 APIs, which are not measured here.
 
 Design. Dense (tiny records) and sparse (large records) MCAP logs of the same
-size produce about the same number of chunks (forced cuts closer than the
-minimum chunk are absorbed) but differ ~1000x in record count. So:
+size differ ~1000x in record count, and each is measured at several sizes. The
+scanners treat the two differently on purpose: a sparse walk jumps from header
+to header through a 64 KiB window, a dense walk reads sequentially through a
+bounded sliding window. So each kind of log has its own fixed workspace, and
+the model is
 
-* records-independence: at every size, peak(dense) - peak(sparse) must be
-  within noise, although dense holds ~1000x more records;
-* a least-squares fit  peak = a + b_chunk * chunks + b_record * records  over
-  every sample must give b_record ~ 0 and b_chunk within the per-chunk object
-  cost, with intercept a within the declared workspace.
+    peak = workspace[kind] + b_chunk * chunks + b_record * records
+
+fitted per scanner code path. Within one kind chunks and records both grow
+with file size; across kinds their ratio differs ~1000x, which is what
+separates the two slopes. The contract is then four statements:
+
+* every workspace[kind] is within the bound FILE_SCANNING.md declares for
+  that code path;
+* b_chunk is within the cost of one returned chunk;
+* b_record is ~0: memory does not grow with the number of records;
+* no single sample leaves the envelope  workspace bound + per-chunk cost.
+
+A run whose repeat-to-repeat spread could hide one retained bit per record is
+reported as underpowered and fails: it is not evidence either way.
+
+(An earlier model gave both kinds one shared intercept. When the dense walk
+gained its own bounded window, that model attributed the constant difference
+between the kinds to b_record and reported O(records) memory for a scanner
+whose memory was flat across a 4x change in record count.)
 
 Each measurement runs in a fresh child process and reports its own peak
 resident memory (Windows PeakWorkingSetSize, POSIX ru_maxrss) relative to its
@@ -43,42 +60,54 @@ MCAP_MAGIC = b"\x89MCAP0\r\n"
 MIB = 1 << 20
 BATCH = 8 * MIB
 
-# First-principles bounds (see FILE_SCANNING.md). Workspace: the 32 MiB payload
-# window plus parallel-CDC candidate workspace bounded by that window and a
-# 64 KiB header read-ahead; one returned chunk costs a Python Boundary object, its
-# 32-byte address bytes object, a list slot and the Rust Vec entry it came from.
-MAX_INTERCEPT_BYTES = 160 * MIB
+# Declared bounds (native/ol_chunk/FILE_SCANNING.md, "Memory behavior"), with room
+# for the interpreter and allocator around them.
+#   windowed-stream: the plain-CDC payload window, max(32 MiB, 4 * max_size),
+#     plus the parallel candidate workspace that window bounds.
+#   record-walk: the dense header window (8 MiB + 2 * max_size + 2h + 64 KiB
+#     retained, plus one 16 MiB read-ahead block: 24.1 MiB at the default
+#     sizes) and, only when that window does not hold a batch, the
+#     8 MiB + max_size batch buffer: 32.4 MiB together.
+# One returned chunk costs a Python Boundary object, its 32-byte address bytes
+# object, a list slot and the Rust Vec entry it came from.
+MAX_WORKSPACE_BYTES = {"windowed-stream": 48 * MIB, "record-walk": 40 * MIB}
 MAX_BYTES_PER_CHUNK = 1024
 MAX_BYTES_PER_RECORD = 0.05
-DENSE_SPARSE_TOLERANCE = (8 * MIB, 0.10)  # absolute floor, fraction of peak
+# The smallest per-record retention worth the name is one bit. A run whose
+# repeat spread cannot resolve that proves nothing about records.
+MIN_RESOLVABLE_BYTES_PER_RECORD = 0.125
 
 
 def write_mcap(path: Path, size: int, record_bytes: int) -> int:
-    """Write a valid MCAP v0 log of exactly ``size`` bytes; return its record count."""
+    """Write a valid MCAP v0 log of exactly ``size`` bytes; return its record count.
+
+    Every record carries fresh random bytes, so the log has no period and no
+    two records alike. An earlier generator tiled one 8 MiB batch and padded
+    the end with up to 8 MiB of copies of a single record. Both were corpus
+    artefacts that decided the measured peak: the period equalled the dense
+    scanner's batch size, which locked its window into one of two states
+    (about 16 or 24 MiB touched) for a whole file by where the first cut fell,
+    and a run of identical records is the tie case that the scanner hands to
+    plain CDC with a buffer of its own.
+    """
     payload_len = record_bytes - 9
-    block = os.urandom(4 * MIB)
-    one = bytearray()
+    record_head = b"\x05" + struct.pack("<Q", payload_len)
     records_per_batch = max(1, BATCH // record_bytes)
-    for i in range(records_per_batch):
-        off = (i * 7919) % (len(block) - payload_len)
-        one += b"\x05" + struct.pack("<Q", payload_len) + block[off : off + payload_len]
-    batch = bytes(one)
     header = b"\x01" + struct.pack("<Q", 4) + b"ros2"
     body_budget = size - len(MCAP_MAGIC) * 2 - len(header)
     records = 1
     with path.open("wb") as out:
         out.write(MCAP_MAGIC + header)
-        written = 0
-        while written + len(batch) <= body_budget:
-            out.write(batch)
-            written += len(batch)
-            records += records_per_batch
-        remaining = body_budget - written
+        remaining = body_budget
         while remaining >= record_bytes:
-            out.write(batch[:record_bytes])
-            remaining -= record_bytes
-            written += record_bytes
-            records += 1
+            count = min(records_per_batch, remaining // record_bytes)
+            batch = bytearray(os.urandom(count * record_bytes))
+            # Stamp the 9-byte record header over the start of each record.
+            for offset, value in enumerate(record_head):
+                batch[offset::record_bytes] = bytes([value]) * count
+            out.write(batch)
+            remaining -= count * record_bytes
+            records += count
         if remaining >= 9:
             out.write(b"\x05" + struct.pack("<Q", remaining - 9) + os.urandom(remaining - 9))
             records += 1
@@ -92,12 +121,12 @@ def write_mcap(path: Path, size: int, record_bytes: int) -> int:
 
 
 def write_plain(path: Path, size: int) -> int:
-    block = os.urandom(BATCH)
+    """Write ``size`` random bytes with no period (see write_mcap)."""
     with path.open("wb") as out:
         left = size
         while left:
-            n = min(left, len(block))
-            out.write(block[:n])
+            n = min(left, BATCH)
+            out.write(os.urandom(n))
             left -= n
     return 0
 
@@ -179,45 +208,36 @@ def child(api: str, path: str, fmt: str) -> None:
     }))
 
 
-def lstsq3(rows: list[tuple[float, float, float]]) -> tuple[float, float, float]:
-    """Least squares for y = a + b*x1 + c*x2 via the 3x3 normal equations."""
-    n = len(rows)
-    s = [[0.0] * 3 for _ in range(3)]
-    t = [0.0] * 3
-    for x1, x2, y in rows:
-        v = (1.0, x1, x2)
-        for i in range(3):
-            t[i] += v[i] * y
-            for j in range(3):
-                s[i][j] += v[i] * v[j]
-    if n < 3:
-        raise ValueError("need at least three samples")
-    m = [row[:] + [t[i]] for i, row in enumerate(s)]
-    for col in range(3):
-        pivot = max(range(col, 3), key=lambda r: abs(m[r][col]))
-        if abs(m[pivot][col]) < 1e-12:
-            raise ValueError("degenerate design: vary chunks and records independently")
+def least_squares(columns: list[list[float]], y: list[float]) -> list[float]:
+    """Coefficients of  y = sum(beta[k] * columns[k])  by column-scaled normal equations.
+
+    Raises ValueError when the samples given cannot tell the columns apart
+    (too few sizes, or one kind of log only).
+    """
+    k, n = len(columns), len(y)
+    if n < k:
+        raise ValueError(f"degenerate design: {n} samples cannot determine {k} coefficients")
+    scale = [max(abs(v) for v in column) or 1.0 for column in columns]
+    scaled = [[v / factor for v in column] for column, factor in zip(columns, scale)]
+    m = [
+        [sum(a * b for a, b in zip(scaled[i], scaled[j])) for j in range(k)]
+        + [sum(a * b for a, b in zip(scaled[i], y))]
+        for i in range(k)
+    ]
+    for col in range(k):
+        pivot = max(range(col, k), key=lambda r: abs(m[r][col]))
+        if abs(m[pivot][col]) < 1e-9 * n:
+            raise ValueError(
+                "degenerate design: measure at least two sizes, and dense and sparse logs, "
+                "so chunks and records vary independently"
+            )
         m[col], m[pivot] = m[pivot], m[col]
-        for r in range(3):
+        for r in range(k):
             if r != col:
                 f = m[r][col] / m[col][col]
-                for c in range(col, 4):
+                for c in range(col, k + 1):
                     m[r][c] -= f * m[col][c]
-    return tuple(m[i][3] / m[i][i] for i in range(3))  # type: ignore[return-value]
-
-
-def lstsq2(rows: list[tuple[float, float]]) -> tuple[float, float]:
-    """Least squares for y = a + b*x."""
-    n = len(rows)
-    if n < 2:
-        raise ValueError("need at least two samples")
-    mx = sum(x for x, _ in rows) / n
-    my = sum(y for _, y in rows) / n
-    sxx = sum((x - mx) ** 2 for x, _ in rows)
-    if sxx == 0:
-        raise ValueError("degenerate design: chunk counts do not vary")
-    b = sum((x - mx) * (y - my) for x, y in rows) / sxx
-    return my - b * mx, b
+    return [m[i][k] / m[i][i] / scale[i] for i in range(k)]
 
 
 def code_path(sample: dict) -> str:
@@ -233,66 +253,106 @@ def code_path(sample: dict) -> str:
 
 
 def evaluate(samples: list[dict]) -> dict:
-    """Fit memory per (api, code path) and test the contract.
+    """Fit  peak = workspace[kind] + b_chunk*chunks + b_record*records  per API; test the contract.
 
-    The dense-versus-sparse comparison is CHUNK-ADJUSTED: format-aware chunking
-    can return different chunk counts for dense and sparse logs of one size,
-    and per-chunk output is allowed. Memory that grew with records would
-    survive the adjustment (dense holds ~1000x more records) and fail here.
+    One API's samples are fitted together. The cost of a returned chunk is the
+    same whichever scanner produced it, so the plain log (thousands of chunks,
+    no records) pins b_chunk and the dense log is left to speak about records.
+    Fitting each code path alone leaves b_chunk to the sparse log, whose few
+    chunks cannot resolve it, and the dense log's ordinary per-chunk growth is
+    then charged to records.
     """
     verdicts: list[str] = []
-    groups: dict[tuple[str, str], list[dict]] = {}
-    for s in samples:
-        groups.setdefault((s["api"], code_path(s)), []).append(s)
+    groups: dict[str, list[dict]] = {}
+    for sample in samples:
+        groups.setdefault(sample["api"], []).append(sample)
     fits = {}
-    for (api, path), rows in sorted(groups.items()):
-        label = f"{api}/{path}"
-        records_vary = len({r["records"] for r in rows}) > 1 and any(r["records"] for r in rows)
-        if records_vary:
-            a, b_chunk, b_record = lstsq3([(r["chunks"], r["records"], r["peak_delta_bytes"]) for r in rows])
-        else:
-            a, b_chunk = lstsq2([(r["chunks"], r["peak_delta_bytes"]) for r in rows])
-            b_record = 0.0
-        fits[label] = {"intercept_bytes": a, "bytes_per_chunk": b_chunk, "bytes_per_record": b_record,
-                       "records_vary": records_vary, "samples": len(rows)}
-        if a > MAX_INTERCEPT_BYTES:
-            verdicts.append(f"{label}: intercept {a / MIB:.1f} MiB exceeds {MAX_INTERCEPT_BYTES / MIB:.0f} MiB workspace")
+    growth = []
+    for api, rows in sorted(groups.items()):
+        label = api
+        kinds = sorted({r["kind"] for r in rows})
+        paths = {kind: code_path({"api": api, "kind": kind}) for kind in kinds}
+        bounds = {kind: MAX_WORKSPACE_BYTES[paths[kind]] for kind in kinds}
+        with_records = any(r["records"] for r in rows)
+        columns = [[1.0 if r["kind"] == kind else 0.0 for r in rows] for kind in kinds]
+        columns.append([float(r["chunks"]) for r in rows])
+        if with_records:
+            columns.append([float(r["records"]) for r in rows])
+        beta = least_squares(columns, [float(r["peak_delta_bytes"]) for r in rows])
+        workspace = dict(zip(kinds, beta))
+        b_chunk = beta[len(kinds)]
+        b_record = beta[len(kinds) + 1] if with_records else 0.0
+
+        # Repeat spread: how far two measurements of the same file disagree.
+        cells: dict[tuple[str, int], list[dict]] = {}
+        for r in rows:
+            cells.setdefault((r["kind"], r["size"]), []).append(r)
+        spread = max(
+            max(r["peak_delta_bytes"] for r in cell) - min(r["peak_delta_bytes"] for r in cell)
+            for cell in cells.values()
+        )
+        # Records vary WITHIN a kind only through file size (the level of each
+        # kind is its workspace), so this span is the lever arm b_record rests on.
+        record_span = max(
+            max(r["records"] for r in rows if r["kind"] == kind) - min(r["records"] for r in rows if r["kind"] == kind)
+            for kind in kinds
+        )
+        resolvable = (2.0 * spread / record_span) if record_span else None
+        fits[label] = {
+            "workspace_bytes": workspace, "workspace_bound_bytes": bounds, "code_paths": paths,
+            "bytes_per_chunk": b_chunk, "bytes_per_record": b_record, "records_vary": with_records,
+            "repeat_spread_bytes": spread, "record_span": record_span,
+            "resolvable_bytes_per_record": resolvable, "samples": len(rows),
+        }
+        for kind, value in workspace.items():
+            if value > bounds[kind]:
+                verdicts.append(f"{label}: {kind} workspace {value / MIB:.1f} MiB exceeds the declared "
+                                f"{bounds[kind] / MIB:.0f} MiB ({paths[kind]})")
         if b_chunk > MAX_BYTES_PER_CHUNK:
             verdicts.append(f"{label}: {b_chunk:.0f} bytes/chunk exceeds {MAX_BYTES_PER_CHUNK}")
-        # One-sided: the contract forbids memory that GROWS with records. Within
-        # one corpus kind chunks and records are proportional, so the joint fit
-        # can trade a little per-chunk cost for a small negative per-record term;
-        # that is collinearity, not memory, and the chunk-adjusted dense/sparse
-        # comparison below is the direct test of record independence.
-        if b_record > MAX_BYTES_PER_RECORD:
-            verdicts.append(f"{label}: {b_record:.4f} bytes/record exceeds {MAX_BYTES_PER_RECORD} (O(records) memory)")
+        # One-sided: the contract forbids memory that GROWS with records.
+        if with_records:
+            if b_record > MAX_BYTES_PER_RECORD:
+                verdicts.append(f"{label}: {b_record:.4f} bytes/record exceeds {MAX_BYTES_PER_RECORD} "
+                                "(O(records) memory)")
+            elif resolvable is None or resolvable > MIN_RESOLVABLE_BYTES_PER_RECORD:
+                shown = "nothing (records do not vary within a kind)" if resolvable is None \
+                    else f"only {resolvable:.3f} bytes/record"
+                verdicts.append(f"{label}: underpowered: repeat spread {spread / MIB:.2f} MiB over a span of "
+                                f"{record_span:,} records resolves {shown}; use larger sizes or more repeats")
         for r in rows:
-            bound = MAX_INTERCEPT_BYTES + MAX_BYTES_PER_CHUNK * r["chunks"]
-            if r["peak_delta_bytes"] > bound:
+            envelope = bounds[r["kind"]] + MAX_BYTES_PER_CHUNK * r["chunks"]
+            if r["peak_delta_bytes"] > envelope:
                 verdicts.append(f"{label}: sample at {r['size'] / MIB:.0f} MiB ({r['kind']}) used "
-                                f"{r['peak_delta_bytes'] / MIB:.1f} MiB > envelope {bound / MIB:.1f} MiB")
-    pairs = []
-    for (api, path), rows in sorted(groups.items()):
-        if path != "record-walk" and api != "cdc_file":
-            continue
-        b_chunk = fits[f"{api}/{path}"]["bytes_per_chunk"]
-        for size in sorted({r["size"] for r in rows}):
-            dense = [r for r in rows if r["size"] == size and r["kind"] == "mcap-dense"]
-            sparse = [r for r in rows if r["size"] == size and r["kind"] == "mcap-sparse"]
-            if not dense or not sparse:
+                                f"{r['peak_delta_bytes'] / MIB:.1f} MiB > envelope {envelope / MIB:.1f} MiB")
+        # The same statement without a model, for a reader: what each kind's
+        # peak did between its smallest and its largest file.
+        for kind in kinds:
+            sizes = sorted({r["size"] for r in rows if r["kind"] == kind})
+            if len(sizes) < 2:
                 continue
-            d = statistics.median(r["peak_delta_bytes"] - b_chunk * r["chunks"] for r in dense)
-            sp = statistics.median(r["peak_delta_bytes"] - b_chunk * r["chunks"] for r in sparse)
-            raw_d = statistics.median(r["peak_delta_bytes"] for r in dense)
-            raw_s = statistics.median(r["peak_delta_bytes"] for r in sparse)
-            limit = max(DENSE_SPARSE_TOLERANCE[0], DENSE_SPARSE_TOLERANCE[1] * max(raw_d, raw_s))
-            pairs.append({"api": api, "path": path, "size": size, "dense_records": dense[0]["records"],
-                          "sparse_records": sparse[0]["records"], "dense_chunks": dense[0]["chunks"],
-                          "sparse_chunks": sparse[0]["chunks"], "dense_median": raw_d, "sparse_median": raw_s,
-                          "chunk_adjusted_difference": d - sp, "limit": limit})
-            if d - sp > limit:
-                verdicts.append(f"{api} @ {size / MIB:.0f} MiB: chunk-adjusted dense exceeds sparse by {(d - sp) / MIB:.1f} MiB")
-    return {"fits": fits, "dense_vs_sparse": pairs, "failures": verdicts, "passed": not verdicts}
+            small, large = cells[(kind, sizes[0])], cells[(kind, sizes[-1])]
+            growth.append({
+                "api": api, "path": paths[kind], "kind": kind, "smallest_size": sizes[0], "largest_size": sizes[-1],
+                "records": [small[0]["records"], large[0]["records"]],
+                "chunks": [small[0]["chunks"], large[0]["chunks"]],
+                "median_peak_bytes": [statistics.median(r["peak_delta_bytes"] for r in small),
+                                      statistics.median(r["peak_delta_bytes"] for r in large)],
+            })
+    return {"fits": fits, "growth": growth, "failures": verdicts, "passed": not verdicts}
+
+
+def print_verdict(verdict: dict) -> None:
+    for label, fit in verdict["fits"].items():
+        spaces = "  ".join(f"{kind} {value / MIB:.1f}" for kind, value in fit["workspace_bytes"].items())
+        print(f"fit {label}: workspace MiB [{spaces}]  {fit['bytes_per_chunk']:.0f} B/chunk  "
+              f"{fit['bytes_per_record']:.5f} B/record  (repeat spread {fit['repeat_spread_bytes'] / MIB:.2f} MiB)")
+    for g in verdict["growth"]:
+        low, high = g["median_peak_bytes"]
+        print(f"  {g['api']} {g['kind']}: {g['smallest_size'] / MIB:.0f} -> {g['largest_size'] / MIB:.0f} MiB, "
+              f"records {g['records'][0]:,} -> {g['records'][1]:,}, chunks {g['chunks'][0]:,} -> {g['chunks'][1]:,}: "
+              f"peak {low / MIB:.1f} -> {high / MIB:.1f} MiB")
+    print("PASS" if verdict["passed"] else "FAIL: " + "; ".join(verdict["failures"]))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -316,13 +376,7 @@ def main(argv: list[str] | None = None) -> int:
         saved.update(verdict)
         out = args.report or args.evaluate
         out.write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8")
-        for label, fit in verdict["fits"].items():
-            print(f"fit {label}: a={fit['intercept_bytes'] / MIB:.1f} MiB  {fit['bytes_per_chunk']:.0f} B/chunk  "
-                  f"{fit['bytes_per_record']:.5f} B/record")
-        for p in verdict["dense_vs_sparse"]:
-            print(f"  {p['api']} {p['size'] / MIB:.0f} MiB: records {p['dense_records']:,} vs {p['sparse_records']:,}; "
-                  f"chunk-adjusted dense-sparse {p['chunk_adjusted_difference'] / MIB:+.2f} MiB (limit {p['limit'] / MIB:.1f})")
-        print("PASS" if verdict["passed"] else "FAIL: " + "; ".join(verdict["failures"]))
+        print_verdict(verdict)
         return 0 if verdict["passed"] else 1
     if args.workdir is None or args.report is None:
         parser.error("--workdir and --report are required")
@@ -340,8 +394,6 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 for api in apis:
                     fmt = "none" if kind == "plain" else "mcap"
-                    if kind == "plain" and api == "format_aware_fd":
-                        continue
                     for rep in range(args.repeats):
                         proc = subprocess.run(
                             [sys.executable, __file__, "--child", api, str(path), fmt],
@@ -368,18 +420,16 @@ def main(argv: list[str] | None = None) -> int:
         "environment": {
             "platform": platform.platform(), "machine": platform.machine(), "processor": platform.processor(),
             "python": sys.version.split()[0], "native_version": native_version, "cpus": os.cpu_count(),
-            "workdir": str(args.workdir),
         },
-        "bounds": {"max_intercept_bytes": MAX_INTERCEPT_BYTES, "max_bytes_per_chunk": MAX_BYTES_PER_CHUNK,
-                   "max_bytes_per_record": MAX_BYTES_PER_RECORD, "dense_sparse_tolerance": DENSE_SPARSE_TOLERANCE},
+        "bounds": {"max_workspace_bytes": MAX_WORKSPACE_BYTES, "max_bytes_per_chunk": MAX_BYTES_PER_CHUNK,
+                   "max_bytes_per_record": MAX_BYTES_PER_RECORD,
+                   "min_resolvable_bytes_per_record": MIN_RESOLVABLE_BYTES_PER_RECORD},
         "samples": samples,
         **verdict,
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    for api, fit in verdict["fits"].items():
-        print(f"fit {api}: a={fit['intercept_bytes'] / MIB:.1f} MiB  {fit['bytes_per_chunk']:.0f} B/chunk  {fit['bytes_per_record']:.5f} B/record")
-    print("PASS" if verdict["passed"] else "FAIL: " + "; ".join(verdict["failures"]))
+    print_verdict(verdict)
     return 0 if verdict["passed"] else 1
 
 

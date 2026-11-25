@@ -163,6 +163,34 @@ ceiling. A low minimum chunk size can produce a large output. The separate
 intentionally return every record/box offset and require O(records/boxes)
 space; the file chunk scanner does not use those list-returning APIs.
 
+The dense header window is allocated once, at its bound, on the first slide
+(`stream::tests::a_dense_walk_allocates_its_window_once_within_the_documented_bound`).
+Left to grow on demand it doubled to 32 MiB and, on an allocator that cannot
+extend a large block in place, briefly held the old and the new copy: macOS
+measured 48.7 MiB for a 256 MiB dense log before this was fixed.
+
+`scripts/bench_scan_memory.py` qualifies this table on real files (in CI:
+256 MiB and 1 GiB, dense, sparse and plain, on Linux, Windows and macOS). Each
+kind of log has its own fixed workspace, so it fits
+`peak = workspace[kind] + b_chunk * chunks + b_record * records` per API and
+requires:
+
+- every workspace within the bound declared here plus room for the
+  interpreter: 40 MiB for the record walk, 48 MiB for the windowed stream;
+- `b_chunk` at most 1,024 bytes and `b_record` at most 0.05 bytes;
+- repeat-to-repeat spread small enough to see one retained bit per record
+  (otherwise the run fails as underpowered).
+
+Its logs are random throughout. A log that tiles one 8 MiB block repeats with
+the scanner's batch size, which locks the dense window to one phase for the
+whole file (about 16 or 24 MiB touched, by where the first cut falls), and a
+run of identical records is the tie case handed to plain CDC with a buffer of
+its own; both make the measured peak a property of the corpus.
+
+Measured on Windows, 256 MiB to 1 GiB: dense 25.6 to 26.8 MiB while records
+went from 8.4 M to 33.6 M (the growth is the 12,272 additional returned
+chunks), sparse 9.4 to 9.7 MiB, plain 33.8 to 34.9 MiB; `b_record` -0.005.
+
 Python exposes `CDC_FILE_WINDOW_BYTES` and `FORMAT_AWARE_IN_MEMORY_LIMIT` so
 callers can inspect the declared limits. These are payload limits, not full
 process memory budgets.

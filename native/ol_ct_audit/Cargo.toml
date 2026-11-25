@@ -20,6 +20,8 @@ ol_capability         = { path = "../ol_capability" }
 ol_duress             = { path = "../ol_duress" }
 ol_pqkem              = { path = "../ol_pqkem" }
 ol_confidential       = { path = "../ol_confidential" }
+ol_quic               = { path = "../ol_quic" }
+rustls                = { workspace = true }
 blake3                = { workspace = true }
 zeroize               = { workspace = true }
 rand_chacha           = "0.3"

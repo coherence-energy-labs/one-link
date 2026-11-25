@@ -302,6 +302,32 @@ def list_cases(binary: pathlib.Path) -> list[dict]:
     return cases
 
 
+def memcheck_command(valgrind: list[str], xml_path: pathlib.Path, binary: pathlib.Path, case: str) -> list[str]:
+    """The Memcheck invocation for one case.
+
+    Leak kinds are switched off: this audit judges secret-dependent control
+    flow and memory addresses, plus genuine memory errors (invalid reads and
+    writes stay violations). Blocks still allocated when a short-lived audit
+    process exits (process-wide state in the TLS and RNG libraries) say
+    nothing about either. XML mode forces ``--leak-check=full`` whatever is
+    asked (measured on Valgrind 3.22: ``--leak-check=no`` still reported
+    ``Leak_PossiblyLost``), so the leak KINDS are deselected instead. Leak
+    detection for shipped code belongs to the sanitizer and fuzz lanes.
+    """
+    return [
+        *valgrind,
+        "--tool=memcheck",
+        "--show-leak-kinds=none",
+        "--errors-for-leak-kinds=none",
+        "--track-origins=yes",
+        "--error-limit=no",
+        "--xml=yes",
+        f"--xml-file={xml_path}",
+        str(binary),
+        case,
+    ]
+
+
 def run_case(
     case: dict,
     binary: pathlib.Path,
@@ -317,16 +343,7 @@ def run_case(
     xml_path = work / f"{case['name']}.xml"
     if xml_path.exists():
         xml_path.unlink()
-    command = [
-        *valgrind,
-        "--tool=memcheck",
-        "--track-origins=yes",
-        "--error-limit=no",
-        "--xml=yes",
-        f"--xml-file={xml_path}",
-        str(binary),
-        case["name"],
-    ]
+    command = memcheck_command(valgrind, xml_path, binary, case["name"])
     try:
         proc = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:

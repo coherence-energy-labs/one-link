@@ -1396,8 +1396,10 @@ dependencies = [
  "ol_onion",
  "ol_pair_qr",
  "ol_pqkem",
+ "ol_quic",
  "ol_threshold_recovery",
  "rand_chacha 0.3.1",
+ "rustls",
  "x25519-dalek",
  "zeroize",
 ]
@@ -1676,6 +1678,7 @@ dependencies = [
  "rcgen",
  "ring",
  "rustls",
+ "subtle",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",

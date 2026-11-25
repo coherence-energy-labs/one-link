@@ -168,6 +168,36 @@ fn threshold_share_byte() {
     }
 }
 
+// -------------------------------------------------------------------- quic
+
+/// The dialer's server-certificate check. The fingerprint the dialer expects
+/// is secret; the presented certificate is public. Run for a matching
+/// fingerprint and for mismatches at the first and last byte.
+fn quic_server_cert_fingerprint() {
+    use rustls::client::danger::ServerCertVerifier;
+    use rustls::pki_types::{ServerName, UnixTime};
+    let identity = ol_quic::Identity::generate().expect("a fresh QUIC identity");
+    let cert = identity.cert_der().into_owned();
+    let name = ServerName::try_from("peer.invalid").expect("a valid DNS name");
+    // Read once, before any secret is marked; the verifier ignores the time.
+    let now = UnixTime::now();
+    for flipped in [None, Some(0usize), Some(31)] {
+        let mut expected = identity.fingerprint();
+        if let Some(index) = flipped {
+            expected[index] ^= 0xFF;
+        }
+        let verifier = ol_quic::IdentityBoundServerVerifier::new(expected);
+        mark_secret(&verifier);
+        let outcome = black_box(&verifier).verify_server_cert(&cert, &[], &name, &[], now);
+        let accepted = public(outcome.is_ok());
+        assert_eq!(
+            accepted,
+            flipped.is_none(),
+            "only the matching fingerprint verifies"
+        );
+    }
+}
+
 // ------------------------------------------------------------------- onion
 
 fn onion_hop_id_eq() {
@@ -551,6 +581,13 @@ const CASES: &[Case] = &[
         covers: &[],
         what: "Shamir split of secret bytes with a secret coefficient stream",
         run: threshold_share_byte,
+    },
+    Case {
+        name: "quic_server_cert_fingerprint",
+        expect: Expect::Clean,
+        covers: &["ol_quic/tests/constant_time.rs::fingerprint_ct_compare_timing_uniform"],
+        what: "the dialer's server-certificate fingerprint check under a secret expected fingerprint",
+        run: quic_server_cert_fingerprint,
     },
     Case {
         name: "onion_hop_id_eq",

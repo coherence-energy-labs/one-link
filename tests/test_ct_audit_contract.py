@@ -197,8 +197,23 @@ def test_marker_in_a_caller_frame_does_not_excuse_the_callee(tree: Path):
 
 def test_non_secret_error_kind_is_never_declassified(tree: Path):
     lib = (tree / "native/crate/src/lib.rs").as_posix()
-    [report] = _classify(tree, [("f", lib, 2)], kind="InvalidRead")
-    assert report.classification == "violation"
+    for kind in ("InvalidRead", "InvalidWrite", "InvalidFree", "Leak_PossiblyLost", "SyscallParam"):
+        [report] = _classify(tree, [("f", lib, 2)], kind=kind)
+        assert report.classification == "violation", kind
+
+
+def test_memcheck_runs_without_exit_time_leak_reports_but_keeps_memory_errors():
+    command = audit.memcheck_command(["valgrind"], Path("case.xml"), Path("bin"), "some_case")
+    # Exit-time leak summaries are out of this audit's scope and are switched
+    # off at the source; a leak kind that still appeared would be a violation
+    # (test above), so this cannot silently hide one.
+    # XML mode forces --leak-check=full, so the kinds are deselected instead.
+    assert "--show-leak-kinds=none" in command and "--errors-for-leak-kinds=none" in command
+    assert "--leak-check=no" not in command, "XML mode ignores it; it would only look like protection"
+    assert "--tool=memcheck" in command and "--xml=yes" in command
+    assert command[-2:] == ["bin", "some_case"]
+    # Nothing here suppresses memory errors or undefined-value reports.
+    assert not any(arg.startswith(("--suppressions", "--undef-value-errors=no")) for arg in command)
 
 
 def test_external_declassification_requires_exact_version_line_and_text(tree: Path):

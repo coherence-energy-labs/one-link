@@ -21,6 +21,7 @@ ed25519-dalek  = { workspace = true }
 x509-parser    = { workspace = true }
 rand_core      = { workspace = true }
 blake3         = { workspace = true }
+subtle         = { workspace = true }
 thiserror      = { workspace = true }
 tracing        = { workspace = true }
 

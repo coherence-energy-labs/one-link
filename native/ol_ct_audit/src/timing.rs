@@ -1008,6 +1008,71 @@ impl Harness for ShareByte {
     }
 }
 
+// ===================================================================== quic
+
+/// The dialer's server-certificate check (`IdentityBoundServerVerifier`):
+/// the fingerprint the dialer expects is the secret, the presented
+/// certificate is public, and both classes reject it. The server name and
+/// the time are fixed outside the timed call.
+struct QuicServerCertFingerprint {
+    cert: rustls::pki_types::CertificateDer<'static>,
+    name: rustls::pki_types::ServerName<'static>,
+    now: rustls::pki_types::UnixTime,
+    near_expected: ol_quic::PeerFingerprint,
+}
+
+impl QuicServerCertFingerprint {
+    fn accepts(&self, verifier: &ol_quic::IdentityBoundServerVerifier) -> bool {
+        use rustls::client::danger::ServerCertVerifier;
+        verifier
+            .verify_server_cert(&self.cert, &[], &self.name, &[], self.now)
+            .is_ok()
+    }
+}
+
+impl Harness for QuicServerCertFingerprint {
+    type Input = ol_quic::IdentityBoundServerVerifier;
+    type Output = bool;
+    fn setup(_rng: &mut ChaCha20Rng) -> Self {
+        let identity = ol_quic::Identity::generate().expect("a fresh QUIC identity");
+        let harness = Self {
+            cert: identity.cert_der().into_owned(),
+            name: rustls::pki_types::ServerName::try_from("peer.invalid")
+                .expect("a valid DNS name"),
+            // Read once in setup, never inside the timed call.
+            now: rustls::pki_types::UnixTime::now(),
+            near_expected: near(identity.fingerprint()),
+        };
+        assert!(
+            harness.accepts(&ol_quic::IdentityBoundServerVerifier::new(
+                identity.fingerprint()
+            )),
+            "the matching fingerprint must verify"
+        );
+        assert!(
+            !harness.accepts(&ol_quic::IdentityBoundServerVerifier::new(
+                harness.near_expected
+            )),
+            "both classes must reject"
+        );
+        harness
+    }
+    fn input(
+        &mut self,
+        class: Class,
+        rng: &mut ChaCha20Rng,
+    ) -> ol_quic::IdentityBoundServerVerifier {
+        ol_quic::IdentityBoundServerVerifier::new(match class {
+            Class::Fixed => self.near_expected,
+            Class::Random => bytes(rng),
+        })
+    }
+    #[inline(never)]
+    fn run(&mut self, input: &ol_quic::IdentityBoundServerVerifier) -> bool {
+        self.accepts(input)
+    }
+}
+
 // ==================================================================== onion
 
 struct HopIdEq {
@@ -1747,6 +1812,17 @@ pub(crate) const TARGETS: &[Target] = &[
         random: "uniform shared secrets (the derived key differs from the reference throughout)",
         calls: 2,
         measure: measure::<ChainKeyEq>,
+    },
+    Target {
+        name: "quic_server_cert_fingerprint",
+        expect: Expect::ConstantTime,
+        covers: &["quic_server_cert_fingerprint"],
+        what: "the dialer's server-certificate fingerprint check (X.509 parse + constant-time compare); both classes reject",
+        secret: "the 32-byte fingerprint the dialer expects",
+        fixed: "the presented certificate's fingerprint with its last byte flipped (an early-exit compare would scan all 32 bytes)",
+        random: "uniform fingerprints (an early-exit compare would stop at the first byte)",
+        calls: 1,
+        measure: measure::<QuicServerCertFingerprint>,
     },
     Target {
         name: "onion_header_mac_verify",

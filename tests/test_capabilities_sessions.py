@@ -96,3 +96,22 @@ def test_session_catalog_names_core_peer_flows():
         "folder_merkle_sync",
         "pairing",
     } <= names
+
+
+def test_session_catalog_exposes_receiver_commit_completion_contracts():
+    from one_link.capabilities import FILE_COMMIT_RECEIPT_V1, FOLDER_SYNC_COMMIT_V1
+
+    catalog = {entry["name"]: entry for entry in protocol_catalog()}
+    for name in ("file_cdc_transfer", "file_binary_stream"):
+        entry = catalog[name]
+        assert entry["schema_version"] == 2
+        assert entry["capability"] == FILE_COMMIT_RECEIPT_V1
+        assert entry["completion_message"] == "FILE_COMMIT"
+        assert entry["steps"][-1]["message"] == "FILE_COMMIT"
+        assert "sent_unconfirmed" in entry["completion_requirement"]
+    folder = catalog["folder_merkle_sync"]
+    assert folder["capability"] == FOLDER_SYNC_COMMIT_V1
+    assert [step["message"] for step in folder["steps"][-2:]] == [
+        "FOLDER_SYNC_VERIFY", "FOLDER_SYNC_COMMIT",
+    ]
+    assert folder["completion_message"] == "FOLDER_SYNC_COMMIT"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import importlib.util
 import json
 import os
@@ -84,7 +85,7 @@ def decide(report, event, needs=None):
     ({"native/src/lib.rs": "changed code\n"}, True),
     ({"native/src/lib.rs": None}, True),
     ({"native/src/lib.rs": None, "docs/moved.rs": "baseline\n"}, True),
-    ({"native/src/space and\nnewline.rs": "code\n"}, True),
+    ({"native/src/space and newline.rs": "code\n"}, True),
     ({"uv.lock": "dependencies\n"}, True),
     ({"scripts/native_ci_scope.py": "policy\n"}, True),
 ])
@@ -94,6 +95,32 @@ def test_complete_diff_handles_docs_code_empty_deleted_and_moved_paths(repositor
     assert report["diff_verified"] is True
     assert set(report["changed_paths"]) == set(changes)
     assert ("all applicable work succeeded" if applicable else "proves no applicable paths") in decide(report, event)
+
+
+@pytest.mark.parametrize("kind", scope.PATHS)
+def test_nul_diff_preserves_newline_paths_without_host_filename_restrictions(repository, kind, monkeypatch):
+    event, candidate_report = candidate(repository, kind, {"docs/guide.md": "doc\n"})
+    # Git can report paths created on another platform that Windows cannot
+    # materialize. Exercise that raw diff contract without creating such a
+    # filename; commit identity and ancestry checks still use the real repo.
+    path = "native/src/space and\nnewline.rs"
+    raw_diff = b"docs/guide.md\0" + path.encode("utf-8") + b"\0"
+    real_git = scope._git
+
+    def diff_with_newline(repo, *args):
+        if args[0] == "diff":
+            assert "-z" in args and "--no-renames" in args
+            return raw_diff
+        return real_git(repo, *args)
+
+    monkeypatch.setattr(scope, "_git", diff_with_newline)
+    report = scope.compute_scope(repository, kind, "pull_request", event, candidate_report["checkout_sha"])
+    assert report["changed_paths"] == ["docs/guide.md", path]
+    assert report["matching_paths"] == [path]
+    assert report["changed_count"] == 2 and report["matching_count"] == 1
+    assert report["diff_sha256"] == hashlib.sha256(raw_diff).hexdigest()
+    assert report["applicable"] is True
+    assert "all applicable work succeeded" in decide(report, event)
 
 
 def test_scope_inspects_the_entire_diff_without_github_path_filter_limits(repository):

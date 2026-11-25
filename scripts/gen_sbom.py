@@ -148,6 +148,19 @@ def _validate_frozen_requirements(path: Path) -> None:
             raise SbomError(f"Python requirement has no SHA-256 distribution hash: {requirement!r}")
 
 
+def _license_choice(value: str) -> list[dict[str, Any]]:
+    """CycloneDX license entry for a Cargo `license` string.
+
+    A compound SPDX expression ("Apache-2.0 OR MIT") must use the `expression`
+    form; `license.id` accepts only a single SPDX identifier, and the schema
+    rejects an expression there. Every component (workspace member, vendored
+    backport, and its pedigree ancestor) goes through this one function.
+    """
+    if re.search(r"(?:^|\s)(?:AND|OR|WITH)(?:\s|$)|[()]", value):
+        return [{"expression": value}]
+    return [{"license": {"id": value}}]
+
+
 def _cargo_purl(name: str, version: str, source: str | None) -> str:
     base = f"pkg:cargo/{quote(name, safe='-._~')}@{quote(version, safe='-._~')}"
     qualifiers: list[tuple[str, str]] = []
@@ -353,11 +366,7 @@ def _cargo_inventory(
             additions["one-link:cargo:workspace-member"] = "true"
             additions["one-link:cargo:workspace-path"] = member["path"]
             if "license" in member:
-                license_value = member["license"]
-                if re.search(r"(?:^|\s)(?:AND|OR|WITH)(?:\s|$)|[()]", license_value):
-                    component["licenses"] = [{"expression": license_value}]
-                else:
-                    component["licenses"] = [{"license": {"id": license_value}}]
+                component["licenses"] = _license_choice(member["license"])
             if "description" in member:
                 component["description"] = member["description"]
         vendor = vendors.get((package.name, package.version))
@@ -371,14 +380,14 @@ def _cargo_inventory(
                 package.name, package.version, "registry+https://github.com/rust-lang/crates.io-index"
             )
             component["modified"] = True
-            component["licenses"] = [{"license": {"id": proof["package"]["license"]}}]
+            component["licenses"] = _license_choice(proof["package"]["license"])
             component["hashes"] = [{"alg": "SHA-256", "content": proof["source_tree_sha256"]}]
             component["pedigree"] = {
                 "ancestors": [{
                     "type": "library", "name": package.name, "version": package.version,
                     "purl": component["purl"],
                     "hashes": [{"alg": "SHA-256", "content": upstream["crate_sha256"]}],
-                    "licenses": [{"license": {"id": proof["package"]["license"]}}],
+                    "licenses": _license_choice(proof["package"]["license"]),
                     "externalReferences": [{"type": "distribution", "url": upstream["crate_url"]}],
                 }],
                 "patches": [{"type": "backport", "diff": {

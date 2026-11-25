@@ -1811,11 +1811,20 @@ def complete_pending_recovery(
                     overwrite=bool(intent.get("overwrite_files", True)),
                 )
 
+            from one_link import state as _state
+
             master_seed.install_seed_derived_authority(
                 root,
                 identity_path=id_path,
                 seed=seed,
                 previous_seed=previous_seed,
+                # A bundle-restored state.db is already keyed to this seed;
+                # only a state.db that survives the transaction is re-keyed.
+                state_db_restored=any(
+                    str(name).replace("\\", "/").casefold()
+                    == _state.DB_FILE.casefold()
+                    for name in written
+                ),
             )
             # A durable applied phase separates transaction work from cleanup.
             # If power fails after either stage file is removed, replay can
@@ -1996,9 +2005,13 @@ def restore_artifact_evidence(
         "data_root_key_artifact": root / lockbox.DRK_FILENAME,
         "lockbox_salt_artifact": root / lockbox.SALT_FILENAME,
         "lockbox_dek_envelope_artifact": root / lockbox.DEK_ENVELOPE_FILENAME,
-        "state_db_artifact": root / "state.db",
-        "state_wal_artifact": root / "state.db-wal",
-        "state_shm_artifact": root / "state.db-shm",
+        # Everything the current data key protects, from the registry the
+        # key-minting guards use (state.db and its sidecars included).
+        **{
+            f"{artifact.name}_artifact": artifact.path(root)
+            for artifact in lockbox.DEK_PROTECTED_ARTIFACTS
+            if not artifact.regenerable
+        },
         "state_key_artifact": root / keychain.LOCAL_KEY_FILENAME,
         "state_recovery_key_artifact": root / keychain.RECOVERY_KEY_FILENAME,
         "pending_recovery_artifact": _intent_path(root),

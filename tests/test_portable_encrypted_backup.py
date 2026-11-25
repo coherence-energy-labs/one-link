@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from one_link import backup_bundle, keychain, master_seed, state_encryption
+from one_link import backup_bundle, keychain, lockbox, master_seed, state_encryption
 from one_link.key_material import KeyMaterialIntegrityError
 from one_link.state import State
 
@@ -61,6 +61,12 @@ def _make_live_source(
 ) -> tuple[Path, State]:
     root = _data_root(monkeypatch, home)
     master_seed.store_seed(root, seed)
+    # Bootstrap the source the way the daemon does before State opens: an
+    # explicit-passphrase install publishes its LockBox recovery envelope
+    # first (a no-op in silent mode).  Without it, a passphrase in the
+    # environment at export time would be minting a new data key over an
+    # existing state.db, which create_bundle refuses (test_dek_authority_registry).
+    lockbox.prepare_bootstrap_recovery_envelope(root, seed=seed)
     state = State(db_path=root / "state.db")
     state.set_setting("portable-proof", "exact-row-value")
     return root, state

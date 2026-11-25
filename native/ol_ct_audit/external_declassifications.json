@@ -1,0 +1,15 @@
+{
+  "schema": "one-link/ct-audit-external-declassifications/v1",
+  "policy": "A verdict branch inside a third-party crate may be declassified only by an entry here: exact package and version (as locked), file, line and the reviewed source text. A version bump or any edit to that line stops the entry matching, so the audit fails until the new code is reviewed.",
+  "entries": [
+    {
+      "package": "universal-hash",
+      "version": "0.5.1",
+      "file": "src/lib.rs",
+      "line": 154,
+      "source_text": "if self.finalize().ct_eq(expected).into() {",
+      "reason": "Poly1305 tag verdict: the tag is compared with subtle::ConstantTimeEq and only accept/reject (the AEAD's public result) is branched on. Reached from chacha20poly1305 0.10.1 decrypt_in_place_detached.",
+      "cases": ["confidential_unseal_tampered"]
+    }
+  ]
+}

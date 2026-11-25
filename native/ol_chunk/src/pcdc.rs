@@ -18,6 +18,7 @@
 //! 0.36-0.74 ms/MiB, its largest remaining serial ingest cost.
 
 use crate::cdc::CdcParams;
+use crate::error::ChunkError;
 use fastcdc::v2020::{get_gear_with_seed, logarithm2, MASKS};
 use rayon::prelude::*;
 
@@ -25,12 +26,42 @@ const SEGMENT: usize = 1 << 20;
 const WINDOW: usize = 63;
 
 /// Byte ranges `[start, end)` of every chunk, identical to the serial scanner.
-#[must_use]
-pub fn chunk_ranges(buffer: &[u8], params: CdcParams) -> Vec<(usize, usize)> {
+///
+/// # Errors
+///
+/// The [`CdcParams::validate`] error for an invalid profile, before any byte
+/// is hashed; [`ChunkError::NoProgress`] if a cut fails to advance (not
+/// reachable with validated parameters).
+pub fn chunk_ranges(buffer: &[u8], params: CdcParams) -> Result<Vec<(usize, usize)>, ChunkError> {
+    params.validate()?;
+    unvalidated_chunk_ranges(buffer, params)
+}
+
+/// v2020 normalization-level-1 masks `(mask_s, mask_l)` for `avg_size`, or
+/// `None` when the average has no entry in [`MASKS`] (only outside
+/// [`CdcParams::AVG_SIZE_RANGE`]).
+fn level1_masks(avg_size: u32) -> Option<(u64, u64)> {
+    let bits = usize::try_from(logarithm2(avg_size)).ok()?;
+    Some((
+        *MASKS.get(bits.checked_add(1)?)?,
+        *MASKS.get(bits.checked_sub(1)?)?,
+    ))
+}
+
+/// The kernel behind [`chunk_ranges`] without the parameter gate. It stays
+/// total on any profile: an average with no mask is an error, and so is a
+/// cut that does not advance, which is what `(1, 2, 4)` produced (`avg = 2`
+/// selects the all-zero masks, so every position is a cut and the first
+/// candidate is offset 0; the loop then pushed `(0, 0)` until allocation
+/// failed). Separate so the guard can be tested with those very parameters.
+fn unvalidated_chunk_ranges(
+    buffer: &[u8],
+    params: CdcParams,
+) -> Result<Vec<(usize, usize)>, ChunkError> {
+    let (mask_s, mask_l) = level1_masks(params.avg_size).ok_or(ChunkError::InvalidParameters(
+        "avg_size has no FastCDC mask",
+    ))?;
     let (gear, _gear_ls) = get_gear_with_seed(0);
-    let bits = logarithm2(params.avg_size);
-    let mask_s = MASKS[(bits + 1) as usize];
-    let mask_l = MASKS[(bits - 1) as usize];
     let n = buffer.len();
     let starts: Vec<usize> = (0..n).step_by(SEGMENT).collect();
     let parts: Vec<(Vec<usize>, Vec<usize>)> = starts
@@ -65,6 +96,7 @@ pub fn chunk_ranges(buffer: &[u8], params: CdcParams) -> Vec<(usize, usize)> {
         params.avg_size as usize,
         params.max_size as usize,
     );
+    // `level1_masks` has no entry below avg = 2, so the divisor is non-zero.
     let mut out = Vec::with_capacity(n / sizes.1 + 1);
     let mut start = 0;
     while start < n {
@@ -77,10 +109,20 @@ pub fn chunk_ranges(buffer: &[u8], params: CdcParams) -> Vec<(usize, usize)> {
             &gear,
             (&cand_s, &cand_l),
         );
+        // `cut` never returns more than the `n - start` bytes it was given
+        // (its region-A positions are below `remaining` and its candidates
+        // are buffer positions), for any profile; zero is the one way this
+        // loop could fail to terminate.
+        if count == 0 {
+            return Err(ChunkError::NoProgress {
+                offset: start,
+                len: n,
+            });
+        }
         out.push((start, start + count));
         start += count;
     }
-    out
+    Ok(out)
 }
 
 /// BLAKE3 chunk addresses for `ranges` of `buffer`, computed in parallel.
@@ -175,6 +217,67 @@ mod tests {
     }
 
     #[test]
+    fn a_cut_that_does_not_advance_is_an_error_not_a_loop() {
+        // The witnessed profile: avg = 2 selects the all-zero masks, so the
+        // first position the kernel tests (offset 0, as min / 2 == 0) is a
+        // cut. Before the guard this pushed (0, 0) until allocation failed.
+        let witness = CdcParams {
+            min_size: 1,
+            avg_size: 2,
+            max_size: 4,
+        };
+        assert_eq!(level1_masks(witness.avg_size), Some((0, 0)));
+        let buf = noise(100, 0x5EED);
+        assert!(matches!(
+            unvalidated_chunk_ranges(&buf, witness),
+            Err(ChunkError::NoProgress {
+                offset: 0,
+                len: 100
+            })
+        ));
+        // The public entry point never reaches the kernel with it.
+        assert!(matches!(
+            chunk_ranges(&buf, witness),
+            Err(ChunkError::SizeOutOfRange {
+                field: "min_size",
+                value: 1,
+                ..
+            })
+        ));
+        // An empty buffer has no cut to make, so the guard cannot misfire.
+        assert_eq!(unvalidated_chunk_ranges(&[], witness).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn the_unvalidated_kernel_refuses_an_average_without_a_mask() {
+        for avg_size in [0, 1, (1 << 25) - 1, u32::MAX] {
+            let p = CdcParams {
+                min_size: 0,
+                avg_size,
+                max_size: u32::MAX,
+            };
+            assert_eq!(level1_masks(avg_size), None, "avg {avg_size}");
+            assert!(
+                matches!(
+                    unvalidated_chunk_ranges(&[7; 64], p),
+                    Err(ChunkError::InvalidParameters(_))
+                ),
+                "avg {avg_size}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_valid_average_selects_two_non_zero_masks() {
+        // With non-zero masks and min_size >= 64 the first cut the kernel can
+        // make is at byte 64, so a validated profile cannot stall the loop.
+        for avg_size in CdcParams::AVG_SIZE_RANGE {
+            let (mask_s, mask_l) = level1_masks(avg_size).expect("valid average has masks");
+            assert!(mask_s != 0 && mask_l != 0, "avg {avg_size}");
+        }
+    }
+
+    #[test]
     fn the_derivation_assumptions_hold() {
         let (gear, gear_ls) = get_gear_with_seed(0);
         for i in 0..256 {
@@ -206,7 +309,11 @@ mod tests {
         .enumerate()
         {
             let buf = noise(n, 0x9E37_79B9 + i as u64);
-            assert_eq!(chunk_ranges(&buf, p), serial(&buf, p), "length {n}");
+            assert_eq!(
+                chunk_ranges(&buf, p).unwrap(),
+                serial(&buf, p),
+                "length {n}"
+            );
         }
     }
 
@@ -224,7 +331,7 @@ mod tests {
             let buf = noise(2048, 0xC0FF_EE00 + seed);
             for n in 64..2048 {
                 assert_eq!(
-                    chunk_ranges(&buf[..n], p),
+                    chunk_ranges(&buf[..n], p).unwrap(),
                     serial(&buf[..n], p),
                     "seed {seed} len {n}"
                 );
@@ -266,7 +373,7 @@ mod tests {
         zeros[1_000_000] = 1;
         for p in profiles {
             for buf in [noise(5 << 20, 42), zeros.clone(), runs.clone()] {
-                assert_eq!(chunk_ranges(&buf, p), serial(&buf, p), "{p:?}");
+                assert_eq!(chunk_ranges(&buf, p).unwrap(), serial(&buf, p), "{p:?}");
             }
         }
     }

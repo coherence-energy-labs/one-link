@@ -227,20 +227,32 @@ def test_acquire_lockbox_returns_a_working_lockbox(tmp_path, monkeypatch):
 
 
 def test_acquire_lockbox_passphrase_takes_precedence(tmp_path, monkeypatch):
-    """When ONE_LINK_PASSPHRASE is set, acquire_lockbox uses the
-    scrypt path. The resulting lockbox must NOT match the silent-
-    mode lockbox (different key derivation → different keys)."""
+    """When ONE_LINK_PASSPHRASE is set on an install with no data key yet,
+    acquire_lockbox uses the scrypt path, an independent derivation from the
+    silent DRK.  On an install whose silent key was already handed out, the
+    passphrase must NOT take precedence: switching keys would orphan every
+    value wrapped under the DRK (audit H1), so it refuses and the silent
+    value stays readable."""
+    from one_link.key_material import KeyMaterialProtectionError
     from one_link.lockbox import acquire_lockbox
     monkeypatch.delenv("ONE_LINK_PASSPHRASE", raising=False)
-    lb_silent = acquire_lockbox(tmp_path)
+    lb_silent = acquire_lockbox(tmp_path / "silent-install")
     monkeypatch.setenv("ONE_LINK_PASSPHRASE", "hunter2")
-    lb_passphrase = acquire_lockbox(tmp_path)
+    lb_passphrase = acquire_lockbox(tmp_path / "passphrase-install")
+    assert lb_passphrase.is_silent is False
     plain = b"x" * 32
     blob_silent = lb_silent.wrap(plain)
     # The passphrase-derived lockbox cannot unwrap the silent-derived
     # blob and vice versa — independent key derivations.
     with pytest.raises(LockBoxError):
         lb_passphrase.unwrap(blob_silent)
+    with pytest.raises(LockBoxError):
+        lb_silent.unwrap(lb_passphrase.wrap(plain))
+
+    with pytest.raises(KeyMaterialProtectionError, match="explicit recovery migration"):
+        acquire_lockbox(tmp_path / "silent-install")
+    monkeypatch.delenv("ONE_LINK_PASSPHRASE")
+    assert acquire_lockbox(tmp_path / "silent-install").unwrap(blob_silent) == plain
 
 
 def test_silent_drk_does_not_leak_in_cleartext_on_windows(tmp_path):

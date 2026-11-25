@@ -4,19 +4,11 @@ a85c9ec8dacfad56774768db6969fc80dbbff69b:script_dump/project_source_dump_part01.
 a85c9ec8dacfad56774768db6969fc80dbbff69b:script_dump/project_source_dump_part01.txt:generic-api-key:132813
 a85c9ec8dacfad56774768db6969fc80dbbff69b:script_dump/project_source_dump_part01.txt:generic-api-key:264959
 a85c9ec8dacfad56774768db6969fc80dbbff69b:script_dump/project_source_dump_part01.txt:generic-api-key:304676
-script_dump/project_source_dump_part01.txt:generic-api-key:41644
-script_dump/project_source_dump_part01.txt:generic-api-key:132813
-script_dump/project_source_dump_part01.txt:generic-api-key:264959
-script_dump/project_source_dump_part01.txt:generic-api-key:304676
 c0cfa5ea617c60c9eed010da60ac67d7e39a0001:native/one_link_native/src/proximity_pair.rs:generic-api-key:208
 c17f91deff5a51e103a5d745257dbcc2c10ea172:native/ol_chunk/src/blake3_wrap.rs:generic-api-key:64
-src/one_link/relay_client.py:generic-api-key:1366
-src/one_link/relay_routing.py:generic-api-key:146
-# Reviewed 2026-11-25: courier service protocol field type annotation only.
-# The historical line declares a public cryptography type without a value;
-# it is not a credential. Exempt exactly this commit/path/rule/line.
-aac9f834855cf0f9fcd388d9579c4465178a61df:src/one_link/courier_service.py:generic-api-key:85
-# The first rationale quoted that same public declaration and triggered the
-# detector in a comment. This second exception is limited to that historical
-# comment; all other rules, paths and history remain scanned.
-27cc28be750027a8663893b5dacd5616188bf435:.gitleaksignore:generic-api-key:16
+# Every entry above names a commit already on master, so its SHA is stable.
+# New false positives go in .gitleaks.toml as content-anchored allowlists (rule,
+# path and exact line). A commit-SHA fingerprint does not survive a squash or
+# rebase merge, which re-creates the same content under a new commit, and a
+# path:rule:line fingerprint without a commit hides any finding that later
+# lands on that line number, in any commit.

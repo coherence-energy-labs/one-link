@@ -1,0 +1,34 @@
+--- a/src/algebra.rs
++++ b/src/algebra.rs
+@@ -145,8 +145,29 @@
+         Eta: CbdSamplingSize,
+     {
+         let vals: Polynomial = Encode::<Eta::SampleSize>::decode(B);
+-        Self(vals.0.iter().map(|val| Eta::ONES[val.0 as usize]).collect())
+-    }
++        Self(vals.0.iter().map(|val| cbd_coefficient::<Eta>(val.0)).collect())
++    }
++}
++
++// One Link backport of ml-kem 0.3.4's `cbd_coefficient` (src/algebra.rs of the crates.io
++// package with SHA-256 84ca78b66f46050d49fa21693ae8adab2081d8101b65d8067316b6b70b64a0d1
++// recorded in native/patches/ml-kem-0.2.3.json). The 0.2.3 lookup `Eta::ONES[val]` indexes a
++// table by sampled bits that, during decapsulation's re-encryption, derive from the decrypted
++// message: a secret-dependent memory index (and bounds-check branch) reported by
++// One Link's Valgrind audit (native/ol_ct_audit). Counting ones directly computes the same
++// value, ONES[x + (y << eta)] = (popcount(x) + q - popcount(y)) mod q, without a table.
++#[allow(clippy::cast_possible_truncation)]
++fn cbd_coefficient<Eta>(bits: Integer) -> FieldElement
++where
++    Eta: CbdSamplingSize,
++{
++    let eta = Eta::USIZE;
++    let low_mask: Integer = (1 << eta) - 1;
++    let x = (bits & low_mask).count_ones() as Integer;
++    let y = (bits >> eta).count_ones() as Integer;
++    // x, y <= eta, so x + q - y lies in [q - eta, q + eta]: one conditional subtraction
++    // reduces it fully.
++    FieldElement(FieldElement::small_reduce(x + FieldElement::Q - y))
+ }
+ 
+ /// A vector of polynomials of length `k`

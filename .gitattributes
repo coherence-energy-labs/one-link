@@ -4,6 +4,9 @@
 
 # Preserve the exact reviewed upstream crate bytes on every checkout platform.
 native/ol_shell/vendor/** -text -whitespace
+native/vendor/** -text -whitespace
+native/patches/** text eol=lf
+native/patches/*.patch -whitespace
 native/ol_shell/patches/** text eol=lf
 # A unified diff's blank context lines and the original license retain their
 # upstream whitespace; changing either would invalidate the reviewed bytes.

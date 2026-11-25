@@ -11,9 +11,9 @@ Production release qualification remains incomplete as recorded in
 | Graph | Authoritative input | Continuous gate and evidence |
 | --- | --- | --- |
 | Python application, extras and tooling | `pyproject.toml`, `uv.lock`; native Python packaging in `native/pyproject.toml` | Frozen universal export; PyPI and OSV audit reports; complete Python SBOM dependency graph |
-| Native runtime workspace | `native/Cargo.toml`, member manifests, `native/Cargo.lock` | RustSec vulnerabilities **and warnings** fail the gate; JSON retained |
+| Native runtime workspace | `native/Cargo.toml`, member manifests, `native/Cargo.lock`, `native/patches/ml-kem-0.2.3.json` | RustSec vulnerabilities **and warnings** fail the gate; JSON retained. The local ml-kem backport has exact source verification and the live registry-ancestor advisory gate. |
 | Native fuzz tooling | `native/fuzz/Cargo.toml`, `native/fuzz/Cargo.lock` | RustSec vulnerabilities **and warnings** fail the gate; JSON retained |
-| Native window shell | `native/ol_shell/Cargo.toml`, `native/ol_shell/Cargo.lock`, `native/ol_shell/patches/glib-0.18.5.json` | RustSec's vulnerability category fails the gate and warnings remain visible. The reviewed local GLib backport also has exact source verification, optimized regressions and a required live registry-ancestor advisory gate, detailed below. |
+| Native window shell | `native/ol_shell/Cargo.toml`, `native/ol_shell/Cargo.lock`, `native/ol_shell/patches/glib-0.18.5.json` | RustSec vulnerabilities **and warnings** fail the gate, with exactly one dispositioned exception (`--ignore RUSTSEC-2024-0370`, below); JSON retained without the exception. The reviewed local GLib backport also has exact source verification, optimized regressions and a required live registry-ancestor advisory gate, detailed below. |
 | Rendezvous container | `deploy/rendezvous/requirements.in`, `requirements.lock`, `Dockerfile` | Separately audited hashed requirements, constrained to reviewed root-lock versions; pinned container inputs |
 | JavaScript test tools | `tests/js/package.json`, `package-lock.json` | Locked npm install and dependency audit in the JavaScript contract gate |
 
@@ -46,6 +46,56 @@ not a clean result; the original reports are retained. The
 RustSec database used for that shell result contained 1,567 advisories at commit
 `10db6998b5d74ec438bcf0763125bd425a068a8f`. Future CI scans query the then-current
 database and may correctly produce a different result.
+
+### RustSec gate discipline (2026-11-25)
+
+Every Cargo graph now fails on vulnerabilities **and on every warning class**
+(unsound, unmaintained, yanked, notice): `cargo audit --deny warnings`. Before
+this, the shell gate ran without `--deny warnings`, so an unsound,
+unmaintained or yanked shell dependency could never fail it. The only
+exception is exact and recorded here:
+
+| Graph | Exception | Disposition |
+| --- | --- | --- |
+| `native/ol_shell/Cargo.lock` | `--ignore RUSTSEC-2024-0370` | `proc-macro-error 1.0.4` is unmaintained and has no patched release. It is a compile-time proc-macro helper, used only by `glib-macros 0.18.5` and `gtk3-macros 0.18.2` in the GTK 0.18 stack (verified from the lockfile). The migration below is the remedy. Any other or new warning fails. |
+| `native/Cargo.lock`, `native/fuzz/Cargo.lock` | none | — |
+
+The archived JSON reports are produced without any `--ignore`, so the
+dispositioned warning stays visible in the evidence of every run.
+
+What was verified locally on 2026-11-25 with the pinned cargo-audit **0.22.2**
+against the RustSec database at commit `b9b8a3c2cb1f2a3c76ab17a551193568c9f8b7a4`
+(1,568 advisories): the main and fuzz lockfiles reported no vulnerability and
+no warning. The shell lockfile reported no vulnerability and exactly one
+warning, `RUSTSEC-2024-0370` (`unmaintained`, `proc-macro-error 1.0.4`).
+`--deny warnings --ignore RUSTSEC-2024-0370` exited 0. The same command with a
+different `--ignore` ID exited 1. The glib unsound advisory no longer appears
+in cargo-audit's shell result because cargo-audit omits local path packages.
+That is exactly why the live registry-ancestor gate below exists.
+
+### Repository-wide source-override verification
+
+`scripts/verify_vendor_patches.py` checks every Cargo manifest and every
+`.cargo/config` / `.cargo/config.toml` that Git would build from, tracked or
+untracked-but-not-ignored. It no longer reads only the shell manifest.
+
+- A `[patch.crates-io]` entry is accepted only when it is exactly
+  `{ path = "..." }`, is declared in that manifest's
+  `[package|workspace.metadata.one-link.vendored-patches]`, and is selected as
+  a source-less package by the `Cargo.lock` beside it. Its bytes must match
+  the reviewed provenance and, with `--fetch-upstream`, the original crates.io
+  archive plus the committed diff.
+- Git patches, other-source patches, renaming or version-only patches,
+  `[replace]`, and any `[patch]`, `[source]`, `paths` or `registry.index` in a
+  Cargo config fail.
+- Every `Cargo.lock` must agree. A lockfile that resolves a backported package
+  version from the registry fails, because that graph silently builds the
+  unpatched code.
+
+`scripts/audit_vendor_advisories.py` queries the registry ancestor of every
+backport found this way. Each provenance record must list the exact advisory
+IDs its backport covers. An empty list declares that it covers none, so any
+returned finding fails.
 
 ## Default-branch alerts versus candidate status
 
@@ -183,7 +233,8 @@ undefined behavior and optimized-build crashes when invoked, as described by
 the advisory. Absence of a direct first-party call does **not** establish
 that vulnerable code is unreachable through dependencies. A separate Cargo
 workspace also does not isolate the shipped UI from security consequences.
-No advisory IDs are globally ignored. The source fix addresses the specified
+No advisory ID is ignored globally. The shell RustSec gate ignores exactly
+RUSTSEC-2024-0370, for the reason recorded above. The source fix addresses the specified
 iterator defect; the original medium advisory remains visible in the live
 ancestor query. The `proc-macro-error` maintenance warning is still open.
 These scoped results **do not grant complete production qualification to the

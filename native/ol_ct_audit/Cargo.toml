@@ -1,0 +1,30 @@
+[package]
+name = "ol_ct_audit"
+version = "0.22.1"
+edition = "2021"
+description = "Deterministic secret-dependence audit of One Link's constant-time primitives under Valgrind Memcheck."
+license = "AGPL-3.0-or-later"
+publish = false
+
+# Audit-only binary: it is never shipped and adds no external package to the
+# lockfile (every dependency below is already in the workspace graph).
+[[bin]]
+name = "ol_ct_audit"
+path = "src/main.rs"
+
+[dependencies]
+ol_threshold_recovery = { path = "../ol_threshold_recovery" }
+ol_onion              = { path = "../ol_onion" }
+ol_pair_qr            = { path = "../ol_pair_qr" }
+ol_capability         = { path = "../ol_capability" }
+ol_duress             = { path = "../ol_duress" }
+ol_pqkem              = { path = "../ol_pqkem" }
+ol_confidential       = { path = "../ol_confidential" }
+blake3                = { workspace = true }
+zeroize               = { workspace = true }
+rand_chacha           = "0.3"
+x25519-dalek          = { version = "2.0", features = ["static_secrets"] }
+curve25519-dalek      = { version = "4", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
+
+[lints]
+workspace = true

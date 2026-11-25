@@ -132,17 +132,11 @@ pub fn share_byte(s: u8, k: u32, n: u32, state: &mut PrngState) -> Result<Vec<Sh
     // Build coefficient vector: a_0 = s, a_1..a_{k-1} = random.
     let mut coeffs: Vec<u32> = Vec::with_capacity(k as usize);
     coeffs.push(u32::from(s) & 0xFF);
+    // Every coefficient, the top one included, is uniform over the whole
+    // field: see `share_bytes_with_next` for why a non-zero top coefficient
+    // must NOT be forced.
     for _ in 1..k {
         coeffs.push(u32::from(state.next_byte()));
-    }
-    // Top coefficient must be non-zero to actually be degree k-1; re-roll
-    // if PRNG produced 0. Keeps the scheme information-theoretic even on
-    // degenerate draws.
-    if k >= 2 {
-        let last = (k - 1) as usize;
-        while coeffs[last] == 0 {
-            coeffs[last] = u32::from(state.next_byte());
-        }
     }
     // Evaluate p(j) for j = 1..=n. x == 0 is the secret, never a share.
     let mut shares = Vec::with_capacity(n as usize);
@@ -208,14 +202,19 @@ where
     let mut coeffs = Zeroizing::new(vec![0u8; k as usize]);
     for &secret_byte in secret {
         coeffs[0] = secret_byte;
+        // Perfect secrecy requires a_1..a_{k-1} uniform over ALL of GF(2^8),
+        // zero included. Given k-1 shares and any candidate secret s', exactly
+        // one polynomial of degree <= k-1 passes through them, and its top
+        // coefficient is an affine function of s' with a non-zero slope (the
+        // x^{k-1} coefficient of the Lagrange basis polynomial for x = 0). So
+        // exactly one s' corresponds to a zero top coefficient. Forcing that
+        // coefficient non-zero (the previous re-roll loop) let anyone holding
+        // k-1 shares rule that s' out, and its loop branched on a secret.
+        // Uniform draws restore perfect secrecy and fix the timing at k-1
+        // draws per byte. The `perfect_secrecy_*` unit tests check it
+        // exhaustively.
         for coefficient in &mut coeffs[1..] {
             *coefficient = next_byte()?;
-        }
-        if k >= 2 {
-            let last = k as usize - 1;
-            while coeffs[last] == 0 {
-                coeffs[last] = next_byte()?;
-            }
         }
         for (index, stream) in streams.iter_mut().enumerate() {
             let x = (index + 1) as u32;
@@ -404,6 +403,93 @@ fn poly_eval(coeffs: &[u32], x: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Split one secret byte with a scripted coefficient stream; returns the
+    /// share y-values and how many coefficient bytes were drawn.
+    fn split_scripted(secret: u8, k: u32, n: u32, script: &[u8]) -> (Vec<u8>, usize) {
+        let mut drawn = 0usize;
+        let streams = share_bytes_with_next(&[secret], k, n, || {
+            let byte = script
+                .get(drawn)
+                .copied()
+                .ok_or(ShareError::RandomnessUnavailable(
+                    "scripted coefficient stream exhausted".to_string(),
+                ))?;
+            drawn += 1;
+            Ok(byte)
+        })
+        .expect("valid parameters and enough scripted bytes");
+        (streams.iter().map(|stream| stream[0]).collect(), drawn)
+    }
+
+    #[test]
+    fn perfect_secrecy_exhaustive_k2_single_share() {
+        // k = 2: one share must carry no information about the secret.
+        // Over every coefficient a_1 in GF(2^8), each share value must occur
+        // exactly once, for every secret. A forced non-zero a_1 makes the
+        // share at x = 1 never equal the secret: an observer could rule out
+        // s = y, and this test fails.
+        for secret in 0..=255u8 {
+            for x_index in 0..3usize {
+                let mut seen = [0u16; 256];
+                for a1 in 0..=255u8 {
+                    let (ys, drawn) = split_scripted(secret, 2, 3, &[a1]);
+                    assert_eq!(drawn, 1, "exactly k-1 coefficient draws per byte");
+                    seen[usize::from(ys[x_index])] += 1;
+                }
+                assert!(
+                    seen.iter().all(|&count| count == 1),
+                    "share x={} is not uniform for secret {secret:#04x}",
+                    x_index + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn perfect_secrecy_exhaustive_k3_two_shares() {
+        // k = 3: any two shares must be jointly uniform and independent of
+        // the secret. Over every (a_1, a_2) in GF(2^8)^2, each (y_i, y_j) pair
+        // must occur exactly once. A sample of secrets keeps this fast while
+        // still covering 0, 1, 0xFF and arbitrary values.
+        let secrets = [
+            0x00u8, 0x01, 0x02, 0x1B, 0x42, 0x53, 0x80, 0xAA, 0xC1, 0xCA, 0xFE, 0xFF,
+        ];
+        for &secret in &secrets {
+            for (i, j) in [(0usize, 1usize), (0, 2), (1, 2)] {
+                let mut seen = vec![0u8; 65536];
+                for a1 in 0..=255u8 {
+                    for a2 in 0..=255u8 {
+                        let (ys, drawn) = split_scripted(secret, 3, 3, &[a1, a2]);
+                        assert_eq!(drawn, 2, "exactly k-1 coefficient draws per byte");
+                        let slot = usize::from(ys[i]) << 8 | usize::from(ys[j]);
+                        seen[slot] = seen[slot].saturating_add(1);
+                    }
+                }
+                assert!(
+                    seen.iter().all(|&count| count == 1),
+                    "shares ({}, {}) are not jointly uniform for secret {secret:#04x}",
+                    i + 1,
+                    j + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_top_coefficient_is_accepted_and_still_reconstructs() {
+        // a_{k-1} = 0 is a legitimate uniform draw: k shares still
+        // reconstruct, and no extra coefficient byte is consumed.
+        let (ys, drawn) = split_scripted(0x42, 3, 4, &[0x17, 0x00]);
+        assert_eq!(drawn, 2);
+        let shares: Vec<Share> = ys
+            .iter()
+            .enumerate()
+            .map(|(index, &y)| Share::new(u8::try_from(index + 1).expect("small"), y))
+            .collect();
+        assert_eq!(reconstruct_byte(&shares[..3], 3).unwrap(), 0x42);
+        assert_eq!(reconstruct_byte(&shares[1..], 3).unwrap(), 0x42);
+    }
 
     #[test]
     fn params_valid_bounds() {

@@ -150,3 +150,34 @@ def test_bulk_chunk_sources_for_file_roundtrip(tmp_path: Path):
         assert src["source"] == "file_index:fixed"
     finally:
         state.close()
+
+
+def test_chunk_sources_accept_size_only_end_only_and_skip_malformed(tmp_path: Path):
+    """A chunk may describe its extent by `size` or by `end`; neither is required with the other.
+
+    The size used to be read as c.get("size", int(c["end"]) - start), whose
+    default is evaluated eagerly: a size-only chunk raised KeyError and was
+    silently dropped from the source index.
+    """
+    state = State(db_path=tmp_path / "state.db")
+    try:
+        p = tmp_path / "source.bin"
+        p.write_bytes(b"abcdefghijklmno")
+        st = p.stat()
+        chunks = [
+            {"start": 0, "size": 5, "hash": "a" * 64},              # size only
+            {"start": 5, "end": 10, "hash": "b" * 64},              # end only
+            {"start": 10, "end": 15, "size": 5, "hash": "c" * 64},  # both
+            {"start": 15, "hash": "d" * 64},                        # neither: malformed
+            {"start": 0, "size": 0, "hash": "e" * 64},              # empty extent
+        ]
+        recorded = state.record_chunk_sources_for_file(
+            path=str(p.resolve()), file_size=st.st_size, mtime_ms=int(st.st_mtime * 1000), chunks=chunks,
+        )
+        assert recorded == 3
+        assert state.chunks_sourced([letter * 64 for letter in "abcde"]) == ["a" * 64, "b" * 64, "c" * 64]
+        assert [state.get_chunk_sources(letter * 64)[0]["size"] for letter in "abc"] == [5, 5, 5]
+        assert state.get_chunk_sources("a" * 64)[0]["start"] == 0
+        assert state.get_chunk_sources("b" * 64)[0]["start"] == 5
+    finally:
+        state.close()

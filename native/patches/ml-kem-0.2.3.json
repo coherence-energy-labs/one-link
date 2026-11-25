@@ -1,0 +1,81 @@
+{
+ "backport": {
+  "advisories": [],
+  "advisory_note": "No RustSec/GHSA identifier exists for this defect and OSV returns no advisory for ml-kem 0.2.3 (queried 2026-11-25). The upstream fix is RustCrypto/KEMs #386, released in 0.3.3.",
+  "changed_files": [
+   "src/algebra.rs"
+  ],
+  "finding": "secret-indexed ONES[val] lookup in sample_cbd during decapsulation re-encryption (native/ol_ct_audit)",
+  "patch_path": "patches/ml-kem-0.2.3-ct-cbd.patch",
+  "patch_sha256": "cbb3bdadb8be5bcf442851c67e6f5658cd9bc236abb7d618b80ae89c59640ee3",
+  "reference": "ml-kem 0.3.4 src/algebra.rs cbd_coefficient (table-free CBD sampling)",
+  "reference_crate_sha256": "84ca78b66f46050d49fa21693ae8adab2081d8101b65d8067316b6b70b64a0d1",
+  "reference_crate_url": "https://static.crates.io/crates/ml-kem/ml-kem-0.3.4.crate",
+  "upstream_fix_commit": "415bfd11f05727f2657c8f1bed53eeae188a9bfb",
+  "upstream_fix_released_in": "ml-kem 0.3.3",
+  "upstream_url": "https://github.com/RustCrypto/KEMs/pull/386"
+ },
+ "files": {
+  ".cargo_vcs_info.json": "3f8061e2d01a38419ac059be1cc5eccb48387e2663454a0415adac5297519ad4",
+  "CHANGELOG.md": "4cd6c830c9eb4c2173c2cbffa58f8083727df056a8807fc25a56803f574a68ca",
+  "Cargo.lock": "24dc277c361b44209d5ad3e96680a44fe8b34158f74c86fdff7e839151fd66df",
+  "Cargo.toml": "ea413b009dbf23cc6197eb1c7ba4ecaa12ce07cefbae1b5caaf8cb8b5e74d073",
+  "Cargo.toml.orig": "d3a4c47a911c658d3ff4a444579130a1dc7038efa59d2b06601108696299c867",
+  "LICENSE-APACHE": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+  "LICENSE-MIT": "a7e3b55af7a711768727f3f4a39fed2559c0c996d476908d888715ffb29e4cfe",
+  "README.md": "ae0a79fb8ada453ff8ff74bd9640f4f4dd57211f179727d963bdab2f41eff29d",
+  "benches/mlkem.rs": "ba4a509be882480f406be1f495990dd69c1f62ada4021daf5d31913344cc6f76",
+  "src/algebra.rs": "2914f51e90cf502ae0d9ce9545152e193eda4cc0a8469686f704ab302e0cbc82",
+  "src/compress.rs": "fba413c605336f83ae5f48e6c53fda3c6ea0dbf79c02b057925cfa3bc6226805",
+  "src/crypto.rs": "05b2181b12e54eb09d50b85642c771bb0cbda55ade6413325650e150e1fb7e2f",
+  "src/encode.rs": "ef945e48b473bfa1b07f33c8ca826592375a21b79f3bd471dce2903428b01ca0",
+  "src/kem.rs": "f777708f1d6181bf048cce6600990cfab31c1e3a7724e274f4dcf52a6b3bc1e1",
+  "src/lib.rs": "b120a50ff1ebb9f3d672cd8d20b6c551109839b1ca44c4c92fd7595a1243375e",
+  "src/param.rs": "d981af2ac4bc54daa32f01d94ba818e5ad281e77557d20d7c8f99f061500ad40",
+  "src/pke.rs": "0e11cf4bfac90b282a1149fcc4dfc19d5aa01409ab065c17bd0ecda5597de1e2",
+  "src/util.rs": "3cce845f65b8b003f8ef532f759ba242e38c5c9e2098d6d51f55ebe520c08e72",
+  "tests/README.md": "becee737f90b76cf1c1df2e365a74a41709332b4bb14200e1179e43c478da52e"
+ },
+ "maintenance": "One Link project-maintained backport; original version preserved; not an upstream 0.2 patch release. Retire by migrating to ml-kem >= 0.3.4 (seed-form keys).",
+ "package": {
+  "license": "Apache-2.0 OR MIT",
+  "name": "ml-kem",
+  "path": "vendor/ml-kem-0.2.3",
+  "version": "0.2.3"
+ },
+ "schema": "one-link-vendored-cargo-patch/v1",
+ "source_tree_sha256": "1d5bc205e1b7dfc8ea7589c1bbcd1d1551ca926d4e9eb82e23694781732f83c1",
+ "tree_hash_format": "SHA256 of UTF-8 JSON filename-to-SHA256 map with sorted keys and compact separators",
+ "upstream": {
+  "crate_sha256": "8de49b3df74c35498c0232031bb7e85f9389f913e2796169c8ab47a53993a18f",
+  "crate_url": "https://static.crates.io/crates/ml-kem/ml-kem-0.2.3.crate",
+  "source_tree_sha256": "ca8367bd4ad59b4f9a9f28d5a7f1c8b18e484ea38984b130f2b1a02fb964f13a",
+  "vcs": {
+   "git": {
+    "sha1": "72dbb072b7efb790d6a158053ad352c364e51f6a"
+   },
+   "path_in_vcs": "ml-kem"
+  }
+ },
+ "upstream_files": {
+  ".cargo_vcs_info.json": "3f8061e2d01a38419ac059be1cc5eccb48387e2663454a0415adac5297519ad4",
+  "CHANGELOG.md": "4cd6c830c9eb4c2173c2cbffa58f8083727df056a8807fc25a56803f574a68ca",
+  "Cargo.lock": "24dc277c361b44209d5ad3e96680a44fe8b34158f74c86fdff7e839151fd66df",
+  "Cargo.toml": "ea413b009dbf23cc6197eb1c7ba4ecaa12ce07cefbae1b5caaf8cb8b5e74d073",
+  "Cargo.toml.orig": "d3a4c47a911c658d3ff4a444579130a1dc7038efa59d2b06601108696299c867",
+  "LICENSE-APACHE": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+  "LICENSE-MIT": "a7e3b55af7a711768727f3f4a39fed2559c0c996d476908d888715ffb29e4cfe",
+  "README.md": "ae0a79fb8ada453ff8ff74bd9640f4f4dd57211f179727d963bdab2f41eff29d",
+  "benches/mlkem.rs": "ba4a509be882480f406be1f495990dd69c1f62ada4021daf5d31913344cc6f76",
+  "src/algebra.rs": "1f6ac2d8ad434cc290cc6c912ff83042a537ab3fdb805a2bf4ea9e65df334e4e",
+  "src/compress.rs": "fba413c605336f83ae5f48e6c53fda3c6ea0dbf79c02b057925cfa3bc6226805",
+  "src/crypto.rs": "05b2181b12e54eb09d50b85642c771bb0cbda55ade6413325650e150e1fb7e2f",
+  "src/encode.rs": "ef945e48b473bfa1b07f33c8ca826592375a21b79f3bd471dce2903428b01ca0",
+  "src/kem.rs": "f777708f1d6181bf048cce6600990cfab31c1e3a7724e274f4dcf52a6b3bc1e1",
+  "src/lib.rs": "b120a50ff1ebb9f3d672cd8d20b6c551109839b1ca44c4c92fd7595a1243375e",
+  "src/param.rs": "d981af2ac4bc54daa32f01d94ba818e5ad281e77557d20d7c8f99f061500ad40",
+  "src/pke.rs": "0e11cf4bfac90b282a1149fcc4dfc19d5aa01409ab065c17bd0ecda5597de1e2",
+  "src/util.rs": "3cce845f65b8b003f8ef532f759ba242e38c5c9e2098d6d51f55ebe520c08e72",
+  "tests/README.md": "becee737f90b76cf1c1df2e365a74a41709332b4bb14200e1179e43c478da52e"
+ }
+}

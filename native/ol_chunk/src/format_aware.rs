@@ -33,6 +33,7 @@
 use crate::blake3_wrap;
 use crate::cdc::{Boundary, CdcParams, ChunkScanner};
 use crate::error::ChunkError;
+use crate::walk;
 
 /// Container formats recognized by the format-aware chunker.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -189,53 +190,18 @@ fn matches_iso_bmff_extension(leading: &[u8]) -> bool {
 /// a forced cut. Stops on the first malformed header so a
 /// non-BMFF buffer that happens to match the leading-bytes check
 /// can't drive the scanner off a cliff.
+///
+/// Total on every input, and the same walker (`walk::walk_mp4_boxes`) as
+/// [`crate::stream::mp4_box_offsets_seekable`], so the two agree byte for
+/// byte. Box sizes are untrusted 32/64-bit values; no position arithmetic
+/// can wrap.
 #[must_use]
 pub fn mp4_box_offsets(buffer: &[u8]) -> Vec<usize> {
     let mut offsets = Vec::new();
-    let mut pos = 0usize;
-    while pos + 8 <= buffer.len() {
-        let size = u64::from(u32::from_be_bytes([
-            buffer[pos],
-            buffer[pos + 1],
-            buffer[pos + 2],
-            buffer[pos + 3],
-        ]));
-        let kind = &buffer[pos + 4..pos + 8];
-        // Sanity: the 4-byte type MUST be 4 ASCII chars. Any non-
-        // printable rejects the rest of the buffer.
-        if !kind.iter().all(|b| b.is_ascii_alphanumeric() || *b == b' ') {
-            break;
-        }
+    let Ok(()) = walk::walk_mp4_boxes(&mut walk::Memory(buffer), |_, pos| {
         offsets.push(pos);
-        let advance = match size {
-            // Size == 1 means a 64-bit extended size in the next 8
-            // bytes (rare in practice; bail out if not enough room).
-            1 => {
-                if pos + 16 > buffer.len() {
-                    break;
-                }
-                let mut be = [0u8; 8];
-                be.copy_from_slice(&buffer[pos + 8..pos + 16]);
-                u64::from_be_bytes(be)
-            }
-            // Size == 0 means "to end of file". This is the last
-            // box; stop after collecting its offset.
-            0 => break,
-            _ => size,
-        };
-        // Defensive: a corrupt size field smaller than the header
-        // would loop forever. Refuse to advance less than 8 bytes.
-        if advance < 8 {
-            break;
-        }
-        let Ok(advance) = usize::try_from(advance) else {
-            break;
-        };
-        let Some(next_pos) = pos.checked_add(advance) else {
-            break;
-        };
-        pos = next_pos;
-    }
+        Ok(())
+    });
     offsets
 }
 
@@ -243,32 +209,13 @@ pub fn mp4_box_offsets(buffer: &[u8]) -> Vec<usize> {
 /// header (length-prefixed RIFF sub-chunk). The data chunk is the
 /// dominant payload of a WAV; cutting there isolates the audio
 /// samples from the variable-size metadata before it.
+///
+/// Same walker as [`crate::stream::wav_data_offset_seekable`]; sizes are
+/// widened to `u64` and positions advanced with checked arithmetic.
 #[must_use]
 pub fn wav_data_offset(buffer: &[u8]) -> Option<usize> {
-    if buffer.len() < 12 || &buffer[0..4] != b"RIFF" || &buffer[8..12] != b"WAVE" {
-        return None;
-    }
-    let mut pos = 12usize;
-    while pos + 8 <= buffer.len() {
-        let id = &buffer[pos..pos + 4];
-        let size = u32::from_le_bytes([
-            buffer[pos + 4],
-            buffer[pos + 5],
-            buffer[pos + 6],
-            buffer[pos + 7],
-        ]) as usize;
-        if id == b"data" {
-            return Some(pos);
-        }
-        // RIFF sub-chunks are byte-aligned but their size word is
-        // not padded; the actual layout pads odd sizes by 1.
-        let advance = 8 + size + (size & 1);
-        if advance < 8 {
-            break;
-        }
-        pos = pos.saturating_add(advance);
-    }
-    None
+    let Ok(offset) = walk::find_wav_data(&mut walk::Memory(buffer));
+    offset
 }
 
 /// Walk an MCAP v0 buffer and return structurally validated top-level
@@ -278,46 +225,15 @@ pub fn wav_data_offset(buffer: &[u8]) -> Option<usize> {
 /// after the 8-byte magic. A crashed/in-progress recording may not yet
 /// have trailing magic; in that case every complete prefix record is
 /// still usable as a conservative structural boundary.
+///
+/// Same walker as [`crate::stream::mcap_record_offsets_seekable`].
 #[must_use]
 pub fn mcap_record_offsets(buffer: &[u8]) -> Vec<usize> {
-    const RECORD_HEADER: usize = 9;
-    if buffer.len() < MCAP_MAGIC.len() + RECORD_HEADER
-        || !buffer.starts_with(&MCAP_MAGIC)
-        || buffer[MCAP_MAGIC.len()] != 0x01
-    {
-        return Vec::new();
-    }
-
-    let data_end = if buffer.ends_with(&MCAP_MAGIC) && buffer.len() >= 2 * MCAP_MAGIC.len() {
-        buffer.len() - MCAP_MAGIC.len()
-    } else {
-        buffer.len()
-    };
     let mut offsets = Vec::new();
-    let mut pos = MCAP_MAGIC.len();
-
-    while pos + RECORD_HEADER <= data_end {
-        let opcode = buffer[pos];
-        if opcode == 0 {
-            break;
-        }
-        let mut raw_len = [0u8; 8];
-        raw_len.copy_from_slice(&buffer[pos + 1..pos + RECORD_HEADER]);
-        let Ok(content_len) = usize::try_from(u64::from_le_bytes(raw_len)) else {
-            break;
-        };
-        let Some(next) = pos
-            .checked_add(RECORD_HEADER)
-            .and_then(|value| value.checked_add(content_len))
-        else {
-            break;
-        };
-        if next > data_end {
-            break;
-        }
+    let Ok(()) = walk::walk_mcap_records(&mut walk::Memory(buffer), |_, pos| {
         offsets.push(pos);
-        pos = next;
-    }
+        Ok(())
+    });
     offsets
 }
 

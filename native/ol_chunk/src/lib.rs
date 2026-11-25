@@ -48,6 +48,7 @@ pub mod format_aware;
 pub mod frame;
 pub mod pcdc;
 pub mod stream;
+mod walk;
 
 pub use blake3_wrap::{
     chunk_address_convergent, chunk_address_raw, derive_aead_key, derive_ratchet_key_id,

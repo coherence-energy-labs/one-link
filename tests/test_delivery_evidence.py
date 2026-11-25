@@ -324,8 +324,12 @@ def test_shell_graph_is_audited_and_inventoried_without_hiding_upstream_warnings
         assert "cargo-audit-shell.json" in text
         assert "--additional-cargo shell native/ol_shell/Cargo.toml" in text
         assert "--additional-cargo fuzz native/fuzz/Cargo.toml" in text
+        # The shell gate denies warnings ("unsound", "unmaintained", "yanked"
+        # are warnings to cargo-audit) and exempts only the one documented,
+        # dispositioned advisory by exact id -- never a whole class.
         gates = [step for job in document["jobs"].values() for step in job.get("steps", [])
-                 if step.get("run", "").strip() == "cargo audit --file native/ol_shell/Cargo.lock"]
+                 if step.get("run", "").strip()
+                 == "cargo audit --file native/ol_shell/Cargo.lock --deny warnings --ignore RUSTSEC-2024-0370"]
         assert len(gates) == 1
         assert "!cancelled()" in gates[0]["if"]
         assert not gates[0].get("continue-on-error")

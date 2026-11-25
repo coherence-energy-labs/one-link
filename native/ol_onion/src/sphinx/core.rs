@@ -17,6 +17,7 @@ use zeroize::Zeroize;
 
 use crate::errors::{OnionError, OnionResult};
 use crate::hop::HopId;
+use crate::keyderiv::is_all_zero_ct;
 use crate::sphinx::header::{build_header, peel_header, HeaderPeelOutcome, DESTINATION_MARKER};
 use crate::sphinx::primitives::{
     chacha20_xor_in_place, derive_hop_keys, HopKeys, HEADER_LEN, MAX_HOPS, PAYLOAD_LEN,
@@ -240,7 +241,8 @@ pub fn build_sphinx_onion<R: RngCore + CryptoRng>(
         // Shared secret: sender_eph_sk * cumulative_blind * hop.pk.
         let shared_point = (sender_eph_sk * cumulative_blind) * hop.static_pk;
         let shared_bytes = shared_point.compress().to_bytes();
-        if shared_bytes.iter().all(|&b| b == 0) {
+        // ct-audit: declassify (small-order verdict is the public result)
+        if is_all_zero_ct(&shared_bytes) {
             return Err(OnionError::SmallOrderPubkey);
         }
         let keys = derive_hop_keys(&shared_bytes, &alpha_bytes);
@@ -333,7 +335,8 @@ pub fn compute_final_hop_shared_key(
         let alpha_bytes = alpha_i.compress().to_bytes();
         let shared_point = (sender_eph_sk * cumulative_blind) * hop.static_pk;
         let shared_bytes = shared_point.compress().to_bytes();
-        if shared_bytes.iter().all(|&b| b == 0) {
+        // ct-audit: declassify (small-order verdict is the public result)
+        if is_all_zero_ct(&shared_bytes) {
             return Err(OnionError::SmallOrderPubkey);
         }
         if idx == last_idx {
@@ -394,7 +397,8 @@ pub fn peel_sphinx_layer(
         .ok_or(OnionError::SmallOrderPubkey)?;
     let shared_point = relay_sk * alpha_point;
     let shared_bytes = shared_point.compress().to_bytes();
-    if shared_bytes.iter().all(|&b| b == 0) {
+    // ct-audit: declassify (small-order verdict is the public result)
+    if is_all_zero_ct(&shared_bytes) {
         return Err(OnionError::SmallOrderPubkey);
     }
     let keys = derive_hop_keys(&shared_bytes, &alpha_bytes);
@@ -408,6 +412,7 @@ pub fn peel_sphinx_layer(
     payload.copy_from_slice(packet.payload());
     chacha20_xor_in_place(&keys.payload_stream, &mut payload);
 
+    // ct-audit: declassify (deliver-or-forward is the relay's routing output)
     match outcome {
         HeaderPeelOutcome::Deliver => {
             // Extract user payload via length prefix.

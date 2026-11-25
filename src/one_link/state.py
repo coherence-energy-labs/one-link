@@ -63,6 +63,123 @@ from typing import Any, Iterable, Mapping, Optional
 from one_link.paths import data_dir
 
 DB_FILE = "state.db"
+
+
+# ─── key-protected State fields: the one registry ────────────────────────────
+#
+# Every State column (or JSON member of a column) whose stored bytes depend on
+# a key the install can rotate is listed here, with the key family it depends
+# on.  Writers seal and readers open these values only through
+# ``State._seal_field`` / ``State._open_field``, and identity rotation /
+# recovery re-keys exactly this set (``State.rekey_protected_fields``) inside
+# the same crash-replayable transaction that carries the whole-file LockBox
+# envelopes.  ``tests/test_rotation_state_field_carry.py`` holds the registry
+# complete: a static census of every seal/open primitive call in this module
+# and a dynamic census of every cell the real writers leave in the database.
+
+# The install's application data key (a LockBox): the silent DRK, which is
+# derive_drk(seed) and so changes with the seed, or a passphrase envelope's
+# stable DEK, which does not.
+FIELD_FAMILY_DATA_KEY = "data_key"
+# Deterministic AES-SIV under derive_path_pii_key(seed) (audit M30): changes
+# with every seed change, in both LockBox modes.
+FIELD_FAMILY_PATH_PII = "path_pii"
+
+
+@dataclass(frozen=True)
+class KeyProtectedField:
+    name: str
+    table: str
+    column: str
+    family: str
+    label: str
+    json_key: str = ""
+    aad: bytes = b""
+    plaintext_len: int = 32
+
+
+GROUP_SENDER_CHAIN_KEY = KeyProtectedField(
+    "group_sender_chains.chain_key", "group_sender_chains", "chain_key",
+    FIELD_FAMILY_DATA_KEY, label="chain_key",
+)
+SELF_MESH_ROOT_SEED = KeyProtectedField(
+    "self_mesh_roots.root_seed", "self_mesh_roots", "root_seed",
+    FIELD_FAMILY_DATA_KEY, label="self-mesh root seed",
+)
+TRANSFER_SOURCE_PATH = KeyProtectedField(
+    "transfers.metadata_json.path", "transfers", "metadata_json",
+    FIELD_FAMILY_PATH_PII, label="transfer source path",
+    json_key="path", aad=b"OL/state/transfers/path|v1",
+)
+CHUNK_SOURCE_PATH = KeyProtectedField(
+    "chunk_sources.path", "chunk_sources", "path",
+    FIELD_FAMILY_PATH_PII, label="chunk source path",
+    aad=b"OL/state/chunk_sources/path|v1",
+)
+FILE_INDEX_PATH = KeyProtectedField(
+    "file_index_cache.path", "file_index_cache", "path",
+    FIELD_FAMILY_PATH_PII, label="file index path",
+    aad=b"OL/state/file_index_cache/path|v1",
+)
+KEY_PROTECTED_FIELDS: tuple[KeyProtectedField, ...] = (
+    GROUP_SENDER_CHAIN_KEY,
+    SELF_MESH_ROOT_SEED,
+    TRANSFER_SOURCE_PATH,
+    CHUNK_SOURCE_PATH,
+    FILE_INDEX_PATH,
+)
+
+
+def carry_key_protected_fields(
+    data_dir: Path,
+    *,
+    previous_data_key: Optional[bytes],
+    target_data_key: bytes,
+    previous_seed: Optional[bytes],
+    target_seed: bytes,
+) -> dict[str, dict[str, int]]:
+    """Re-key every registered field of ``data_dir``'s state.db, if needed.
+
+    Called by a confirmed seed/authority replacement before either key is
+    published.  Opens State only when a key actually changes and the
+    database exists; the daemon opens it the same way moments later.
+    """
+    if not isinstance(target_seed, (bytes, bytearray)) or len(target_seed) != 32:
+        raise ValueError("target_seed must be 32 bytes")
+    db_path = Path(data_dir) / DB_FILE
+    data_key_changes = previous_data_key is not None and not secrets.compare_digest(
+        bytes(previous_data_key), bytes(target_data_key)
+    )
+    path_key_changes = previous_seed is not None and not secrets.compare_digest(
+        bytes(previous_seed), bytes(target_seed)
+    )
+    if not (data_key_changes or path_key_changes) or not db_path.exists():
+        return {}
+    try:
+        state = State(db_path=db_path)
+    except Exception as exc:
+        # Publishing the new key without re-keying would orphan every sealed
+        # value the moment this database becomes readable again (a locked
+        # keychain at boot, for example).  The transaction stays pending and
+        # replays at the next boot instead.
+        from one_link.key_material import KeyMaterialProtectionError
+
+        raise KeyMaterialProtectionError(
+            "state.db cannot be opened to re-key its protected fields, so the "
+            "key replacement stays pending until it can: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    try:
+        return state.rekey_protected_fields(
+            previous_data_key=previous_data_key if data_key_changes else None,
+            target_data_key=bytes(target_data_key),
+            previous_seed=previous_seed if path_key_changes else None,
+            target_seed=bytes(target_seed),
+        )
+    finally:
+        state.close()
+
+
 MAX_REMOTE_INSTRUCTION_SEEN_ROWS = 65_536
 MAX_REMOTE_INSTRUCTION_REPLAY_RETENTION_MS = 16 * 60 * 1000
 _LOWER_HEX_CHARS = frozenset("0123456789abcdef")
@@ -755,14 +872,204 @@ class State:
     # AAD strings: distinct per column so a path that exists in both
     # tables encrypts to different ciphertext, ensuring a leak of one
     # column doesn't help an attacker pivot via the other.
-    _PATH_PII_AAD_CHUNK_SOURCES = b"OL/state/chunk_sources/path|v1"
-    _PATH_PII_AAD_FILE_INDEX = b"OL/state/file_index_cache/path|v1"
+    # The AADs live in KEY_PROTECTED_FIELDS; these names remain for readers
+    # outside this module (storage_lifecycle reads transfer paths).
+    _PATH_PII_AAD_CHUNK_SOURCES = CHUNK_SOURCE_PATH.aad
+    _PATH_PII_AAD_FILE_INDEX = FILE_INDEX_PATH.aad
     # 2026-05-22 audit T3-J: wrap the per-transfer source ``path``
     # so the ledger row + on-disk DB don't carry the user's
     # filesystem layout in plaintext. Distinct AAD per column so
     # leaked chunk_sources / file_index_cache rows can't help
     # decrypt this column even though many paths are the same.
-    _PATH_PII_AAD_TRANSFER = b"OL/state/transfers/path|v1"
+    _PATH_PII_AAD_TRANSFER = TRANSFER_SOURCE_PATH.aad
+
+    def _seal_field(self, field: KeyProtectedField, value: Any) -> Any:
+        """Seal one registered field for storage under its key family.
+
+        The only producer of key-protected State ciphertext: a value that
+        bypasses this cannot be found by ``rekey_protected_fields``.
+        """
+        if field.family == FIELD_FAMILY_DATA_KEY:
+            from one_link.lockbox import maybe_wrap
+
+            return maybe_wrap(bytes(value), self._lockbox)
+        return self._wrap_path(value, aad=field.aad)
+
+    def _open_field(self, field: KeyProtectedField, stored: Any) -> Any:
+        """Open one registered field read from storage.
+
+        Data-key fields are fixed width: exactly ``plaintext_len`` bytes is
+        legacy cleartext and ``plaintext_len + 29`` is a LockBox envelope.
+        Length, not the one-byte marker, discriminates, because a random
+        32-byte secret begins with the marker byte once in 256 values.
+        """
+        if field.family == FIELD_FAMILY_DATA_KEY:
+            from one_link.lockbox import MIN_WRAPPED_LEN
+
+            raw = bytes(stored)
+            if len(raw) == field.plaintext_len:
+                return raw
+            if len(raw) != field.plaintext_len + MIN_WRAPPED_LEN:
+                raise ValueError(
+                    f"invalid stored {field.label} length: {len(raw)}"
+                )
+            if self._lockbox is None:
+                raise RuntimeError(
+                    f"found a non-cleartext {field.label} but no lockbox is "
+                    "configured (was ONE_LINK_PASSPHRASE removed?)"
+                )
+            return self._lockbox.unwrap(raw)
+        return self._unwrap_path(stored, aad=field.aad)
+
+    def rekey_protected_fields(
+        self,
+        *,
+        previous_data_key: Optional[bytes],
+        target_data_key: bytes,
+        previous_seed: Optional[bytes],
+        target_seed: bytes,
+    ) -> dict[str, dict[str, int]]:
+        """Re-key every ``KEY_PROTECTED_FIELDS`` value in ONE durable transaction.
+
+        A family whose previous key is ``None`` is unchanged and skipped.
+        Each stored value is classified by authentication, never guessed:
+
+        * opens under the target key: already current (a replay after the
+          transaction committed converges here);
+        * opens under the previous key: re-sealed under the target key;
+        * opens under neither: counted as ``unopenable`` and left exactly as
+          stored (it was sealed by a key this transaction does not hold).
+
+        SQLite commits all of it or none of it, so an interruption leaves
+        every row under the previous key and the replay re-runs it.
+        """
+        from one_link.lockbox import LockBox, LockBoxError, MIN_WRAPPED_LEN
+        from one_link.path_pii import PATH_PII_MARKER, PathPIIEncryptor
+
+        target_box = LockBox(bytes(target_data_key))
+        previous_box = (
+            LockBox(bytes(previous_data_key)) if previous_data_key is not None else None
+        )
+        target_paths = PathPIIEncryptor(bytes(target_seed))
+        previous_paths = (
+            PathPIIEncryptor(bytes(previous_seed)) if previous_seed is not None else None
+        )
+
+        def _opens(box, blob: bytes) -> bool:
+            try:
+                box.unwrap(blob)
+            except LockBoxError:
+                return False
+            return True
+
+        report: dict[str, dict[str, int]] = {}
+        with self.durable_write_transaction():
+            for field in KEY_PROTECTED_FIELDS:
+                counts = {"rekeyed": 0, "current": 0, "unopenable": 0}
+                report[field.name] = counts
+                # Path-PII ciphertext is deterministic: every chunk row of one
+                # file stores the same value, so classify each distinct value
+                # once: stored value -> ("current" | "unopenable", None) or
+                # ("rekey", resealed value).
+                path_verdicts: dict[str, tuple[str, Optional[str]]] = {}
+                if field.family == FIELD_FAMILY_DATA_KEY and previous_box is None:
+                    continue
+                if field.family == FIELD_FAMILY_PATH_PII and previous_paths is None:
+                    continue
+                # Exactly one previous key applies to this field's family and
+                # the guards above guarantee it is present. Bind it once, as a
+                # non-optional name, so a missing key can never be mistaken for
+                # an undecryptable row further down.
+                field_previous_box = previous_box if field.family == FIELD_FAMILY_DATA_KEY else None
+                field_previous_paths = previous_paths if field.family != FIELD_FAMILY_DATA_KEY else None
+                last_rowid = 0
+                while True:
+                    rows = self._conn.execute(
+                        f"SELECT rowid, {field.column} FROM {field.table} "
+                        "WHERE rowid > ? AND "
+                        f"{field.column} IS NOT NULL ORDER BY rowid LIMIT 512",
+                        (last_rowid,),
+                    ).fetchall()
+                    if not rows:
+                        break
+                    for rowid, stored in rows:
+                        last_rowid = int(rowid)
+                        if field.family == FIELD_FAMILY_DATA_KEY:
+                            blob = bytes(stored)
+                            if len(blob) != field.plaintext_len + MIN_WRAPPED_LEN:
+                                continue  # legacy cleartext: keyless
+                            if _opens(target_box, blob):
+                                counts["current"] += 1
+                                continue
+                            if field_previous_box is None:
+                                raise RuntimeError(
+                                    f"re-key of {field.name} reached without its previous data key"
+                                )
+                            try:
+                                plaintext = field_previous_box.unwrap(blob)
+                            except LockBoxError:
+                                counts["unopenable"] += 1
+                                continue
+                            sealed: Any = target_box.wrap(plaintext)
+                        else:
+                            document: Any = None
+                            if field.json_key:
+                                try:
+                                    document = json.loads(stored)
+                                except (TypeError, ValueError):
+                                    continue
+                                if not isinstance(document, dict):
+                                    continue
+                                value = document.get(field.json_key)
+                            else:
+                                value = stored
+                            if not isinstance(value, str) or not value.startswith(
+                                PATH_PII_MARKER
+                            ):
+                                continue  # legacy cleartext: keyless
+                            verdict = path_verdicts.get(value)
+                            if verdict is None:
+                                if target_paths.unwrap(value, aad=field.aad) is not None:
+                                    verdict = ("current", None)
+                                else:
+                                    if field_previous_paths is None:
+                                        raise RuntimeError(
+                                            f"re-key of {field.name} reached without its previous path key"
+                                        )
+                                    plaintext_path = field_previous_paths.unwrap(
+                                        value, aad=field.aad,
+                                    )
+                                    verdict = (
+                                        ("unopenable", None)
+                                        if plaintext_path is None
+                                        else (
+                                            "rekey",
+                                            target_paths.wrap(plaintext_path, aad=field.aad),
+                                        )
+                                    )
+                                path_verdicts[value] = verdict
+                            if verdict[0] != "rekey":
+                                counts[verdict[0]] += 1
+                                continue
+                            resealed = verdict[1]
+                            if document is not None:
+                                document[field.json_key] = resealed
+                                sealed = json.dumps(
+                                    document, separators=(",", ":"), sort_keys=True,
+                                )
+                            else:
+                                sealed = resealed
+                        # OR REPLACE: a deterministic path ciphertext can be a
+                        # key column (chunk_sources, file_index_cache); if the
+                        # same plaintext path already has a current-key row,
+                        # the two rows describe one path and one survives.
+                        self._conn.execute(
+                            f"UPDATE OR REPLACE {field.table} SET {field.column} = ? "
+                            "WHERE rowid = ?",
+                            (sealed, rowid),
+                        )
+                        counts["rekeyed"] += 1
+        return report
 
     def _wrap_path(self, value: str, *, aad: bytes) -> str:
         if self._path_pii is None or not value:
@@ -4117,8 +4424,7 @@ class State:
         # disk attacker without the passphrase sees AEAD ciphertext.
         # When no lockbox is configured this is a no-op passthrough
         # (cleartext on disk — same as before this fix).
-        from one_link.lockbox import maybe_wrap as _lb_wrap
-        chain_key_at_rest = _lb_wrap(chain_key, self._lockbox)
+        chain_key_at_rest = self._seal_field(GROUP_SENDER_CHAIN_KEY, chain_key)
         with self._write_lock:
             self._conn.execute(
                 """
@@ -4170,19 +4476,7 @@ class State:
         # (marker + nonce + ct + tag). This avoids the 1/256 false
         # positive that a generic is_wrapped check would have on
         # the small-marker-byte collision class.
-        chain_key = bytes(row["chain_key"])
-        if len(chain_key) not in (32, 61):
-            raise ValueError(
-                f"invalid stored chain_key length: {len(chain_key)}"
-            )
-        if len(chain_key) == 61:
-            from one_link.lockbox import LockBox  # noqa: F401
-            if self._lockbox is None:
-                raise RuntimeError(
-                    "found a non-cleartext chain_key but no lockbox is "
-                    "configured (was ONE_LINK_PASSPHRASE removed?)"
-                )
-            chain_key = self._lockbox.unwrap(chain_key)
+        chain_key = self._open_field(GROUP_SENDER_CHAIN_KEY, row["chain_key"])
         return {
             "epoch": row["epoch"],
             "chain_key": chain_key,
@@ -5735,9 +6029,7 @@ class State:
         meta_to_store = dict(metadata or {})
         raw_path = meta_to_store.get("path")
         if isinstance(raw_path, str) and raw_path:
-            meta_to_store["path"] = self._wrap_path(
-                raw_path, aad=self._PATH_PII_AAD_TRANSFER,
-            )
+            meta_to_store["path"] = self._seal_field(TRANSFER_SOURCE_PATH, raw_path)
         with self._write_lock:
             self._conn.execute(
                 """
@@ -6647,11 +6939,9 @@ class State:
                 root_seed=bytes(root_seed),
                 root_pub=bytes(root_pub),
             )
-        from one_link.lockbox import maybe_wrap as _lb_wrap
-
         now = _now_ms()
         seed_at_rest = (
-            _lb_wrap(bytes(root_seed), self._lockbox)
+            self._seal_field(SELF_MESH_ROOT_SEED, bytes(root_seed))
             if root_seed is not None else None
         )
         meta_json = json.dumps(metadata or {}, separators=(",", ":"), sort_keys=True)
@@ -7672,22 +7962,7 @@ class State:
             # one-byte marker check has a 1/256 false-positive rate for random
             # 32-byte seeds, which previously made enrollment minting fail
             # intermittently whenever a valid seed happened to begin 0x01.
-            stored_seed = bytes(row["root_seed"])
-            if len(stored_seed) == 32:
-                root_seed = stored_seed
-            elif len(stored_seed) == 61:
-                if self._lockbox is None:
-                    raise RuntimeError(
-                        "found a non-cleartext self-mesh root seed but no "
-                        "lockbox is configured (was ONE_LINK_PASSPHRASE "
-                        "removed?)"
-                    )
-                root_seed = self._lockbox.unwrap(stored_seed)
-            else:
-                raise ValueError(
-                    "invalid stored self-mesh root seed length: "
-                    f"{len(stored_seed)}"
-                )
+            root_seed = self._open_field(SELF_MESH_ROOT_SEED, row["root_seed"])
             self._validate_self_mesh_root_seed(
                 root_seed=root_seed,
                 root_pub=bytes(row["root_pub"]),
@@ -7835,9 +8110,7 @@ class State:
         # values, so legacy rows / unwrapped paths pass through.
         raw_path = metadata.get("path") if isinstance(metadata, dict) else None
         if isinstance(raw_path, str) and raw_path:
-            metadata["path"] = self._unwrap_path(
-                raw_path, aad=self._PATH_PII_AAD_TRANSFER,
-            )
+            metadata["path"] = self._open_field(TRANSFER_SOURCE_PATH, raw_path)
         return TransferRecord(
             id=row["id"],
             direction=row["direction"],
@@ -9442,9 +9715,7 @@ class State:
     ) -> None:
         now = _now_ms()
         # v0.20.7 (M30): wrap path before persisting.
-        wrapped_path = self._wrap_path(
-            str(path), aad=self._PATH_PII_AAD_CHUNK_SOURCES,
-        )
+        wrapped_path = self._seal_field(CHUNK_SOURCE_PATH, str(path))
         with self._write_lock:
             self._conn.execute(
                 """
@@ -9497,16 +9768,17 @@ class State:
         # v0.20.7 (M30): wrap path once for the whole batch — same
         # plaintext path → same ciphertext (AES-SIV deterministic),
         # so the existing PRIMARY KEY de-duplication still works.
-        wrapped_path = self._wrap_path(
-            str(path), aad=self._PATH_PII_AAD_CHUNK_SOURCES,
-        )
+        wrapped_path = self._seal_field(CHUNK_SOURCE_PATH, str(path))
         clean: list[tuple[str, str, int, int, int, int, str, int]] = []
         avail: list[tuple[str, int, str, int]] = []
         for index, c in enumerate(chunks):
             try:
                 chunk_hash = str(c["hash"])
                 start = int(c["start"])
-                size = int(c.get("size", int(c["end"]) - start))
+                # A dict.get default is evaluated eagerly: writing this as
+                # c.get("size", int(c["end"]) - start) raised KeyError for a
+                # chunk that carries only `size`, and the chunk was skipped.
+                size = int(c["size"]) if "size" in c else int(c["end"]) - start
             except (AttributeError, KeyError, TypeError, ValueError) as exc:
                 log.warning(
                     "record_chunk_sources_for_file: skipping malformed "
@@ -9577,9 +9849,7 @@ class State:
                 "chunk_hash": r["chunk_hash"],
                 # v0.20.7 (M30): unwrap on read; legacy cleartext rows
                 # pass through untouched via PathPIIEncryptor.unwrap.
-                "path": self._unwrap_path(
-                    r["path"], aad=self._PATH_PII_AAD_CHUNK_SOURCES,
-                ),
+                "path": self._open_field(CHUNK_SOURCE_PATH, r["path"]),
                 "start": int(r["start"]),
                 "size": int(r["size"]),
                 "mtime_ms": int(r["mtime_ms"]),
@@ -9604,9 +9874,7 @@ class State:
         row no longer identifies the promised chunk so future availability
         checks do not repeatedly reopen the same invalid source.
         """
-        wrapped_path = self._wrap_path(
-            str(path), aad=self._PATH_PII_AAD_CHUNK_SOURCES,
-        )
+        wrapped_path = self._seal_field(CHUNK_SOURCE_PATH, str(path))
         with self._write_lock:
             self._conn.execute(
                 "DELETE FROM chunk_sources "
@@ -9715,9 +9983,7 @@ class State:
         # Survivor wins. Unwrap and return.
         wrapped, (_w, file_size, mtime_ms) = next(iter(candidates.items()))
         try:
-            unwrapped = self._unwrap_path(
-                wrapped, aad=self._PATH_PII_AAD_CHUNK_SOURCES,
-            )
+            unwrapped = self._open_field(CHUNK_SOURCE_PATH, wrapped)
         except Exception:
             return None
         return {
@@ -9790,9 +10056,7 @@ class State:
                 "hash": str(c["hash"]),
             })
         # v0.20.7 (M30): wrap path before persisting.
-        wrapped_path = self._wrap_path(
-            str(path), aad=self._PATH_PII_AAD_FILE_INDEX,
-        )
+        wrapped_path = self._seal_field(FILE_INDEX_PATH, str(path))
         with self._write_lock:
             self._conn.execute(
                 """
@@ -9984,9 +10248,7 @@ class State:
         # deterministic-encrypted row written in record_file_index_cache.
         # Same plaintext + AAD → same ciphertext (AES-SIV), so the
         # index lookup still works.
-        wrapped_path = self._wrap_path(
-            str(path), aad=self._PATH_PII_AAD_FILE_INDEX,
-        )
+        wrapped_path = self._seal_field(FILE_INDEX_PATH, str(path))
         row = self._conn.execute(
             """
             SELECT path, size, mtime_ns, ctime_ns, blob_hash, index_kind,
@@ -10041,9 +10303,7 @@ class State:
         if not isinstance(chunks, list):
             chunks = []
         return {
-            "path": self._unwrap_path(
-                row["path"], aad=self._PATH_PII_AAD_FILE_INDEX,
-            ),
+            "path": self._open_field(FILE_INDEX_PATH, row["path"]),
             "size": int(row["size"]),
             "mtime_ns": int(row["mtime_ns"]),
             "ctime_ns": int(row["ctime_ns"]),

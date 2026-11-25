@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Build the offline owner UI from its canonical feature/service sources.
+"""Build offline owner and peer pages from canonical feature/service sources.
 
 No npm install, network access, minification, or runtime module loader is
-required. Ordered feature modules retain the two established browser closure
+required. Ordered feature modules retain the established browser closure
 lifecycles. Isolated services declare dependencies in factory parameters.
-Run ``python scripts/build_owner_ui.py --check`` in CI to reject stale output.
+The historical entry point checks both pages by default. Use ``--page owner``
+or ``--page peer`` for a single artifact. CI can keep running
+``python scripts/build_owner_ui.py --check`` to reject either stale output.
 """
 
 from __future__ import annotations
@@ -20,10 +22,20 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "frontend" / "owner"
 OUTPUT = ROOT / "src" / "one_link" / "web" / "index.html"
+PEER_SOURCE = ROOT / "frontend" / "peer"
+PEER_OUTPUT = ROOT / "src" / "one_link" / "web" / "peer.html"
+PAGE_SOURCES = {"owner": SOURCE, "peer": PEER_SOURCE}
+PAGE_OUTPUTS = {"owner": OUTPUT, "peer": PEER_OUTPUT}
+PAGE_GROUPS = {"owner": ["owner", "calls"], "peer": ["peer"]}
+FEATURE_AREAS = {
+    "owner": {"owner": {"main"}, "calls": {"calls"}},
+    "peer": {"peer": {"identity", "rendezvous", "transport", "pairing", "messages", "daemon_chat", "ui"}},
+}
 FINGERPRINT = "__ONE_LINK_SOURCE_FINGERPRINT__"
 GROUP_WRAPPERS = {
     "owner": ("(() => {\n", "})();\n"),
     "calls": ("(function () {\n", "})();\n"),
+    "peer": ("(() => {\n", "})();\n"),
 }
 CALL_HEADER = (
     "// Living Presence Tier α-pre - call UI driver.\n"
@@ -33,7 +45,7 @@ CALL_HEADER = (
 
 
 class BuildError(ValueError):
-    """The canonical source set cannot produce a valid owner UI artifact."""
+    """The canonical source set cannot produce a valid browser artifact."""
 
 
 def _read(source: Path, relative: str) -> str:
@@ -41,7 +53,7 @@ def _read(source: Path, relative: str) -> str:
         raise BuildError("module/template paths must be nonempty strings")
     path = source / relative
     if path.is_symlink() or not path.resolve().is_relative_to(source.resolve()):
-        raise BuildError(f"source path must stay within owner_ui: {relative}")
+        raise BuildError(f"source path must stay within the canonical directory: {relative}")
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
@@ -57,14 +69,17 @@ def load_manifest(source: Path = SOURCE) -> dict:
     except json.JSONDecodeError as exc:
         raise BuildError(f"invalid manifest JSON: {exc}") from exc
     if not isinstance(manifest, dict) or manifest.get("schema") != 1:
-        raise BuildError("unsupported owner UI manifest schema")
+        raise BuildError("unsupported browser source manifest schema")
+    page = manifest.get("page", "owner")
+    if not isinstance(page, str) or page not in PAGE_GROUPS:
+        raise BuildError(f"unsupported browser page: {page!r}")
     groups = manifest.get("groups")
     if (
         not isinstance(groups, list)
         or not all(isinstance(group, dict) for group in groups)
-        or [group.get("name") for group in groups] != list(GROUP_WRAPPERS)
+        or [group.get("name") for group in groups] != PAGE_GROUPS[page]
     ):
-        raise BuildError("manifest must contain owner and calls groups in that order")
+        raise BuildError(f"manifest must contain {PAGE_GROUPS[page]} groups in that order")
     seen: set[str] = set()
     factories: set[str] = set()
     for group in groups:
@@ -75,7 +90,7 @@ def load_manifest(source: Path = SOURCE) -> dict:
             if not isinstance(module, dict):
                 raise BuildError("module entries must be objects")
             path = module.get("path")
-            if not isinstance(path, str) or not re.fullmatch(r"(?:main|calls|services)/[a-z_]+\.js", path):
+            if not isinstance(path, str) or not re.fullmatch(r"[a-z_]+/[a-z0-9_]+\.js", path):
                 raise BuildError(f"invalid module path: {path!r}")
             if path in seen:
                 raise BuildError(f"duplicate module: {path}")
@@ -85,8 +100,8 @@ def load_manifest(source: Path = SOURCE) -> dict:
             kind = module.get("kind")
             if kind not in {"feature", "service"}:
                 raise BuildError(f"invalid module kind: {path}")
-            expected_area = "services" if kind == "service" else "main" if group["name"] == "owner" else "calls"
-            if path.split("/", 1)[0] != expected_area:
+            allowed_areas = {"services"} if kind == "service" else FEATURE_AREAS[page][group["name"]]
+            if path.split("/", 1)[0] not in allowed_areas:
                 raise BuildError(f"module is outside its declared lifecycle: {path}")
             if kind == "service":
                 factory = module.get("factory")
@@ -108,6 +123,7 @@ def load_manifest(source: Path = SOURCE) -> dict:
 
 def script_sources(source: Path = SOURCE, manifest: dict | None = None) -> dict[str, str]:
     manifest = manifest or load_manifest(source)
+    page = manifest.get("page", "owner")
     scripts: dict[str, str] = {}
     for group in manifest["groups"]:
         name = group["name"]
@@ -117,6 +133,10 @@ def script_sources(source: Path = SOURCE, manifest: dict | None = None) -> dict[
         # must cross each factory's explicit parameter boundary. This outer
         # scope still keeps the factory names out of the browser global scope.
         parts = [CALL_HEADER if name == "calls" else "", "(() => {\n"]
+        if page == "peer":
+            # The original peer closure is strict. Its extracted services must
+            # retain those semantics as well as the inner feature lifecycle.
+            parts.append('  "use strict";\n')
         for kind in ("service", "feature"):
             if kind == "feature":
                 parts.append(opening)
@@ -127,7 +147,7 @@ def script_sources(source: Path = SOURCE, manifest: dict | None = None) -> dict[
                 body = _read(source, path)
                 if re.search(r"</script\b", body, re.I):
                     raise BuildError(f"inline script terminator in module: {path}")
-                parts.extend((f"// owner-ui module: {path}\n", body))
+                parts.extend((f"// {page}-ui module: {path}\n", body))
         parts.extend((closing, "})();\n"))
         scripts[name] = "".join(parts)
     return scripts
@@ -135,16 +155,17 @@ def script_sources(source: Path = SOURCE, manifest: dict | None = None) -> dict[
 
 def build(source: Path = SOURCE) -> str:
     manifest = load_manifest(source)
+    page = manifest.get("page", "owner")
     html = _read(source, manifest.get("template"))
     for name, script in script_sources(source, manifest).items():
-        marker = f"<!-- owner-ui:script {name} -->"
+        marker = f"<!-- {page}-ui:script {name} -->"
         if html.count(marker) != 1:
             raise BuildError(f"template must contain exactly one {marker}")
         html = html.replace(marker, f"<script>\n{script}</script>")
-    if "<!-- owner-ui:script " in html:
+    if re.search(r"<!-- [a-z]+-ui:script ", html):
         raise BuildError("template has an unresolved script marker")
     fingerprint_declaration = f'const PAGE_SOURCE_FINGERPRINT = "{FINGERPRINT}";'
-    if html.count(fingerprint_declaration) != 1:
+    if page == "owner" and html.count(fingerprint_declaration) != 1:
         raise BuildError("generated HTML must preserve the source fingerprint declaration")
     return html
 
@@ -152,23 +173,42 @@ def build(source: Path = SOURCE) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="fail if committed HTML differs; do not write")
-    parser.add_argument("--source", type=Path, default=SOURCE, help="canonical owner_ui source directory")
-    parser.add_argument("--output", type=Path, default=OUTPUT, help="generated HTML artifact")
+    parser.add_argument("--page", choices=["owner", "peer", "all"], help="page to build (default: both)")
+    parser.add_argument("--source", type=Path, help="custom canonical source directory for one page")
+    parser.add_argument("--output", type=Path, help="custom generated artifact for one page")
     args = parser.parse_args(argv)
     try:
-        expected = build(args.source)
-        existing = args.output.read_text(encoding="utf-8") if args.output.exists() else ""
+        if args.source is not None or args.output is not None:
+            if args.page == "all":
+                raise BuildError("custom source/output requires a single page")
+            source = args.source or PAGE_SOURCES[args.page or "owner"]
+            page = load_manifest(source).get("page", "owner")
+            if args.page is not None and page != args.page:
+                raise BuildError("custom source manifest differs from --page")
+            targets = [(page, source, args.output or PAGE_OUTPUTS[page])]
+        else:
+            pages = PAGE_SOURCES if args.page in {None, "all"} else [args.page]
+            targets = [(page, PAGE_SOURCES[page], PAGE_OUTPUTS[page]) for page in pages]
+        result = 0
+        for page, source, output in targets:
+            result = max(result, _build_target(page, source, output, check=args.check))
+        return result
     except (BuildError, OSError, UnicodeError) as exc:
-        print(f"Owner UI build failed: {exc}", file=sys.stderr)
+        print(f"Browser UI build failed: {exc}", file=sys.stderr)
         return 2
+
+
+def _build_target(page: str, source: Path, output: Path, *, check: bool) -> int:
+    expected = build(source)
+    existing = output.read_text(encoding="utf-8") if output.exists() else ""
     if expected == existing:
-        print("Owner UI generated HTML is current.")
+        print(f"{page.title()} UI generated HTML is current.")
         return 0
-    if args.check:
-        print("Owner UI generated HTML is stale. Run: python scripts/build_owner_ui.py", file=sys.stderr)
+    if check:
+        print(f"{page.title()} UI generated HTML is stale. Run: python scripts/build_owner_ui.py", file=sys.stderr)
         diff = difflib.unified_diff(
             existing.splitlines(), expected.splitlines(),
-            fromfile=str(args.output), tofile="canonical owner_ui build", lineterm="",
+            fromfile=str(output), tofile=f"canonical {page}_ui build", lineterm="",
         )
         for index, line in enumerate(diff):
             if index >= 100:
@@ -176,9 +216,9 @@ def main(argv: list[str] | None = None) -> int:
                 break
             print(line, file=sys.stderr)
         return 1
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(expected, encoding="utf-8", newline="\n")
-    print(f"Built owner UI: {args.output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(expected, encoding="utf-8", newline="\n")
+    print(f"Built {page} UI: {output}")
     return 0
 
 

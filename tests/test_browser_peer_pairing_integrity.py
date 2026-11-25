@@ -50,7 +50,12 @@ def peer_source() -> str:
 
 
 def _encoding_and_crypto_source(source: str) -> str:
-    encoding = _section(source, 'const HEX = "0123456789abcdef";', "// ── fingerprint")
+    # The generated service has a real lexical boundary. Instantiate its
+    # shipped factory rather than slicing its private locals out of that scope.
+    encoding = (
+        _section(source, "function createPeerEncoding(", "\n}\n") + "\n}\n"
+        + "const { bytesToHex, bytesToB64Url, b64UrlToBytes } = createPeerEncoding({ btoa, atob });\n"
+    )
     fingerprint = _section(
         source,
         "async function fingerprintOf(pubBytes)",
@@ -290,6 +295,7 @@ async function makeRecord(alias) {{
 def test_signed_session_and_pair_hello_reject_key_or_session_swap(
     peer_source: str,
 ) -> None:
+    ice_config_factory = _section(peer_source, "function createPeerIceConfig(", "\n}\n") + "\n}\n"
     webrtc = _section(
         peer_source,
         'const WRTC_PROTOCOL_VERSION = "OL-WRTC-1";',
@@ -334,6 +340,7 @@ globalThis.RTCSessionDescription = class {{
 
 {_encoding_and_crypto_source(peer_source)}
 {_pinned_ed25519_fetch_source()}
+{ice_config_factory}
 const state = {{ rec: null, pairing: null }};
 {webrtc}
 {pair_constants}

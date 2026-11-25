@@ -14,6 +14,14 @@ def _section(start: str, end: str) -> str:
     return source[first:source.index(end, first)]
 
 
+def _progress_service() -> str:
+    # Exercise the actual shipped factory and its explicit collaborators.
+    # The factory lives outside the feature closure, so a contiguous slice
+    # between unrelated feature functions is no longer its executable unit.
+    factory = _section("function createPeerProgress(", "\n}\n") + "\n}\n"
+    return factory + "const { _pairingProgress } = createPeerProgress({ state, performance });\n"
+
+
 def _run(script: str) -> None:
     node = shutil.which("node")
     if node is None:
@@ -49,7 +57,7 @@ const fetch = async (url, options) => {
 
 
 def test_progress_keeps_bounded_connection_states_without_session_payloads() -> None:
-    progress = _section("function _pairingProgress()", "async function _runAutoPairFlow(pair)")
+    progress = _progress_service()
     _run("""
 const assert = require('node:assert/strict');
 const state = {};
@@ -72,7 +80,9 @@ assert.equal(JSON.stringify(state.autopair_diagnostics).includes('must not be re
 
 @pytest.mark.parametrize("scenario", ["channel_error", "deadline_during_config", "cancel_during_config"])
 def test_pairing_setup_failure_always_settles_and_cleans_up(scenario: str) -> None:
-    flow = _section("function _pairingProgress()", "// ── v0.20.2 — daemon DataChannel router")
+    flow = _progress_service() + _section(
+        "async function _runAutoPairFlow(pair)", "// ── v0.20.2 — daemon DataChannel router",
+    )
     _run("""
 const assert = require('node:assert/strict');
 const state = {rec: {public_key_b64u: 'fixture', fingerprint: 'fixture'}};

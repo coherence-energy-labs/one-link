@@ -1,0 +1,316 @@
+{
+  "schema": 1,
+  "page": "peer",
+  "template": "peer.template.html",
+  "groups": [
+    {
+      "name": "peer",
+      "modules": [
+        {
+          "path": "ui/dom.js",
+          "kind": "feature",
+          "responsibility": "DOM helpers, identity status and diagnostics"
+        },
+        {
+          "path": "services/encoding.js",
+          "kind": "service",
+          "responsibility": "Byte/hex/base64url encoding with injected platform codecs",
+          "factory": "createPeerEncoding"
+        },
+        {
+          "path": "ui/encoding.js",
+          "kind": "feature",
+          "responsibility": "Encoding bindings and browser fingerprint function"
+        },
+        {
+          "path": "identity/config.js",
+          "kind": "feature",
+          "responsibility": "Identity storage/envelope constants and typed errors"
+        },
+        {
+          "path": "identity/ed25519.js",
+          "kind": "feature",
+          "responsibility": "Pinned Ed25519 WASM load, allocation and operations"
+        },
+        {
+          "path": "identity/validation.js",
+          "kind": "feature",
+          "responsibility": "Identity record and wrapped-envelope validation"
+        },
+        {
+          "path": "identity/indexeddb.js",
+          "kind": "feature",
+          "responsibility": "IndexedDB identity authority persistence"
+        },
+        {
+          "path": "identity/opfs.js",
+          "kind": "feature",
+          "responsibility": "OPFS locking, pending recovery and authority replacement"
+        },
+        {
+          "path": "identity/kdf.js",
+          "kind": "feature",
+          "responsibility": "Legacy/Argon passphrase encoding and key derivation"
+        },
+        {
+          "path": "identity/envelope.js",
+          "kind": "feature",
+          "responsibility": "Authenticated identity envelope wrap and unwrap"
+        },
+        {
+          "path": "identity/deletion.js",
+          "kind": "feature",
+          "responsibility": "Identity deletion and bounded test diagnostics"
+        },
+        {
+          "path": "identity/generation.js",
+          "kind": "feature",
+          "responsibility": "Browser identity creation and temporary key cleanup"
+        },
+        {
+          "path": "services/state.js",
+          "kind": "service",
+          "responsibility": "Fresh identity session state per peer page",
+          "factory": "createPeerState"
+        },
+        {
+          "path": "ui/state.js",
+          "kind": "feature",
+          "responsibility": "Peer state construction"
+        },
+        {
+          "path": "identity/presentation.js",
+          "kind": "feature",
+          "responsibility": "Identity setup/unlock gates and failure presentation"
+        },
+        {
+          "path": "identity/boot.js",
+          "kind": "feature",
+          "responsibility": "Identity boot capability checks and loading"
+        },
+        {
+          "path": "identity/controls.js",
+          "kind": "feature",
+          "responsibility": "Identity reset/export/unlock and passphrase controls"
+        },
+        {
+          "path": "rendezvous/signatures.js",
+          "kind": "feature",
+          "responsibility": "Canonical JSON, signing, daemon answer verification and register envelope"
+        },
+        {
+          "path": "rendezvous/client.js",
+          "kind": "feature",
+          "responsibility": "Bounded rendezvous protocol parsing and requests"
+        },
+        {
+          "path": "transport/selector.js",
+          "kind": "feature",
+          "responsibility": "Explicitly experimental transport scoring and path-stat persistence"
+        },
+        {
+          "path": "transport/signals.js",
+          "kind": "feature",
+          "responsibility": "WebRTC signal schemas, signing and signer continuity"
+        },
+        {
+          "path": "services/ice_config.js",
+          "kind": "service",
+          "responsibility": "Bounded public ICE fetch, STUN filtering and same-device address selection",
+          "factory": "createPeerIceConfig"
+        },
+        {
+          "path": "transport/config.js",
+          "kind": "feature",
+          "responsibility": "Public ICE service binding and candidate projection"
+        },
+        {
+          "path": "transport/webrtc.js",
+          "kind": "feature",
+          "responsibility": "Peer connection, signal exchange and control/bulk sends"
+        },
+        {
+          "path": "ui/rendezvous.js",
+          "kind": "feature",
+          "responsibility": "Rendezvous registration and refresh UI lifecycle"
+        },
+        {
+          "path": "ui/manual_transport.js",
+          "kind": "feature",
+          "responsibility": "Manual WebRTC offer/answer controls"
+        },
+        {
+          "path": "pairing/config.js",
+          "kind": "feature",
+          "responsibility": "Pairing/SAS constants and peer-record contract"
+        },
+        {
+          "path": "pairing/peers_store.js",
+          "kind": "feature",
+          "responsibility": "Paired-peer OPFS record persistence"
+        },
+        {
+          "path": "pairing/sas.js",
+          "kind": "feature",
+          "responsibility": "Deterministic SAS words and art"
+        },
+        {
+          "path": "pairing/validation.js",
+          "kind": "feature",
+          "responsibility": "Pair hello/confirm validation"
+        },
+        {
+          "path": "pairing/handshake.js",
+          "kind": "feature",
+          "responsibility": "SAS handshake lifecycle, confirmation and persistence"
+        },
+        {
+          "path": "ui/peers.js",
+          "kind": "feature",
+          "responsibility": "Paired peer card hydration and controls"
+        },
+        {
+          "path": "messages/store.js",
+          "kind": "feature",
+          "responsibility": "Message schema, IndexedDB store and ACK history"
+        },
+        {
+          "path": "messages/outbox_contract.js",
+          "kind": "feature",
+          "responsibility": "Outbox authority binding and immutable payload contract"
+        },
+        {
+          "path": "messages/outbox_storage.js",
+          "kind": "feature",
+          "responsibility": "Atomic message/outbox persistence and quarantine"
+        },
+        {
+          "path": "messages/outbox_drain.js",
+          "kind": "feature",
+          "responsibility": "Reserved outbox attempts, bounded draining and ACK commit"
+        },
+        {
+          "path": "messages/delivery.js",
+          "kind": "feature",
+          "responsibility": "Direct paired-browser chat send and receive"
+        },
+        {
+          "path": "ui/chat.js",
+          "kind": "feature",
+          "responsibility": "Direct chat rendering and channel lifecycle hooks"
+        },
+        {
+          "path": "pairing/invites.js",
+          "kind": "feature",
+          "responsibility": "Pair/invite query handling and self-mesh invite ceremony"
+        },
+        {
+          "path": "pairing/setup_claim.js",
+          "kind": "feature",
+          "responsibility": "Setup SAS derivation and claim validation"
+        },
+        {
+          "path": "pairing/setup.js",
+          "kind": "feature",
+          "responsibility": "Device invite claim, owner confirmation and status polling"
+        },
+        {
+          "path": "pairing/preflight.js",
+          "kind": "feature",
+          "responsibility": "Identity readiness and auto-pair platform preflight"
+        },
+        {
+          "path": "services/progress.js",
+          "kind": "service",
+          "responsibility": "Per-attempt bounded local pairing phase observations",
+          "factory": "createPeerProgress"
+        },
+        {
+          "path": "pairing/progress.js",
+          "kind": "feature",
+          "responsibility": "Bounded pairing progress service binding"
+        },
+        {
+          "path": "pairing/auto_pair.js",
+          "kind": "feature",
+          "responsibility": "Auto-pair deadline, cancellation, signaling and channel handoff"
+        },
+        {
+          "path": "daemon_chat/authority.js",
+          "kind": "feature",
+          "responsibility": "Daemon channel registration and browser possession proof"
+        },
+        {
+          "path": "daemon_chat/connection.js",
+          "kind": "feature",
+          "responsibility": "Auto-reconnect, request routing and retry deadlines"
+        },
+        {
+          "path": "daemon_chat/api.js",
+          "kind": "feature",
+          "responsibility": "Daemon chat/group request wrappers"
+        },
+        {
+          "path": "daemon_chat/roster.js",
+          "kind": "feature",
+          "responsibility": "Daemon peer/group roster rendering"
+        },
+        {
+          "path": "daemon_chat/search.js",
+          "kind": "feature",
+          "responsibility": "Global daemon search results and selection"
+        },
+        {
+          "path": "daemon_chat/conversations.js",
+          "kind": "feature",
+          "responsibility": "Daemon peer/group conversation opening and history"
+        },
+        {
+          "path": "daemon_chat/composer.js",
+          "kind": "feature",
+          "responsibility": "Daemon chat send intents and conversation search"
+        },
+        {
+          "path": "daemon_chat/uploads.js",
+          "kind": "feature",
+          "responsibility": "Windowed phone-file upload, backpressure and cancel"
+        },
+        {
+          "path": "daemon_chat/management.js",
+          "kind": "feature",
+          "responsibility": "Peer aliases/mute and group management"
+        },
+        {
+          "path": "ui/settings.js",
+          "kind": "feature",
+          "responsibility": "Phone settings and identity sign-out flow"
+        },
+        {
+          "path": "daemon_chat/downloads.js",
+          "kind": "feature",
+          "responsibility": "File bubble content, download and bounded reads"
+        },
+        {
+          "path": "daemon_chat/messages.js",
+          "kind": "feature",
+          "responsibility": "Daemon message rendering, reactions and mutation controls"
+        },
+        {
+          "path": "ui/public_api.js",
+          "kind": "feature",
+          "responsibility": "Existing lifecycle hooks and public diagnostics API"
+        },
+        {
+          "path": "ui/lifecycle.js",
+          "kind": "feature",
+          "responsibility": "Advanced surfaces, query selection and stored-cert relogin"
+        },
+        {
+          "path": "ui/boot.js",
+          "kind": "feature",
+          "responsibility": "Post-identity flow dispatch and boot completion"
+        }
+      ]
+    }
+  ]
+}

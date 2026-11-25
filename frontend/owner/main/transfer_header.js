@@ -160,17 +160,7 @@
           ));
           // Clear local state for the cancelled rows so the pill
           // disappears without waiting for the WS round-trip.
-          for (const id of activeIds) {
-            const rec = state.transfersById.get(id);
-            if (rec) {
-              rec.status = "failed";
-              rec.metadata = {
-                ...(rec.metadata || {}),
-                error: "cancelled by user",
-                error_class: "CancelledByUser",
-              };
-            }
-          }
+          for (const id of activeIds) transferStore.markCancelledByUser(id);
           renderTransferHeaderPill();
           scheduleRenderMessages?.();
           toast(

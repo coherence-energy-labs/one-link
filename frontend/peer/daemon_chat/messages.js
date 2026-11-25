@@ -239,16 +239,13 @@
   }
 
   function _setDaemonReply(m) {
-    state.daemon_reply_to = {
-      id: String(m.id || ""),
-      body: String(m.body || m.file?.name || "(message)").slice(0, 160),
-    };
+    daemonConversation.setReplyTo(m);
     _renderDaemonReplyBar();
     $("#daemon-chat-input")?.focus();
   }
 
   function _clearDaemonReply() {
-    state.daemon_reply_to = null;
+    daemonConversation.clearReplyTo();
     _renderDaemonReplyBar();
   }
 
@@ -262,8 +259,7 @@
   }
 
   $("#btn-daemon-chat-back")?.addEventListener("click", () => {
-    state.daemon_active_peer = null;
-    state.daemon_active_group = null;
+    daemonConversation.close();
     _clearDaemonReply();
     _showOnly("#daemon-roster-card");
   });

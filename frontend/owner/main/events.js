@@ -1,5 +1,10 @@
   // ── WebSocket live events ──────────────────────────────────────────
   let ws = null;
+  // Call events the call driver threw on (reported in diagnostics).
+  let _callEventHandlerFailures = 0;
+  function callEventHandlerFailures() {
+    return _callEventHandlerFailures;
+  }
   function connectWS() {
     try { if (ws) ws.close(); } catch {}
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -24,7 +29,15 @@
           if (typeof window.handleLivingPresenceCallEvent === "function") {
             window.handleLivingPresenceCallEvent(m);
           }
-        } catch (_) { /* defensive - never let UI handler crash WS */ }
+        } catch (error) {
+          // Never let the call UI crash the event stream, and never hide
+          // its failure either: count it for diagnostics and log it.
+          _callEventHandlerFailures += 1;
+          console.error(
+            `call event handler failed (${_callEventHandlerFailures} so far):`,
+            m && m.tail_kind, error,
+          );
+        }
       } else if (m.type === "frame_provenance") {
         // Living Presence Tier α-pre - daemon verified an inbound
         // FILE_PROVENANCE message (or recorded our own outbound
@@ -370,13 +383,7 @@
         // anything that consumes that pref.
         const { scope, id, kind, value } = m;
         if (state.chatPrefs && scope && id && kind) {
-          if (!state.chatPrefs[scope]) state.chatPrefs[scope] = {};
-          if (!state.chatPrefs[scope][id]) state.chatPrefs[scope][id] = {};
-          if (value === null || value === undefined) {
-            delete state.chatPrefs[scope][id][kind];
-          } else {
-            state.chatPrefs[scope][id][kind] = value;
-          }
+          settingsStore.setChatPref(scope, id, kind, value);
           if (scope === "group") renderGroups();
           if (scope === "peer") renderPeers();
           applyActiveChatWallpaper();
@@ -421,18 +428,11 @@
         refreshPeers();
       } else if (m.type === "msg_edit") {
         // v0.7.6: live edit. Patch the in-memory message + rerender.
-        const target = state.messages.find(x => x.id === m.target);
-        if (target) {
-          target.body = m.body;
-          target.edited_at_ms = m.edited_at_ms;
+        if (messageStore.editMessage("direct", m.target, m.body, m.edited_at_ms)) {
           scheduleRenderMessages();
         }
       } else if (m.type === "msg_delete") {
-        const target = state.messages.find(x => x.id === m.target);
-        if (target) {
-          target.body = null;
-          target.deleted = true;
-          target.deleted_at_ms = m.deleted_at_ms;
+        if (messageStore.tombstoneMessage("direct", m.target, m.deleted_at_ms)) {
           scheduleRenderMessages();
         }
       } else if (m.type === "update_status") {
@@ -538,47 +538,24 @@
             reply_to: m.reply_to,
             ts_ms: m.ts_ms || Date.now(),
           };
-          const idx = state.groupMessages.findIndex(x => x.id === row.id);
-          if (idx >= 0) state.groupMessages[idx] = { ...state.groupMessages[idx], ...row };
-          else state.groupMessages.unshift(row);
+          messageStore.upsertGroupRow(row);
           renderGroupConversation();
         }
       } else if (m.type === "group_msg_edit") {
         if ((m.group_id_hex || m.group_id) === state.selectedGroup) {
-          const target = state.groupMessages.find(x => x.id === m.target);
-          if (target) {
-            target.body = m.body;
-            target.edited_at_ms = m.edited_at_ms;
+          if (messageStore.editMessage("group", m.target, m.body, m.edited_at_ms)) {
             renderGroupConversation();
           }
         }
       } else if (m.type === "group_msg_delete") {
         if ((m.group_id_hex || m.group_id) === state.selectedGroup) {
-          const target = state.groupMessages.find(x => x.id === m.target);
-          if (target) {
-            target.body = null;
-            target.deleted = true;
-            target.deleted_at_ms = m.deleted_at_ms;
+          if (messageStore.tombstoneMessage("group", m.target, m.deleted_at_ms)) {
             renderGroupConversation();
           }
         }
       } else if (m.type === "group_reaction") {
         if ((m.group_id_hex || m.group_id) === state.selectedGroup) {
-          const target = state.groupMessages.find(x => x.id === m.target);
-          if (target) {
-            target.reactions = target.reactions || {};
-            if (m.op === "add") {
-              target.reactions[m.emoji] = target.reactions[m.emoji] || [];
-              if (!target.reactions[m.emoji].includes(m.peer_fp)) {
-                target.reactions[m.emoji].push(m.peer_fp);
-              }
-            } else if (target.reactions[m.emoji]) {
-              target.reactions[m.emoji] = target.reactions[m.emoji]
-                .filter(f => f !== m.peer_fp);
-              if (target.reactions[m.emoji].length === 0) {
-                delete target.reactions[m.emoji];
-              }
-            }
+          if (messageStore.applyReaction("group", m.target, m.op, m.emoji, m.peer_fp)) {
             renderGroupConversation();
           }
         }
@@ -595,23 +572,7 @@
       } else if (m.type === "reaction") {
         // v0.7.5: live reaction event. Apply to whichever in-memory
         // message matches the target id, then re-render.
-        const target = state.messages.find(x => x.id === m.target);
-        if (target) {
-          target.reactions = target.reactions || {};
-          if (m.op === "add") {
-            target.reactions[m.emoji] = target.reactions[m.emoji] || [];
-            if (!target.reactions[m.emoji].includes(m.peer_fp)) {
-              target.reactions[m.emoji].push(m.peer_fp);
-            }
-          } else {
-            if (target.reactions[m.emoji]) {
-              target.reactions[m.emoji] = target.reactions[m.emoji]
-                .filter(f => f !== m.peer_fp);
-              if (target.reactions[m.emoji].length === 0) {
-                delete target.reactions[m.emoji];
-              }
-            }
-          }
+        if (messageStore.applyReaction("direct", m.target, m.op, m.emoji, m.peer_fp)) {
           scheduleRenderMessages();
         }
       } else if (m.type === "pair_request") {
@@ -654,23 +615,11 @@
         // the server's authoritative ts / metadata. Without this
         // we'd render twice on the fast path. Same applies if the
         // user happens to receive an echo for any id we've already
-        // got — replace, don't duplicate.
-        const dupIdx = state.messages.findIndex(x => x.id === msg.id);
-        if (dupIdx >= 0) {
-          const prev = state.messages[dupIdx];
-          // Keep any local-only fields (_sendingState etc.) if the
-          // event lacks them, but mark sent now that the daemon
-          // confirms it.
-          state.messages[dupIdx] = {
-            ...prev, ...msg,
-            _sendingState: "sent",
-            _error: undefined,
-            _queueReason: undefined,
-          };
-        } else {
-          state.messages.push(msg);
-        }
-        if (state.messages.length > 1000) state.messages = state.messages.slice(-800);
+        // got — replace, don't duplicate. Local-only fields
+        // (_sendingState etc.) the event lacks are kept, but the row is
+        // marked sent now that the daemon confirms it. messageStore
+        // keeps the newest 800 once history passes 1000 rows.
+        messageStore.receiveDirect(msg);
         if (msg.t === "TEXT" && msg.dir === "in") {
           const peer = state.peers.get(msg.peer);
           const who = peer?.display_name || peer?.hostname || msg.peer;
@@ -730,34 +679,12 @@
         // the attention list (stuck → unstuck, failed → dismissed,
         // held → accepted). Coalesce via the scheduler.
         scheduleAttentionRefresh();
-        const idx = state.transfers.findIndex(t => t.id === m.transfer.id);
-        if (idx >= 0) state.transfers.splice(idx, 1, m.transfer);
-        else state.transfers.unshift(m.transfer);
-        state.transfers.sort((a, b) => (b.updated_ms || 0) - (a.updated_ms || 0));
-        const evictedIds = state.transfers.slice(80).map(t => t.id);
-        state.transfers = state.transfers.slice(0, 80);
-        // 2026-05-22 audit Batch AA: prune the by-id Map and the
-        // (dir|blob) index when entries fall off the 80-cap array.
-        // Previously the Map grew monotonically across a long
-        // session; thousands of stale transfer rows accumulated in
-        // memory because the array hard-cap had no symmetric
-        // delete. _trackTransferIndex maintains transferByDirBlob
-        // (used by transferForMessage O(1) lookup); both need
-        // cleanup or stale ids paper-over fresh ones.
-        for (const eid of evictedIds) {
-          state.transfersById.delete(eid);
-          if (state.transferByDirBlob) {
-            for (const [key, val] of state.transferByDirBlob) {
-              if (val && val.id === eid) {
-                state.transferByDirBlob.delete(key);
-              }
-            }
-          }
-        }
-        state.transfersById.set(m.transfer.id, m.transfer);
-        // T3-Z: keep the (dir|blob) index in sync with the
-        // primary map so transferForMessage stays O(1).
-        _trackTransferIndex(m.transfer);
+        // transferStore replaces or prepends the row, keeps the list
+        // newest-first and capped at 80, and prunes evicted rows from
+        // the by-id Map and the (dir|blob) index (2026-05-22 audit
+        // Batch AA: the Map used to grow for the whole session). T3-Z:
+        // it keeps the index in sync so transferForMessage stays O(1).
+        transferStore.applyEvent(m.transfer);
         // v0.8.8: update the per-transfer EWMA bytes-per-second
         // tracker so the chat bubble + header pill can show a live
         // rate. Cleared on terminal status (complete / failed).

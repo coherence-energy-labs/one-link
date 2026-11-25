@@ -58,6 +58,7 @@ from aiohttp import WSMsgType, web
 
 from one_link import certified_surface, control_ipc
 from one_link.build_identity import runtime_build_identity
+from one_link.call_routes import CallRouter
 from one_link.courier_files import (
     COURIER_FILE_MAX_BYTES, CourierDirectoryMonitor, CourierFileCatalog, CourierFileInfo,
 )
@@ -78,6 +79,7 @@ from one_link.device_relogin import (
     encode_b64u,
 )
 from one_link.fault_observability import report_best_effort_failure
+from one_link.off_loop_import import OFF_LOOP_IMPORTS
 from one_link.local_stun import LocalStunService
 from one_link.paths import data_dir, inbox_dir
 from one_link._coerce import to_int
@@ -1445,6 +1447,49 @@ class _RecoveryBundleTooLarge(ValueError):
 # random port only as a last resort.
 PREFERRED_UI_PORT = 7117
 UI_PORT_FALLBACK_RANGE = 16
+
+#: Operator/test override for the UI listener port.
+#:   unset  -> preferred port, then the fallback range, then OS-assigned;
+#:   ``0``  -> skip the preferred range and bind an OS-assigned port;
+#:   ``N``  -> bind exactly N (1..65535) or fail startup, never falling back.
+UI_PORT_ENV = "ONE_LINK_UI_PORT"
+
+
+class UiPortStartupError(RuntimeError):
+    """The configured UI port cannot be honored; daemon startup must fail.
+
+    ``fatal_startup`` tells the daemon not to downgrade this into a headless
+    start: an explicit port request is an instruction, not a preference.
+    """
+
+    fatal_startup = True
+
+
+def ui_port_override(environ: Mapping[str, str] | None = None) -> int | None:
+    """Parse :data:`UI_PORT_ENV`; ``None`` when unset. Raises on invalid text."""
+
+    env = os.environ if environ is None else environ
+    if UI_PORT_ENV not in env:
+        return None
+    raw = env[UI_PORT_ENV]
+    text = raw.strip() if isinstance(raw, str) else ""
+    if not text or not text.isascii() or not text.isdigit() or int(text) > 65535:
+        raise UiPortStartupError(
+            f"{UI_PORT_ENV}={raw!r} is invalid: expected 0 (OS-assigned) "
+            "or a TCP port 1..65535"
+        )
+    return int(text)
+
+
+async def _preload_qr_renderer() -> None:
+    """Import the SVG QR renderer off the event loop (first import ~0.2 s).
+
+    Failures are left to the handler's own ``import`` statement, which keeps
+    each endpoint's existing error contract.
+    """
+
+    with contextlib.suppress(Exception):
+        await OFF_LOOP_IMPORTS.load("qrcode.image.svg")
 
 
 # 2026-05-22 UX — phone-friendly onboarding landing page.
@@ -3389,6 +3434,90 @@ class UIServer:
                 s.close()
             return None
 
+    async def _bind_ui_listener(self, bind_host: str, requested_port: int | None) -> None:
+        """Bind the UI listener under the ``ONE_LINK_UI_PORT`` policy.
+
+        ``requested_port`` is :func:`ui_port_override`'s result. ``None``
+        keeps the historical policy; an explicit port (``0``: OS-assigned) is
+        bound exactly or raises :class:`UiPortStartupError`, never falling
+        back. Sets ``self.site`` and ``self.port``.
+        """
+        # Try the well-known port first so browser tabs survive restarts.
+        # Fall through 7118..7132 if taken, then OS-assigned random as
+        # last resort.
+        #
+        # v0.20.5 — the previous "ownership probe" raced with TIME_WAIT
+        # entries from a just-killed daemon: bind() would succeed (so
+        # we own the port) but the probe's connect would briefly hit
+        # the kernel's TIME_WAIT-routing layer, fail to read a 200,
+        # and we'd fall through to a higher port. Result: every
+        # restart claimed a different port number, breaking every
+        # bookmark + previously-minted pair URL. On Windows + Linux,
+        # bind() succeeding ≠ "TIME_WAIT clear" but DOES mean "we
+        # own this listener now" — connections will route to us, not
+        # to the dead 5-tuples in TIME_WAIT. Probe removed.
+        if self.runner is None:
+            raise RuntimeError("the UI listener is bound after the app runner is set up, not before")
+        if requested_port is None:
+            candidates: range | tuple[int, ...] = range(
+                PREFERRED_UI_PORT, PREFERRED_UI_PORT + UI_PORT_FALLBACK_RANGE
+            )
+        else:
+            candidates = (requested_port,)
+        bound = False
+        for candidate in candidates:
+            # v0.21.x: on Windows, pre-bind with SO_EXCLUSIVEADDRUSE
+            # so a hostile local process that sets SO_REUSEADDR can't
+            # steal our port. On other platforms the option doesn't
+            # exist and the default semantics already prevent stealing.
+            ex_sock = self._bind_exclusive_socket(bind_host, candidate)
+            if ex_sock is not None:
+                site: web.BaseSite = web.SockSite(self.runner, ex_sock)
+                try:
+                    await site.start()
+                except OSError:
+                    with contextlib.suppress(OSError):
+                        ex_sock.close()
+                    continue
+                self.site = site
+                # getsockname, not ``candidate``: an explicit 0 is OS-assigned.
+                self.port = int(ex_sock.getsockname()[1])
+                bound = True
+                break
+            if os.name == "nt":
+                # The exclusive bind failed (port truly in use).
+                # Skip to next candidate; don't fall through to a
+                # non-exclusive TCPSite that could shadow another
+                # daemon via the REUSEADDR loophole.
+                continue
+            try:
+                site = web.TCPSite(self.runner, host=bind_host, port=candidate)
+                await site.start()
+                self.site = site
+                sockets = getattr(getattr(site, "_server", None), "sockets", None) or ()
+                self.port = int(sockets[0].getsockname()[1]) if sockets else candidate
+                bound = True
+                break
+            except OSError:
+                # Port in use by ANOTHER LISTENER — try the next.
+                # TIME_WAIT entries don't cause this on Windows or
+                # modern Linux; only an actively-listening rival
+                # process does.
+                continue
+        if bound:
+            return
+        if requested_port is not None:
+            raise UiPortStartupError(
+                f"{UI_PORT_ENV}={requested_port}: {bind_host}:{requested_port} "
+                "could not be bound (already in use?); refusing to fall back "
+                "to another port"
+            )
+        site = web.TCPSite(self.runner, host=bind_host, port=0)
+        await site.start()
+        sock = site._server.sockets[0]  # type: ignore[union-attr]
+        self.site = site
+        self.port = sock.getsockname()[1]
+
     async def _probe_owned_http_port(self, bind_host: str, port: int) -> bool:
         """Return True only if the HTTP listener reached on this port is us.
 
@@ -4031,7 +4160,8 @@ class UIServer:
         # decline / hangup / resume / recording start-approve-decline-
         # stop). GET /api/v1/calls lists active calls; GET .../{id}
         # returns one call's snapshot. See call_api.py for action
-        # vocabulary + response shape.
+        # vocabulary + response shape. Handlers live in call_routes.py
+        # (CallRouter); capsule upload handlers stay on the server.
         r.add_post("/api/v1/calls", self._guarded(self.api_call_action))
         r.add_get("/api/v1/calls", self._guarded(self.api_calls_list))
         r.add_get("/api/v1/calls/{call_id}/trace", self._guarded(self.api_call_trace))
@@ -5512,6 +5642,7 @@ class UIServer:
                 status=409,
                 headers={"Cache-Control": "no-store"},
             )
+        await _preload_qr_renderer()
         try:
             import qrcode  # types-qrcode stub package supplies the type info
             import qrcode.image.svg
@@ -6740,6 +6871,7 @@ class UIServer:
             "127.0.0.1",
         )
         landing = f"http://{lan_ip}:{self.port}/install?code={code}"
+        await _preload_qr_renderer()
         try:
             import qrcode
             import qrcode.image.svg
@@ -7051,6 +7183,7 @@ class UIServer:
                 {"error": "url_too_long", "hint": "max 2048 chars"},
                 status=413,
             )
+        await _preload_qr_renderer()
         try:
             import qrcode  # types-qrcode stub package supplies the type info
             import qrcode.image.svg
@@ -7091,17 +7224,17 @@ class UIServer:
         currently trusted roster row. A bearer never creates authority;
         unknown, revoked, ambiguous, or uncertified keys close with 4030.
         """
-        # aiortc imports are lazy so this module loads even on
-        # daemons without aiortc. If we get here, we need it.
-        try:
-            from aiortc import (
-                RTCConfiguration,
-                RTCIceServer,
-                RTCPeerConnection,
-                RTCSessionDescription,
-            )
-        except ImportError:
+        # aiortc is optional, and its first import loads PyAV and native
+        # codecs (measured at seconds on a cold cache). It is imported once
+        # per process on a worker thread so this handler never stalls the
+        # event loop; an absent package still answers 501.
+        aiortc = await OFF_LOOP_IMPORTS.load_optional("aiortc")
+        if aiortc is None:
             return web.Response(status=501, text="aiortc not installed")
+        RTCConfiguration = aiortc.RTCConfiguration
+        RTCIceServer = aiortc.RTCIceServer
+        RTCPeerConnection = aiortc.RTCPeerConnection
+        RTCSessionDescription = aiortc.RTCSessionDescription
 
         from one_link.peer_rtc import (
             BrowserPeer,
@@ -10116,146 +10249,22 @@ class UIServer:
             setattr(self.daemon, "_call_reliability", rel)
         return rel
 
+    def _call_router(self) -> CallRouter:
+        """The /api/v1/calls route group (``call_routes.py``), built lazily."""
+        router = self.__dict__.get("_call_routes")
+        if router is None:
+            router = CallRouter(_ServerCallRouteHost(self), logger=log)
+            self._call_routes = router
+        return router
+
     async def api_call_action(self, request: web.Request) -> web.Response:
-        """POST /api/v1/calls — dispatch one action.
+        """POST /api/v1/calls — dispatch one action (see ``CallRouter.action``).
 
-        Body shape: ``{"action": "initiate", "peer_master_vk_hex": ...,
-        "negotiated_capabilities": [...]}`` or ``{"action": "hangup",
-        "call_id": "..."}``. Returns the structured CallAPI response.
-
-        Also handles the SDP / ICE actions that bypass CallManager:
-          - ``send_sdp_offer`` / ``send_sdp_answer``: forward the
-            browser's SDP to the peer via a ``CALL_SDP_OFFER`` /
-            ``CALL_SDP_ANSWER`` wire message.
-          - ``send_ice_candidate``: forward a trickled ICE candidate
-            via ``CALL_ICE``.
-        These don't touch CallManager — they sit on the media-layer
-        rail next to the lifecycle FSM.
+        Lifecycle actions go through CallAPI and are flushed to the wire;
+        SDP/ICE relay, frame attestation, RTC metrics, predictive continuity
+        and handoff actions are delegated to their tier handlers.
         """
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response(
-                {
-                    "ok": False,
-                    "user_message": "Request shape was unexpected.",
-                },
-                status=400,
-            )
-        if not isinstance(body, dict):
-            return web.json_response(
-                {"ok": False, "user_message": "Request shape was unexpected."},
-                status=400,
-            )
-
-        raw_action = body.get("action")
-        action_name = raw_action.strip().lower() if isinstance(raw_action, str) else ""
-
-        # Media-layer actions — bypass CallManager.
-        if action_name in {
-            "send_sdp_offer", "send_sdp_answer", "send_ice_candidate",
-        }:
-            return await self._handle_media_layer_action(action_name, body)
-
-        # Tier β — per-window provenance attestation from the browser.
-        if action_name == "attest_frame":
-            return await self._handle_attest_frame_action(body)
-
-        # Tier γ — browser pushes per-window WebRTC stats.
-        if action_name == "report_metrics":
-            return self._handle_report_metrics_action(body)
-        if action_name == "report_call_event":
-            return self._handle_report_call_event_action(body)
-
-        # Browser/app restart recovery: restore the live media engine
-        # against an existing backend-owned call instead of opening a
-        # duplicate call or letting each side guess.
-        if action_name == "rejoin":
-            return self._handle_rejoin_call_action(body)
-
-        # Tier η — browser-driven Predictive Continuity API.
-        if action_name == "observe_frame":
-            return self._handle_observe_frame_action(body)
-        if action_name == "predict_frame":
-            return self._handle_predict_frame_action(body)
-
-        # Tier ε — browser/Body confirms handoff secondary is ready.
-        if action_name == "mark_handoff_prewarmed":
-            return self._handle_mark_handoff_prewarmed_action(body)
-
-        if action_name == "initiate":
-            from one_link.call_manager import normalize_call_kind
-
-            try:
-                call_kind = normalize_call_kind(body.get("kind"))
-            except ValueError:
-                return web.json_response(
-                    {
-                        "ok": False,
-                        "user_message": "Choose a voice or video call.",
-                    },
-                    status=400,
-                )
-            peer_fp = body.get("peer_master_vk_hex")
-            if not isinstance(peer_fp, str) or not self.daemon._call_capability_allowed(
-                peer_fp, call_kind
-            ):
-                return web.json_response(
-                    {
-                        "ok": False,
-                        "call_kind": call_kind,
-                        "user_message": ("That contact is not allowed to use this call type."),
-                    },
-                    status=403,
-                )
-            body = dict(body)
-            body["kind"] = call_kind
-
-        api = self._call_api()
-        result = api.handle_json(body)
-        # Flush the response so outbound wire messages actually reach
-        # the peer + tail events broadcast to the WebSocket UIs.
-        delivered: tuple[str, ...] = ()
-        try:
-            delivered = tuple(await self.daemon.flush_call_api_response(result))
-        except Exception as exc:
-            log.warning("flush_call_api_response failed: %s", exc)
-        if action_name == "initiate" and result.ok and result.outbound and not delivered:
-            peer_label = str(body.get("peer_label") or "That device").strip()
-            return web.json_response({
-                "ok": False,
-                "call_id": result.call_id,
-                    "call_kind": result.call_kind,
-                    "phase": result.phase,
-                "consent_phase": result.consent_phase,
-                "user_message": (
-                    f"{peer_label} is not reachable right now. "
-                    "Open One Link on that device, then try again."
-                ),
-                "call_complete": result.call_complete,
-                "outbound": [
-                    {"type": m.type, "peer": m.peer_master_vk_hex}
-                    for m in result.outbound
-                ],
-                "delivered": [],
-            })
-        # Translate the result back to JSON. We omit the binary-ish
-        # tail-events (those flow via the WebSocket separately) so
-        # this response is small + UI-friendly.
-        return web.json_response({
-            "ok": result.ok,
-            "call_id": result.call_id,
-                "call_kind": result.call_kind,
-                "phase": result.phase,
-            "consent_phase": result.consent_phase,
-            "user_message": result.user_message,
-            "call_complete": result.call_complete,
-            "outbound": [
-                {"type": m.type, "peer": m.peer_master_vk_hex}
-                for m in result.outbound
-            ],
-            "delivered": list(delivered),
-        })
+        return await self._call_router().action(request)
 
     def _capsule_ingest_states(self) -> dict[str, dict[str, Any]]:
         """Return the bounded per-server capsule retry registry.
@@ -10853,7 +10862,7 @@ class UIServer:
         enriched_body.setdefault("best_relay_health", route_policy.get("best_relay_health"))
         enriched_body.setdefault("best_relay_score", route_policy.get("best_relay_score"))
         recommendation = reliability.record_metrics(enriched_body)
-        self._append_call_media_audit(enriched_body)
+        self._call_router().media_audit.append_metrics(enriched_body)
         return web.json_response({
             "ok": True,
             "call_id": call_id,
@@ -10862,435 +10871,6 @@ class UIServer:
             "recovery_intent": reliability.recovery_intent_for(call_id),
             "routePolicy": route_policy,
         })
-
-    def _handle_report_call_event_action(self, body: dict) -> web.Response:
-        """Browser posts privacy-safe WebRTC state-machine breadcrumbs."""
-        call_id = body.get("call_id")
-        if not isinstance(call_id, str) or not call_id:
-            return web.json_response(
-                {"ok": False, "user_message": "Call is no longer active."},
-            )
-        reliability = self._call_reliability()
-        reliability.record_event(body)
-        self._append_call_media_event_audit(body)
-        return web.json_response({
-            "ok": True,
-            "call_id": call_id,
-            "session_authority": reliability.session_for(call_id),
-            "recovery_intent": reliability.recovery_intent_for(call_id),
-        })
-
-    def _call_peer_label(self, peer_fp: str) -> str:
-        peer_label = peer_fp[:8]
-        try:
-            rec = self.daemon.state.get_peer(peer_fp) if self.daemon.state is not None else None
-            if rec is not None:
-                peer_label = (
-                    getattr(rec, "local_alias", None)
-                    or getattr(rec, "display_name", None)
-                    or getattr(rec, "hostname", None)
-                    or peer_label
-                )
-        except Exception as peer_exc:
-            report_best_effort_failure(
-                log,
-                "call_peer_label",
-                peer_exc,
-                level=logging.DEBUG,
-            )
-        return peer_label
-
-    def _call_media_backfill(self, call_id: str) -> tuple[dict, list]:
-        sdp_backfill = {}
-        ice_backfill = []
-        try:
-            sdp_backfill = dict(
-                getattr(self.daemon, "_call_sdp_backfill", {}).get(call_id, {})
-            )
-        except Exception:
-            sdp_backfill = {}
-        try:
-            ice_backfill = list(
-                getattr(self.daemon, "_call_ice_backfill", {}).get(call_id, [])
-            )
-        except Exception:
-            ice_backfill = []
-        return sdp_backfill, ice_backfill
-
-    def _call_snapshot(self, call_id: str, mgr) -> dict:
-        s = mgr.session_snapshot()
-        rec_value = s.recording_state.value if s.recording_state.value is not None else 0
-        peer_fp = mgr.state.peer_master_vk_hex
-        local_role = mgr.state.local_role
-        sdp_backfill, ice_backfill = self._call_media_backfill(call_id)
-        return {
-            "ok": True,
-            "call_id": call_id,
-            "peer_master_vk_hex": peer_fp,
-            "peer_label": self._call_peer_label(peer_fp),
-            "local_role": local_role,
-            "call_kind": getattr(mgr.state, "call_kind", "voice"),
-            "is_incoming": local_role == "recipient",
-            "pending_sdp_offer": sdp_backfill.get("sdp_offer"),
-            "pending_sdp_answer": sdp_backfill.get("sdp_answer"),
-            "pending_ice_candidates": ice_backfill,
-            "phase": mgr.phase.name.lower(),
-            "consent_phase": mgr.consent_phase.name.lower(),
-            "intensity": s.current_intensity.name.lower(),
-            "current_rung": s.current_rung_value.name.lower(),
-            "recording_state": int(rec_value),
-            "is_active": mgr.is_active,
-            "is_capturing": mgr.is_capturing,
-            "is_resumable": mgr.is_resumable,
-            "is_complete": mgr.is_complete,
-            "backend_authority": self._call_authority_snapshot(mgr),
-            "path_recommendation": self._call_reliability().recommendation_for(call_id),
-            "media_session_authority": self._call_reliability().session_for(call_id),
-            "media_recovery_intent": self._call_reliability().recovery_intent_for(call_id),
-            "rejoin": {
-                "allowed": bool(mgr.is_active or mgr.phase.name.lower() in {"inviting", "ringing"}),
-                "same_call_id": True,
-                "requires_media_restart": bool(mgr.is_active),
-            },
-        }
-
-    def _handle_rejoin_call_action(self, body: dict) -> web.Response:
-        call_id = body.get("call_id")
-        if not isinstance(call_id, str) or not call_id:
-            return web.json_response(
-                {"ok": False, "user_message": "This call is no longer active."},
-                status=404,
-            )
-        mgr = self.daemon._call_registry.get(call_id)
-        if mgr is None or mgr.is_complete:
-            return web.json_response(
-                {"ok": False, "user_message": "This call is no longer active."},
-                status=404,
-            )
-        reliability = self._call_reliability()
-        reliability.record_event({
-            "call_id": call_id,
-            "event": "client_rejoin_requested",
-            "reason": str(body.get("reason") or "browser_rejoin"),
-        })
-        snap = self._call_snapshot(call_id, mgr)
-        snap["session_authority"] = reliability.session_for(call_id)
-        snap["recovery_intent"] = reliability.recovery_intent_for(call_id)
-        return web.json_response(snap)
-
-    def _append_call_media_event_audit(self, body: dict) -> None:
-        """Append a sanitized call-media event row.
-
-        Events are fixed slugs from the browser media driver. They do not
-        include SDP, ICE candidates, IP addresses, device names, file names,
-        peer labels, or message contents.
-        """
-        try:
-            call_id = str(body.get("call_id") or "")
-            event = str(body.get("event") or "").strip().lower()
-            allowed_events = {
-                "local_media_ready",
-                "negotiation_starting",
-                "offer_preparing",
-                "offer_sent",
-                "offer_send_failed",
-                "answer_preparing",
-                "answer_sent",
-                "answer_send_failed",
-                "answer_resend",
-                "answer_resent",
-                "answer_resend_failed",
-                "offer_resend",
-                "offer_resent",
-                "offer_resend_failed",
-                "accept_resend",
-                "waiting_for_media_offer",
-                "remote_offer_received",
-                "remote_answer_received",
-                "remote_track_connected",
-                "remote_track_muted",
-                "remote_track_unmuted",
-                "remote_track_ended",
-                "remote_video_metadata",
-                "remote_video_resize",
-                "remote_video_playing",
-                "remote_video_waiting",
-                "remote_video_stalled",
-                "remote_video_error",
-                "remote_video_no_frames",
-                "remote_surface_synced",
-                "media_path_repair",
-                "media_path_repair_failed",
-                "ice_restart_requested",
-                "remote_playback_revive",
-                "pc_rebuild_start",
-                "pc_rebuild_offer_sent",
-                "attest_recorder_start_failed",
-                "microphone_changed",
-                "microphone_change_failed",
-                "camera_changed",
-                "camera_change_failed",
-                "audio_output_changed",
-                "audio_output_change_failed",
-                "media_device_changed",
-                "video_fit_changed",
-                "screen_share_started",
-                "screen_share_stopped",
-                "screen_share_failed",
-                "screen_share_unavailable",
-                "pip_started",
-                "pip_failed",
-                "pip_unavailable",
-                "background_blur_changed",
-                "voicemail_capsule_requested",
-                "capsule_capture_started",
-                "capsule_chunk_upload_failed",
-                "capsule_capture_finalized",
-                "capsule_capture_finalize_failed",
-                "group_call_requested",
-                "call_hold_started",
-                "call_hold_ended",
-                "layout_changed",
-                "captions_started",
-                "captions_stopped",
-                "captions_failed",
-                "captions_unavailable",
-                "voice_processing_changed",
-                "call_debug_copied",
-                "call_debug_copy_failed",
-                "tau_media_adapted",
-                "tau_capture_adapted",
-                "tau_capture_adapt_failed",
-                "ice_host_only_mode",
-                "ice_relay_ready",
-                "relay_escape_requested",
-                "remote_media_frozen",
-                "network_resume_repair",
-                "network_offline",
-                "duplicate_remote_offer_ignored",
-                "sas_words_shown",
-                "sas_words_missing",
-                "offer_collision",
-                "offer_collision_recovery_start",
-                "offer_collision_rollback",
-                "offer_collision_rebuild",
-                "offer_collision_recovered",
-                "offer_collision_recovery_failed",
-                "ice_state_changed",
-                "backend_recommendation_received",
-                "backend_recommendation_applied",
-                "backend_recommendation_failed",
-                "session_authority_seen",
-                "recovery_intent_seen",
-                "recovery_intent_applied",
-                "recovery_intent_failed",
-                "call_trace_exported",
-                "call_trace_export_failed",
-                "relay_probe_completed",
-                "relay_probe_failed",
-                "turn_credentials_refreshed",
-                "turn_credentials_refresh_failed",
-                "client_rejoin_requested",
-                "client_rejoin_media_ready",
-                "client_rejoin_failed",
-                "auto_call_trace_captured",
-                "auto_call_trace_failed",
-            }
-            if not call_id or event not in allowed_events:
-                return
-
-            def _clean_token(name: str, allowed: set[str]) -> str | None:
-                raw = body.get(name)
-                if not isinstance(raw, str):
-                    return None
-                clean = raw.strip().lower()
-                return clean if clean in allowed else None
-
-            def _clean_small_int(name: str, lo: int, hi: int) -> int | None:
-                if name not in body:
-                    return None
-                try:
-                    value = int(body.get(name) or 0)
-                except (TypeError, ValueError):
-                    return None
-                return max(lo, min(hi, value))
-
-            row = {
-                "ts_ms": int(time.time() * 1000),
-                "row_type": "event",
-                "call_id": call_id,
-                "event": event,
-                "reason": _clean_token(
-                    "reason", {
-                        "start", "accept", "active", "watchdog", "metrics",
-                        "duplicate_offer", "offer_collision", "offer_echo",
-                        "ringing_backfill", "answered", "no_answer",
-                        "stalled_media", "media_path_repair", "contain", "cover",
-                        "repair", "renderer_detached", "playback_revive",
-                        "ice_state_changed", "connection_state_changed",
-                        "remote_audio_ended", "remote_video_ended",
-                        "focus", "split", "compact",
-                        "observe", "hold", "watch", "backend_recommendation",
-                        "revive_playback", "renegotiate", "audio_first_repair",
-                        "ice_restart", "downshift", "rebuild_peer_connection",
-                        "backend_ice_restart", "backend_renegotiate",
-                        "backend_audio_first_repair",
-                        "negotiating", "connected", "degraded",
-                        "reconnecting", "recovered", "failed",
-                        "restart_ice", "force_relay",
-                        "recovery_intent", "revive_playback",
-                        "relay_probe", "credential_refresh",
-                        "credential_expiring",
-                        "browser_rejoin", "backfill_active",
-                        "media_rejoin", "daemon_restart",
-                        "auto_trace", "sustained_media_freeze",
-                        "watchdog_no_media_movement",
-                    },
-                ),
-                "media_kind": _clean_token("media_kind", {"audio", "video"}),
-                "state": _clean_token(
-                    "state",
-                    {
-                        "new", "checking", "connected", "completed",
-                        "failed", "disconnected", "closed", "connecting",
-                        "enabled", "disabled", "full", "steady", "survival",
-                        "auto", "direct", "relay", "same",
-                        "negotiating", "degraded", "recovered",
-                        "survival", "audio_first",
-                        "healthy", "poor", "unknown",
-                    },
-                ),
-                "ok": bool(body.get("ok")) if "ok" in body else None,
-                "repair_stage": _clean_small_int("repair_stage", 0, 3),
-            }
-            log_dir = data_dir() / "logs"
-            log_dir.mkdir(parents=True, exist_ok=True)
-            with (log_dir / "call_media_audit.jsonl").open(
-                "a", encoding="utf-8",
-            ) as f:
-                f.write(json.dumps(row, sort_keys=True) + "\n")
-        except Exception as exc:
-            log.debug("call media event audit append failed: %s", exc)
-
-    def _append_call_media_audit(self, body: dict) -> None:
-        """Append a privacy-safe WebRTC media diagnostic row.
-
-        The row intentionally excludes SDP bodies, ICE candidate strings,
-        IP addresses, device names, and message contents. It captures only
-        state-machine and aggregate media counters so a failed call can be
-        diagnosed after the fact.
-        """
-        try:
-            call_id = str(body.get("call_id") or "")
-            if not call_id:
-                return
-            allowed_states = {
-                "new", "checking", "connected", "completed", "failed",
-                "disconnected", "closed", "connecting", "stable",
-                "have-local-offer", "have-remote-offer",
-                "have-local-pranswer", "have-remote-pranswer",
-                "gathering", "complete",
-            }
-
-            def _state(name: str) -> str | None:
-                raw = body.get(name)
-                if not isinstance(raw, str):
-                    return None
-                clean = raw.strip().lower()
-                return clean if clean in allowed_states else None
-
-            def _int(name: str) -> int | None:
-                raw = body.get(name)
-                if raw is None:
-                    return None
-                try:
-                    value = int(raw)
-                except (TypeError, ValueError):
-                    return None
-                return max(0, min(value, 32))
-
-            def _counter(name: str) -> int | None:
-                raw = body.get(name)
-                if raw is None:
-                    return None
-                try:
-                    value = int(raw)
-                except (TypeError, ValueError):
-                    return None
-                return max(0, min(value, 10_000_000_000))
-
-            def _float(name: str) -> float | None:
-                raw = body.get(name)
-                if raw is None:
-                    return None
-                try:
-                    value = float(raw)
-                except (TypeError, ValueError):
-                    return None
-                if value != value:
-                    return None
-                return value
-
-            row = {
-                "ts_ms": int(time.time() * 1000),
-                "row_type": "metrics",
-                "call_id": call_id,
-                "ice_connection_state": _state("ice_connection_state"),
-                "connection_state": _state("connection_state"),
-                "ice_gathering_state": _state("ice_gathering_state"),
-                "signaling_state": _state("signaling_state"),
-                "has_local_description": bool(body.get("has_local_description")),
-                "has_remote_description": bool(body.get("has_remote_description")),
-                "local_audio_tracks": _int("local_audio_tracks"),
-                "local_video_tracks": _int("local_video_tracks"),
-                "local_live_audio_tracks": _int("local_live_audio_tracks"),
-                "local_live_video_tracks": _int("local_live_video_tracks"),
-                "remote_audio_tracks": _int("remote_audio_tracks"),
-                "remote_video_tracks": _int("remote_video_tracks"),
-                "remote_live_audio_tracks": _int("remote_live_audio_tracks"),
-                "remote_live_video_tracks": _int("remote_live_video_tracks"),
-                "remote_muted_audio_tracks": _int("remote_muted_audio_tracks"),
-                "remote_muted_video_tracks": _int("remote_muted_video_tracks"),
-                "inbound_audio_bytes": _counter("inbound_audio_bytes"),
-                "inbound_audio_packets": _counter("inbound_audio_packets"),
-                "inbound_video_bytes": _counter("inbound_video_bytes"),
-                "inbound_video_packets": _counter("inbound_video_packets"),
-                "inbound_video_frames_decoded": _counter("inbound_video_frames_decoded"),
-                "inbound_video_frames_dropped": _counter("inbound_video_frames_dropped"),
-                "remote_video_width": _counter("remote_video_width"),
-                "remote_video_height": _counter("remote_video_height"),
-                "remote_video_ready_state": _counter("remote_video_ready_state"),
-                "remote_video_paused": bool(body.get("remote_video_paused")),
-                "rtt_ms": _float("rtt_ms"),
-                "jitter_ms": _float("jitter_ms"),
-                "loss_rate": _float("loss_rate"),
-                "bandwidth_estimate_kbps": _float("bandwidth_estimate_kbps"),
-                "media_health_state": (
-                    str(body.get("media_health_state")).strip().lower()
-                    if isinstance(body.get("media_health_state"), str)
-                    else None
-                ),
-                "media_health_severity": _int("media_health_severity"),
-                "remote_video_src_attached": bool(body.get("remote_video_src_attached")),
-                "remote_audio_src_attached": bool(body.get("remote_audio_src_attached")),
-                "ice_relay_ready": bool(body.get("ice_relay_ready")),
-                "relay_escape_active": bool(body.get("relay_escape_active")),
-                "best_relay_health": (
-                    str(body.get("best_relay_health")).strip().lower()
-                    if str(body.get("best_relay_health") or "").strip().lower()
-                    in {"healthy", "degraded", "poor", "unknown"}
-                    else None
-                ),
-                "best_relay_score": _float("best_relay_score"),
-            }
-            log_dir = data_dir() / "logs"
-            log_dir.mkdir(parents=True, exist_ok=True)
-            with (log_dir / "call_media_audit.jsonl").open(
-                "a", encoding="utf-8",
-            ) as f:
-                f.write(json.dumps(row, sort_keys=True) + "\n")
-        except Exception as exc:
-            log.debug("call media audit append failed: %s", exc)
 
     def _handle_observe_frame_action(self, body: dict) -> web.Response:
         """Tier η — browser reports an arriving real audio/video frame.
@@ -11483,179 +11063,15 @@ class UIServer:
 
     async def api_calls_list(self, request: web.Request) -> web.Response:
         """GET /api/v1/calls — list active call snapshots."""
-        registry = self.daemon._call_registry
-        out = []
-        for cid in registry.active_call_ids():
-            mgr = registry.get(cid)
-            if mgr is None:
-                continue
-            peer_fp = mgr.state.peer_master_vk_hex
-            peer_label = peer_fp[:8]
-            try:
-                rec = self.daemon.state.get_peer(peer_fp) if self.daemon.state is not None else None
-                if rec is not None:
-                    peer_label = (
-                        getattr(rec, "local_alias", None)
-                        or getattr(rec, "display_name", None)
-                        or getattr(rec, "hostname", None)
-                        or peer_label
-                    )
-            except Exception as peer_exc:
-                report_best_effort_failure(
-                    log,
-                    "call_list_peer_label",
-                    peer_exc,
-                    level=logging.DEBUG,
-                )
-            local_role = mgr.state.local_role
-            sdp_backfill = {}
-            try:
-                sdp_backfill = dict(
-                    getattr(self.daemon, "_call_sdp_backfill", {}).get(cid, {})
-                )
-            except Exception:
-                sdp_backfill = {}
-            try:
-                ice_backfill = list(
-                    getattr(self.daemon, "_call_ice_backfill", {}).get(cid, [])
-                )
-            except Exception:
-                ice_backfill = []
-            out.append({
-                "call_id": cid,
-                "peer_master_vk_hex": peer_fp,
-                "peer_label": peer_label,
-                "local_role": local_role,
-                    "call_kind": getattr(mgr.state, "call_kind", "voice"),
-                    "is_incoming": local_role == "recipient",
-                "pending_sdp_offer": sdp_backfill.get("sdp_offer"),
-                "pending_sdp_answer": sdp_backfill.get("sdp_answer"),
-                "pending_ice_candidates": ice_backfill,
-                "phase": mgr.phase.name.lower(),
-                "consent_phase": mgr.consent_phase.name.lower(),
-                "is_active": mgr.is_active,
-                "is_capturing": mgr.is_capturing,
-                "is_resumable": mgr.is_resumable,
-                "is_complete": mgr.is_complete,
-                "backend_authority": self._call_authority_snapshot(mgr),
-                "path_recommendation": self._call_reliability().recommendation_for(cid),
-                "media_session_authority": self._call_reliability().session_for(cid),
-                "media_recovery_intent": self._call_reliability().recovery_intent_for(cid),
-            })
-        return web.json_response({"calls": out})
+        return await self._call_router().list_calls(request)
 
     async def api_call_state(self, request: web.Request) -> web.Response:
         """GET /api/v1/calls/{call_id} — one call's snapshot."""
-        call_id = request.match_info.get("call_id", "")
-        mgr = self.daemon._call_registry.get(call_id)
-        if mgr is None:
-            # Doctrine §3.2.f: no "not found" error code. Plain
-            # language instead.
-            return web.json_response(
-                {
-                    "ok": False,
-                    "user_message": "This call is no longer active.",
-                },
-                status=404,
-            )
-        s = mgr.session_snapshot()
-        rec_value = s.recording_state.value if s.recording_state.value is not None else 0
-        peer_fp = mgr.state.peer_master_vk_hex
-        peer_label = peer_fp[:8]
-        try:
-            rec = self.daemon.state.get_peer(peer_fp) if self.daemon.state is not None else None
-            if rec is not None:
-                peer_label = (
-                    getattr(rec, "local_alias", None)
-                    or getattr(rec, "display_name", None)
-                    or getattr(rec, "hostname", None)
-                    or peer_label
-                )
-        except Exception as peer_exc:
-            report_best_effort_failure(
-                log,
-                "call_detail_peer_label",
-                peer_exc,
-                level=logging.DEBUG,
-            )
-        local_role = mgr.state.local_role
-        sdp_backfill = {}
-        try:
-            sdp_backfill = dict(
-                getattr(self.daemon, "_call_sdp_backfill", {}).get(call_id, {})
-            )
-        except Exception:
-            sdp_backfill = {}
-        try:
-            ice_backfill = list(
-                getattr(self.daemon, "_call_ice_backfill", {}).get(call_id, [])
-            )
-        except Exception:
-            ice_backfill = []
-        return web.json_response({
-            "ok": True,
-            "call_id": call_id,
-            "peer_master_vk_hex": peer_fp,
-            "peer_label": peer_label,
-            "local_role": local_role,
-                "call_kind": getattr(mgr.state, "call_kind", "voice"),
-                "is_incoming": local_role == "recipient",
-            "pending_sdp_offer": sdp_backfill.get("sdp_offer"),
-            "pending_sdp_answer": sdp_backfill.get("sdp_answer"),
-            "pending_ice_candidates": ice_backfill,
-            "phase": mgr.phase.name.lower(),
-            "consent_phase": mgr.consent_phase.name.lower(),
-            "intensity": s.current_intensity.name.lower(),
-            "current_rung": s.current_rung_value.name.lower(),
-            "recording_state": int(rec_value),
-            "is_active": mgr.is_active,
-            "is_capturing": mgr.is_capturing,
-            "is_resumable": mgr.is_resumable,
-            "is_complete": mgr.is_complete,
-            "backend_authority": self._call_authority_snapshot(mgr),
-            "path_recommendation": self._call_reliability().recommendation_for(call_id),
-            "media_session_authority": self._call_reliability().session_for(call_id),
-            "media_recovery_intent": self._call_reliability().recovery_intent_for(call_id),
-        })
+        return await self._call_router().call_state(request)
 
     async def api_call_trace(self, request: web.Request) -> web.Response:
         """GET /api/v1/calls/{call_id}/trace — privacy-safe flight recorder."""
-        call_id = request.match_info.get("call_id", "")
-        mgr = self.daemon._call_registry.get(call_id)
-        if mgr is None:
-            return web.json_response(
-                {"ok": False, "user_message": "This call is no longer active."},
-                status=404,
-            )
-        trace = self._call_reliability().trace_for(call_id)
-        trace["backend_authority"] = self._call_authority_snapshot(mgr)
-        trace["routePolicy"] = self._resolved_webrtc_route_policy(call_id=call_id)
-        return web.json_response(trace)
-
-    @staticmethod
-    def _call_authority_snapshot(mgr) -> dict:
-        phase = mgr.phase.name.lower()
-        if mgr.is_complete:
-            authority_state = "ended"
-        elif mgr.is_resumable:
-            authority_state = "recovered"
-        elif mgr.is_capturing:
-            authority_state = "degraded"
-        elif mgr.is_active:
-            authority_state = "connected"
-        elif phase == "ringing":
-            authority_state = "ringing"
-        elif phase == "inviting":
-            authority_state = "negotiating"
-        else:
-            authority_state = phase
-        return {
-            "state": authority_state,
-            "phase": phase,
-            "is_active": bool(mgr.is_active),
-            "is_resumable": bool(mgr.is_resumable),
-            "is_complete": bool(mgr.is_complete),
-        }
+        return await self._call_router().call_trace(request)
 
     async def api_list_ui_sessions(
         self, request: web.Request,
@@ -15991,6 +15407,7 @@ class UIServer:
             self._sweep_setup_device_invites()
             if token not in self._setup_device_invites:
                 raise ValueError("invite expired or not found")
+            await _preload_qr_renderer()
             import io
             import qrcode
             import qrcode.image.svg
@@ -17688,6 +17105,7 @@ class UIServer:
         token = str(request.query.get("token") or "")
         try:
             parsed = parse_enrollment_invite(token)
+            await _preload_qr_renderer()
             import io
             import qrcode
             import qrcode.image.svg
@@ -18165,6 +17583,7 @@ class UIServer:
             ttl_s = int(request.query.get("ttl_s") or 180)
         except ValueError:
             ttl_s = 180
+        await _preload_qr_renderer()
         try:
             import qrcode
             import qrcode.image.svg
@@ -28969,6 +28388,9 @@ class UIServer:
         )
 
     async def start(self) -> int:
+        # An explicit port request is validated before anything is touched,
+        # so a typo cannot leave half-published runtime state behind.
+        requested_port = ui_port_override()
         self._closing = False
         # ``ui.token`` and ``server.port`` are process-lifetime publications.
         # Invalidate prior values before the first await so a stale file cannot
@@ -28995,67 +28417,12 @@ class UIServer:
         # bearer/session authentication and only public short-lived pairing
         # flows remain available without TLS.
         bind_host = os.environ.get("ONE_LINK_BIND_HOST") or "127.0.0.1"
-        # Try the well-known port first so browser tabs survive restarts.
-        # Fall through 7118..7132 if taken, then OS-assigned random as
-        # last resort.
-        #
-        # v0.20.5 — the previous "ownership probe" raced with TIME_WAIT
-        # entries from a just-killed daemon: bind() would succeed (so
-        # we own the port) but the probe's connect would briefly hit
-        # the kernel's TIME_WAIT-routing layer, fail to read a 200,
-        # and we'd fall through to a higher port. Result: every
-        # restart claimed a different port number, breaking every
-        # bookmark + previously-minted pair URL. On Windows + Linux,
-        # bind() succeeding ≠ "TIME_WAIT clear" but DOES mean "we
-        # own this listener now" — connections will route to us, not
-        # to the dead 5-tuples in TIME_WAIT. Probe removed.
-        bound = False
-        for candidate in range(
-            PREFERRED_UI_PORT, PREFERRED_UI_PORT + UI_PORT_FALLBACK_RANGE
-        ):
-            # v0.21.x: on Windows, pre-bind with SO_EXCLUSIVEADDRUSE
-            # so a hostile local process that sets SO_REUSEADDR can't
-            # steal our port. On other platforms the option doesn't
-            # exist and the default semantics already prevent stealing.
-            ex_sock = self._bind_exclusive_socket(bind_host, candidate)
-            if ex_sock is not None:
-                site: web.BaseSite = web.SockSite(self.runner, ex_sock)
-                try:
-                    await site.start()
-                except OSError:
-                    with contextlib.suppress(OSError):
-                        ex_sock.close()
-                    continue
-                self.site = site
-                self.port = candidate
-                bound = True
-                break
-            if os.name == "nt":
-                # The exclusive bind failed (port truly in use).
-                # Skip to next candidate; don't fall through to a
-                # non-exclusive TCPSite that could shadow another
-                # daemon via the REUSEADDR loophole.
-                continue
-            try:
-                site = web.TCPSite(self.runner, host=bind_host, port=candidate)
-                await site.start()
-                self.site = site
-                self.port = candidate
-                bound = True
-                break
-            except OSError:
-                # Port in use by ANOTHER LISTENER — try the next.
-                # TIME_WAIT entries don't cause this on Windows or
-                # modern Linux; only an actively-listening rival
-                # process does.
-                continue
-        if not bound:
-            site = web.TCPSite(self.runner, host=bind_host, port=0)
-            await site.start()
-            sock = site._server.sockets[0]  # type: ignore[union-attr]
-            self.site = site
-            self.port = sock.getsockname()[1]
+        await self._bind_ui_listener(bind_host, requested_port)
         self.bind_host = bind_host
+        # Heavy optional imports (aiortc/PyAV for browser-peer WebRTC, the
+        # SVG QR renderer) start now on a worker thread, so the first pairing
+        # request does not wait for them and never imports them on the loop.
+        OFF_LOOP_IMPORTS.warm(("aiortc", "qrcode.image.svg"))
         await self._start_local_stun(bind_host)
         # v0.20.7 (security audit M29): wrap the UI token with the
         # daemon's lockbox WHEN explicit passphrase mode is active.
@@ -29291,6 +28658,71 @@ class UIServer:
         delivery_store = getattr(self, "_ui_delivery_idempotency", None)
         if delivery_store is not None:
             delivery_store.close()
+
+
+class _ServerCallRouteHost:
+    """``CallRouteHost`` over a live :class:`UIServer`; reads at call time."""
+
+    __slots__ = ("_server",)
+
+    _MEDIA_LAYER_ACTIONS = frozenset({"send_sdp_offer", "send_sdp_answer", "send_ice_candidate"})
+
+    def __init__(self, server: "UIServer") -> None:
+        self._server = server
+
+    def call_registry(self) -> Any:
+        return self._server.daemon._call_registry
+
+    def call_api(self) -> Any:
+        return self._server._call_api()
+
+    def call_reliability(self) -> Any:
+        return self._server._call_reliability()
+
+    def call_capability_allowed(self, peer_fp: str, call_kind: str) -> bool:
+        return self._server.daemon._call_capability_allowed(peer_fp, call_kind)
+
+    async def flush_call_api_response(self, response: Any) -> Any:
+        return await self._server.daemon.flush_call_api_response(response)
+
+    def peer_record(self, peer_fp: str) -> Any | None:
+        state = self._server.daemon.state
+        return state.get_peer(peer_fp) if state is not None else None
+
+    def call_media_backfill(self, call_id: str) -> tuple[dict, list]:
+        daemon = self._server.daemon
+        try:
+            sdp = dict(getattr(daemon, "_call_sdp_backfill", {}).get(call_id, {}))
+        except Exception:
+            sdp = {}
+        try:
+            ice = list(getattr(daemon, "_call_ice_backfill", {}).get(call_id, []))
+        except Exception:
+            ice = []
+        return sdp, ice
+
+    def webrtc_route_policy(self, call_id: str) -> dict:
+        return self._server._resolved_webrtc_route_policy(call_id=call_id)
+
+    def call_media_audit_path(self) -> Path:
+        return data_dir() / "logs" / "call_media_audit.jsonl"
+
+    async def dispatch_extension_action(self, action: str, body: dict) -> Any:
+        """Tier actions that ride POST /api/v1/calls but belong to other planes."""
+        server = self._server
+        if action in self._MEDIA_LAYER_ACTIONS:
+            return await server._handle_media_layer_action(action, body)
+        if action == "attest_frame":  # Tier β provenance
+            return await server._handle_attest_frame_action(body)
+        if action == "report_metrics":  # Tier γ RTC stats
+            return server._handle_report_metrics_action(body)
+        if action == "observe_frame":  # Tier η predictive continuity
+            return server._handle_observe_frame_action(body)
+        if action == "predict_frame":
+            return server._handle_predict_frame_action(body)
+        if action == "mark_handoff_prewarmed":  # Tier ε handoff
+            return server._handle_mark_handoff_prewarmed_action(body)
+        return None
 
 
 def read_server_port() -> int:

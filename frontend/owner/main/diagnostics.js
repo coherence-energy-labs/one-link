@@ -111,6 +111,7 @@
       },
       groups: { count: state.groups?.size || 0 },
       messages_in_memory: state.messages.length,
+      call_event_handler_failures: callEventHandlerFailures(),
       transfers: { active: state.transfers?.length || 0 },
       unread_total: state.totalUnread || 0,
       debug_event_summary: _diagnosticEventSummary(state.debugEntries || []),

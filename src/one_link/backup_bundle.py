@@ -668,6 +668,38 @@ def create_bundle(
     extra_allowlist: Iterable[str] = (),
     state_passphrase: str | None = None,
 ) -> bytes:
+    """Encode a portable encrypted backup; see ``_create_bundle_in_transaction``.
+
+    The whole export runs inside the LockBox envelope transaction: the bundle
+    archives the recovery envelope, the data-root key and state.db together,
+    so no data-key change (a passphrase migration, a first passphrase boot)
+    may interleave with it.  Other holders wait for it, boundedly.
+    """
+    if not isinstance(seed, (bytes, bytearray)) or len(seed) != 32:
+        raise ValueError("seed must be 32 bytes")
+    resolved = Path(data_dir).resolve()
+    if not resolved.is_dir():
+        raise FileNotFoundError(f"data_dir does not exist: {resolved}")
+    from one_link import lockbox
+
+    with lockbox.envelope_transaction(resolved, purpose="backup export"):
+        return _create_bundle_in_transaction(
+            seed=seed,
+            data_dir=resolved,
+            include_files=include_files,
+            extra_allowlist=extra_allowlist,
+            state_passphrase=state_passphrase,
+        )
+
+
+def _create_bundle_in_transaction(
+    *,
+    seed: bytes,
+    data_dir: Path,
+    include_files: bool = False,
+    extra_allowlist: Iterable[str] = (),
+    state_passphrase: str | None = None,
+) -> bytes:
     """Encode a portable encrypted backup of the daemon's state.
 
     Args:

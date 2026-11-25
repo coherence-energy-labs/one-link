@@ -78,6 +78,14 @@ os.environ.setdefault("ONE_LINK_DISABLE_AT_REST_ENCRYPTION", "1")
 # accept-first delenv / setenv this to control it explicitly.
 os.environ.setdefault("ONE_LINK_REQUIRE_FILE_ACCEPT", "0")
 
+# Test daemons must never take the product's well-known UI ports. Without an
+# override a daemon auto-discovers from 7117 upward, so while a developer's
+# real daemon was restarting (2026-11-25) test daemons bound 7117/7118 and the
+# open app window could reach a TEST daemon. 0 = an OS-assigned port; tests
+# read the chosen port back from data/server.port. A test that covers the
+# preferred-port policy itself sets or deletes this variable explicitly.
+os.environ.setdefault("ONE_LINK_UI_PORT", "0")
+
 
 _PYTEST_SESSION_HOME_CLEANED = False
 

@@ -2,7 +2,9 @@
   // The browser handles audio/video tracks directly via WebRTC SRTP;
   // the daemon brokers SDP exchange. Local media stays on this device
   // until the call ends - the daemon never sees the raw audio/video.
-  const media = createCallMediaState();
+  // mediaState owns the media/route state; `media` is its read-only view.
+  const mediaState = createCallMediaState();
+  const media = mediaState.view;
   if (typeof window !== "undefined") {
     window._livingPresenceMedia = media;
   }
@@ -53,7 +55,7 @@
     if (!callUI.activeCallId || !media.iceRelayReady) return;
     const now = Date.now();
     if (now - Number(media.lastRelayProbeMs || 0) < 120000) return;
-    media.lastRelayProbeMs = now;
+    mediaState.set("lastRelayProbeMs", now);
     try {
       const result = await fetch("/api/peer-rtc/relay-probe", {
         method: "POST",
@@ -65,14 +67,7 @@
           reason: reason || "call_health",
         }),
       }).then((r) => r.json());
-      if (result && result.routePolicy) {
-        media.routePolicyDetail = result.routePolicy;
-        media.bestRelayHealth = String(result.routePolicy.best_relay_health || "");
-        media.bestRelayScore = Number.isFinite(Number(result.routePolicy.best_relay_score))
-          ? Number(result.routePolicy.best_relay_score)
-          : null;
-        media.turnCredentialExpiresAtMs = Number(result.routePolicy.credential_expires_at_ms || 0) || null;
-      }
+      if (result && result.routePolicy) mediaState.recordRoutePolicy(result.routePolicy);
       reportCallEvent("relay_probe_completed", {
         reason: "relay_probe",
         state: media.bestRelayHealth || "unknown",
@@ -90,7 +85,7 @@
     if (!callUI.activeCallId || !media.pc) return false;
     const now = Date.now();
     if (now - Number(media.lastIceConfigRefreshMs || 0) < 60000) return false;
-    media.lastIceConfigRefreshMs = now;
+    mediaState.set("lastIceConfigRefreshMs", now);
     try {
       const iceUrl = `/api/peer-rtc/ice-config?call_id=${encodeURIComponent(callUI.activeCallId)}`;
       const cfg = await fetch(iceUrl, {
@@ -99,18 +94,13 @@
       if (Array.isArray(cfg.iceServers) && cfg.iceServers.length > 0) {
         media.pc.setConfiguration({ iceServers: cfg.iceServers });
       }
-      media.localCandidateAddresses = _callLocalAddressesFromIceConfig(cfg);
-      media.routePolicyDetail = cfg.routePolicy || null;
-      media.iceRelayReady = Array.isArray(cfg.iceServers)
+      mediaState.set("localCandidateAddresses", _callLocalAddressesFromIceConfig(cfg));
+      mediaState.set("iceRelayReady", Array.isArray(cfg.iceServers)
         && cfg.iceServers.some((srv) => {
           const urls = Array.isArray(srv.urls) ? srv.urls : [srv.urls];
           return urls.some((u) => String(u || "").toLowerCase().startsWith("turn:") || String(u || "").toLowerCase().startsWith("turns:"));
-        });
-      media.bestRelayHealth = String(cfg.routePolicy?.best_relay_health || "");
-      media.bestRelayScore = Number.isFinite(Number(cfg.routePolicy?.best_relay_score))
-        ? Number(cfg.routePolicy.best_relay_score)
-        : null;
-      media.turnCredentialExpiresAtMs = Number(cfg.routePolicy?.credential_expires_at_ms || 0) || null;
+        }));
+      mediaState.recordRoutePolicy(cfg.routePolicy);
       reportCallEvent("turn_credentials_refreshed", {
         reason: reason || "credential_refresh",
         state: media.iceRelayReady ? "relay" : "direct",
@@ -154,7 +144,7 @@
         height: { ideal: profile.height, max: profile.height },
         frameRate: { ideal: profile.frameRate, max: profile.frameRate },
       });
-      callUI.lastCaptureProfile = profile.name;
+      callState.set("lastCaptureProfile", profile.name);
       reportCallEvent("tau_capture_adapted", {
         state: profile.name === "audio-first" ? "survival" : profile.name,
         reason: reason || "metrics",
@@ -175,7 +165,7 @@
       const stream = await navigator.mediaDevices.getUserMedia(
         buildMediaConstraints(constraints || { audio: true, video: true }),
       );
-      media.localStream = stream;
+      mediaState.set("localStream", stream);
       attachLocalPreview(stream);
       refreshCallDevicePickers().catch(() => {});
       return stream;
@@ -186,7 +176,7 @@
           const audioOnly = await navigator.mediaDevices.getUserMedia(
             { audio: true },
           );
-          media.localStream = audioOnly;
+          mediaState.set("localStream", audioOnly);
           refreshCallDevicePickers().catch(() => {});
           // No video preview to show - but the call can still
           // proceed with voice.
@@ -264,7 +254,7 @@
       || (state.stream && (!state.srcVideoMatches || !state.srcAudioMatches));
     const now = Date.now();
     if (changed || now - Number(callUI.lastRemoteSurfaceSyncMs || 0) > 7000) {
-      callUI.lastRemoteSurfaceSyncMs = now;
+      callState.set("lastRemoteSurfaceSyncMs", now);
       reportCallEvent("remote_surface_synced", {
         reason: reason || "sync",
         remote_video_visible: state.hasRenderableVideo,
@@ -279,7 +269,7 @@
   }
 
   function attachRemoteStream(stream) {
-    media.remoteStream = stream;
+    mediaState.set("remoteStream", stream);
     syncRemoteMediaSurface("attach_remote_stream");
   }
 

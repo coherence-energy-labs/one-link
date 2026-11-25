@@ -37,6 +37,7 @@ import struct
 import subprocess
 import sys
 import time
+from typing import Any, Sequence
 
 MCAP_MAGIC = b"\x89MCAP0\r\n"
 MIB = 1 << 20
@@ -149,6 +150,8 @@ def child(api: str, path: str, fmt: str) -> None:
     size = os.path.getsize(path)
     peak_before, current_before = _peak_and_current()
     started = time.perf_counter()
+    # Boundary and FormatBoundary share start/end; only the latter has format_forced.
+    result: Sequence[Any]
     if api == "format_aware_file":
         result = chunk.format_aware_file(path, fmt)
     elif api == "cdc_file":

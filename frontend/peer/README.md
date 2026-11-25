@@ -53,6 +53,26 @@ are not added to `window`.
 | `createPeerState()` | None | Fresh in-memory identity/session fields for one page. Identity material is not copied into a second global store. |
 | `createPeerIceConfig({ fetch, AbortController, setTimeout, clearTimeout })` | HTTP, abort controller, timer lifecycle | Public ICE loading, STUN filtering and explicitly enabled local-address selection. Owns its 8-second request timer and host-only failure fallback. |
 | `createPeerProgress({ state, performance })` | The owning peer state and monotonic clock | A per-attempt progress recorder with the existing bounded 32-entry history. It records phases and standard connection states, with no signaling payloads. |
+| `createStatePublisher(target)` | The shared `state` object | Identical to the owner page's copy (a contract test compares the bytes). Publishes owned fields read-only; a raw write throws and names the owner. |
+| `createPeerIdentity()` | None | **Identity state owner**: unlocked record, committed envelope, pending encrypted commit, boot failure, and the once-per-page post-unlock flow. Holds no passphrase. |
+| `createDaemonLink({ clearTimeout })` | Timer release | **Transport state owner**: the one daemon DataChannel, its fingerprint, in-flight requests by rid and the identity-possession handshake. Replacing or closing the channel rejects that channel's requests; a stale close owns nothing; `dispose()` releases every timer and waiter. |
+| `createDaemonConversation()` | None | **Message rendering state owner** for daemon chat: open peer or group (never both), bounded reply target, confirmed peer-record updates and the roster rows. |
+
+`ui/state.js` publishes the identity fields on `state` (`state.rec`,
+`state.envelope`, ...). `daemon_chat/authority.js` publishes the daemon
+transport and conversation fields (`state.daemon_dc`, `state.daemon_pending`,
+`state.daemon_active_peer`, ...). Readers, including `window.__oneLinkPeer.state`,
+see them unchanged; writes go through the owners. `state.pairing` stays an
+ordinary shared field, because browser E2E tests assign it through the public
+API. The pairing and chat function hooks (`ui/public_api.js`, `ui/chat.js`)
+are deliberate one-time composition. Both are listed in
+`tests/js/ownership_baseline.json` with their rationale.
+
+`pairing/auto_pair.js` races every held browser call (ICE config,
+createOffer, setLocalDescription, ICE gathering, signing) against the pairing
+deadline (RUN-01). A held step therefore cannot leave the flow pending, a late
+result cannot rewrite the outcome, and no signaling socket opens after the
+deadline (`tests/test_peer_pairing_offer_stall.py`).
 
 The service tests instantiate these factories independently of the page. The
 pairing lifecycle tests instantiate the generated progress service and execute

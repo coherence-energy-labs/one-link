@@ -62,6 +62,12 @@
   let _lastRenderedLen = 0;
   let _forceMessageBottomUntil = 0;
 
+  // A conversation switch starts a new arrival baseline: the next render
+  // must not count the new conversation's history as "new" messages.
+  function _resetRenderedMessageCount() {
+    _lastRenderedLen = 0;
+  }
+
   function _isMessagesNearBottom(container, thresholdPx = NEAR_BOTTOM_PX) {
     if (!container) return true;
     const distFromBottom =

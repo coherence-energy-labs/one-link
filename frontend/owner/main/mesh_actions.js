@@ -1,6 +1,6 @@
   async function refreshSelfMesh({ refreshHealth = true } = {}) {
     try {
-      state.selfMesh = await api.selfMesh();
+      identityStore.replaceSelfMesh(await api.selfMesh());
       renderSelfMesh();
       if (refreshHealth) await refreshOneHealth();
     } catch (_e) {

@@ -7,8 +7,7 @@
       console.warn("_openDaemonChat called without peer.fingerprint", peer);
       return;
     }
-    state.daemon_active_peer = peer;
-    state.daemon_active_group = null;
+    daemonConversation.openPeer(peer);
     // Single-pane: chat takes the screen.
     _showOnly("#daemon-chat-card");
     const titleText =
@@ -81,8 +80,7 @@
 
   async function _openDaemonGroupChat(group) {
     if (!group || !group.group_id) return;
-    state.daemon_active_peer = null;
-    state.daemon_active_group = group;
+    daemonConversation.openGroup(group);
     _clearDaemonReply();
     _showOnly("#daemon-chat-card");
     text($("#daemon-chat-title"), group.name || "Group");

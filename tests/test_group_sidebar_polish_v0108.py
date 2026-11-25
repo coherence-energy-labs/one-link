@@ -122,7 +122,7 @@ def test_leave_group_clears_local_state(index_html: str):
     snippet = index_html[idx:idx + 1000]
     assert "state.selectedGroup = null" in snippet
     assert "state.groupDetail = null" in snippet
-    assert "state.groupMessages = []" in snippet
+    assert "messageStore.clearGroup()" in snippet
     assert '"#convo-empty"' in snippet
 
 

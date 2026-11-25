@@ -22,19 +22,23 @@
     );
     const proceed = await preflight({ video: wantVideo, peerLabel: label });
     if (!proceed) return;
-    callUI.activeCallId = null;
-    callUI.activeCallPeer = label;
-    callUI.activeCallPeerFp = peerMasterVkHex;
-    callUI.activeCallLocalRole = "originator";
-    callUI.activeCallKind = wantVideo ? "video" : "voice";
-    media.expectRemoteAudio = true;
-    media.expectRemoteVideo = wantVideo;
+    callState.update({
+      activeCallId: null,
+      activeCallPeer: label,
+      activeCallPeerFp: peerMasterVkHex,
+      activeCallLocalRole: "originator",
+      activeCallKind: wantVideo ? "video" : "voice",
+    });
+    mediaState.update({
+      expectRemoteAudio: true,
+      expectRemoteVideo: wantVideo,
+    });
     showOutgoingOverlay(label, {
       kind: wantVideo ? "video" : "voice",
     });
     addOneCallEvent("Starting secure call path...");
     setupRtcPeerConnection();
-    callUI.localMediaReady = false;
+    callState.set("localMediaReady", false);
     const mediaPromise = startLocalMedia({ audio: true, video: wantVideo });
     const result = await callApiPost({
       action: "initiate",
@@ -46,13 +50,15 @@
       if (typeof toast === "function") toast(result.user_message, "warn");
       hideOutgoingOverlay();
       stopAllMedia();
-      callUI.activeCallId = null;
-      callUI.activeCallPeer = null;
-      callUI.activeCallPeerFp = null;
-      callUI.activeCallLocalRole = "";
+      callState.update({
+        activeCallId: null,
+        activeCallPeer: null,
+        activeCallPeerFp: null,
+        activeCallLocalRole: "",
+      });
       return;
     }
-    callUI.activeCallId = result.call_id;
+    callState.set("activeCallId", result.call_id);
     // v0.21.x: track this outgoing call so we get a missed-call /
     // ended-call bubble in chat when the daemon's phase_changed
     // event fires for ended/async_capture.
@@ -94,7 +100,7 @@
         stream.getVideoTracks().forEach((t) => { t.enabled = false; });
       }
     }
-    callUI.localMediaReady = true;
+    callState.set("localMediaReady", true);
     reportCallEvent("local_media_ready", { reason: "start" });
     // Originator creates the SDP offer + sends it now. The peer
     // will respond with an SDP answer once they accept.

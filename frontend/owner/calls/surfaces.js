@@ -363,8 +363,7 @@
   function addOneCallEvent(text) {
     if (!text) return;
     if (isNoisyCallEvent(text)) return;
-    callUI.oneEvents.unshift({ text, at: Date.now() });
-    callUI.oneEvents = callUI.oneEvents.slice(0, 4);
+    callState.recordOneEvent({ text, at: Date.now() });
     const feed = $$("#call-one-feed");
     if (!feed) return;
     feed.innerHTML = callUI.oneEvents.map((ev) => (
@@ -397,7 +396,7 @@
   }
 
   function resetOneCallRail(peerLabel) {
-    callUI.oneEvents = [];
+    callState.clearOneEvents();
     updateOneChip("#call-one-score", "Protected");
     updateOneChip("#call-one-route", "Local");
     updateOneChip("#call-one-rtt", "--");

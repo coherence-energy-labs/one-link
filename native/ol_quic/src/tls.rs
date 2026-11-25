@@ -185,7 +185,10 @@ fn verify_identity_cert(
     expected: &PeerFingerprint,
 ) -> Result<(), RustlsError> {
     let presented = extract_pubkey_fingerprint(cert_der)?;
-    // Constant-time fingerprint compare.
+    // Constant-time fingerprint compare: a dialer must not reveal, through
+    // how long a rejection takes, how much of the fingerprint it expects a
+    // presented certificate matched.
+    // ct-audit: declassify (accept/reject of the presented certificate)
     if !ct_eq(&presented, expected) {
         return Err(RustlsError::General("peer fingerprint mismatch".into()));
     }
@@ -275,13 +278,16 @@ fn verify_tls13_ed25519_handshake_signature(
     Ok(HandshakeSignatureValid::assertion())
 }
 
+/// Constant-time fingerprint equality.
+///
+/// A hand-written OR-fold ending in `diff == 0` is branchless only in
+/// source: the optimiser may recognise the boolean and reintroduce an early
+/// exit. `subtle` routes the result through an optimisation barrier, and
+/// `ol_ct_audit` checks the emitted code (case `quic_server_cert_fingerprint`).
 #[inline]
 fn ct_eq(a: &[u8; FINGERPRINT_LEN], b: &[u8; FINGERPRINT_LEN]) -> bool {
-    let mut diff = 0u8;
-    for i in 0..FINGERPRINT_LEN {
-        diff |= a[i] ^ b[i];
-    }
-    diff == 0
+    use subtle::ConstantTimeEq;
+    bool::from(a.ct_eq(b))
 }
 
 #[cfg(test)]

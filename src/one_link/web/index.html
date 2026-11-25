@@ -12915,21 +12915,12 @@ function createOwnerFormatting({
 // Isolated service: dependencies are explicit parameters; no owner closure access.
 function createOwnerState() {
   const state = {
-    me: null,
     peers: new Map(),     // short_id -> peer
     hiddenLocalPeers: 0,
     selectedPeer: null,   // short_id
-    messages: [],         // recent across all peers
-    transfers: [],
-    transfersById: new Map(),  // id -> transfer record (fast lookup for msg status)
-    // v0.8.8: per-transfer rate tracker. Each entry is
-    // {lastBytes, lastTs, bps} where bps is a rolling EWMA (alpha=0.4).
-    // Cleared on transfer completion / failure.
-    transferRates: new Map(),
     folders: [],
     status: null,
     fabric: null,
-    selfMesh: null,
     oneSetup: null,
     oneHealth: null,
     searchQuery: "",
@@ -12958,7 +12949,6 @@ function createOwnerState() {
     // When user clicks a group in the sidebar, we set this. Mutually
     // exclusive with selectedPeer (entering a group exits 1:1 view).
     selectedGroup: null,  // group_id_hex or null
-    groupMessages: [],    // current group's messages, refreshed on switch
     // Ephemeral group_id -> peer fingerprint -> expiry deadline. This is
     // deliberately memory-only; composition metadata never enters history.
     groupTyping: {},
@@ -12992,6 +12982,595 @@ function createOwnerState() {
     totalUnread: 0,
   };
   return state;
+}
+// owner-ui module: services/state_publisher.js
+// Isolated service: dependencies are explicit parameters; no owner closure access.
+//
+// A feature state owner keeps its fields private and changes them only
+// through its own functions. The page still reads that state through the
+// shared namespace (`state.transfers`, `state.messages`, ...), so this
+// publisher installs a read-only accessor per field. Assigning one throws a
+// TypeError that names the owner: a missed migration fails loudly instead of
+// silently forking the owner's copy. A field is published once, by one owner.
+function createStatePublisher(target, label = "state") {
+  if (!target || typeof target !== "object") throw new TypeError(`${label} must be an object`);
+  const ownerOf = new Map();
+  function publish(owner, readers) {
+    if (typeof owner !== "string" || !owner) throw new TypeError("a published field needs a named owner");
+    for (const [field, read] of Object.entries(readers)) {
+      if (typeof read !== "function") throw new TypeError(`${label}.${field} needs a reader function`);
+      if (ownerOf.has(field) || Object.prototype.hasOwnProperty.call(target, field)) {
+        throw new TypeError(`${label}.${field} already has an owner (${ownerOf.get(field) || "a plain field"})`);
+      }
+      ownerOf.set(field, owner);
+      Object.defineProperty(target, field, {
+        enumerable: true,
+        configurable: false,
+        get: read,
+        set() {
+          throw new TypeError(`${label}.${field} is owned by ${owner}; change it through ${owner}`);
+        },
+      });
+    }
+  }
+  return Object.freeze({
+    publish,
+    ownerOf: (field) => ownerOf.get(field) || null,
+    fields: () => [...ownerOf.keys()],
+  });
+}
+// owner-ui module: services/message_store.js
+// Isolated service: dependencies are explicit parameters; no owner closure access.
+//
+// Owner of the in-memory conversation history the renderers draw: the
+// recent direct messages across all peers, and the selected group's
+// messages. Live events, optimistic sends, send-state updates and local
+// clears all change it here; renderers read it through `state.messages` and
+// `state.groupMessages`. Message rows themselves stay plain objects so the
+// renderers and their hashes see exactly the fields the daemon sent.
+function createMessageStore() {
+  // Direct history is capped: past 1000 rows the newest 800 are kept.
+  const DIRECT_CAP = 1000;
+  const DIRECT_KEEP = 800;
+
+  let direct = [];
+  let group = [];
+
+  function rows(scope) {
+    if (scope === "direct") return direct;
+    if (scope === "group") return group;
+    throw new TypeError(`unknown message scope: ${scope}`);
+  }
+
+  function find(scope, id) {
+    return rows(scope).find((x) => x.id === id) || null;
+  }
+
+  // GET /api/messages replaced the direct history (the value is kept as
+  // returned, as before).
+  function replaceDirect(messages) {
+    direct = messages;
+  }
+
+  function replaceGroup(messages) {
+    group = messages;
+  }
+
+  function clearGroup() {
+    group = [];
+  }
+
+  // Local chat history was wiped.
+  function clearAll() {
+    direct = [];
+    group = [];
+  }
+
+  // An optimistic bubble for a send the daemon has not confirmed yet.
+  function appendDirect(message) {
+    direct.push(message);
+  }
+
+  // A `msg` event. An id already painted (an optimistic bubble whose
+  // client_msg_id the daemon threaded through, or a repeated echo) is
+  // replaced by one canonical row marked sent; local-only fields the event
+  // lacks are kept. Returns the canonical row.
+  function receiveDirect(message) {
+    const dupIdx = direct.findIndex((x) => x.id === message.id);
+    let row;
+    if (dupIdx >= 0) {
+      const prev = direct[dupIdx];
+      row = {
+        ...prev, ...message,
+        _sendingState: "sent",
+        _error: undefined,
+        _queueReason: undefined,
+      };
+      direct[dupIdx] = row;
+    } else {
+      row = message;
+      direct.push(message);
+    }
+    if (direct.length > DIRECT_CAP) direct = direct.slice(-DIRECT_KEEP);
+    return row;
+  }
+
+  // A synthesized CALL_LOG row (missed / ended call) from the call driver.
+  function appendCallLog(row) {
+    direct.push(row);
+    if (direct.length > DIRECT_CAP) direct = direct.slice(-DIRECT_KEEP);
+    return row;
+  }
+
+  // A `group_msg` row for the open group: merged into a known id, otherwise
+  // prepended (group history is newest-first).
+  function upsertGroupRow(row) {
+    const idx = group.findIndex((x) => x.id === row.id);
+    if (idx >= 0) group[idx] = { ...group[idx], ...row };
+    else group.unshift(row);
+  }
+
+  // Live edit. Returns whether the target was in memory.
+  function editMessage(scope, id, body, editedAtMs) {
+    const target = find(scope, id);
+    if (!target) return false;
+    target.body = body;
+    target.edited_at_ms = editedAtMs;
+    return true;
+  }
+
+  // Live delete: the row stays as a tombstone.
+  function tombstoneMessage(scope, id, deletedAtMs) {
+    const target = find(scope, id);
+    if (!target) return false;
+    target.body = null;
+    target.deleted = true;
+    target.deleted_at_ms = deletedAtMs;
+    return true;
+  }
+
+  // Live reaction add/remove from one peer fingerprint. An emoji whose last
+  // reactor left is removed. Returns whether the target was in memory.
+  function applyReaction(scope, id, op, emoji, peerFp) {
+    const target = find(scope, id);
+    if (!target) return false;
+    target.reactions = target.reactions || {};
+    if (op === "add") {
+      target.reactions[emoji] = target.reactions[emoji] || [];
+      if (!target.reactions[emoji].includes(peerFp)) target.reactions[emoji].push(peerFp);
+    } else if (target.reactions[emoji]) {
+      target.reactions[emoji] = target.reactions[emoji].filter((f) => f !== peerFp);
+      if (target.reactions[emoji].length === 0) delete target.reactions[emoji];
+    }
+    return true;
+  }
+
+  // One outbound bubble's send-state (sending / sent / queued / failed).
+  // A tombstoned row is never decorated (2026-05-22 audit Batch AA): a
+  // deleted message must not render with a "sent" tick. Returns the updated
+  // row, or null when nothing changed.
+  function markSendState(id, sendingState, extras = {}) {
+    const idx = direct.findIndex((x) => x.id === id);
+    if (idx < 0) return null;
+    const current = direct[idx];
+    if (current.deleted_at_ms || current.body === "[message deleted]") return null;
+    direct[idx] = { ...current, _sendingState: sendingState, ...extras };
+    return direct[idx];
+  }
+
+  // Lifecycle: the empty history a new page starts with.
+  function reset() {
+    clearAll();
+  }
+
+  return Object.freeze({
+    direct: () => direct,
+    group: () => group,
+    find,
+    replaceDirect,
+    replaceGroup,
+    clearGroup,
+    clearAll,
+    appendDirect,
+    receiveDirect,
+    appendCallLog,
+    upsertGroupRow,
+    editMessage,
+    tombstoneMessage,
+    applyReaction,
+    markSendState,
+    reset,
+  });
+}
+// owner-ui module: services/transfer_store.js
+// Isolated service: dependencies are explicit parameters; no owner closure access.
+//
+// Owner of the page's mirror of the daemon's transfer ledger. The daemon is
+// the source of transfer truth; this store holds the most recent rows the
+// page has seen, the by-id map file bubbles read, the lazily built
+// (direction|blob) index, and the per-transfer EWMA rate tracker. Every
+// change happens here. Readers see the live collections through `state`.
+function createTransferStore({ now }) {
+  if (typeof now !== "function") throw new TypeError("createTransferStore needs a clock");
+  // The WebSocket path keeps the newest 80 rows; evicted rows also leave
+  // the by-id map and the index (2026-05-22 audit Batch AA).
+  const RECENT_LIMIT = 80;
+  // v0.8.8: EWMA alpha for bytes/second. Smooths chunk-by-chunk bursts
+  // without going stale on slow links.
+  const _RATE_ALPHA = 0.4;
+
+  let list = [];
+  let byId = new Map();
+  let byDirBlob = null; // built on first lookup, then maintained incrementally
+  const rates = new Map(); // id -> { lastBytes, lastTs, bps }
+
+  function dirBlobKey(t) {
+    const blob = (t?.blob_hash || "").toLowerCase();
+    return blob && t.direction ? `${t.direction}|${blob}` : null;
+  }
+
+  function rebuildDirBlobIndex() {
+    const idx = new Map();
+    for (const t of byId.values()) {
+      const key = dirBlobKey(t);
+      if (key) idx.set(key, t);
+    }
+    byDirBlob = idx;
+  }
+
+  // Incremental path for the WebSocket handler; avoids a full rebuild per
+  // transfer event. Without an index yet, build it.
+  function trackDirBlob(t) {
+    if (!byDirBlob) {
+      rebuildDirBlobIndex();
+      return;
+    }
+    const key = dirBlobKey(t);
+    if (key) byDirBlob.set(key, t);
+  }
+
+  // A full snapshot from GET /api/transfers.
+  function replaceAll(transfers) {
+    list = transfers;
+    byId = new Map();
+    for (const t of list) byId.set(t.id, t);
+  }
+
+  // A live `transfer` event: replace or prepend the row, keep newest-first,
+  // cap the list, prune evicted rows from the map and index, then record
+  // the row in both.
+  function applyEvent(transfer) {
+    const idx = list.findIndex((t) => t.id === transfer.id);
+    if (idx >= 0) list.splice(idx, 1, transfer);
+    else list.unshift(transfer);
+    list.sort((a, b) => (b.updated_ms || 0) - (a.updated_ms || 0));
+    const evictedIds = list.slice(RECENT_LIMIT).map((t) => t.id);
+    list = list.slice(0, RECENT_LIMIT);
+    for (const eid of evictedIds) {
+      byId.delete(eid);
+      if (byDirBlob) {
+        for (const [key, val] of byDirBlob) {
+          if (val && val.id === eid) byDirBlob.delete(key);
+        }
+      }
+    }
+    byId.set(transfer.id, transfer);
+    trackDirBlob(transfer);
+  }
+
+  // Local history was cleared: drop the rows and the by-id map. The index
+  // and rate tracker are left as they were; the caller refreshes the ledger
+  // immediately afterwards, as before this owner existed.
+  function clearRecords() {
+    list = [];
+    byId = new Map();
+  }
+
+  // A row the user cleared from the transfer panel leaves the list only.
+  function dropListed(id) {
+    list = list.filter((x) => x.id !== id);
+  }
+
+  // The user cancelled active rows; reflect it before the WebSocket
+  // round-trip confirms. Returns whether the row was known.
+  function markCancelledByUser(id) {
+    const rec = byId.get(id);
+    if (!rec) return false;
+    rec.status = "failed";
+    rec.metadata = {
+      ...(rec.metadata || {}),
+      error: "cancelled by user",
+      error_class: "CancelledByUser",
+    };
+    return true;
+  }
+
+  // Terminal rows forget their rate so a retry of the same id starts clean.
+  function forgetRate(id) {
+    return rates.delete(id);
+  }
+
+  // One progress snapshot of a non-terminal transfer.
+  function sampleRate(t) {
+    if (t.status !== "active" && t.status !== "offered") {
+      // queued / paused: keep the last bps, restamp so a resume's first
+      // delta is reasonable.
+      const cur = rates.get(t.id) || {};
+      cur.lastBytes = t.progress_bytes || 0;
+      cur.lastTs = now();
+      rates.set(t.id, cur);
+      return;
+    }
+    const at = now();
+    const prev = rates.get(t.id);
+    if (!prev) {
+      rates.set(t.id, { lastBytes: t.progress_bytes || 0, lastTs: at, bps: 0 });
+      return;
+    }
+    const dt = (at - prev.lastTs) / 1000;
+    if (dt < 0.1) return; // <100ms gaps are too noisy
+    const db = (t.progress_bytes || 0) - prev.lastBytes;
+    if (db < 0) {
+      // progress went backwards (resume / retry): restart.
+      rates.set(t.id, { lastBytes: t.progress_bytes || 0, lastTs: at, bps: 0 });
+      return;
+    }
+    const inst = db / dt;
+    const ewma = (1 - _RATE_ALPHA) * (prev.bps || 0) + _RATE_ALPHA * inst;
+    rates.set(t.id, { lastBytes: t.progress_bytes || 0, lastTs: at, bps: ewma });
+  }
+
+  // Lifecycle: a fresh, empty mirror (the same state a new page starts in).
+  function reset() {
+    list = [];
+    byId = new Map();
+    byDirBlob = null;
+    rates.clear();
+  }
+
+  return Object.freeze({
+    list: () => list,
+    byId: () => byId,
+    dirBlobIndex: () => byDirBlob,
+    rates: () => rates,
+    replaceAll,
+    applyEvent,
+    clearRecords,
+    dropListed,
+    markCancelledByUser,
+    rebuildDirBlobIndex,
+    trackDirBlob,
+    forgetRate,
+    sampleRate,
+    reset,
+  });
+}
+// owner-ui module: services/settings_store.js
+// Isolated service: dependencies are explicit parameters; no owner closure access.
+//
+// Owner of the owner page's settings state:
+//   - the runtime settings cache that DND, sound, theme, receipts and the
+//     composer consult between /api/settings loads;
+//   - the settings editor's hydration and unsaved-changes flags;
+//   - the cached rendezvous URL list;
+//   - the per-chat preference cache (color, wallpaper, archived), which the
+//     server owns and chat_pref events keep in sync.
+// Readers see the cache through `state.runtimeSettings`,
+// `state.rendezvousUrls` and `state.chatPrefs`.
+function createSettingsStore() {
+  let runtime;          // undefined until the page installs its defaults
+  let rendezvousUrls;   // undefined until the first status/settings load
+  let chatPrefs;        // undefined until the chat preference cache starts
+  let hydrating = false;
+  let dirty = false;
+
+  function replaceRuntime(settings) {
+    if (!settings || typeof settings !== "object") throw new TypeError("runtime settings must be an object");
+    runtime = settings;
+    return runtime;
+  }
+
+  // Kept as the daemon returned it (callers already default to []).
+  function setRendezvousUrls(urls) {
+    rendezvousUrls = urls;
+    return rendezvousUrls;
+  }
+
+  // The cache starts empty (but present) when the chat feature loads.
+  function startChatPrefs() {
+    chatPrefs = chatPrefs || { peer: {}, group: {} };
+    return chatPrefs;
+  }
+
+  // The server is the authority: a fresh GET replaces the cache.
+  function replaceChatPrefs(peer, group) {
+    chatPrefs = { peer: peer || {}, group: group || {} };
+    return chatPrefs;
+  }
+
+  // One preference. null/undefined clears it. Returns false (and changes
+  // nothing) while the cache has not started, as the live event did.
+  function setChatPref(scope, id, kind, value) {
+    if (!chatPrefs) return false;
+    if (!chatPrefs[scope]) chatPrefs[scope] = {};
+    if (!chatPrefs[scope][id]) chatPrefs[scope][id] = {};
+    if (value === null || value === undefined) delete chatPrefs[scope][id][kind];
+    else chatPrefs[scope][id][kind] = value;
+    return true;
+  }
+
+  // Settings editor lifecycle. While hydrating, programmatic control
+  // updates must not mark the form dirty.
+  function beginHydration() { hydrating = true; }
+  function endHydration() { hydrating = false; }
+  // Returns whether the change counted (false while hydrating).
+  function markDirty() {
+    if (hydrating) return false;
+    dirty = true;
+    return true;
+  }
+  function markClean() { dirty = false; }
+
+  // Lifecycle: back to the state of a freshly loaded page.
+  function reset() {
+    runtime = undefined;
+    rendezvousUrls = undefined;
+    chatPrefs = undefined;
+    hydrating = false;
+    dirty = false;
+  }
+
+  return Object.freeze({
+    runtime: () => runtime,
+    rendezvousUrls: () => rendezvousUrls,
+    chatPrefs: () => chatPrefs,
+    isHydrating: () => hydrating,
+    isDirty: () => dirty,
+    replaceRuntime,
+    setRendezvousUrls,
+    startChatPrefs,
+    replaceChatPrefs,
+    setChatPref,
+    beginHydration,
+    endHydration,
+    markDirty,
+    markClean,
+    reset,
+  });
+}
+// owner-ui module: services/identity_store.js
+// Isolated service: dependencies are explicit parameters; no owner closure access.
+//
+// Owner of this device's identity snapshot on the owner page: `me` (from
+// GET /api/me: fingerprint, display name, onboarding and update flags) and
+// the personal device mesh that lists the devices that are also "me".
+// Readers see them through `state.me` and `state.selfMesh`.
+function createIdentityStore() {
+  let me = null;
+  let selfMesh = null;
+
+  function replaceMe(snapshot) {
+    me = snapshot;
+    return me;
+  }
+
+  // A local rename, reflected before the next /api/me snapshot.
+  function rename(displayName) {
+    me = { ...(me || {}), display_name: displayName };
+    return me;
+  }
+
+  function replaceSelfMesh(mesh) {
+    selfMesh = mesh;
+    return selfMesh;
+  }
+
+  // Lifecycle: no identity known yet.
+  function reset() {
+    me = null;
+    selfMesh = null;
+  }
+
+  return Object.freeze({
+    me: () => me,
+    selfMesh: () => selfMesh,
+    replaceMe,
+    rename,
+    replaceSelfMesh,
+    reset,
+  });
+}
+// owner-ui module: services/polling_cluster.js
+// Isolated service: dependencies are explicit parameters; no owner closure access.
+//
+// Owner of the owner page's background polling transport: the cluster of
+// interval timers that refresh peers, transfers, status, health, fabric
+// truth and groups alongside the WebSocket (2026-05-21 audit T3-P). A 401
+// burst pauses the whole cluster so it cannot keep re-firing session
+// recovery; explicit recovery resumes it with fresh intervals. dispose()
+// releases every timer the cluster holds.
+function createPollingCluster({ setInterval, clearInterval }) {
+  if (typeof setInterval !== "function" || typeof clearInterval !== "function") {
+    throw new TypeError("createPollingCluster needs interval timers");
+  }
+  let timers = [];
+  let paused = false;
+
+  function schedule(tasks) {
+    return tasks.map(([fn, ms]) => setInterval(fn, ms));
+  }
+
+  // Boot: add the polls to whatever the cluster already holds.
+  function start(tasks) {
+    timers.push(...schedule(tasks));
+  }
+
+  // Stop every poll and remember that the cluster is paused. An empty
+  // cluster has nothing to pause and stays unpaused.
+  function pause() {
+    if (!timers.length) return false;
+    for (const id of timers) {
+      try { clearInterval(id); } catch (_) {}
+    }
+    timers = [];
+    paused = true;
+    return true;
+  }
+
+  // Re-schedule fresh intervals, only after a pause, so a partial
+  // pause/resume cycle can never double-fire.
+  function resume(tasks) {
+    if (!paused) return false;
+    paused = false;
+    timers = schedule(tasks);
+    return true;
+  }
+
+  function dispose() {
+    for (const id of timers) {
+      try { clearInterval(id); } catch (_) {}
+    }
+    timers = [];
+    paused = false;
+  }
+
+  return Object.freeze({
+    start,
+    pause,
+    resume,
+    dispose,
+    isPaused: () => paused,
+    timerIds: () => timers.slice(),
+  });
+}
+// owner-ui module: services/call_log_bridge.js
+// Isolated service: dependencies are explicit parameters; no owner closure access.
+//
+// The one route from the call driver (a separate closure) into the owner
+// page's message rendering state. Published as window.__oneLinkCallLog. The
+// driver asks it for a peer's short id and hands it synthesized CALL_LOG rows
+// (missed / ended call bubbles); the row lands in the message store and the
+// open conversation re-renders. Nothing else of the owner page is reachable
+// through it.
+function createCallLogBridge({ messageStore, getPeers, getSelectedPeer, renderMessages }) {
+  if (!messageStore || typeof messageStore.appendCallLog !== "function") {
+    throw new TypeError("createCallLogBridge needs the message store");
+  }
+  function peerShortIdForFp(fp) {
+    if (!fp) return null;
+    for (const p of getPeers().values()) {
+      if (p.fingerprint === fp) return p.short_id;
+    }
+    return null;
+  }
+  function appendCallLog(row) {
+    if (!row || row.t !== "CALL_LOG" || typeof row.id !== "string" || !row.id) {
+      throw new TypeError("the call bubble bridge accepts CALL_LOG rows only");
+    }
+    messageStore.appendCallLog(row);
+    if (row.peer === getSelectedPeer()) renderMessages();
+  }
+  return Object.freeze({ peerShortIdForFp, appendCallLog });
 }
 // owner-ui module: services/api_client.js
 // Isolated service: dependencies are explicit parameters; no owner closure access.
@@ -13414,6 +13993,40 @@ function createOwnerApiClient({
 // owner-ui module: main/state.js
   // ── State ──────────────────────────────────────────────────────────
   const state = createOwnerState();
+
+  // Feature state owners (MNT-03). Each one keeps its fields private and
+  // changes them only through its own functions; `state.<field>` stays the
+  // page's read path. Writing a published field throws, naming its owner.
+  // tests/js/ownership_baseline.json lists what each feature retired from
+  // the shared bag; the ownership census fails if any of it is written again.
+  const stateOwners = createStatePublisher(state);
+  const messageStore = createMessageStore();
+  const transferStore = createTransferStore({ now: () => Date.now() });
+  const settingsStore = createSettingsStore();
+  const identityStore = createIdentityStore();
+  const pollingCluster = createPollingCluster({
+    setInterval: (fn, ms) => setInterval(fn, ms),
+    clearInterval: (id) => clearInterval(id),
+  });
+  stateOwners.publish("messageStore", {
+    messages: messageStore.direct,
+    groupMessages: messageStore.group,
+  });
+  stateOwners.publish("transferStore", {
+    transfers: transferStore.list,
+    transfersById: transferStore.byId,
+    transferByDirBlob: transferStore.dirBlobIndex,
+    transferRates: transferStore.rates,
+  });
+  stateOwners.publish("settingsStore", {
+    runtimeSettings: settingsStore.runtime,
+    rendezvousUrls: settingsStore.rendezvousUrls,
+    chatPrefs: settingsStore.chatPrefs,
+  });
+  stateOwners.publish("identityStore", {
+    me: identityStore.me,
+    selfMesh: identityStore.selfMesh,
+  });
 
   // v0.7.5: fixed emoji palette for reactions. Custom picker
   // arrives in v0.7.5.1 - for now five universally-meaningful
@@ -13917,29 +14530,26 @@ function createOwnerApiClient({
     });
   }
 
+  // The background polling cluster: [refresh, period ms]. Boot starts
+  // it; a 401 burst pauses it; explicit recovery resumes it.
+  function _mainPollTasks() {
+    return [
+      [refreshPeers, 5000],
+      [refreshTransfers, 4000],
+      [refreshStatus, 8000],
+      [refreshOneHealth, 15000],
+      [refreshFabricTruth, 30000],
+      [refreshGroups, 12000],
+    ];
+  }
   function _pauseMainPollTimers() {
-    const timers = state._mainPollTimers;
-    if (!Array.isArray(timers) || !timers.length) return;
-    for (const id of timers) {
-      try { clearInterval(id); } catch (_) {}
-    }
-    // Empty the array; ``_resumeMainPollTimers`` re-schedules
-    // fresh intervals so we don't accidentally double-fire after
-    // a partial pause/resume cycle.
-    state._mainPollTimers = [];
-    state._mainPollTimersPaused = true;
+    // pollingCluster empties its timers; ``_resumeMainPollTimers``
+    // re-schedules fresh intervals so we don't accidentally
+    // double-fire after a partial pause/resume cycle.
+    pollingCluster.pause();
   }
   function _resumeMainPollTimers() {
-    if (!state._mainPollTimersPaused) return;
-    state._mainPollTimersPaused = false;
-    state._mainPollTimers = [
-      setInterval(refreshPeers, 5000),
-      setInterval(refreshTransfers, 4000),
-      setInterval(refreshStatus, 8000),
-      setInterval(refreshOneHealth, 15000),
-      setInterval(refreshFabricTruth, 30000),
-      setInterval(refreshGroups, 12000),
-    ];
+    pollingCluster.resume(_mainPollTasks());
   }
 
   function showSessionExpiredBanner() {
@@ -14663,8 +15273,8 @@ function createOwnerApiClient({
   }
   // v0.10.0 - runtime settings cache populated when settings load.
   // Defaults are sane so notifyIncoming + soundOnIncoming work even
-  // before /api/settings has been fetched.
-  state.runtimeSettings = {
+  // before /api/settings has been fetched. settingsStore owns the cache.
+  settingsStore.replaceRuntime({
     theme: "dark",
     ui_density: "comfortable",
     message_bubble_style: "gradient",
@@ -14682,7 +15292,7 @@ function createOwnerApiClient({
     dnd_end: "07:00",
     notification_sound: true,
     pair_default_allow_all: true,
-  };
+  });
 
   // v0.10.0: live theme apply. Sets <html data-theme="..."> which
   // CSS variable overrides key off of. No element-by-element repaint.
@@ -14701,7 +15311,7 @@ function createOwnerApiClient({
           "--my-avatar", r.avatar_color,
         );
       }
-      state.runtimeSettings = {
+      settingsStore.replaceRuntime({
         theme: r.theme || "dark",
         ui_density: r.ui_density || "comfortable",
         message_bubble_style: r.message_bubble_style || "gradient",
@@ -14727,7 +15337,7 @@ function createOwnerApiClient({
         // v0.12.3 typing-indicator privacy.
         send_typing_indicators: r.send_typing_indicators !== false,
         display_typing_indicators: r.display_typing_indicators !== false,
-      };
+      });
       // Reuse this settings snapshot for the update toggle. The previous
       // DOMContentLoaded hook issued a second /api/settings request during
       // every boot solely to read this one field.
@@ -17607,26 +18217,15 @@ function createOwnerApiClient({
   // ``"<dir>|<blob_hash>"`` so the lookup becomes O(1). Rebuilt
   // whenever ``state.transfersById`` is mutated.
 // owner-ui module: main/transfer_facts.js
+  // T3-Z: the O(1) (direction|blob) -> transfer index is owned by
+  // transferStore, next to the by-id map it is derived from.
   function _rebuildTransferByDirBlob() {
-    const idx = new Map();
-    for (const t of state.transfersById.values()) {
-      const blob = (t.blob_hash || "").toLowerCase();
-      if (!blob || !t.direction) continue;
-      idx.set(`${t.direction}|${blob}`, t);
-    }
-    state.transferByDirBlob = idx;
+    transferStore.rebuildDirBlobIndex();
   }
   function _trackTransferIndex(t) {
     // Incremental update path for the WS-event handler. Avoids a
     // full rebuild on every transfer event.
-    if (!state.transferByDirBlob) {
-      _rebuildTransferByDirBlob();
-      return;
-    }
-    const blob = (t?.blob_hash || "").toLowerCase();
-    if (blob && t.direction) {
-      state.transferByDirBlob.set(`${t.direction}|${blob}`, t);
-    }
+    transferStore.trackDirBlob(t);
   }
   function transferForMessage(msg) {
     const blob = (msg.blob || "").toLowerCase();
@@ -17696,56 +18295,19 @@ function createOwnerApiClient({
 
   // v0.8.8: per-transfer EWMA rate tracker. Each `transfer` WS event
   // is a snapshot - by diffing progress_bytes across events we get
-  // bytes/sec without any extra wire data. EWMA (alpha=0.4) smooths
-  // out the chunk-by-chunk burstiness without going stale on slow
-  // links. Reset on terminal status so the next transfer for the
-  // same id (e.g. retry after pause) starts clean.
-  const _RATE_ALPHA = 0.4;
+  // bytes/sec without any extra wire data. transferStore owns the
+  // tracker and its EWMA (alpha=0.4), which smooths out chunk-by-chunk
+  // burstiness without going stale on slow links. Reset on terminal
+  // status so the next transfer for the same id (e.g. retry after
+  // pause) starts clean.
   function updateTransferRate(t) {
     if (!t || !t.id) return;
     const terminal = t.status === "complete" || t.status === "failed";
     if (terminal) {
-      state.transferRates.delete(t.id);
+      transferStore.forgetRate(t.id);
       return;
     }
-    if (t.status !== "active" && t.status !== "offered") {
-      // queued / paused - keep last bps but stamp timestamp so a
-      // resume's first delta is reasonable.
-      const cur = state.transferRates.get(t.id) || {};
-      cur.lastBytes = t.progress_bytes || 0;
-      cur.lastTs = Date.now();
-      state.transferRates.set(t.id, cur);
-      return;
-    }
-    const now = Date.now();
-    const prev = state.transferRates.get(t.id);
-    if (!prev) {
-      state.transferRates.set(t.id, {
-        lastBytes: t.progress_bytes || 0,
-        lastTs: now,
-        bps: 0,
-      });
-      return;
-    }
-    const dt = (now - prev.lastTs) / 1000;
-    if (dt < 0.1) return;  // ignore <100ms gaps - too noisy.
-    const db = (t.progress_bytes || 0) - prev.lastBytes;
-    if (db < 0) {
-      // progress went backwards (resume / retry) - restart.
-      state.transferRates.set(t.id, {
-        lastBytes: t.progress_bytes || 0,
-        lastTs: now,
-        bps: 0,
-      });
-      return;
-    }
-    const inst = db / dt;
-    const ewma = (1 - _RATE_ALPHA) * (prev.bps || 0) + _RATE_ALPHA * inst;
-    state.transferRates.set(t.id, {
-      lastBytes: t.progress_bytes || 0,
-      lastTs: now,
-      bps: ewma,
-    });
+    transferStore.sampleRate(t);
   }
   function rateForTransfer(t) {
     if (!t) return 0;
@@ -18804,7 +19366,7 @@ function createOwnerApiClient({
 // owner-ui module: main/mesh_actions.js
   async function refreshSelfMesh({ refreshHealth = true } = {}) {
     try {
-      state.selfMesh = await api.selfMesh();
+      identityStore.replaceSelfMesh(await api.selfMesh());
       renderSelfMesh();
       if (refreshHealth) await refreshOneHealth();
     } catch (_e) {
@@ -19668,17 +20230,7 @@ function createOwnerApiClient({
           ));
           // Clear local state for the cancelled rows so the pill
           // disappears without waiting for the WS round-trip.
-          for (const id of activeIds) {
-            const rec = state.transfersById.get(id);
-            if (rec) {
-              rec.status = "failed";
-              rec.metadata = {
-                ...(rec.metadata || {}),
-                error: "cancelled by user",
-                error_class: "CancelledByUser",
-              };
-            }
-          }
+          for (const id of activeIds) transferStore.markCancelledByUser(id);
           renderTransferHeaderPill();
           scheduleRenderMessages?.();
           toast(
@@ -19793,6 +20345,12 @@ function createOwnerApiClient({
   let _msgPillCount = 0;
   let _lastRenderedLen = 0;
   let _forceMessageBottomUntil = 0;
+
+  // A conversation switch starts a new arrival baseline: the next render
+  // must not count the new conversation's history as "new" messages.
+  function _resetRenderedMessageCount() {
+    _lastRenderedLen = 0;
+  }
 
   function _isMessagesNearBottom(container, thresholdPx = NEAR_BOTTOM_PX) {
     if (!container) return true;
@@ -21690,7 +22248,7 @@ function createOwnerApiClient({
     closeMobileSidebar();
     // v0.21.1: reset the new-message pill on conversation switch.
     _hideNewMessagePill();
-    _lastRenderedLen = 0;
+    _resetRenderedMessageCount();
     _forceMessagesBottomNowAndAfter();
     // v0.14.1 persist for boot-time restore.
     _saveLastSelection("group", gidHex);
@@ -21704,9 +22262,9 @@ function createOwnerApiClient({
     }
     try {
       const r = await api.get(`/api/groups/${gidHex}/messages?limit=200`);
-      state.groupMessages = r.messages || [];
+      messageStore.replaceGroup(r.messages || []);
     } catch (e) {
-      state.groupMessages = [];
+      messageStore.clearGroup();
     }
     renderGroups();
     renderGroupConversation();
@@ -21920,7 +22478,7 @@ function createOwnerApiClient({
   // /api/chat-prefs at boot + kept in sync by chat_pref WS events.
   // localStorage is still written so the FIRST paint after a
   // reload is instant (we don't have to wait for the GET).
-  state.chatPrefs = state.chatPrefs || { peer: {}, group: {} };
+  settingsStore.startChatPrefs();
   function _readChatPref(scope, id, kind) {
     const cached = state.chatPrefs?.[scope]?.[id]?.[kind];
     if (cached !== undefined) return cached;
@@ -21939,13 +22497,8 @@ function createOwnerApiClient({
     return undefined;
   }
   function _writeChatPref(scope, id, kind, value) {
-    if (!state.chatPrefs[scope]) state.chatPrefs[scope] = {};
-    if (!state.chatPrefs[scope][id]) state.chatPrefs[scope][id] = {};
-    if (value === null || value === undefined || value === "") {
-      delete state.chatPrefs[scope][id][kind];
-    } else {
-      state.chatPrefs[scope][id][kind] = value;
-    }
+    // A local pick also clears on "" (an emptied picker).
+    settingsStore.setChatPref(scope, id, kind, value === "" ? null : value);
     // Mirror to localStorage for instant first-paint on reload.
     if (kind === "color") {
       const k = `one_link.${scope}_color.${id}`;
@@ -21969,7 +22522,7 @@ function createOwnerApiClient({
     try {
       const r = await api.get("/api/chat-prefs");
       // Server is the authority; replace any cached state.
-      state.chatPrefs = { peer: r.peer || {}, group: r.group || {} };
+      settingsStore.replaceChatPrefs(r.peer, r.group);
       // Re-render anything that consumed the prefs.
       renderGroups();
       renderPeers();
@@ -22148,7 +22701,7 @@ function createOwnerApiClient({
       closeGroupSettings();
       state.selectedGroup = null;
       state.groupDetail = null;
-      state.groupMessages = [];
+      messageStore.clearGroup();
       $("#convo-active").style.display = "none";
       $("#convo-empty").style.display = "grid";
       await refreshGroups();
@@ -24192,7 +24745,7 @@ function createOwnerApiClient({
       console.warn(status.reason);
     }
     if (selfMesh.status === "fulfilled") {
-      state.selfMesh = selfMesh.value;
+      identityStore.replaceSelfMesh(selfMesh.value);
       renderSelfMesh();
     }
     // Keep rendezvous URLs cached so the empty-state nudge is accurate without
@@ -24200,7 +24753,7 @@ function createOwnerApiClient({
     if (rendezvous.status === "fulfilled") {
       const r = rendezvous.value;
       const before = (state.rendezvousUrls || []).length;
-      state.rendezvousUrls = r.urls || [];
+      settingsStore.setRendezvousUrls(r.urls || []);
       if (before === 0 && state.peers && state.peers.size === 0) {
         renderPeers();
       }
@@ -24690,9 +25243,7 @@ function createOwnerApiClient({
   async function refreshTransfers() {
     try {
       const { transfers } = await api.transfers();
-      state.transfers = transfers || [];
-      state.transfersById = new Map();
-      for (const t of state.transfers) state.transfersById.set(t.id, t);
+      transferStore.replaceAll(transfers || []);
       // T3-Z: rebuild the O(1) (dir|blob) → transfer lookup index.
       _rebuildTransferByDirBlob();
       renderTransfers();
@@ -24895,7 +25446,7 @@ function createOwnerApiClient({
         del.onclick = async () => {
           try {
             await api.del(`/api/transfers/${encodeURIComponent(t.id)}`);
-            state.transfers = state.transfers.filter(x => x.id !== t.id);
+            transferStore.dropListed(t.id);
             renderTransfers();
             await refreshStatus();
           } catch (e) {
@@ -25206,24 +25757,14 @@ function createOwnerApiClient({
   // sendCurrent on resolve and by the inline Retry button. Re-
   // renders only if the affected message is in the active thread.
   function _markBubbleState(msgId, sendingState, extras = {}) {
-    const idx = state.messages.findIndex(x => x.id === msgId);
-    if (idx < 0) return;
-    // 2026-05-22 audit Batch AA: don't overwrite send-state on a
-    // message that was already deleted out from under us — that
-    // would render "[message deleted]" with a ✓ "sent" tick.
+    // 2026-05-22 audit Batch AA: messageStore never overwrites
+    // send-state on a message that was already deleted out from under
+    // us — that would render "[message deleted]" with a ✓ "sent" tick.
     // Both ``deleted_at_ms`` (server-side delete) and a body of
-    // ``[message deleted]`` (legacy client-side flag) are signals
-    // that the message has been tombstoned; don't decorate it.
-    const current = state.messages[idx];
-    if (current.deleted_at_ms || current.body === "[message deleted]") {
-      return;
-    }
-    state.messages[idx] = {
-      ...current,
-      _sendingState: sendingState,
-      ...extras,
-    };
-    if (state.messages[idx].peer === state.selectedPeer) renderMessages();
+    // ``[message deleted]`` (legacy client-side flag) are signals that
+    // the message has been tombstoned; it is not decorated.
+    const updated = messageStore.markSendState(msgId, sendingState, extras);
+    if (updated && updated.peer === state.selectedPeer) renderMessages();
   }
   // v0.21.x: render the per-bubble send-state pill (Sending… /
   // Queued / Failed · Retry). Lives inline at the bottom of the
@@ -25696,7 +26237,7 @@ function createOwnerApiClient({
     // - a stale "↓ 3 new" badge from the previous conversation
     // would mislead the user about the new one.
     _hideNewMessagePill();
-    _lastRenderedLen = 0;
+    _resetRenderedMessageCount();
     _forceMessagesBottomNowAndAfter();
     // v0.14.0 prefetch: record this switch in the Markov chain
     // and pre-warm the predicted next peer in idle time.
@@ -25707,7 +26248,7 @@ function createOwnerApiClient({
     state.selectedPeer = shortId;
     state.selectedGroup = null;
     state.groupDetail = null;
-    state.groupMessages = [];
+    messageStore.clearGroup();
     // v0.21.x: opening a peer is "I've read everything queued there",
     // so the per-peer badge clears and the tab title + OS badge
     // recompute. Reading a group does the same in selectGroup below.
@@ -27392,7 +27933,7 @@ function createOwnerApiClient({
     loadLocalCollections();
     try {
       const me = await _bootApiGetWithRetry("/api/me");
-      state.me = me;
+      identityStore.replaceMe(me);
       $("#me-host").textContent = me.display_name || me.hostname;
       // v0.10.4: apply persisted presence on load so the dot
       // matches the user's last choice.
@@ -27482,13 +28023,8 @@ function createOwnerApiClient({
     // session-expired banner — each one re-firing _maybe401 ->
     // _attemptAutoRecovery -> Promise pileup. The auth-loss
     // banner now stops the cluster; explicit recovery resumes.
-    state._mainPollTimers = state._mainPollTimers || [];
-    state._mainPollTimers.push(setInterval(refreshPeers, 5000));
-    state._mainPollTimers.push(setInterval(refreshTransfers, 4000));
-    state._mainPollTimers.push(setInterval(refreshStatus, 8000));
-    state._mainPollTimers.push(setInterval(refreshOneHealth, 15000));
-    state._mainPollTimers.push(setInterval(refreshFabricTruth, 30000));
-    state._mainPollTimers.push(setInterval(refreshGroups, 12000));
+    // pollingCluster owns the timers.
+    pollingCluster.start(_mainPollTasks());
     // T3-O: free in-tab File-cache blob URLs on page hide so a
     // long-lived tab that sent 200+ photos doesn't accumulate
     // 200+ retained Blob references. The daemon's
@@ -27534,7 +28070,7 @@ function createOwnerApiClient({
         const r = await api.del(`/api/groups/${gid}/history`);
         toast(`Cleared ${r.deleted || 0} message${r.deleted === 1 ? "" : "s"}`, "good");
         if (state.selectedGroup === gid) {
-          state.groupMessages = [];
+          messageStore.clearGroup();
           if (typeof renderGroupConversation === "function") {
             renderGroupConversation();
           }
@@ -27641,7 +28177,7 @@ function createOwnerApiClient({
   async function loadHistory() {
     try {
       const { messages } = await api.get("/api/messages?limit=300");
-      state.messages = messages;
+      messageStore.replaceDirect(messages);
       renderMessages();
     } catch (e) { console.warn(e); }
   }
@@ -27928,6 +28464,11 @@ function createOwnerApiClient({
 // owner-ui module: main/events.js
   // ── WebSocket live events ──────────────────────────────────────────
   let ws = null;
+  // Call events the call driver threw on (reported in diagnostics).
+  let _callEventHandlerFailures = 0;
+  function callEventHandlerFailures() {
+    return _callEventHandlerFailures;
+  }
   function connectWS() {
     try { if (ws) ws.close(); } catch {}
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -27952,7 +28493,15 @@ function createOwnerApiClient({
           if (typeof window.handleLivingPresenceCallEvent === "function") {
             window.handleLivingPresenceCallEvent(m);
           }
-        } catch (_) { /* defensive - never let UI handler crash WS */ }
+        } catch (error) {
+          // Never let the call UI crash the event stream, and never hide
+          // its failure either: count it for diagnostics and log it.
+          _callEventHandlerFailures += 1;
+          console.error(
+            `call event handler failed (${_callEventHandlerFailures} so far):`,
+            m && m.tail_kind, error,
+          );
+        }
       } else if (m.type === "frame_provenance") {
         // Living Presence Tier α-pre - daemon verified an inbound
         // FILE_PROVENANCE message (or recorded our own outbound
@@ -28298,13 +28847,7 @@ function createOwnerApiClient({
         // anything that consumes that pref.
         const { scope, id, kind, value } = m;
         if (state.chatPrefs && scope && id && kind) {
-          if (!state.chatPrefs[scope]) state.chatPrefs[scope] = {};
-          if (!state.chatPrefs[scope][id]) state.chatPrefs[scope][id] = {};
-          if (value === null || value === undefined) {
-            delete state.chatPrefs[scope][id][kind];
-          } else {
-            state.chatPrefs[scope][id][kind] = value;
-          }
+          settingsStore.setChatPref(scope, id, kind, value);
           if (scope === "group") renderGroups();
           if (scope === "peer") renderPeers();
           applyActiveChatWallpaper();
@@ -28349,18 +28892,11 @@ function createOwnerApiClient({
         refreshPeers();
       } else if (m.type === "msg_edit") {
         // v0.7.6: live edit. Patch the in-memory message + rerender.
-        const target = state.messages.find(x => x.id === m.target);
-        if (target) {
-          target.body = m.body;
-          target.edited_at_ms = m.edited_at_ms;
+        if (messageStore.editMessage("direct", m.target, m.body, m.edited_at_ms)) {
           scheduleRenderMessages();
         }
       } else if (m.type === "msg_delete") {
-        const target = state.messages.find(x => x.id === m.target);
-        if (target) {
-          target.body = null;
-          target.deleted = true;
-          target.deleted_at_ms = m.deleted_at_ms;
+        if (messageStore.tombstoneMessage("direct", m.target, m.deleted_at_ms)) {
           scheduleRenderMessages();
         }
       } else if (m.type === "update_status") {
@@ -28466,47 +29002,24 @@ function createOwnerApiClient({
             reply_to: m.reply_to,
             ts_ms: m.ts_ms || Date.now(),
           };
-          const idx = state.groupMessages.findIndex(x => x.id === row.id);
-          if (idx >= 0) state.groupMessages[idx] = { ...state.groupMessages[idx], ...row };
-          else state.groupMessages.unshift(row);
+          messageStore.upsertGroupRow(row);
           renderGroupConversation();
         }
       } else if (m.type === "group_msg_edit") {
         if ((m.group_id_hex || m.group_id) === state.selectedGroup) {
-          const target = state.groupMessages.find(x => x.id === m.target);
-          if (target) {
-            target.body = m.body;
-            target.edited_at_ms = m.edited_at_ms;
+          if (messageStore.editMessage("group", m.target, m.body, m.edited_at_ms)) {
             renderGroupConversation();
           }
         }
       } else if (m.type === "group_msg_delete") {
         if ((m.group_id_hex || m.group_id) === state.selectedGroup) {
-          const target = state.groupMessages.find(x => x.id === m.target);
-          if (target) {
-            target.body = null;
-            target.deleted = true;
-            target.deleted_at_ms = m.deleted_at_ms;
+          if (messageStore.tombstoneMessage("group", m.target, m.deleted_at_ms)) {
             renderGroupConversation();
           }
         }
       } else if (m.type === "group_reaction") {
         if ((m.group_id_hex || m.group_id) === state.selectedGroup) {
-          const target = state.groupMessages.find(x => x.id === m.target);
-          if (target) {
-            target.reactions = target.reactions || {};
-            if (m.op === "add") {
-              target.reactions[m.emoji] = target.reactions[m.emoji] || [];
-              if (!target.reactions[m.emoji].includes(m.peer_fp)) {
-                target.reactions[m.emoji].push(m.peer_fp);
-              }
-            } else if (target.reactions[m.emoji]) {
-              target.reactions[m.emoji] = target.reactions[m.emoji]
-                .filter(f => f !== m.peer_fp);
-              if (target.reactions[m.emoji].length === 0) {
-                delete target.reactions[m.emoji];
-              }
-            }
+          if (messageStore.applyReaction("group", m.target, m.op, m.emoji, m.peer_fp)) {
             renderGroupConversation();
           }
         }
@@ -28523,23 +29036,7 @@ function createOwnerApiClient({
       } else if (m.type === "reaction") {
         // v0.7.5: live reaction event. Apply to whichever in-memory
         // message matches the target id, then re-render.
-        const target = state.messages.find(x => x.id === m.target);
-        if (target) {
-          target.reactions = target.reactions || {};
-          if (m.op === "add") {
-            target.reactions[m.emoji] = target.reactions[m.emoji] || [];
-            if (!target.reactions[m.emoji].includes(m.peer_fp)) {
-              target.reactions[m.emoji].push(m.peer_fp);
-            }
-          } else {
-            if (target.reactions[m.emoji]) {
-              target.reactions[m.emoji] = target.reactions[m.emoji]
-                .filter(f => f !== m.peer_fp);
-              if (target.reactions[m.emoji].length === 0) {
-                delete target.reactions[m.emoji];
-              }
-            }
-          }
+        if (messageStore.applyReaction("direct", m.target, m.op, m.emoji, m.peer_fp)) {
           scheduleRenderMessages();
         }
       } else if (m.type === "pair_request") {
@@ -28582,23 +29079,11 @@ function createOwnerApiClient({
         // the server's authoritative ts / metadata. Without this
         // we'd render twice on the fast path. Same applies if the
         // user happens to receive an echo for any id we've already
-        // got — replace, don't duplicate.
-        const dupIdx = state.messages.findIndex(x => x.id === msg.id);
-        if (dupIdx >= 0) {
-          const prev = state.messages[dupIdx];
-          // Keep any local-only fields (_sendingState etc.) if the
-          // event lacks them, but mark sent now that the daemon
-          // confirms it.
-          state.messages[dupIdx] = {
-            ...prev, ...msg,
-            _sendingState: "sent",
-            _error: undefined,
-            _queueReason: undefined,
-          };
-        } else {
-          state.messages.push(msg);
-        }
-        if (state.messages.length > 1000) state.messages = state.messages.slice(-800);
+        // got — replace, don't duplicate. Local-only fields
+        // (_sendingState etc.) the event lacks are kept, but the row is
+        // marked sent now that the daemon confirms it. messageStore
+        // keeps the newest 800 once history passes 1000 rows.
+        messageStore.receiveDirect(msg);
         if (msg.t === "TEXT" && msg.dir === "in") {
           const peer = state.peers.get(msg.peer);
           const who = peer?.display_name || peer?.hostname || msg.peer;
@@ -28658,34 +29143,12 @@ function createOwnerApiClient({
         // the attention list (stuck → unstuck, failed → dismissed,
         // held → accepted). Coalesce via the scheduler.
         scheduleAttentionRefresh();
-        const idx = state.transfers.findIndex(t => t.id === m.transfer.id);
-        if (idx >= 0) state.transfers.splice(idx, 1, m.transfer);
-        else state.transfers.unshift(m.transfer);
-        state.transfers.sort((a, b) => (b.updated_ms || 0) - (a.updated_ms || 0));
-        const evictedIds = state.transfers.slice(80).map(t => t.id);
-        state.transfers = state.transfers.slice(0, 80);
-        // 2026-05-22 audit Batch AA: prune the by-id Map and the
-        // (dir|blob) index when entries fall off the 80-cap array.
-        // Previously the Map grew monotonically across a long
-        // session; thousands of stale transfer rows accumulated in
-        // memory because the array hard-cap had no symmetric
-        // delete. _trackTransferIndex maintains transferByDirBlob
-        // (used by transferForMessage O(1) lookup); both need
-        // cleanup or stale ids paper-over fresh ones.
-        for (const eid of evictedIds) {
-          state.transfersById.delete(eid);
-          if (state.transferByDirBlob) {
-            for (const [key, val] of state.transferByDirBlob) {
-              if (val && val.id === eid) {
-                state.transferByDirBlob.delete(key);
-              }
-            }
-          }
-        }
-        state.transfersById.set(m.transfer.id, m.transfer);
-        // T3-Z: keep the (dir|blob) index in sync with the
-        // primary map so transferForMessage stays O(1).
-        _trackTransferIndex(m.transfer);
+        // transferStore replaces or prepends the row, keeps the list
+        // newest-first and capped at 80, and prunes evicted rows from
+        // the by-id Map and the (dir|blob) index (2026-05-22 audit
+        // Batch AA: the Map used to grow for the whole session). T3-Z:
+        // it keeps the index in sync so transferForMessage stays O(1).
+        transferStore.applyEvent(m.transfer);
         // v0.8.8: update the per-transfer EWMA bytes-per-second
         // tracker so the chat bubble + header pill can show a live
         // rate. Cleared on terminal status (complete / failed).
@@ -29779,7 +30242,7 @@ function createOwnerApiClient({
         // Do not paint this result into a different group if the user switched
         // conversations while the request was in flight.
         if (state.selectedGroup === groupId) {
-          state.groupMessages = r.messages || [];
+          messageStore.replaceGroup(r.messages || []);
           _forceNextMessagesToBottom();
           renderGroupConversation();
         }
@@ -29887,7 +30350,7 @@ function createOwnerApiClient({
           _attempts: 1,
         };
         if (replyToId) optimistic.reply_to = replyToId;
-        state.messages.push(optimistic);
+        messageStore.appendDirect(optimistic);
         _forceNextMessagesToBottom();
         // Clear composer up-front so the bubble is visible where it
         // landed — no "did it send?" ambiguity.
@@ -30652,7 +31115,7 @@ function createOwnerApiClient({
     if (newName && newName !== state.me?.display_name) {
       try {
         await api.post("/api/settings", { display_name: newName });
-        state.me = { ...(state.me || {}), display_name: newName };
+        identityStore.rename(newName);
         $("#me-host").textContent = newName;
       } catch (e) {
         toast(`Couldn't save name: ${e.message || e}`, "warn");
@@ -34836,6 +35299,7 @@ function createOwnerApiClient({
       },
       groups: { count: state.groups?.size || 0 },
       messages_in_memory: state.messages.length,
+      call_event_handler_failures: callEventHandlerFailures(),
       transfers: { active: state.transfers?.length || 0 },
       unread_total: state.totalUnread || 0,
       debug_event_summary: _diagnosticEventSummary(state.debugEntries || []),
@@ -36069,8 +36533,7 @@ function createOwnerApiClient({
 // owner-ui module: main/settings_shell.js
   // ── Settings modal ─────────────────────────────────────────────────
   const settingsBackdrop = $("#settings-backdrop");
-  let _settingsHydrating = false;
-  let _settingsDirty = false;
+  // settingsStore owns the editor's hydration and unsaved-changes flags.
 
   function setSettingsSaveStatus(text, kind = "") {
     const status = $("#settings-save-status");
@@ -36081,13 +36544,12 @@ function createOwnerApiClient({
   }
 
   function markSettingsDirty() {
-    if (_settingsHydrating) return;
-    _settingsDirty = true;
+    if (!settingsStore.markDirty()) return;
     setSettingsSaveStatus("Unsaved changes.", "dirty");
   }
 
   function markSettingsClean(text = "No changes yet.") {
-    _settingsDirty = false;
+    settingsStore.markClean();
     setSettingsSaveStatus(text);
   }
 
@@ -36355,13 +36817,11 @@ function createOwnerApiClient({
       await api.del(endpoint);
       toast(`${label} cleared`, "good");
       if (scope === "chat") {
-        state.messages = [];
-        state.groupMessages = [];
+        messageStore.clearAll();
         await loadHistory();
       }
       if (scope === "files") {
-        state.transfers = [];
-        state.transfersById = new Map();
+        transferStore.clearRecords();
         await refreshFiles();
         await refreshTransfers();
       }
@@ -36389,10 +36849,8 @@ function createOwnerApiClient({
     try {
       await api.post("/api/traces/wipe", { confirm: typed });
       toast("Local app traces wiped", "good", 5000);
-      state.messages = [];
-      state.groupMessages = [];
-      state.transfers = [];
-      state.transfersById = new Map();
+      messageStore.clearAll();
+      transferStore.clearRecords();
       state.activityEvents = [];
       await Promise.allSettled([
         loadHistory(),
@@ -37836,7 +38294,7 @@ function createOwnerApiClient({
   }
 
   $("#btn-settings").onclick = async () => {
-    _settingsHydrating = true;
+    settingsStore.beginHydration();
     markSettingsClean("Loading settings...");
     try {
       const r = await api.get("/api/settings");
@@ -37905,7 +38363,7 @@ function createOwnerApiClient({
       const aax = $("#set-auto-accept-exts");
       if (aax) aax.value = (r.auto_accept_extensions || []).join(", ");
       // Cache for runtime checks (DND + sound + theme).
-      state.runtimeSettings = {
+      settingsStore.replaceRuntime({
         theme: r.theme || "dark",
         ui_density: r.ui_density || "comfortable",
         message_bubble_style: r.message_bubble_style || "gradient",
@@ -37928,7 +38386,7 @@ function createOwnerApiClient({
         display_read_receipts: r.display_read_receipts !== false,
         send_typing_indicators: r.send_typing_indicators !== false,
         display_typing_indicators: r.display_typing_indicators !== false,
-      };
+      });
     } catch (e) {
       $("#set-name").value = "";
       $("#set-autoaccept").checked = false;
@@ -37937,11 +38395,11 @@ function createOwnerApiClient({
     // v0.5.3: load current rendezvous URLs + status
     try {
       const r = await api.get("/api/rendezvous");
-      state.rendezvousUrls = r.urls || [];
+      settingsStore.setRendezvousUrls(r.urls || []);
       $("#set-rendezvous").value = (r.urls || []).join("\n");
       renderRendezvousStatus(r);
     } catch (e) {
-      state.rendezvousUrls = [];
+      settingsStore.setRendezvousUrls([]);
       $("#set-rendezvous").value = "";
       renderRendezvousStatus({});
     }
@@ -37961,7 +38419,7 @@ function createOwnerApiClient({
     refreshSessionSettings();
     refreshSettingsPrivacyPresets();
     refreshSettingsSecurityAudit();
-    _settingsHydrating = false;
+    settingsStore.endHydration();
     markSettingsClean("No changes yet.");
     settingsBackdrop.classList.add("show");
   };
@@ -38114,7 +38572,7 @@ function createOwnerApiClient({
       applyTheme(payload.theme);
       applyAppearanceSettings(payload);
       if (payload.avatar_color) applyMyAvatarColor(payload.avatar_color);
-      state.runtimeSettings = {
+      settingsStore.replaceRuntime({
         theme: payload.theme,
         ui_density: payload.ui_density,
         message_bubble_style: payload.message_bubble_style,
@@ -38137,7 +38595,7 @@ function createOwnerApiClient({
         display_read_receipts: payload.display_read_receipts,
         send_typing_indicators: payload.send_typing_indicators,
         display_typing_indicators: payload.display_typing_indicators,
-      };
+      });
       if (!payload.display_typing_indicators) {
         state.peerTyping = {};
         state.groupTyping = {};
@@ -38162,7 +38620,7 @@ function createOwnerApiClient({
     if (changed) {
       try {
         const res = await api.post("/api/rendezvous", { urls: newUrls });
-        state.rendezvousUrls = res.urls || [];
+        settingsStore.setRendezvousUrls(res.urls || []);
         renderRendezvousStatus({ active: res.active, urls: res.urls });
         toast(
           res.urls.length === 0
@@ -38382,6 +38840,30 @@ function createOwnerApiClient({
   // the gap it was measuring was Edge's reserved chrome height
   // (now known + handled). The title now reads simply "One Link".
   document.title = "One Link";
+// owner-ui module: main/call_bridges.js
+  // ── Owner-page services for the call driver (MNT-03) ───────────────
+  // The call driver runs in its own closure, so none of this closure's
+  // names (state, api, toast, selectPeer, ...) are in scope there. It gets
+  // exactly these two explicit bridges and nothing else:
+  //   __oneLinkCallLog   missed/ended call bubbles into the message store
+  //   __oneLinkCallHost  the owner services the driver's UI uses
+  // tests/js/ownership_census.js fails the build if the driver names an
+  // owner-closure binding directly again.
+  window.__oneLinkCallLog = createCallLogBridge({
+    messageStore,
+    getPeers: () => state.peers,
+    getSelectedPeer: () => state.selectedPeer,
+    renderMessages: () => renderMessages(),
+  });
+  window.__oneLinkCallHost = Object.freeze({
+    post: (path, body) => api.post(path, body),
+    upload: (peerId, file, opts) => api.upload(peerId, file, opts),
+    newClientMsgId: () => _newClientMsgId(),
+    toast: (message, kind, ms) => toast(message, kind, ms),
+    errorToastBody: (error) => errorToastBody(error),
+    returnToOneHealthGuideIfPending: () => returnToOneHealthGuideIfPending(),
+    selectPeer: (peerId) => selectPeer(peerId),
+  });
 })();
 })();
 </script>
@@ -38606,17 +39088,92 @@ function createOwnerApiClient({
 // All call actions go through POST /api/v1/calls; state updates
 // arrive over the WebSocket as "call_event" tail events.
 (() => {
+// owner-ui module: services/owned_record.js
+// Isolated service: dependencies are explicit parameters; no owner closure access.
+//
+// A closed-schema state record for one feature state owner. The fields that
+// exist are fixed when the record is created. Every write goes through
+// set / update / increment, which refuse a field the schema does not declare.
+// Readers get `view`: its properties are live getters, and any assignment,
+// definition or deletion through it throws a TypeError naming the owner.
+// That holds in sloppy code too (a frozen object would fail silently there),
+// so a write that bypasses the owner fails at the write, not later.
+//
+// The owning service keeps `fields` private for its named transitions and
+// hands out only the view and the write functions it chooses to expose.
+function createOwnedRecord(owner, initial) {
+  if (typeof owner !== "string" || !owner) throw new TypeError("an owned record needs a named owner");
+  const fields = { ...initial };
+  const known = new Set(Object.keys(fields));
+
+  function refuse(key) {
+    throw new TypeError(`${owner}.${String(key)} is owned state; change it through the ${owner} owner`);
+  }
+  function requireKnown(key) {
+    if (!known.has(key)) throw new TypeError(`${owner} has no field ${String(key)}`);
+  }
+
+  const target = {};
+  for (const key of known) {
+    Object.defineProperty(target, key, {
+      enumerable: true,
+      configurable: false,
+      get: () => fields[key],
+      set: () => refuse(key),
+    });
+  }
+  const view = new Proxy(target, {
+    set: (_target, key) => refuse(key),
+    defineProperty: (_target, key) => refuse(key),
+    deleteProperty: (_target, key) => refuse(key),
+    setPrototypeOf: () => refuse("[[Prototype]]"),
+    preventExtensions: () => refuse("[[Extensible]]"),
+  });
+
+  function set(key, value) {
+    requireKnown(key);
+    fields[key] = value;
+    return value;
+  }
+
+  // Several fields in one step. Every key is checked before any is written.
+  function update(patch) {
+    const keys = Object.keys(patch);
+    for (const key of keys) requireKnown(key);
+    for (const key of keys) fields[key] = patch[key];
+    return view;
+  }
+
+  function increment(key, by = 1) {
+    requireKnown(key);
+    fields[key] += by;
+    return fields[key];
+  }
+
+  return Object.freeze({ view, fields, set, update, increment, has: (key) => known.has(key) });
+}
 // owner-ui module: services/call_state.js
 // Isolated service: dependencies are explicit parameters; no owner closure access.
-function createCallState() {
-  const callUI = {
+//
+// Owner of one call driver's call state: the active and inbound call
+// identity, SDP/ICE negotiation bookkeeping, media telemetry and repair
+// counters, backend recommendations, history, and the telemetry timers.
+// `view` is the read path (the driver binds it as `callUI`); it is
+// read-only. Scalar fields change through set / update / increment, which
+// refuse undeclared fields. Collections, call tracking and lifecycle change
+// only through the named transitions below. dispose() releases the timers.
+function createCallState({ clearInterval } = {}) {
+  const record = createOwnedRecord("callUI", {
     activeCallId: null,
     activeCallPeer: null,
     activeCallPeerFp: null,
     activeCallLocalRole: "",
+    activeCallKind: undefined,
     inboundCallId: null,
     inboundCallPeer: null,
     inboundCallPeerFp: null,
+    // An SDP offer that arrived before local media was ready.
+    pendingRemoteOffer: undefined,
     pendingIceCandidates: [],
     appliedIceKeys: new Set(),
     appliedRemoteOfferKeys: new Set(),
@@ -38675,21 +39232,211 @@ function createCallState() {
     lastRecoveryIntent: null,
     lastRecoveryIntentKey: "",
     lastRecoveryIntentMs: 0,
+    lastSessionAuthority: undefined,
+    lastSessionAuthorityKey: undefined,
+    lastSessionAuthorityMs: undefined,
     backendActionCooldowns: {},
     callHistory: [],
+    callNotes: undefined,
     acceptedCallIds: new Set(),
     lastAcceptRetryMs: {},
     lastRejoinAttemptMs: {},
     autoTraceBuffer: [],
     lastAutoTraceMs: 0,
     lastAutoTraceKey: "",
-  };
-  return callUI;
+    // Per-call lifecycle tracking for missed/ended call bubbles; created by
+    // the event router when it starts.
+    _callTracking: undefined,
+  });
+  const f = record.fields;
+
+  // ── Call acceptance ──
+  function acceptCall(callId) { f.acceptedCallIds.add(callId); }
+  function forgetAcceptedCall(callId) { return f.acceptedCallIds.delete(callId); }
+  function stampAcceptRetry(callId, at) { f.lastAcceptRetryMs[callId] = at; }
+  function stampRejoinAttempt(callId, at) { f.lastRejoinAttemptMs[callId] = at; }
+
+  // ── Signaling bookkeeping ──
+  function markIceApplied(key) { f.appliedIceKeys.add(key); }
+  function markRemoteOfferApplied(key) { f.appliedRemoteOfferKeys.add(key); }
+  function markRemoteAnswerApplied(key) { f.appliedRemoteAnswerKeys.add(key); }
+  function queueIceCandidate(candidate) { f.pendingIceCandidates.push(candidate); }
+  // Remove and return every queued candidate, in arrival order.
+  function takeQueuedIceCandidates() { return f.pendingIceCandidates.splice(0); }
+  // A new peer connection: no queued candidates and no applied ICE keys.
+  function forgetIceSignals() {
+    f.pendingIceCandidates = [];
+    f.appliedIceKeys.clear();
+  }
+  // A rebuilt peer connection also forgets applied offers/answers and any
+  // SDP in flight.
+  function forgetNegotiation() {
+    forgetIceSignals();
+    f.appliedRemoteOfferKeys.clear();
+    f.appliedRemoteAnswerKeys.clear();
+    f.sdpOfferInFlight = false;
+    f.sdpAnswerInFlight = false;
+    f.lastLocalOfferSdp = "";
+    f.lastLocalAnswerSdp = "";
+  }
+
+  // ── Repair diagnosis ──
+  // One more observation of `kind`, raising the escalation score by
+  // `severity` (capped at 10). Returns the per-kind counts (for reading).
+  function countRepairDiagnosis(kind, severity) {
+    const counts = f.repairDiagnosisCounts || {};
+    counts[kind] = Number(counts[kind] || 0) + 1;
+    f.repairDiagnosisCounts = counts;
+    f.repairEscalationScore = Math.min(10, Number(f.repairEscalationScore || 0) + severity);
+    return counts;
+  }
+  function clearRepairDiagnosis() {
+    f.repairDiagnosisCounts = {};
+    f.lastRepairDiagnosis = null;
+  }
+
+  // ── Backend guidance ──
+  function stampBackendCooldown(action, at) { f.backendActionCooldowns[action] = at; }
+
+  // ── Bounded logs ──
+  // The newest 12 automatic traces, newest first.
+  function recordAutoTrace(payload) {
+    f.autoTraceBuffer.unshift(payload);
+    f.autoTraceBuffer = f.autoTraceBuffer.slice(0, 12);
+  }
+  function recordCallHistory(entry) {
+    f.callHistory.unshift(entry);
+    f.callHistory = f.callHistory.slice(0, 10);
+  }
+  function recordOneEvent(event) {
+    f.oneEvents.unshift(event);
+    f.oneEvents = f.oneEvents.slice(0, 4);
+  }
+  function clearOneEvents() { f.oneEvents = []; }
+
+  // ── Per-call tracking (missed / ended bubbles) ──
+  function startCallTracking() {
+    if (!f._callTracking) f._callTracking = {};
+  }
+  function trackCall(callId, entry) { f._callTracking[callId] = entry; }
+  function markTrackedCallActive(callId) {
+    const t = f._callTracking[callId];
+    if (t) t.reachedActive = true;
+    return Boolean(t);
+  }
+  // Returns the tracked call, now ended, or null if it is unknown or
+  // already ended.
+  function endTrackedCall(callId, at) {
+    const t = f._callTracking[callId];
+    if (!t || t.endedAt) return null;
+    t.endedAt = at;
+    return t;
+  }
+  function forgetTrackedCall(callId) { delete f._callTracking[callId]; }
+
+  // ── Lifecycle ──
+  // Everything a finished call leaves behind in negotiation, telemetry,
+  // quality, adaptation and repair state. Call identity, history, backend
+  // guidance, timers and the event log are not per-media-session state.
+  function resetMediaSession() {
+    f.pendingIceCandidates = [];
+    f.appliedIceKeys.clear();
+    f.appliedRemoteOfferKeys.clear();
+    f.appliedRemoteAnswerKeys.clear();
+    f.localMediaReady = false;
+    f.lastLocalOfferSdp = "";
+    f.lastLocalAnswerSdp = "";
+    f.lastOfferSendMs = 0;
+    f.lastAnswerSendMs = 0;
+    f.lastLocalOfferCreatedMs = 0;
+    f.remoteOfferCollisionCount = 0;
+    f.lastMetricsSnapshot = null;
+    f.lastMediaRepairMs = 0;
+    f.lastInboundVideoBytes = 0;
+    f.lastInboundAudioBytes = 0;
+    f.stalledMediaTicks = 0;
+    f.lastInboundPacketsLost = 0;
+    f.lastInboundPacketsReceived = 0;
+    f.qualityEwmaRttMs = null;
+    f.qualityEwmaLoss = null;
+    f.qualityBadTicks = 0;
+    f.qualityGoodTicks = 0;
+    f.lastUserVisibleRepairMs = 0;
+    f.adaptationLevel = 0;
+    f.tauPressureTicks = 0;
+    f.tauStableTicks = 0;
+    f.lastTauAdaptMs = 0;
+    f.tauRiskEwma = null;
+    f.tauCoherenceEwma = null;
+    f.tauSurpriseEwma = null;
+    f.tauBandwidthEwmaKbps = null;
+    f.tauLastDecision = null;
+    f.lastCaptureProfile = "";
+    f.mediaRepairStage = 0;
+    f.lastPlaybackReviveMs = 0;
+    f.lastPcRebuildMs = 0;
+    f.lastRemoteMediaMovingMs = 0;
+    f.lastRepairDiagnosis = null;
+    f.repairDiagnosisCounts = {};
+    f.repairEscalationScore = 0;
+    f.acceptedCallIds.clear();
+    f.lastAcceptRetryMs = {};
+  }
+
+  // Release the telemetry timers this state holds.
+  function dispose() {
+    if (typeof clearInterval === "function") {
+      if (f.metricsTimer) clearInterval(f.metricsTimer);
+      if (f.mediaWatchdogTimer) clearInterval(f.mediaWatchdogTimer);
+    }
+    f.metricsTimer = null;
+    f.mediaWatchdogTimer = null;
+  }
+
+  return Object.freeze({
+    view: record.view,
+    set: record.set,
+    update: record.update,
+    increment: record.increment,
+    acceptCall,
+    forgetAcceptedCall,
+    stampAcceptRetry,
+    stampRejoinAttempt,
+    markIceApplied,
+    markRemoteOfferApplied,
+    markRemoteAnswerApplied,
+    queueIceCandidate,
+    takeQueuedIceCandidates,
+    forgetIceSignals,
+    forgetNegotiation,
+    countRepairDiagnosis,
+    clearRepairDiagnosis,
+    stampBackendCooldown,
+    recordAutoTrace,
+    recordCallHistory,
+    recordOneEvent,
+    clearOneEvents,
+    startCallTracking,
+    trackCall,
+    markTrackedCallActive,
+    endTrackedCall,
+    forgetTrackedCall,
+    resetMediaSession,
+    dispose,
+  });
 }
 // owner-ui module: services/media_state.js
 // Isolated service: dependencies are explicit parameters; no owner closure access.
+//
+// Owner of one call driver's media and route state: streams, the peer
+// connection, ICE/route policy, and the user's in-call controls. `view` is
+// the read path (the driver binds it as `media`); it is read-only. Fields
+// change through set / update (which refuse undeclared fields) and the reset
+// transitions below. Capture and cleanup features own the browser resources'
+// lifetime (stopping tracks, closing the connection); this owner forgets
+// them.
 function createCallMediaState() {
-  const media = {
+  const record = createOwnedRecord("media", {
     localStream: null,        // MediaStream from getUserMedia
     remoteStream: null,        // assembled from ontrack events
     pc: null,                  // RTCPeerConnection (when wired)
@@ -38728,13 +39475,74 @@ function createCallMediaState() {
     lastRelayProbeMs: 0,
     forceRelayOnRepair: false,
     preferRelayNext: false,
-  };
-  return media;
+  });
+  const f = record.fields;
+
+  // The daemon's route policy for this call (from ICE config, a relay
+  // probe or a metrics report): the policy itself, the best relay's health
+  // and score, and when the TURN credential expires.
+  function recordRoutePolicy(policy) {
+    f.routePolicyDetail = policy || null;
+    f.bestRelayHealth = String(policy?.best_relay_health || "");
+    f.bestRelayScore = Number.isFinite(Number(policy?.best_relay_score))
+      ? Number(policy.best_relay_score)
+      : null;
+    f.turnCredentialExpiresAtMs = Number(policy?.credential_expires_at_ms || 0) || null;
+  }
+
+  // A finished call's ICE and route state: no pending config, no
+  // candidates, an idle candidate chain, the default direct-first policy.
+  function resetRoute() {
+    f.iceConfigReady = null;
+    f.localCandidateAddresses = [];
+    f.iceSignalChain = Promise.resolve();
+    f.iceHelperReady = false;
+    f.iceRelayReady = false;
+    f.routePolicy = "direct_first";
+    f.forceRelayOnRepair = false;
+    f.preferRelayNext = false;
+    f.transceiversReady = false;
+  }
+
+  // A finished call's session controls: no screen share, effects, hold,
+  // reconnect banner or caption start in progress; expect audio only.
+  function resetSessionControls() {
+    f.screenStream = null;
+    f.cameraVideoTrack = null;
+    f.screenSharing = false;
+    f.backgroundBlur = false;
+    // doctrine-ok: §3.2.a internal recovery state reset; user copy stays calm.
+    f.reconnecting = false;
+    f.expectRemoteVideo = false;
+    f.expectRemoteAudio = true;
+    f.transceiversReady = false;
+    f.held = false;
+    f.captionsStarting = false;
+  }
+
+  // A finished call's layout, voice processing, mute and camera choices.
+  function resetPresentation() {
+    f.layoutMode = "focus";
+    f.voiceProcessing = "smart";
+    f.muted = false;
+    f.cameraOff = false;
+  }
+
+  return Object.freeze({
+    view: record.view,
+    set: record.set,
+    update: record.update,
+    recordRoutePolicy,
+    resetRoute,
+    resetSessionControls,
+    resetPresentation,
+  });
 }
 // owner-ui module: services/call_health.js
 // Isolated service: dependencies are explicit parameters; no owner closure access.
 function createCallHealth({
   callUI,
+  callState,
   media,
   setReconnectState,
   updateCallQuality,
@@ -38772,21 +39580,21 @@ function createCallHealth({
 
   function applyCallQualityHysteresis(rawLevel, label) {
     if (rawLevel === "connecting") {
-      callUI.qualityGoodTicks = 0;
+      callState.set("qualityGoodTicks", 0);
       setReconnectState(false);
       updateCallQuality("connecting", label || "Connecting media");
       return;
     }
     // doctrine-ok: §3.2.a internal state name; user copy says repair/recover.
     if (rawLevel === "reconnecting" || rawLevel === "bad") {
-      callUI.qualityBadTicks += 1;
-      callUI.qualityGoodTicks = 0;
+      callState.increment("qualityBadTicks");
+      callState.set("qualityGoodTicks", 0);
     } else if (rawLevel === "good") {
-      callUI.qualityGoodTicks += 1;
-      callUI.qualityBadTicks = Math.max(0, callUI.qualityBadTicks - 1);
+      callState.increment("qualityGoodTicks");
+      callState.set("qualityBadTicks", Math.max(0, callUI.qualityBadTicks - 1));
     } else {
-      callUI.qualityGoodTicks = 0;
-      callUI.qualityBadTicks = Math.max(0, callUI.qualityBadTicks - 1);
+      callState.set("qualityGoodTicks", 0);
+      callState.set("qualityBadTicks", Math.max(0, callUI.qualityBadTicks - 1));
     }
     const showProblem = callUI.qualityBadTicks >= 3;
     const clearProblem = callUI.qualityGoodTicks >= 2;
@@ -38949,7 +39757,7 @@ function createCallHealth({
     const jitter = Number(metrics.jitter_ms || 0);
     const bandwidthKbps = Number(metrics.bandwidth_estimate_kbps || 0);
     if (bandwidthKbps > 0) {
-      callUI.tauBandwidthEwmaKbps = ewmaNullable(callUI.tauBandwidthEwmaKbps, bandwidthKbps, 0.22);
+      callState.set("tauBandwidthEwmaKbps", ewmaNullable(callUI.tauBandwidthEwmaKbps, bandwidthKbps, 0.22));
     }
     const smoothedBandwidthKbps = Number(callUI.tauBandwidthEwmaKbps || bandwidthKbps || 0);
     const expectedKbps = profile ? Math.max(1, Number(profile.maxBitrate || 0) / 1000) : 850;
@@ -38986,16 +39794,16 @@ function createCallHealth({
       (0.08 * icePenalty) +
       routePenalty
     );
-    callUI.tauRiskEwma = ewmaNullable(
+    callState.set("tauRiskEwma", ewmaNullable(
       callUI.tauRiskEwma,
       rawRisk,
       rawRisk > Number(callUI.tauRiskEwma || 0) ? 0.38 : 0.16,
-    );
+    ));
     const risk = clampUnit(callUI.tauRiskEwma);
     const coherence = clampUnit(1 - risk);
-    callUI.tauCoherenceEwma = ewmaNullable(callUI.tauCoherenceEwma, coherence, 0.2);
+    callState.set("tauCoherenceEwma", ewmaNullable(callUI.tauCoherenceEwma, coherence, 0.2));
     const surprise = -Math.log(Math.max(0.01, Number(callUI.tauCoherenceEwma || coherence || 0.01)));
-    callUI.tauSurpriseEwma = ewmaNullable(callUI.tauSurpriseEwma, surprise, 0.2);
+    callState.set("tauSurpriseEwma", ewmaNullable(callUI.tauSurpriseEwma, surprise, 0.2));
     return {
       rawRisk,
       risk,
@@ -39024,20 +39832,20 @@ function createCallHealth({
     const cautious = score.risk >= 0.30 || score.jitterPressure >= 0.46;
     const excellent = score.risk <= 0.14 && score.coherence >= 0.82 && !score.remoteWaiting && score.icePenalty === 0;
     if (critical) {
-      callUI.tauPressureTicks += 2;
-      callUI.tauStableTicks = 0;
+      callState.increment("tauPressureTicks", 2);
+      callState.set("tauStableTicks", 0);
     } else if (pressured) {
-      callUI.tauPressureTicks += 1;
-      callUI.tauStableTicks = 0;
+      callState.increment("tauPressureTicks");
+      callState.set("tauStableTicks", 0);
     } else if (excellent) {
-      callUI.tauStableTicks += 1;
-      callUI.tauPressureTicks = Math.max(0, callUI.tauPressureTicks - 1);
+      callState.increment("tauStableTicks");
+      callState.set("tauPressureTicks", Math.max(0, callUI.tauPressureTicks - 1));
     } else if (cautious) {
-      callUI.tauPressureTicks = Math.max(1, callUI.tauPressureTicks);
-      callUI.tauStableTicks = 0;
+      callState.set("tauPressureTicks", Math.max(1, callUI.tauPressureTicks));
+      callState.set("tauStableTicks", 0);
     } else {
-      callUI.tauPressureTicks = Math.max(0, callUI.tauPressureTicks - 1);
-      callUI.tauStableTicks = Math.max(0, callUI.tauStableTicks - 1);
+      callState.set("tauPressureTicks", Math.max(0, callUI.tauPressureTicks - 1));
+      callState.set("tauStableTicks", Math.max(0, callUI.tauStableTicks - 1));
     }
     if (critical && callUI.tauPressureTicks >= 2) targetLevel = 3;
     else if (pressured && callUI.tauPressureTicks >= 2) targetLevel = Math.max(currentLevel, Math.min(2, currentLevel + 1));
@@ -39058,15 +39866,14 @@ function createCallHealth({
   async function tuneOutboundMediaForTau(metrics) {
     if (!media.pc || !media.pc.getSenders) return;
     const decision = chooseTauVideoLevel(metrics);
-    callUI.tauLastDecision = decision;
+    callState.set("tauLastDecision", decision);
     // doctrine-ok: §3.2.a internal state name; no user-facing reconnect prompt.
     const cooldownMs = decision.targetLevel > decision.currentLevel ? 2800 : 9000;
     const now = Date.now();
     if (now - Number(callUI.lastTauAdaptMs || 0) < cooldownMs) return;
     const targetLevel = decision.targetLevel;
     if (targetLevel === callUI.adaptationLevel) return;
-    callUI.adaptationLevel = targetLevel;
-    callUI.lastTauAdaptMs = now;
+    callState.update({ adaptationLevel: targetLevel, lastTauAdaptMs: now });
     const caps = targetMediaProfile(targetLevel);
     await applyCaptureProfileForTau(targetLevel, decision.reason);
     for (const sender of media.pc.getSenders()) {
@@ -39114,9 +39921,65 @@ function createCallHealth({
   if (typeof window === "undefined") return;
   const $$ = (sel) => document.querySelector(sel);
 
+// owner-ui module: calls/host.js
+  // ── Owner-page services, through their explicit bridge (MNT-03) ──
+  // This driver is its own closure: the owner page's `api`, `toast`,
+  // `selectPeer` and other helpers are not in scope here, and naming them
+  // directly is a ReferenceError (it silently broke the privacy preset
+  // switch, in-call file send and call-end teardown). The owner page
+  // publishes exactly the services the driver uses as
+  // window.__oneLinkCallHost; these adapters are the only route to them.
+  // Without a host page, toasts and navigation are skipped and requests
+  // reject, so each caller's own error path runs.
+  function _callHost() {
+    return (typeof window !== "undefined" && window.__oneLinkCallHost) || null;
+  }
+  function _requireCallHost(what) {
+    const host = _callHost();
+    if (!host) throw new Error(`${what} needs the One Link owner page`);
+    return host;
+  }
+  const api = Object.freeze({
+    post: async (path, body) => _requireCallHost("This request").post(path, body),
+    upload: async (peerId, file, opts) => _requireCallHost("Sending a file").upload(peerId, file, opts),
+  });
+  function toast(message, kind, ms) {
+    const host = _callHost();
+    if (host) host.toast(message, kind, ms);
+  }
+  function errorToastBody(error) {
+    const host = _callHost();
+    if (host) return host.errorToastBody(error);
+    return (error && error.message) ? error.message : String(error);
+  }
+  function _newClientMsgId() {
+    return _requireCallHost("A file intent").newClientMsgId();
+  }
+  function returnToOneHealthGuideIfPending() {
+    const host = _callHost();
+    return host ? host.returnToOneHealthGuideIfPending() : false;
+  }
+  function selectPeer(peerId) {
+    const host = _callHost();
+    if (host) host.selectPeer(peerId);
+  }
+  // Server-controlled text inserted as HTML (2026-05-21 audit T3-A). Kept
+  // local: escaping must never depend on another page being present. The
+  // owner page's _escapeHtml is the same five replacements; a contract
+  // test compares the two on adversarial input.
+  function _escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
 // owner-ui module: calls/state.js
-  // Local state - tracks the currently-shown call surface.
-  const callUI = createCallState();
+  // Local state - tracks the currently-shown call surface. callState owns
+  // it; `callUI` is its read-only view (MNT-03).
+  const callState = createCallState({ clearInterval: (id) => clearInterval(id) });
+  const callUI = callState.view;
   // Expose for debug + tests
   if (typeof window !== "undefined") {
     window._livingPresenceCallUI = callUI;
@@ -39157,8 +40020,10 @@ function createCallHealth({
     const key = `${callId}:${cleanReason}`;
     const now = Date.now();
     if (callUI.lastAutoTraceKey === key && now - Number(callUI.lastAutoTraceMs || 0) < 15000) return null;
-    callUI.lastAutoTraceKey = key;
-    callUI.lastAutoTraceMs = now;
+    callState.update({
+      lastAutoTraceKey: key,
+      lastAutoTraceMs: now,
+    });
     try {
       const [traceResp, localDebug] = await Promise.all([
         fetch(`/api/v1/calls/${encodeURIComponent(callId)}/trace`, {
@@ -39175,8 +40040,7 @@ function createCallHealth({
         local_debug: localDebug || null,
         extra: extra || null,
       };
-      callUI.autoTraceBuffer.unshift(payload);
-      callUI.autoTraceBuffer = callUI.autoTraceBuffer.slice(0, 12);
+      callState.recordAutoTrace(payload);
       try {
         localStorage.setItem(
           "one_link_auto_call_traces",
@@ -39201,7 +40065,9 @@ function createCallHealth({
   // The browser handles audio/video tracks directly via WebRTC SRTP;
   // the daemon brokers SDP exchange. Local media stays on this device
   // until the call ends - the daemon never sees the raw audio/video.
-  const media = createCallMediaState();
+  // mediaState owns the media/route state; `media` is its read-only view.
+  const mediaState = createCallMediaState();
+  const media = mediaState.view;
   if (typeof window !== "undefined") {
     window._livingPresenceMedia = media;
   }
@@ -39252,7 +40118,7 @@ function createCallHealth({
     if (!callUI.activeCallId || !media.iceRelayReady) return;
     const now = Date.now();
     if (now - Number(media.lastRelayProbeMs || 0) < 120000) return;
-    media.lastRelayProbeMs = now;
+    mediaState.set("lastRelayProbeMs", now);
     try {
       const result = await fetch("/api/peer-rtc/relay-probe", {
         method: "POST",
@@ -39264,14 +40130,7 @@ function createCallHealth({
           reason: reason || "call_health",
         }),
       }).then((r) => r.json());
-      if (result && result.routePolicy) {
-        media.routePolicyDetail = result.routePolicy;
-        media.bestRelayHealth = String(result.routePolicy.best_relay_health || "");
-        media.bestRelayScore = Number.isFinite(Number(result.routePolicy.best_relay_score))
-          ? Number(result.routePolicy.best_relay_score)
-          : null;
-        media.turnCredentialExpiresAtMs = Number(result.routePolicy.credential_expires_at_ms || 0) || null;
-      }
+      if (result && result.routePolicy) mediaState.recordRoutePolicy(result.routePolicy);
       reportCallEvent("relay_probe_completed", {
         reason: "relay_probe",
         state: media.bestRelayHealth || "unknown",
@@ -39289,7 +40148,7 @@ function createCallHealth({
     if (!callUI.activeCallId || !media.pc) return false;
     const now = Date.now();
     if (now - Number(media.lastIceConfigRefreshMs || 0) < 60000) return false;
-    media.lastIceConfigRefreshMs = now;
+    mediaState.set("lastIceConfigRefreshMs", now);
     try {
       const iceUrl = `/api/peer-rtc/ice-config?call_id=${encodeURIComponent(callUI.activeCallId)}`;
       const cfg = await fetch(iceUrl, {
@@ -39298,18 +40157,13 @@ function createCallHealth({
       if (Array.isArray(cfg.iceServers) && cfg.iceServers.length > 0) {
         media.pc.setConfiguration({ iceServers: cfg.iceServers });
       }
-      media.localCandidateAddresses = _callLocalAddressesFromIceConfig(cfg);
-      media.routePolicyDetail = cfg.routePolicy || null;
-      media.iceRelayReady = Array.isArray(cfg.iceServers)
+      mediaState.set("localCandidateAddresses", _callLocalAddressesFromIceConfig(cfg));
+      mediaState.set("iceRelayReady", Array.isArray(cfg.iceServers)
         && cfg.iceServers.some((srv) => {
           const urls = Array.isArray(srv.urls) ? srv.urls : [srv.urls];
           return urls.some((u) => String(u || "").toLowerCase().startsWith("turn:") || String(u || "").toLowerCase().startsWith("turns:"));
-        });
-      media.bestRelayHealth = String(cfg.routePolicy?.best_relay_health || "");
-      media.bestRelayScore = Number.isFinite(Number(cfg.routePolicy?.best_relay_score))
-        ? Number(cfg.routePolicy.best_relay_score)
-        : null;
-      media.turnCredentialExpiresAtMs = Number(cfg.routePolicy?.credential_expires_at_ms || 0) || null;
+        }));
+      mediaState.recordRoutePolicy(cfg.routePolicy);
       reportCallEvent("turn_credentials_refreshed", {
         reason: reason || "credential_refresh",
         state: media.iceRelayReady ? "relay" : "direct",
@@ -39353,7 +40207,7 @@ function createCallHealth({
         height: { ideal: profile.height, max: profile.height },
         frameRate: { ideal: profile.frameRate, max: profile.frameRate },
       });
-      callUI.lastCaptureProfile = profile.name;
+      callState.set("lastCaptureProfile", profile.name);
       reportCallEvent("tau_capture_adapted", {
         state: profile.name === "audio-first" ? "survival" : profile.name,
         reason: reason || "metrics",
@@ -39374,7 +40228,7 @@ function createCallHealth({
       const stream = await navigator.mediaDevices.getUserMedia(
         buildMediaConstraints(constraints || { audio: true, video: true }),
       );
-      media.localStream = stream;
+      mediaState.set("localStream", stream);
       attachLocalPreview(stream);
       refreshCallDevicePickers().catch(() => {});
       return stream;
@@ -39385,7 +40239,7 @@ function createCallHealth({
           const audioOnly = await navigator.mediaDevices.getUserMedia(
             { audio: true },
           );
-          media.localStream = audioOnly;
+          mediaState.set("localStream", audioOnly);
           refreshCallDevicePickers().catch(() => {});
           // No video preview to show - but the call can still
           // proceed with voice.
@@ -39463,7 +40317,7 @@ function createCallHealth({
       || (state.stream && (!state.srcVideoMatches || !state.srcAudioMatches));
     const now = Date.now();
     if (changed || now - Number(callUI.lastRemoteSurfaceSyncMs || 0) > 7000) {
-      callUI.lastRemoteSurfaceSyncMs = now;
+      callState.set("lastRemoteSurfaceSyncMs", now);
       reportCallEvent("remote_surface_synced", {
         reason: reason || "sync",
         remote_video_visible: state.hasRenderableVideo,
@@ -39478,7 +40332,7 @@ function createCallHealth({
   }
 
   function attachRemoteStream(stream) {
-    media.remoteStream = stream;
+    mediaState.set("remoteStream", stream);
     syncRemoteMediaSurface("attach_remote_stream");
   }
 
@@ -39530,7 +40384,7 @@ function createCallHealth({
     chooseTauVideoLevel,
     tuneOutboundMediaForTau,
   } = createCallHealth({
-    callUI, media, setReconnectState, updateCallQuality, targetMediaProfile, applyCaptureProfileForTau, updateOneChip, addOneCallEvent, reportCallEvent,
+    callUI, callState, media, setReconnectState, updateCallQuality, targetMediaProfile, applyCaptureProfileForTau, updateOneChip, addOneCallEvent, reportCallEvent,
   });
 
 // owner-ui module: calls/controls.js
@@ -39546,7 +40400,7 @@ function createCallHealth({
       if (!existing.includes("video") && media.pc.addTransceiver) {
         media.pc.addTransceiver("video", { direction: "sendrecv" });
       }
-      media.transceiversReady = true;
+      mediaState.set("transceiversReady", true);
     } catch (_) {}
   }
 
@@ -39664,10 +40518,10 @@ function createCallHealth({
     const btn = $$("#btn-call-share-screen");
     if (media.screenSharing) {
       try { media.screenStream?.getTracks().forEach((t) => t.stop()); } catch (_) {}
-      media.screenStream = null;
+      mediaState.set("screenStream", null);
       const cameraTrack = media.cameraVideoTrack || media.localStream?.getVideoTracks()[0] || null;
       if (cameraTrack) await replaceOutgoingTrack("video", cameraTrack);
-      media.screenSharing = false;
+      mediaState.set("screenSharing", false);
       surface?.classList.remove("screen-sharing");
       if (btn) {
         btn.textContent = "Share";
@@ -39689,10 +40543,10 @@ function createCallHealth({
       });
       const screenTrack = display.getVideoTracks()[0];
       if (!screenTrack) return;
-      media.cameraVideoTrack = media.localStream?.getVideoTracks()[0] || null;
-      media.screenStream = display;
+      mediaState.set("cameraVideoTrack", media.localStream?.getVideoTracks()[0] || null);
+      mediaState.set("screenStream", display);
       await replaceOutgoingTrack("video", screenTrack);
-      media.screenSharing = true;
+      mediaState.set("screenSharing", true);
       screenTrack.onended = () => { toggleScreenShare().catch(() => {}); };
       surface?.classList.add("screen-sharing");
       if (btn) {
@@ -39726,7 +40580,7 @@ function createCallHealth({
   }
 
   function toggleBackgroundBlur() {
-    media.backgroundBlur = !media.backgroundBlur;
+    mediaState.set("backgroundBlur", !media.backgroundBlur);
     const local = $$("#call-local-video");
     const btn = $$("#btn-call-blur");
     local?.classList.toggle("local-blur", media.backgroundBlur);
@@ -39771,7 +40625,7 @@ function createCallHealth({
   }
 
   function setCallHold(on) {
-    media.held = !!on;
+    mediaState.set("held", !!on);
     if (media.localStream) {
       media.localStream.getTracks().forEach((t) => {
         t.enabled = !media.held && (
@@ -39796,7 +40650,7 @@ function createCallHealth({
   function cycleCallLayout() {
     const modes = ["focus", "split", "compact"];
     const next = modes[(modes.indexOf(media.layoutMode) + 1) % modes.length] || "focus";
-    media.layoutMode = next;
+    mediaState.set("layoutMode", next);
     const surface = $$("#call-active-surface");
     if (surface) {
       surface.classList.toggle("layout-split", next === "split");
@@ -39818,15 +40672,17 @@ function createCallHealth({
   }
 
   function _setCaptionsEnabled(enabled) {
-    media.captionsOn = !!enabled;
+    mediaState.set("captionsOn", !!enabled);
     const btn = $$("#btn-call-captions");
     if (btn) btn.setAttribute("aria-pressed", String(media.captionsOn));
   }
 
   function _failActiveCaptions(recognizer, message, reason = "runtime") {
     if (media.captionRecognizer !== recognizer) return;
-    media.captionRecognizer = null;
-    media.captionsStarting = false;
+    mediaState.update({
+      captionRecognizer: null,
+      captionsStarting: false,
+    });
     _setCaptionsEnabled(false);
     try { recognizer.abort(); } catch (_) {}
     addTranscriptLine(message, "One Link");
@@ -39836,9 +40692,9 @@ function createCallHealth({
   async function toggleCaptions() {
     const btn = $$("#btn-call-captions");
     if (media.captionsOn || media.captionsStarting) {
-      media.captionsStarting = false;
+      mediaState.set("captionsStarting", false);
       const active = media.captionRecognizer;
-      media.captionRecognizer = null;
+      mediaState.set("captionRecognizer", null);
       _setCaptionsEnabled(false);
       try { active?.stop(); } catch (_) {}
       if (btn) btn.disabled = false;
@@ -39846,7 +40702,7 @@ function createCallHealth({
       return;
     }
 
-    media.captionsStarting = true;
+    mediaState.set("captionsStarting", true);
     _setCaptionsEnabled(false);
     if (btn) btn.disabled = true;
     try {
@@ -39914,15 +40770,17 @@ function createCallHealth({
           }
         }
       };
-      media.captionRecognizer = rec;
+      mediaState.set("captionRecognizer", rec);
       rec.start();
-      media.captionsStarting = false;
+      mediaState.set("captionsStarting", false);
       _setCaptionsEnabled(true);
       addTranscriptLine("On-device captions enabled.", "One Link");
       reportCallEvent("captions_started");
     } catch (error) {
-      media.captionRecognizer = null;
-      media.captionsStarting = false;
+      mediaState.update({
+        captionRecognizer: null,
+        captionsStarting: false,
+      });
       _setCaptionsEnabled(false);
       const message = error && error.message
         ? error.message
@@ -39939,11 +40797,11 @@ function createCallHealth({
     stopAttestStream();
     if (media.localStream) {
       media.localStream.getTracks().forEach((t) => { try { t.stop(); } catch (_) {} });
-      media.localStream = null;
+      mediaState.set("localStream", null);
     }
     if (media.remoteStream) {
       // Don't stop tracks (peer owns them), just detach.
-      media.remoteStream = null;
+      mediaState.set("remoteStream", null);
     }
     const localV = $$("#call-local-video");
     if (localV) {
@@ -39961,79 +40819,20 @@ function createCallHealth({
     if (surface) surface.classList.remove("has-remote-video");
     if (media.pc) {
       try { media.pc.close(); } catch (_) {}
-      media.pc = null;
+      mediaState.set("pc", null);
     }
-    media.iceConfigReady = null;
-    media.localCandidateAddresses = [];
-    media.iceSignalChain = Promise.resolve();
-    media.iceHelperReady = false;
-    media.iceRelayReady = false;
-    media.routePolicy = "direct_first";
-    media.forceRelayOnRepair = false;
-    media.preferRelayNext = false;
-    media.transceiversReady = false;
-    callUI.pendingIceCandidates = [];
-    callUI.appliedIceKeys.clear();
-    callUI.appliedRemoteOfferKeys.clear();
-    callUI.appliedRemoteAnswerKeys.clear();
-    callUI.localMediaReady = false;
-    callUI.lastLocalOfferSdp = "";
-    callUI.lastLocalAnswerSdp = "";
-    callUI.lastOfferSendMs = 0;
-    callUI.lastAnswerSendMs = 0;
-    callUI.lastLocalOfferCreatedMs = 0;
-    callUI.remoteOfferCollisionCount = 0;
-    callUI.lastMetricsSnapshot = null;
-    callUI.lastMediaRepairMs = 0;
-    callUI.lastInboundVideoBytes = 0;
-    callUI.lastInboundAudioBytes = 0;
-    callUI.stalledMediaTicks = 0;
-    callUI.lastInboundPacketsLost = 0;
-    callUI.lastInboundPacketsReceived = 0;
-    callUI.qualityEwmaRttMs = null;
-    callUI.qualityEwmaLoss = null;
-    callUI.qualityBadTicks = 0;
-    callUI.qualityGoodTicks = 0;
-    callUI.lastUserVisibleRepairMs = 0;
-    callUI.adaptationLevel = 0;
-    callUI.tauPressureTicks = 0;
-    callUI.tauStableTicks = 0;
-    callUI.lastTauAdaptMs = 0;
-    callUI.tauRiskEwma = null;
-    callUI.tauCoherenceEwma = null;
-    callUI.tauSurpriseEwma = null;
-    callUI.tauBandwidthEwmaKbps = null;
-    callUI.tauLastDecision = null;
-    callUI.lastCaptureProfile = "";
-    callUI.mediaRepairStage = 0;
-    callUI.lastPlaybackReviveMs = 0;
-    callUI.lastPcRebuildMs = 0;
-    callUI.lastRemoteMediaMovingMs = 0;
-    callUI.lastRepairDiagnosis = null;
-    callUI.repairDiagnosisCounts = {};
-    callUI.repairEscalationScore = 0;
-    callUI.acceptedCallIds.clear();
-    callUI.lastAcceptRetryMs = {};
-    media.screenStream = null;
-    media.cameraVideoTrack = null;
-    media.screenSharing = false;
-    media.backgroundBlur = false;
+    mediaState.resetRoute();
+    // Negotiation, telemetry, quality, adaptation and repair state of the
+    // finished media session (callState owns the exact field list).
+    callState.resetMediaSession();
     // doctrine-ok: §3.2.a internal recovery state reset; user copy stays calm.
-    media.reconnecting = false;
-    media.expectRemoteVideo = false;
-    media.expectRemoteAudio = true;
-    media.transceiversReady = false;
-    media.held = false;
-    media.captionsStarting = false;
+    mediaState.resetSessionControls();
     _setCaptionsEnabled(false);
     try { media.captionRecognizer?.abort(); } catch (_) {}
-    media.captionRecognizer = null;
+    mediaState.set("captionRecognizer", null);
     const captionsBtn = $$("#btn-call-captions");
     if (captionsBtn) captionsBtn.disabled = false;
-    media.layoutMode = "focus";
-    media.voiceProcessing = "smart";
-    media.muted = false;
-    media.cameraOff = false;
+    mediaState.resetPresentation();
     syncMuteCameraButtons();
   }
 
@@ -40202,7 +41001,7 @@ function createCallHealth({
         try { sender.replaceTrack(null).catch(() => {}); } catch (_) {}
       });
       try { media.pc.close(); } catch (_) {}
-      media.pc = null;
+      mediaState.set("pc", null);
     }
     if (media.localStream) {
       media.localStream.getVideoTracks().forEach((track) => {
@@ -40269,9 +41068,11 @@ function createCallHealth({
       resetCapsuleCapture();
       stopAllMedia();
       hideActiveSurface();
-      if (callUI.activeCallId === finishedCallId) callUI.activeCallId = null;
-      callUI.activeCallPeerFp = null;
-      callUI.activeCallLocalRole = "";
+      if (callUI.activeCallId === finishedCallId) callState.set("activeCallId", null);
+      callState.update({
+        activeCallPeerFp: null,
+        activeCallLocalRole: "",
+      });
       reportCallEvent("capsule_capture_finalized", { reason, ok: true });
       return true;
     } catch (error) {
@@ -40477,7 +41278,7 @@ function createCallHealth({
   function _queueCallIcePayloads(payloads) {
     const bounded = Array.isArray(payloads) ? payloads.slice(0, 9) : [];
     const previous = media.iceSignalChain || Promise.resolve();
-    media.iceSignalChain = previous
+    mediaState.set("iceSignalChain", previous
       .catch(() => undefined)
       .then(async () => {
         for (const payload of bounded) {
@@ -40488,7 +41289,7 @@ function createCallHealth({
             });
           }
         }
-      });
+      }));
     return media.iceSignalChain;
   }
 
@@ -40501,8 +41302,8 @@ function createCallHealth({
     // ``call_event`` tail messages over the existing WebSocket.
     if (!window.RTCPeerConnection) return null;
     if (media.pc && media.pc.signalingState !== "closed") return media.pc;
-    media.localCandidateAddresses = [];
-    media.iceSignalChain = Promise.resolve();
+    mediaState.set("localCandidateAddresses", []);
+    mediaState.set("iceSignalChain", Promise.resolve());
     // Sovereignty default: no third-party STUN servers. The daemon may return
     // its private LAN-only Binding responder plus its OS-observed address;
     // together those preserve a direct same-LAN route when Firefox masks host
@@ -40518,7 +41319,7 @@ function createCallHealth({
     // Resolve both local assistance and any explicitly configured public
     // STUN/TURN before the offer. Failure remains host-only and is observable;
     // it never triggers an undisclosed third-party fallback.
-    media.iceConfigReady = (async () => {
+    mediaState.set("iceConfigReady", (async () => {
       try {
         const iceUrl = callUI.activeCallId
           ? `/api/peer-rtc/ice-config?call_id=${encodeURIComponent(callUI.activeCallId)}`
@@ -40528,21 +41329,16 @@ function createCallHealth({
         });
         if (!r.ok) return;
         const cfg = await r.json();
-        media.localCandidateAddresses = _callLocalAddressesFromIceConfig(cfg);
-        media.iceRelayReady = Array.isArray(cfg.iceServers)
+        mediaState.set("localCandidateAddresses", _callLocalAddressesFromIceConfig(cfg));
+        mediaState.set("iceRelayReady", Array.isArray(cfg.iceServers)
           && cfg.iceServers.some((srv) => {
             const urls = Array.isArray(srv.urls) ? srv.urls : [srv.urls];
             return urls.some((u) => String(u || "").toLowerCase().startsWith("turn:") || String(u || "").toLowerCase().startsWith("turns:"));
-          });
-        media.iceHelperReady = Array.isArray(cfg.iceServers) && cfg.iceServers.length > 0;
-        media.routePolicy = String(cfg.routePolicy?.mode || "direct_first");
-        media.routePolicyDetail = cfg.routePolicy || null;
-        media.bestRelayHealth = String(cfg.routePolicy?.best_relay_health || "");
-        media.bestRelayScore = Number.isFinite(Number(cfg.routePolicy?.best_relay_score))
-          ? Number(cfg.routePolicy.best_relay_score)
-          : null;
-        media.turnCredentialExpiresAtMs = Number(cfg.routePolicy?.credential_expires_at_ms || 0) || null;
-        media.forceRelayOnRepair = cfg.routePolicy?.force_relay_on_repair === true;
+          }));
+        mediaState.set("iceHelperReady", Array.isArray(cfg.iceServers) && cfg.iceServers.length > 0);
+        mediaState.set("routePolicy", String(cfg.routePolicy?.mode || "direct_first"));
+        mediaState.recordRoutePolicy(cfg.routePolicy);
+        mediaState.set("forceRelayOnRepair", cfg.routePolicy?.force_relay_on_repair === true);
         if (Array.isArray(cfg.iceServers) && cfg.iceServers.length > 0) {
           pc.setConfiguration({ iceServers: cfg.iceServers });
           if (media.iceRelayReady) {
@@ -40555,7 +41351,7 @@ function createCallHealth({
       } catch (_) {
         reportCallEvent("ice_config_unavailable", { state: "host_only" });
       }
-    })();
+    })());
     pc.ontrack = (ev) => {
       bindRemoteTrackDiagnostics(ev.track);
       bindRemoteVideoElementDiagnostics();
@@ -40615,7 +41411,7 @@ function createCallHealth({
       if (pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed") {
         repairMediaPath("ice_state_changed").catch(() => {});
       } else if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
-        callUI.qualityGoodTicks += 1;
+        callState.increment("qualityGoodTicks", 1);
       }
     };
     pc.onconnectionstatechange = () => {
@@ -40623,10 +41419,10 @@ function createCallHealth({
       if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
         repairMediaPath("connection_state_changed").catch(() => {});
       } else if (pc.connectionState === "connected") {
-        callUI.qualityGoodTicks += 1;
+        callState.increment("qualityGoodTicks", 1);
       }
     };
-    media.pc = pc;
+    mediaState.set("pc", pc);
     ensureMediaTransceivers();
     return pc;
   }
@@ -40642,7 +41438,7 @@ function createCallHealth({
     }
     if (callUI.sdpOfferInFlight) return;
     try {
-      callUI.sdpOfferInFlight = true;
+      callState.set("sdpOfferInFlight", true);
       addOneCallEvent("Preparing media offer...");
       reportCallEvent("offer_preparing");
       if (media.iceConfigReady) await media.iceConfigReady;
@@ -40650,10 +41446,12 @@ function createCallHealth({
       await ensureLocalTracksOnPeerConnectionSettled();
       const offer = await media.pc.createOffer();
       await media.pc.setLocalDescription(offer);
-      callUI.lastLocalOfferSdp = offer.sdp || "";
-      callUI.lastOfferSendMs = Date.now();
-      callUI.lastLocalOfferCreatedMs = callUI.lastOfferSendMs;
-      callUI.remoteOfferCollisionCount = 0;
+      callState.update({
+        lastLocalOfferSdp: offer.sdp || "",
+        lastOfferSendMs: Date.now(),
+      });
+      callState.set("lastLocalOfferCreatedMs", callUI.lastOfferSendMs);
+      callState.set("remoteOfferCollisionCount", 0);
       const result = await callApiPost({
         action: "send_sdp_offer",
         call_id: callUI.activeCallId,
@@ -40669,7 +41467,7 @@ function createCallHealth({
       addOneCallEvent(`Media offer failed: ${e && e.name ? e.name : "error"}.`);
       reportCallEvent("offer_send_failed", { ok: false });
     } finally {
-      callUI.sdpOfferInFlight = false;
+      callState.set("sdpOfferInFlight", false);
     }
   }
 
@@ -40692,8 +41490,10 @@ function createCallHealth({
     const now = Date.now();
     if (now - callUI.lastOfferSendMs < 3000) return;
     try {
-      callUI.sdpOfferInFlight = true;
-      callUI.lastOfferSendMs = now;
+      callState.update({
+        sdpOfferInFlight: true,
+        lastOfferSendMs: now,
+      });
       addOneCallEvent("Resending media offer...");
       reportCallEvent("offer_resend", { reason: reason || "watchdog" });
       const result = await callApiPost({
@@ -40708,7 +41508,7 @@ function createCallHealth({
     } catch (_) {
       reportCallEvent("offer_resend_failed", { ok: false, reason: reason || "watchdog" });
     } finally {
-      callUI.sdpOfferInFlight = false;
+      callState.set("sdpOfferInFlight", false);
     }
   }
 
@@ -40748,7 +41548,7 @@ function createCallHealth({
   function reviveRemotePlayback(reason) {
     const now = Date.now();
     if (now - Number(callUI.lastPlaybackReviveMs || 0) < 2500) return;
-    callUI.lastPlaybackReviveMs = now;
+    callState.set("lastPlaybackReviveMs", now);
     syncRemoteMediaSurface(reason || "playback_revive");
     reportCallEvent("remote_playback_revive", { reason: reason || "watchdog" });
   }
@@ -40757,7 +41557,7 @@ function createCallHealth({
     if (!callUI.activeCallId || !media.localStream) return false;
     const now = Date.now();
     if (now - Number(callUI.lastPcRebuildMs || 0) < 30000) return false;
-    callUI.lastPcRebuildMs = now;
+    callState.set("lastPcRebuildMs", now);
     addOneCallEvent("Rebuilding media engine...");
     reportCallEvent("pc_rebuild_start", { reason: reason || "watchdog" });
     const remoteTracks = media.remoteStream ? media.remoteStream.getTracks() : [];
@@ -40767,18 +41567,14 @@ function createCallHealth({
     attachRemoteStream(media.remoteStream || new MediaStream());
     if (media.pc) {
       try { media.pc.close(); } catch (_) {}
-      media.pc = null;
+      mediaState.set("pc", null);
     }
-    media.iceConfigReady = null;
-    media.transceiversReady = false;
-    callUI.pendingIceCandidates = [];
-    callUI.appliedIceKeys.clear();
-    callUI.appliedRemoteOfferKeys.clear();
-    callUI.appliedRemoteAnswerKeys.clear();
-    callUI.sdpOfferInFlight = false;
-    callUI.sdpAnswerInFlight = false;
-    callUI.lastLocalOfferSdp = "";
-    callUI.lastLocalAnswerSdp = "";
+    mediaState.update({
+      iceConfigReady: null,
+      transceiversReady: false,
+    });
+    // Queued/applied ICE, applied offers/answers and SDP in flight.
+    callState.forgetNegotiation();
     const pc = setupRtcPeerConnection();
     if (!pc) return false;
     ensureLocalTracksOnPeerConnection();
@@ -40797,7 +41593,7 @@ function createCallHealth({
     if (!media.pc || !callUI.activeCallId) return;
     if (callUI.sdpAnswerInFlight) return;
     try {
-      callUI.sdpAnswerInFlight = true;
+      callState.set("sdpAnswerInFlight", true);
       addOneCallEvent("Preparing media answer...");
       reportCallEvent("answer_preparing");
       if (media.iceConfigReady) await media.iceConfigReady;
@@ -40805,8 +41601,10 @@ function createCallHealth({
       await ensureLocalTracksOnPeerConnectionSettled();
       const answer = await media.pc.createAnswer();
       await media.pc.setLocalDescription(answer);
-      callUI.lastLocalAnswerSdp = answer.sdp || "";
-      callUI.lastAnswerSendMs = Date.now();
+      callState.update({
+        lastLocalAnswerSdp: answer.sdp || "",
+        lastAnswerSendMs: Date.now(),
+      });
       const result = await callApiPost({
         action: "send_sdp_answer",
         call_id: callUI.activeCallId,
@@ -40822,7 +41620,7 @@ function createCallHealth({
       addOneCallEvent(`Media answer failed: ${e && e.name ? e.name : "error"}.`);
       reportCallEvent("answer_send_failed", { ok: false });
     } finally {
-      callUI.sdpAnswerInFlight = false;
+      callState.set("sdpAnswerInFlight", false);
     }
   }
 
@@ -40838,8 +41636,10 @@ function createCallHealth({
     const now = Date.now();
     if (now - callUI.lastAnswerSendMs < 3000) return;
     try {
-      callUI.sdpAnswerInFlight = true;
-      callUI.lastAnswerSendMs = now;
+      callState.update({
+        sdpAnswerInFlight: true,
+        lastAnswerSendMs: now,
+      });
       addOneCallEvent("Resending media answer...");
       reportCallEvent("answer_resend", { reason: reason || "duplicate_offer" });
       const result = await callApiPost({
@@ -40854,7 +41654,7 @@ function createCallHealth({
     } catch (_) {
       reportCallEvent("answer_resend_failed", { ok: false, reason: reason || "duplicate_offer" });
     } finally {
-      callUI.sdpAnswerInFlight = false;
+      callState.set("sdpAnswerInFlight", false);
     }
   }
 
@@ -40870,7 +41670,7 @@ function createCallHealth({
     const hasLiveLocal = ensureLocalTracksOnPeerConnection();
     if (!hasLiveLocal) return;
     if (!callUI.localMediaReady) {
-      callUI.localMediaReady = true;
+      callState.set("localMediaReady", true);
       reportCallEvent("local_media_ready", { reason: reason || "watchdog" });
     }
     if (
@@ -40943,10 +41743,7 @@ function createCallHealth({
       strategy = "renegotiate";
       severity = 2;
     }
-    const counts = callUI.repairDiagnosisCounts || {};
-    counts[kind] = Number(counts[kind] || 0) + 1;
-    callUI.repairDiagnosisCounts = counts;
-    callUI.repairEscalationScore = Math.min(10, Number(callUI.repairEscalationScore || 0) + severity);
+    const counts = callState.countRepairDiagnosis(kind, severity);
     if (
       callUI.repairEscalationScore >= 6 ||
       Number(counts[kind] || 0) >= 3 ||
@@ -40978,27 +41775,24 @@ function createCallHealth({
       media_health: mediaHealth,
       seconds_since_media_moving: secondsSinceMoving,
     };
-    callUI.lastRepairDiagnosis = diagnosis;
+    callState.set("lastRepairDiagnosis", diagnosis);
     return diagnosis;
   }
 
   function markMediaRepairHealthy() {
-    callUI.repairEscalationScore = Math.max(0, Number(callUI.repairEscalationScore || 0) - 2);
-    if (callUI.repairEscalationScore === 0) {
-      callUI.repairDiagnosisCounts = {};
-      callUI.lastRepairDiagnosis = null;
-    }
+    callState.set("repairEscalationScore", Math.max(0, Number(callUI.repairEscalationScore || 0) - 2));
+    if (callUI.repairEscalationScore === 0) callState.clearRepairDiagnosis();
   }
 
   async function repairMediaPath(reason) {
     if (!callUI.activeCallId || !media.pc) return;
     const now = Date.now();
     if (now - Number(callUI.lastMediaRepairMs || 0) < 9000) return;
-    callUI.lastMediaRepairMs = now;
-    callUI.mediaRepairStage = Math.min(3, Number(callUI.mediaRepairStage || 0) + 1);
+    callState.set("lastMediaRepairMs", now);
+    callState.set("mediaRepairStage", Math.min(3, Number(callUI.mediaRepairStage || 0) + 1));
     const diagnosis = diagnoseMediaRepair(reason || "watchdog");
     if (now - Number(callUI.lastUserVisibleRepairMs || 0) > 15000 && callUI.qualityBadTicks >= 2) {
-      callUI.lastUserVisibleRepairMs = now;
+      callState.set("lastUserVisibleRepairMs", now);
       setReconnectState(true, "Repairing media path...");
     }
     addOneCallEvent("Repairing media path...");
@@ -41045,7 +41839,7 @@ function createCallHealth({
       });
       if (diagnosis.strategy === "rebuild_peer_connection" || diagnosis.strategy === "relay_rebuild") {
         if (diagnosis.strategy === "relay_rebuild") {
-          media.preferRelayNext = true;
+          mediaState.set("preferRelayNext", true);
           updateOneChip("#call-one-engine", "Relay escape");
           reportCallEvent("relay_escape_requested", {
             reason: reason || "media_path_repair",
@@ -41098,20 +41892,20 @@ function createCallHealth({
     const now = Date.now();
     const last = Number(callUI.backendActionCooldowns[action] || 0);
     if (now - last < minGapMs) return false;
-    callUI.backendActionCooldowns[action] = now;
+    callState.stampBackendCooldown(action, now);
     return true;
   }
 
   function rememberBackendRecommendation(recommendation) {
     const key = backendRecommendationKey(recommendation);
-    callUI.lastBackendRecommendation = {
+    callState.set("lastBackendRecommendation", {
       at_ms: Date.now(),
       ...(recommendation || {}),
-    };
-    callUI.lastBackendRecommendationMs = callUI.lastBackendRecommendation.at_ms;
+    });
+    callState.set("lastBackendRecommendationMs", callUI.lastBackendRecommendation.at_ms);
     const changed = key && key !== callUI.lastBackendRecommendationKey;
     if (changed) {
-      callUI.lastBackendRecommendationKey = key;
+      callState.set("lastBackendRecommendationKey", key);
       reportCallEvent("backend_recommendation_received", {
         reason: String(recommendation.action || "observe"),
         state: String(recommendation.route_preference || "auto"),
@@ -41130,7 +41924,7 @@ function createCallHealth({
       if (action === "observe" || action === "hold" || action === "watch") return;
 
       if (routePreference === "relay") {
-        media.preferRelayNext = true;
+        mediaState.set("preferRelayNext", true);
         updateOneChip("#call-one-engine", "Relay ready");
       }
 
@@ -41225,14 +42019,14 @@ function createCallHealth({
       intent.priority || 0,
       intent.route_preference || "auto",
     ].join("|");
-    callUI.lastRecoveryIntent = {
+    callState.set("lastRecoveryIntent", {
       at_ms: Date.now(),
       ...intent,
-    };
-    callUI.lastRecoveryIntentMs = callUI.lastRecoveryIntent.at_ms;
+    });
+    callState.set("lastRecoveryIntentMs", callUI.lastRecoveryIntent.at_ms);
     const changed = key && key !== callUI.lastRecoveryIntentKey;
     if (changed) {
-      callUI.lastRecoveryIntentKey = key;
+      callState.set("lastRecoveryIntentKey", key);
       reportCallEvent("recovery_intent_seen", {
         reason: String(intent.action || "observe"),
         state: String(intent.route_preference || "auto"),
@@ -41270,7 +42064,7 @@ function createCallHealth({
         audio_priority: intent.audio_first === true,
       };
       if (routePreference === "relay" || action === "force_relay") {
-        media.preferRelayNext = true;
+        mediaState.set("preferRelayNext", true);
         updateOneChip("#call-one-engine", "Relay repair");
       }
       if (action === "force_relay") {
@@ -41305,13 +42099,13 @@ function createCallHealth({
       session.sequence || "",
       session.recommendation_action || "",
     ].join("|");
-    callUI.lastSessionAuthority = {
+    callState.set("lastSessionAuthority", {
       at_ms: Date.now(),
       ...session,
-    };
-    callUI.lastSessionAuthorityMs = callUI.lastSessionAuthority.at_ms;
+    });
+    callState.set("lastSessionAuthorityMs", callUI.lastSessionAuthority.at_ms);
     if (key !== callUI.lastSessionAuthorityKey) {
-      callUI.lastSessionAuthorityKey = key;
+      callState.set("lastSessionAuthorityKey", key);
       // doctrine-ok: §3.2.a internal state-machine value; user copy below stays calm.
       reportCallEvent("session_authority_seen", {
         reason: state,
@@ -41353,11 +42147,10 @@ function createCallHealth({
     const localStream = media.localStream;
     if (media.pc) {
       try { media.pc.close(); } catch (_) {}
-      media.pc = null;
+      mediaState.set("pc", null);
     }
-    media.iceConfigReady = null;
-    callUI.pendingIceCandidates = [];
-    callUI.appliedIceKeys.clear();
+    mediaState.set("iceConfigReady", null);
+    callState.forgetIceSignals();
     const pc = setupRtcPeerConnection();
     if (!pc) return false;
     if (localStream) ensureLocalTracksOnPeerConnection();
@@ -41401,7 +42194,7 @@ function createCallHealth({
   }
 
   async function recoverRemoteOfferCollision(sdp, key) {
-    callUI.remoteOfferCollisionCount += 1;
+    callState.increment("remoteOfferCollisionCount", 1);
     const ageMs = Date.now() - Number(callUI.lastLocalOfferCreatedMs || 0);
     const shouldRecover = callUI.remoteOfferCollisionCount >= 2 || ageMs > 7000;
     reportCallEvent("offer_collision", {
@@ -41427,11 +42220,13 @@ function createCallHealth({
     }
     try {
       await media.pc.setRemoteDescription({ type: "offer", sdp });
-      if (key) callUI.appliedRemoteOfferKeys.add(key);
-      callUI.remoteOfferCollisionCount = 0;
-      callUI.lastLocalOfferSdp = "";
-      callUI.lastOfferSendMs = 0;
-      callUI.lastLocalOfferCreatedMs = 0;
+      if (key) callState.markRemoteOfferApplied(key);
+      callState.update({
+        remoteOfferCollisionCount: 0,
+        lastLocalOfferSdp: "",
+        lastOfferSendMs: 0,
+        lastLocalOfferCreatedMs: 0,
+      });
       await flushPendingIceCandidates();
       await sendLocalSdpAnswer();
       reportCallEvent("offer_collision_recovered");
@@ -41474,7 +42269,7 @@ function createCallHealth({
       && media.pc.remoteDescription.type === "offer"
       && sdpKey(media.pc.remoteDescription.sdp) === key
     ) {
-      if (key) callUI.appliedRemoteOfferKeys.add(key);
+      if (key) callState.markRemoteOfferApplied(key);
       const hasLocalAnswer = !!(
         callUI.lastLocalAnswerSdp
         || (media.pc.localDescription && media.pc.localDescription.type === "answer")
@@ -41505,8 +42300,8 @@ function createCallHealth({
     }
     try {
       await media.pc.setRemoteDescription({ type: "offer", sdp });
-      if (key) callUI.appliedRemoteOfferKeys.add(key);
-      callUI.remoteOfferCollisionCount = 0;
+      if (key) callState.markRemoteOfferApplied(key);
+      callState.set("remoteOfferCollisionCount", 0);
       await flushPendingIceCandidates();
       await sendLocalSdpAnswer();
     } catch (_) { /* fall through */ }
@@ -41521,14 +42316,14 @@ function createCallHealth({
       && media.pc.remoteDescription.type === "answer"
       && sdpKey(media.pc.remoteDescription.sdp) === key
     ) {
-      if (key) callUI.appliedRemoteAnswerKeys.add(key);
+      if (key) callState.markRemoteAnswerApplied(key);
       return;
     }
     if (media.pc.signalingState !== "have-local-offer") return;
     try {
       await media.pc.setRemoteDescription({ type: "answer", sdp });
-      if (key) callUI.appliedRemoteAnswerKeys.add(key);
-      callUI.remoteOfferCollisionCount = 0;
+      if (key) callState.markRemoteAnswerApplied(key);
+      callState.set("remoteOfferCollisionCount", 0);
       await flushPendingIceCandidates();
     } catch (_) { /* fall through */ }
   }
@@ -41539,12 +42334,12 @@ function createCallHealth({
       if (!iceKey || !callUI.pendingIceCandidates.some((item) => (
         `${item.call_id || callUI.activeCallId || ""}|${item.sdp_mid || ""}|${item.sdp_m_line_index ?? ""}|${item.candidate || ""}|${item.end_of_candidates ? "end" : ""}`
       ) === iceKey)) {
-        callUI.pendingIceCandidates.push(data);
+        callState.queueIceCandidate(data);
       }
       return;
     }
     if (iceKey && callUI.appliedIceKeys.has(iceKey)) return;
-    if (iceKey) callUI.appliedIceKeys.add(iceKey);
+    if (iceKey) callState.markIceApplied(iceKey);
     // end_of_candidates → addIceCandidate(null) signals completion.
     if (data && data.end_of_candidates) {
       try { await media.pc.addIceCandidate(null); } catch (_) {}
@@ -41561,7 +42356,7 @@ function createCallHealth({
 
   async function flushPendingIceCandidates() {
     if (!media.pc || !media.pc.remoteDescription) return;
-    const queued = callUI.pendingIceCandidates.splice(0);
+    const queued = callState.takeQueuedIceCandidates();
     for (const item of queued) {
       await applyRemoteIceCandidate(item);
     }
@@ -41583,7 +42378,7 @@ function createCallHealth({
 
   function setReconnectState(on, text) {
     // doctrine-ok: §3.2.a internal state class; visible copy stays repair-oriented.
-    media.reconnecting = !!on;
+    mediaState.set("reconnecting", !!on);
     const surface = $$("#call-active-surface");
     const banner = $$("#call-reconnect-banner");
     surface?.classList.toggle("reconnecting", !!on);
@@ -41626,11 +42421,10 @@ function createCallHealth({
   }
 
   function rememberCallHistory(label, outcome) {
-    callUI.callHistory.unshift({
+    callState.recordCallHistory({
       label: `${outcome || "Call"} · ${label || callUI.activeCallPeer || "Device"}`,
       when: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
     });
-    callUI.callHistory = callUI.callHistory.slice(0, 10);
     renderCallHistory();
   }
 
@@ -41647,7 +42441,7 @@ function createCallHealth({
   $$("#btn-call-settings-close")?.addEventListener("click", () => toggleCallSettings(false));
   $$("#btn-call-refresh-devices")?.addEventListener("click", () => refreshCallDevicePickers().catch(() => {}));
   $$("#btn-call-video-fit")?.addEventListener("click", () => {
-    media.videoFit = media.videoFit === "contain" ? "cover" : "contain";
+    mediaState.set("videoFit", media.videoFit === "contain" ? "cover" : "contain");
     const surface = $$("#call-active-surface");
     if (surface) surface.classList.toggle("video-fit-contain", media.videoFit === "contain");
     const btn = $$("#btn-call-video-fit");
@@ -41661,10 +42455,10 @@ function createCallHealth({
   $$("#btn-call-layout")?.addEventListener("click", () => cycleCallLayout());
   $$("#btn-call-captions")?.addEventListener("click", () => toggleCaptions());
   $$("#call-notes")?.addEventListener("input", (ev) => {
-    callUI.callNotes = ev.target.value || "";
+    callState.set("callNotes", ev.target.value || "");
   });
   $$("#call-noise-select")?.addEventListener("change", async (ev) => {
-    media.voiceProcessing = ev.target.value === "raw" ? "raw" : "smart";
+    mediaState.set("voiceProcessing", ev.target.value === "raw" ? "raw" : "smart");
     await replaceLocalMediaTracks("audio");
     reportCallEvent("voice_processing_changed", { state: media.voiceProcessing });
   });
@@ -41742,7 +42536,7 @@ function createCallHealth({
     if (callUI.inboundCallId) {
       const callId = callUI.inboundCallId;
       hideIncomingRing();
-      callUI.inboundCallId = null;
+      callState.set("inboundCallId", null);
       await callApiPost({ action: "decline", call_id: callId });
       rememberCallHistory(callUI.inboundCallPeer, "Capsule");
     }
@@ -41761,7 +42555,7 @@ function createCallHealth({
         hideIncomingRing();
         if (callUI.inboundCallId) {
           callApiPost({ action: "decline", call_id: callUI.inboundCallId }).catch(() => {});
-          callUI.inboundCallId = null;
+          callState.set("inboundCallId", null);
         }
         if (data.peer && typeof selectPeer === "function") selectPeer(data.peer);
         const composer = $$("#msg-input");
@@ -41772,15 +42566,15 @@ function createCallHealth({
     });
   }
   $$("#call-mic-select")?.addEventListener("change", async (ev) => {
-    media.selectedAudioInputId = ev.target.value || "";
+    mediaState.set("selectedAudioInputId", ev.target.value || "");
     await replaceLocalMediaTracks("audio");
   });
   $$("#call-camera-select")?.addEventListener("change", async (ev) => {
-    media.selectedVideoInputId = ev.target.value || "";
+    mediaState.set("selectedVideoInputId", ev.target.value || "");
     await replaceLocalMediaTracks("video");
   });
   $$("#call-speaker-select")?.addEventListener("change", async (ev) => {
-    media.selectedAudioOutputId = ev.target.value || "";
+    mediaState.set("selectedAudioOutputId", ev.target.value || "");
     await applyAudioOutputDevice($$("#call-remote-audio"));
   });
   if (navigator.mediaDevices && typeof navigator.mediaDevices.addEventListener === "function") {
@@ -42203,19 +42997,23 @@ function createCallHealth({
     );
     const proceed = await preflight({ video: wantVideo, peerLabel: label });
     if (!proceed) return;
-    callUI.activeCallId = null;
-    callUI.activeCallPeer = label;
-    callUI.activeCallPeerFp = peerMasterVkHex;
-    callUI.activeCallLocalRole = "originator";
-    callUI.activeCallKind = wantVideo ? "video" : "voice";
-    media.expectRemoteAudio = true;
-    media.expectRemoteVideo = wantVideo;
+    callState.update({
+      activeCallId: null,
+      activeCallPeer: label,
+      activeCallPeerFp: peerMasterVkHex,
+      activeCallLocalRole: "originator",
+      activeCallKind: wantVideo ? "video" : "voice",
+    });
+    mediaState.update({
+      expectRemoteAudio: true,
+      expectRemoteVideo: wantVideo,
+    });
     showOutgoingOverlay(label, {
       kind: wantVideo ? "video" : "voice",
     });
     addOneCallEvent("Starting secure call path...");
     setupRtcPeerConnection();
-    callUI.localMediaReady = false;
+    callState.set("localMediaReady", false);
     const mediaPromise = startLocalMedia({ audio: true, video: wantVideo });
     const result = await callApiPost({
       action: "initiate",
@@ -42227,13 +43025,15 @@ function createCallHealth({
       if (typeof toast === "function") toast(result.user_message, "warn");
       hideOutgoingOverlay();
       stopAllMedia();
-      callUI.activeCallId = null;
-      callUI.activeCallPeer = null;
-      callUI.activeCallPeerFp = null;
-      callUI.activeCallLocalRole = "";
+      callState.update({
+        activeCallId: null,
+        activeCallPeer: null,
+        activeCallPeerFp: null,
+        activeCallLocalRole: "",
+      });
       return;
     }
-    callUI.activeCallId = result.call_id;
+    callState.set("activeCallId", result.call_id);
     // v0.21.x: track this outgoing call so we get a missed-call /
     // ended-call bubble in chat when the daemon's phase_changed
     // event fires for ended/async_capture.
@@ -42275,7 +43075,7 @@ function createCallHealth({
         stream.getVideoTracks().forEach((t) => { t.enabled = false; });
       }
     }
-    callUI.localMediaReady = true;
+    callState.set("localMediaReady", true);
     reportCallEvent("local_media_ready", { reason: "start" });
     // Originator creates the SDP offer + sends it now. The peer
     // will respond with an SDP answer once they accept.
@@ -42652,8 +43452,7 @@ function createCallHealth({
   function addOneCallEvent(text) {
     if (!text) return;
     if (isNoisyCallEvent(text)) return;
-    callUI.oneEvents.unshift({ text, at: Date.now() });
-    callUI.oneEvents = callUI.oneEvents.slice(0, 4);
+    callState.recordOneEvent({ text, at: Date.now() });
     const feed = $$("#call-one-feed");
     if (!feed) return;
     feed.innerHTML = callUI.oneEvents.map((ev) => (
@@ -42686,7 +43485,7 @@ function createCallHealth({
   }
 
   function resetOneCallRail(peerLabel) {
-    callUI.oneEvents = [];
+    callState.clearOneEvents();
     updateOneChip("#call-one-score", "Protected");
     updateOneChip("#call-one-route", "Local");
     updateOneChip("#call-one-rtt", "--");
@@ -42777,18 +43576,20 @@ function createCallHealth({
         } else {
           loss = inboundPacketsLost / (inboundPacketsLost + inboundPacketsReceived);
         }
-        callUI.lastInboundPacketsLost = inboundPacketsLost;
-        callUI.lastInboundPacketsReceived = inboundPacketsReceived;
+        callState.update({
+          lastInboundPacketsLost: inboundPacketsLost,
+          lastInboundPacketsReceived: inboundPacketsReceived,
+        });
       }
       if (rttMs !== null) {
-        callUI.qualityEwmaRttMs = callUI.qualityEwmaRttMs === null
+        callState.set("qualityEwmaRttMs", callUI.qualityEwmaRttMs === null
           ? rttMs
-          : Math.round((callUI.qualityEwmaRttMs * 0.7) + (rttMs * 0.3));
+          : Math.round((callUI.qualityEwmaRttMs * 0.7) + (rttMs * 0.3)));
       }
       if (loss !== null) {
-        callUI.qualityEwmaLoss = callUI.qualityEwmaLoss === null
+        callState.set("qualityEwmaLoss", callUI.qualityEwmaLoss === null
           ? loss
-          : (callUI.qualityEwmaLoss * 0.75) + (loss * 0.25);
+          : (callUI.qualityEwmaLoss * 0.75) + (loss * 0.25));
       }
       if (rttMs !== null) updateOneChip("#call-one-rtt", `${rttMs} ms`);
       if (loss !== null) updateOneChip("#call-one-loss", `${Math.round(loss * 100)}%`);
@@ -42850,7 +43651,7 @@ function createCallHealth({
       selected.media_health_renderer_detached = mediaHealth.renderer_detached;
       selected.media_health_renderer_hidden = mediaHealth.renderer_hidden;
       selected.media_health_no_video_frames = mediaHealth.no_video_frames;
-      callUI.lastMetricsSnapshot = {
+      callState.set("lastMetricsSnapshot", {
         at_ms: Date.now(),
         ...selected,
         media_health: mediaHealth,
@@ -42862,7 +43663,7 @@ function createCallHealth({
         smoothed_rtt_ms: callUI.qualityEwmaRttMs,
         bandwidth_estimate_kbps: kbps,
         remote_tracks: remoteTrackSummary(),
-      };
+      });
       const quality = classifyCallQuality(callUI.lastMetricsSnapshot);
       applyCallQualityHysteresis(quality);
       renderParticipants();
@@ -42896,19 +43697,23 @@ function createCallHealth({
       const audioElementFrozen = selected.remote_audio_tracks > 0
         && !audioElementMoving
         && !audioMoving;
-      callUI.lastRemoteVideoTime = remoteVideoTime;
-      callUI.lastRemoteAudioTime = remoteAudioTime;
-      callUI.lastInboundVideoBytes = inboundVideoBytes;
-      callUI.lastInboundAudioBytes = inboundAudioBytes;
-      callUI.lastInboundVideoFramesDecoded = inboundVideoFramesDecoded;
+      callState.update({
+        lastRemoteVideoTime: remoteVideoTime,
+        lastRemoteAudioTime: remoteAudioTime,
+        lastInboundVideoBytes: inboundVideoBytes,
+        lastInboundAudioBytes: inboundAudioBytes,
+        lastInboundVideoFramesDecoded: inboundVideoFramesDecoded,
+      });
       if (videoMoving || audioMoving || videoElementMoving || audioElementMoving) {
-        callUI.lastRemoteMediaMovingMs = Date.now();
-        callUI.frozenMediaTicks = 0;
+        callState.update({
+          lastRemoteMediaMovingMs: Date.now(),
+          frozenMediaTicks: 0,
+        });
         if (
           selected.ice_connection_state === "connected" ||
           selected.ice_connection_state === "completed"
         ) {
-          callUI.mediaRepairStage = 0;
+          callState.set("mediaRepairStage", 0);
           markMediaRepairHealthy();
         }
       }
@@ -42918,30 +43723,30 @@ function createCallHealth({
         && selected.ice_connection_state !== "connected"
         && selected.ice_connection_state !== "completed"
       ) {
-        callUI.stalledMediaTicks += 1;
+        callState.increment("stalledMediaTicks", 1);
       } else if (mediaHealth.state === "remote_media_missing" || mediaHealth.state === "media_starved") {
-        callUI.stalledMediaTicks += 1;
+        callState.increment("stalledMediaTicks", 1);
       } else if (mediaHealth.state === "renderer_detached") {
         reviveRemotePlayback("renderer_detached");
-        callUI.stalledMediaTicks += 1;
+        callState.increment("stalledMediaTicks", 1);
       } else if (selected.remote_video_tracks > 0 && !videoMoving && selected.inbound_video_packets > 0) {
-        callUI.stalledMediaTicks += 1;
+        callState.increment("stalledMediaTicks", 1);
       } else if (selected.remote_audio_tracks > 0 && !audioMoving && selected.inbound_audio_packets > 0) {
-        callUI.stalledMediaTicks += 1;
+        callState.increment("stalledMediaTicks", 1);
       } else {
-        callUI.stalledMediaTicks = 0;
+        callState.set("stalledMediaTicks", 0);
       }
       if (videoElementFrozen || audioElementFrozen) {
-        callUI.frozenMediaTicks += 1;
+        callState.increment("frozenMediaTicks", 1);
       } else {
-        callUI.frozenMediaTicks = 0;
+        callState.set("frozenMediaTicks", 0);
       }
       if (callUI.stalledMediaTicks >= 3) {
-        callUI.stalledMediaTicks = 0;
+        callState.set("stalledMediaTicks", 0);
         repairMediaPath("stalled_media").catch(() => {});
       }
       if (callUI.frozenMediaTicks >= 3) {
-        callUI.frozenMediaTicks = 0;
+        callState.set("frozenMediaTicks", 0);
         reportCallEvent("remote_media_frozen", {
           video_frozen: videoElementFrozen,
           audio_frozen: audioElementFrozen,
@@ -42961,7 +43766,7 @@ function createCallHealth({
       ) {
         const now = Date.now();
         if (now - callUI.lastFrameWarningMs > 5000) {
-          callUI.lastFrameWarningMs = now;
+          callState.set("lastFrameWarningMs", now);
           reportCallEvent("remote_video_no_frames", { media_kind: "video" });
         }
       }
@@ -42986,14 +43791,7 @@ function createCallHealth({
         metricsResult && metricsResult.recovery_intent,
         callUI.lastMetricsSnapshot,
       );
-      if (metricsResult && metricsResult.routePolicy) {
-        media.routePolicyDetail = metricsResult.routePolicy;
-        media.bestRelayHealth = String(metricsResult.routePolicy.best_relay_health || "");
-        media.bestRelayScore = Number.isFinite(Number(metricsResult.routePolicy.best_relay_score))
-          ? Number(metricsResult.routePolicy.best_relay_score)
-          : null;
-        media.turnCredentialExpiresAtMs = Number(metricsResult.routePolicy.credential_expires_at_ms || 0) || null;
-      }
+      if (metricsResult && metricsResult.routePolicy) mediaState.recordRoutePolicy(metricsResult.routePolicy);
       applyBackendSessionAuthority(
         metricsResult && metricsResult.session_authority,
       );
@@ -43078,21 +43876,21 @@ function createCallHealth({
   function startCallTelemetry() {
     if (callUI.metricsTimer) clearInterval(callUI.metricsTimer);
     reportCallMetricsOnce();
-    callUI.metricsTimer = setInterval(reportCallMetricsOnce, 2000);
+    callState.set("metricsTimer", setInterval(reportCallMetricsOnce, 2000));
     startMediaWatchdog();
   }
 
   function stopCallTelemetry() {
     if (callUI.metricsTimer) {
       clearInterval(callUI.metricsTimer);
-      callUI.metricsTimer = null;
+      callState.set("metricsTimer", null);
     }
     stopMediaWatchdog();
   }
 
   function startMediaWatchdog() {
     if (callUI.mediaWatchdogTimer) clearInterval(callUI.mediaWatchdogTimer);
-    callUI.mediaWatchdogTimer = setInterval(() => {
+    callState.set("mediaWatchdogTimer", setInterval(() => {
       syncRemoteMediaSurface("watchdog");
       ensureMediaNegotiation("watchdog");
       if (
@@ -43109,13 +43907,13 @@ function createCallHealth({
         }).catch(() => {});
         repairMediaPath("watchdog_no_media_movement").catch(() => {});
       }
-    }, 1500);
+    }, 1500));
   }
 
   function stopMediaWatchdog() {
     if (callUI.mediaWatchdogTimer) {
       clearInterval(callUI.mediaWatchdogTimer);
-      callUI.mediaWatchdogTimer = null;
+      callState.set("mediaWatchdogTimer", null);
     }
   }
 
@@ -43123,7 +43921,7 @@ function createCallHealth({
     window.addEventListener("online", () => {
       const now = Date.now();
       if (!callUI.activeCallId || now - Number(callUI.lastNetworkResumeRepairMs || 0) < 3000) return;
-      callUI.lastNetworkResumeRepairMs = now;
+      callState.set("lastNetworkResumeRepairMs", now);
       reportCallEvent("network_resume_repair");
       repairMediaPath("network_online").catch(() => {});
     });
@@ -43141,17 +43939,21 @@ function createCallHealth({
     const inboundCallId = callUI.inboundCallId;
     const inboundPeer = callUI.inboundCallPeer;
     const inboundPeerFp = callUI.inboundCallPeerFp;
-    callUI.acceptedCallIds.add(inboundCallId);
+    callState.acceptCall(inboundCallId);
     hideIncomingRing();
-    callUI.activeCallId = inboundCallId;
-    callUI.activeCallPeer = inboundPeer;
-    callUI.activeCallPeerFp = inboundPeerFp;
-    callUI.activeCallLocalRole = "recipient";
+    callState.update({
+      activeCallId: inboundCallId,
+      activeCallPeer: inboundPeer,
+      activeCallPeerFp: inboundPeerFp,
+      activeCallLocalRole: "recipient",
+    });
     showActiveSurface(inboundPeer, "");
     setupRtcPeerConnection();
-    callUI.localMediaReady = false;
-    media.expectRemoteAudio = true;
-    media.expectRemoteVideo = true;
+    callState.set("localMediaReady", false);
+    mediaState.update({
+      expectRemoteAudio: true,
+      expectRemoteVideo: true,
+    });
     const mediaPromise = startLocalMedia({ audio: true, video: true });
     const result = await callApiPost({
       action: "accept", call_id: inboundCallId,
@@ -43165,11 +43967,11 @@ function createCallHealth({
         await ensureLocalTracksOnPeerConnectionSettled();
         startAttestStream(stream);
       }
-      callUI.localMediaReady = true;
+      callState.set("localMediaReady", true);
       reportCallEvent("local_media_ready", { reason: "accept" });
       if (callUI.pendingRemoteOffer) {
         const offerSdp = callUI.pendingRemoteOffer;
-        callUI.pendingRemoteOffer = null;
+        callState.set("pendingRemoteOffer", null);
         await applyRemoteSdpOffer(offerSdp);
       } else {
         addOneCallEvent("Waiting for media offer...");
@@ -43177,18 +43979,22 @@ function createCallHealth({
         setTimeout(() => { backfillLivingPresenceCalls().catch(() => {}); }, 250);
       }
     } else {
-      callUI.acceptedCallIds.delete(inboundCallId);
-      callUI.localMediaReady = false;
+      callState.forgetAcceptedCall(inboundCallId);
+      callState.set("localMediaReady", false);
       hideActiveSurface();
       stopAllMedia();
-      callUI.activeCallId = null;
-      callUI.activeCallPeer = null;
-      callUI.activeCallPeerFp = null;
-      callUI.activeCallLocalRole = "";
+      callState.update({
+        activeCallId: null,
+        activeCallPeer: null,
+        activeCallPeerFp: null,
+        activeCallLocalRole: "",
+      });
       if (typeof toast === "function") toast(result.user_message, "warn");
     }
-    callUI.inboundCallId = null;
-    callUI.inboundCallPeerFp = null;
+    callState.update({
+      inboundCallId: null,
+      inboundCallPeerFp: null,
+    });
   }
 
   async function rejoinActiveCallFromSnapshot(call, reason) {
@@ -43197,17 +44003,21 @@ function createCallHealth({
     const now = Date.now();
     const last = Number(callUI.lastRejoinAttemptMs[callId] || 0);
     if (now - last < 3000) return false;
-    callUI.lastRejoinAttemptMs[callId] = now;
+    callState.stampRejoinAttempt(callId, now);
     const peerLabel = peerLabelFromCall(call);
-    callUI.activeCallId = callId;
-    callUI.activeCallPeer = peerLabel;
-    callUI.activeCallPeerFp = call.peer_master_vk_hex || callUI.activeCallPeerFp;
-    callUI.activeCallLocalRole = call.local_role || (call.is_incoming ? "recipient" : "originator");
-    callUI.acceptedCallIds.add(callId);
+    callState.update({
+      activeCallId: callId,
+      activeCallPeer: peerLabel,
+    });
+    callState.set("activeCallPeerFp", call.peer_master_vk_hex || callUI.activeCallPeerFp);
+    callState.set("activeCallLocalRole", call.local_role || (call.is_incoming ? "recipient" : "originator"));
+    callState.acceptCall(callId);
     const wantsVideo = String(call.kind || call.call_kind || callUI.activeCallKind || "video").toLowerCase() !== "voice";
-    callUI.activeCallKind = wantsVideo ? "video" : "voice";
-    media.expectRemoteAudio = true;
-    media.expectRemoteVideo = wantsVideo;
+    callState.set("activeCallKind", wantsVideo ? "video" : "voice");
+    mediaState.update({
+      expectRemoteAudio: true,
+      expectRemoteVideo: wantsVideo,
+    });
     hideOutgoingOverlay();
     hideIncomingRing();
     showActiveSurface(peerLabel, "");
@@ -43221,12 +44031,12 @@ function createCallHealth({
       return false;
     }
     setupRtcPeerConnection();
-    callUI.localMediaReady = false;
+    callState.set("localMediaReady", false);
     const stream = await startLocalMedia({ audio: true, video: wantsVideo });
     if (stream && media.pc) {
       await ensureLocalTracksOnPeerConnectionSettled();
       startAttestStream(stream);
-      callUI.localMediaReady = true;
+      callState.set("localMediaReady", true);
       reportCallEvent("client_rejoin_media_ready", {
         reason: reason || "browser_rejoin",
         ok: true,
@@ -43271,15 +44081,17 @@ function createCallHealth({
       hideOutgoingOverlay();
       hideActiveSurface();
       stopAllMedia();
-      callUI.activeCallId = null;
+      callState.set("activeCallId", null);
       await acceptInboundCall();
       return true;
     }
     await callApiPost({ action: "decline", call_id: inboundCallId });
     if (callUI.inboundCallId === inboundCallId) {
-      callUI.inboundCallId = null;
-      callUI.inboundCallPeer = null;
-      callUI.inboundCallPeerFp = null;
+      callState.update({
+        inboundCallId: null,
+        inboundCallPeer: null,
+        inboundCallPeerFp: null,
+      });
     }
     return true;
   }
@@ -43297,13 +44109,15 @@ function createCallHealth({
       if (capsuleCapture.active) resetCapsuleCapture();
       stopAllMedia();
       stopCallTelemetry();
-      callUI.activeCallId = null;
-      callUI.activeCallPeer = null;
-      callUI.activeCallPeerFp = null;
-      callUI.activeCallLocalRole = "";
-      callUI.inboundCallId = null;
-      callUI.inboundCallPeer = null;
-      callUI.inboundCallPeerFp = null;
+      callState.update({
+        activeCallId: null,
+        activeCallPeer: null,
+        activeCallPeerFp: null,
+        activeCallLocalRole: "",
+        inboundCallId: null,
+        inboundCallPeer: null,
+        inboundCallPeerFp: null,
+      });
     }
     let inboundStillRinging = false;
     for (const call of calls) {
@@ -43311,10 +44125,10 @@ function createCallHealth({
       const phase = String(call.phase || "").toLowerCase();
       const incoming = !!call.is_incoming || call.local_role === "recipient";
       if (incoming && call.pending_sdp_offer && !callUI.pendingRemoteOffer) {
-        callUI.pendingRemoteOffer = call.pending_sdp_offer;
+        callState.set("pendingRemoteOffer", call.pending_sdp_offer);
       }
       if (!incoming && call.pending_sdp_answer && media.pc) {
-        callUI.activeCallLocalRole = call.local_role || callUI.activeCallLocalRole || "originator";
+        callState.set("activeCallLocalRole", call.local_role || callUI.activeCallLocalRole || "originator");
         applyRemoteSdpAnswer(call.pending_sdp_answer);
       }
       const pendingIce = Array.isArray(call.pending_ice_candidates)
@@ -43336,7 +44150,7 @@ function createCallHealth({
           const now = Date.now();
           const last = Number(callUI.lastAcceptRetryMs[call.call_id] || 0);
           if (now - last > 3000) {
-            callUI.lastAcceptRetryMs[call.call_id] = now;
+            callState.stampAcceptRetry(call.call_id, now);
             callApiPost({ action: "accept", call_id: call.call_id }).catch(() => {});
             reportCallEvent("accept_resend", { reason: "ringing_backfill" });
           }
@@ -43344,9 +44158,9 @@ function createCallHealth({
         }
         inboundStillRinging = true;
         if (callUI.inboundCallId !== call.call_id) {
-          callUI.inboundCallId = call.call_id;
-          callUI.inboundCallPeer = peerLabelFromCall(call);
-          callUI.inboundCallPeerFp = call.peer_master_vk_hex || null;
+          callState.set("inboundCallId", call.call_id);
+          callState.set("inboundCallPeer", peerLabelFromCall(call));
+          callState.set("inboundCallPeerFp", call.peer_master_vk_hex || null);
         }
         if (await resolveSimultaneousCallIfNeeded(
           callUI.inboundCallId,
@@ -43358,12 +44172,12 @@ function createCallHealth({
         continue;
       }
       if (phase === "active") {
-        callUI.acceptedCallIds.add(call.call_id);
+        callState.acceptCall(call.call_id);
         if (!callUI.activeCallId || callUI.activeCallId === call.call_id) {
-          callUI.activeCallId = call.call_id;
-          callUI.activeCallPeer = peerLabelFromCall(call);
-          callUI.activeCallPeerFp = call.peer_master_vk_hex || callUI.activeCallPeerFp;
-          callUI.activeCallLocalRole = call.local_role || (incoming ? "recipient" : "originator");
+          callState.set("activeCallId", call.call_id);
+          callState.set("activeCallPeer", peerLabelFromCall(call));
+          callState.set("activeCallPeerFp", call.peer_master_vk_hex || callUI.activeCallPeerFp);
+          callState.set("activeCallLocalRole", call.local_role || (incoming ? "recipient" : "originator"));
           hideOutgoingOverlay();
           hideIncomingRing();
           showActiveSurface(callUI.activeCallPeer, "");
@@ -43380,10 +44194,10 @@ function createCallHealth({
       if (phase === "async_capture") {
         hideOutgoingOverlay();
         hideIncomingRing();
-        callUI.activeCallId = call.call_id;
-        callUI.activeCallPeer = peerLabelFromCall(call);
-        callUI.activeCallPeerFp = call.peer_master_vk_hex || callUI.activeCallPeerFp;
-        callUI.activeCallLocalRole = call.local_role || callUI.activeCallLocalRole;
+        callState.set("activeCallId", call.call_id);
+        callState.set("activeCallPeer", peerLabelFromCall(call));
+        callState.set("activeCallPeerFp", call.peer_master_vk_hex || callUI.activeCallPeerFp);
+        callState.set("activeCallLocalRole", call.local_role || callUI.activeCallLocalRole);
         showActiveSurface(callUI.activeCallPeer, "Voice capsule");
         if (!media.localStream) {
           const stream = await startLocalMedia({ audio: true, video: false });
@@ -43397,9 +44211,11 @@ function createCallHealth({
         (phase === "ended" || phase === "resumable")
       ) {
         hideIncomingRing();
-        callUI.inboundCallId = null;
-        callUI.inboundCallPeer = null;
-        callUI.inboundCallPeerFp = null;
+        callState.update({
+          inboundCallId: null,
+          inboundCallPeer: null,
+          inboundCallPeerFp: null,
+        });
       }
       if (
         call.call_id === callUI.activeCallId &&
@@ -43409,19 +44225,23 @@ function createCallHealth({
         hideActiveSurface();
         stopAllMedia();
         stopCallTelemetry();
-        callUI.activeCallId = null;
-        callUI.activeCallPeer = null;
-        callUI.activeCallPeerFp = null;
-        callUI.activeCallLocalRole = "";
+        callState.update({
+          activeCallId: null,
+          activeCallPeer: null,
+          activeCallPeerFp: null,
+          activeCallLocalRole: "",
+        });
       }
     }
     if (callUI.inboundCallId && !inboundStillRinging) {
       const matching = calls.find((c) => c && c.call_id === callUI.inboundCallId);
       if (!matching) {
         hideIncomingRing();
-        callUI.inboundCallId = null;
-        callUI.inboundCallPeer = null;
-        callUI.inboundCallPeerFp = null;
+        callState.update({
+          inboundCallId: null,
+          inboundCallPeer: null,
+          inboundCallPeerFp: null,
+        });
       }
     }
   }
@@ -43434,8 +44254,10 @@ function createCallHealth({
     if (!callUI.activeCallId) return;
     const callId = callUI.activeCallId;
     hideOutgoingOverlay();
-    callUI.activeCallId = null;
-    callUI.activeCallLocalRole = "";
+    callState.update({
+      activeCallId: null,
+      activeCallLocalRole: "",
+    });
     await callApiPost({ action: "hangup", call_id: callId });
   });
   const declineBtn = $$("#btn-call-decline");
@@ -43443,7 +44265,7 @@ function createCallHealth({
     if (!callUI.inboundCallId) return;
     const callId = callUI.inboundCallId;
     hideIncomingRing();
-    callUI.inboundCallId = null;
+    callState.set("inboundCallId", null);
     await callApiPost({ action: "decline", call_id: callId });
   });
   const acceptBtn = $$("#btn-call-accept");
@@ -43456,9 +44278,9 @@ function createCallHealth({
     });
     hideIncomingRing();
     if (result.ok) {
-      callUI.activeCallId = callUI.inboundCallId;
-      callUI.activeCallPeer = callUI.inboundCallPeer;
-      callUI.activeCallPeerFp = callUI.inboundCallPeerFp;
+      callState.set("activeCallId", callUI.inboundCallId);
+      callState.set("activeCallPeer", callUI.inboundCallPeer);
+      callState.set("activeCallPeerFp", callUI.inboundCallPeerFp);
       showActiveSurface(callUI.activeCallPeer, "");
       // Tier α: bring up local media on accept.
       setupRtcPeerConnection();
@@ -43475,12 +44297,14 @@ function createCallHealth({
       // emit our answer.
       if (callUI.pendingRemoteOffer) {
         const offerSdp = callUI.pendingRemoteOffer;
-        callUI.pendingRemoteOffer = null;
+        callState.set("pendingRemoteOffer", null);
         await applyRemoteSdpOffer(offerSdp);
       }
     }
-    callUI.inboundCallId = null;
-    callUI.inboundCallPeerFp = null;
+    callState.update({
+      inboundCallId: null,
+      inboundCallPeerFp: null,
+    });
   });
   const hangupBtn = $$("#btn-call-hangup");
   if (hangupBtn) hangupBtn.addEventListener("click", async () => {
@@ -43495,8 +44319,10 @@ function createCallHealth({
     const callId = callUI.activeCallId;
     hideActiveSurface();
     stopAllMedia();
-    callUI.activeCallId = null;
-    callUI.activeCallLocalRole = "";
+    callState.update({
+      activeCallId: null,
+      activeCallLocalRole: "",
+    });
     await callApiPost({ action: "hangup", call_id: callId });
   });
   const recordBtn = $$("#btn-call-record");
@@ -43512,14 +44338,14 @@ function createCallHealth({
   const muteBtn = $$("#btn-call-mute");
   if (muteBtn) muteBtn.addEventListener("click", () => {
     if (!media.localStream) return;
-    media.muted = !media.muted;
+    mediaState.set("muted", !media.muted);
     media.localStream.getAudioTracks().forEach((t) => { t.enabled = !media.muted; });
     syncMuteCameraButtons();
   });
   const cameraBtn = $$("#btn-call-camera");
   if (cameraBtn) cameraBtn.addEventListener("click", () => {
     if (!media.localStream) return;
-    media.cameraOff = !media.cameraOff;
+    mediaState.set("cameraOff", !media.cameraOff);
     media.localStream.getVideoTracks().forEach((t) => { t.enabled = !media.cameraOff; });
     syncMuteCameraButtons();
   });
@@ -43556,7 +44382,7 @@ function createCallHealth({
       });
       hideActiveSurface();
       stopAllMedia();
-      callUI.activeCallId = null;
+      callState.set("activeCallId", null);
     }
     hideSasPane();
   });
@@ -43653,10 +44479,10 @@ function createCallHealth({
   // active phase (peer_declined, invite_timeout, originator
   // cancelled). In-memory; the daemon-side persistence ship will
   // replace this with durable history.
-  if (!callUI._callTracking) callUI._callTracking = {};
+  callState.startCallTracking();
   function _trackCallStart(callId, info) {
     if (!callId) return;
-    callUI._callTracking[callId] = {
+    callState.trackCall(callId, {
       peerLabel: info.peerLabel || "",
       peerFp: info.peerFp || null,
       direction: info.direction || "out",
@@ -43664,29 +44490,40 @@ function createCallHealth({
       startedMs: Date.now(),
       reachedActive: false,
       endedAt: null,
-    };
+    });
   }
   function _markCallActive(callId) {
-    const t = callUI._callTracking[callId];
-    if (t) t.reachedActive = true;
+    callState.markTrackedCallActive(callId);
   }
+  // The missed/ended bubble is cosmetic and runs after call teardown. A
+  // failure here is logged and can never keep a call's surfaces or media
+  // alive, and the call always leaves the tracking table.
   function _resolveCallEnded(callId, endCause) {
-    const t = callUI._callTracking[callId];
-    if (!t || t.endedAt) return;
-    t.endedAt = Date.now();
-    if (!t.reachedActive) {
-      _renderMissedCallBubble(callId, t, endCause);
-    } else {
-      _renderEndedCallBubble(callId, t, endCause);
+    const t = callState.endTrackedCall(callId, Date.now());
+    if (!t) return;
+    try {
+      if (!t.reachedActive) {
+        _renderMissedCallBubble(callId, t, endCause);
+      } else {
+        _renderEndedCallBubble(callId, t, endCause);
+      }
+    } catch (error) {
+      console.error("call bubble failed:", error);
+    } finally {
+      callState.forgetTrackedCall(callId);
     }
-    delete callUI._callTracking[callId];
   }
+  // The owner page's message history is reachable only through its
+  // explicit call-log bridge; without one (no owner page) there is no
+  // conversation to log into.
   function _peerShortIdForFp(fp) {
     if (!fp) return null;
-    for (const p of state.peers.values()) {
-      if (p.fingerprint === fp) return p.short_id;
-    }
-    return null;
+    const bridge = window.__oneLinkCallLog;
+    return bridge ? bridge.peerShortIdForFp(fp) : null;
+  }
+  function _appendCallLog(msg) {
+    const bridge = window.__oneLinkCallLog;
+    if (bridge) bridge.appendCallLog(msg);
   }
   function _renderMissedCallBubble(callId, t, endCause) {
     const peerShortId = _peerShortIdForFp(t.peerFp) || t.peerFp || "";
@@ -43710,9 +44547,7 @@ function createCallHealth({
       call_end_label: labelByCause[endCause] || "No answer",
       call_duration_s: 0,
     };
-    state.messages.push(msg);
-    if (state.messages.length > 1000) state.messages = state.messages.slice(-800);
-    if (msg.peer === state.selectedPeer) renderMessages();
+    _appendCallLog(msg);
   }
   function _renderEndedCallBubble(callId, t, endCause) {
     const peerShortId = _peerShortIdForFp(t.peerFp) || t.peerFp || "";
@@ -43734,9 +44569,7 @@ function createCallHealth({
       call_end_label: durLabel,
       call_duration_s: durSec,
     };
-    state.messages.push(msg);
-    if (state.messages.length > 1000) state.messages = state.messages.slice(-800);
-    if (msg.peer === state.selectedPeer) renderMessages();
+    _appendCallLog(msg);
   }
 
   window.handleLivingPresenceCallEvent = function (m) {
@@ -43748,15 +44581,15 @@ function createCallHealth({
         const now = Date.now();
         const last = Number(callUI.lastAcceptRetryMs[callId] || 0);
         if (now - last > 3000) {
-          callUI.lastAcceptRetryMs[callId] = now;
+          callState.stampAcceptRetry(callId, now);
           callApiPost({ action: "accept", call_id: callId }).catch(() => {});
           reportCallEvent("accept_resend", { reason: "duplicate_ring" });
         }
         return true;
       }
-      callUI.inboundCallId = callId;
-      callUI.inboundCallPeer = (m.peer_label || callId.slice(0, 8));
-      callUI.inboundCallPeerFp = m.peer_master_vk_hex || null;
+      callState.set("inboundCallId", callId);
+      callState.set("inboundCallPeer", m.peer_label || callId.slice(0, 8));
+      callState.set("inboundCallPeerFp", m.peer_master_vk_hex || null);
       resolveSimultaneousCallIfNeeded(callId, callUI.inboundCallPeerFp);
       _trackCallStart(callId, {
         peerLabel: callUI.inboundCallPeer,
@@ -43774,22 +44607,23 @@ function createCallHealth({
         hideOutgoingOverlay();
         hideIncomingRing();
         if (!callUI.activeCallId) {
-          callUI.activeCallId = callId;
-          callUI.activeCallPeer = callId.slice(0, 8);
+          callState.set("activeCallId", callId);
+          callState.set("activeCallPeer", callId.slice(0, 8));
         }
-        if (m.peer_master_vk_hex) callUI.activeCallPeerFp = m.peer_master_vk_hex;
-        callUI.activeCallLocalRole = callUI.activeCallLocalRole || "originator";
+        if (m.peer_master_vk_hex) callState.set("activeCallPeerFp", m.peer_master_vk_hex);
+        callState.set("activeCallLocalRole", callUI.activeCallLocalRole || "originator");
         showActiveSurface(callUI.activeCallPeer, "");
         ensureMediaNegotiation("active");
       } else if (phase === "async_capture") {
         hideOutgoingOverlay();
         hideIncomingRing();
-        if (!callUI.activeCallId) callUI.activeCallId = callId;
+        if (!callUI.activeCallId) callState.set("activeCallId", callId);
         beginCapsuleCapture(callId);
         updateOneChip("#call-one-engine", "Capsule");
         addOneCallEvent("Keep talking, then choose Save capsule when you're done.");
       } else if (phase === "ended" || phase === "resumable") {
-        _resolveCallEnded(callId, m.end_cause || "");
+        // Teardown first: surfaces, capsule capture and media (microphone
+        // and camera) always stop. The call-log bubble comes last.
         hideOutgoingOverlay();
         hideIncomingRing();
         hideActiveSurface();
@@ -43797,9 +44631,10 @@ function createCallHealth({
           resetCapsuleCapture();
         }
         stopAllMedia();
-        if (callUI.activeCallId === callId) callUI.activeCallId = null;
-        if (callUI.activeCallId === null) callUI.activeCallPeerFp = null;
-        if (callUI.activeCallId === null) callUI.activeCallLocalRole = "";
+        if (callUI.activeCallId === callId) callState.set("activeCallId", null);
+        if (callUI.activeCallId === null) callState.set("activeCallPeerFp", null);
+        if (callUI.activeCallId === null) callState.set("activeCallLocalRole", "");
+        _resolveCallEnded(callId, m.end_cause || "");
       }
       return true;
     }
@@ -43821,11 +44656,11 @@ function createCallHealth({
     if (tail === "sdp_offer") {
       // Recipient side: peer's SDP offer arrived. Track it so we
       // setRemoteDescription + createAnswer once we accept.
-      callUI.pendingRemoteOffer = m.sdp || "";
+      callState.set("pendingRemoteOffer", m.sdp || "");
       addOneCallEvent("Media offer received.");
       reportCallEvent("remote_offer_received");
       if (callUI.activeCallId === callId && media.pc && callUI.localMediaReady) {
-        callUI.pendingRemoteOffer = null;
+        callState.set("pendingRemoteOffer", null);
         applyRemoteSdpOffer(m.sdp);
       }
       return true;
@@ -43845,9 +44680,9 @@ function createCallHealth({
       hideOutgoingOverlay();
       hideActiveSurface();
       stopAllMedia();
-      if (callUI.activeCallId === callId) callUI.activeCallId = null;
-      if (callUI.activeCallId === null) callUI.activeCallLocalRole = "";
-      if (callUI.inboundCallId === callId) callUI.inboundCallId = null;
+      if (callUI.activeCallId === callId) callState.set("activeCallId", null);
+      if (callUI.activeCallId === null) callState.set("activeCallLocalRole", "");
+      if (callUI.inboundCallId === callId) callState.set("inboundCallId", null);
       if (typeof toast === "function") {
         toast(m.user_message || "Call refused.", "warn", 6000);
       }

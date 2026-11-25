@@ -56,24 +56,86 @@ factory names nor new mutable state leak into `window`.
 | `createOwnerState()` | None | A fresh owner-state object, including fresh maps, arrays, and pairing state. |
 | `createOwnerFormatting({ document, getSettings })` | DOM access and a live settings accessor | DOM/text formatting functions. The accessor keeps timestamp settings current after edits. |
 | `createOwnerApiClient(...)` | Fetch, constructors/timers, session-error callback, error translator, and intent-ID generator | Existing `api` methods. Its in-flight GET map and per-file intent WeakMap are private to that client. |
-| `createCallState()` | None | A fresh call lifecycle, signaling, and telemetry state object. |
-| `createCallMediaState()` | None | A fresh media/route state object. Capture and cleanup features own resource lifetime. |
-| `createCallHealth(...)` | Call/media state, capture profile functions, and presentation/event callbacks | Health classification, quality hysteresis, selected-candidate extraction, and adaptive video functions. |
+| `createStatePublisher(target)` | The shared `state` object | Publishes an owner's fields on `state` as read-only accessors. A raw assignment throws a `TypeError` naming the owner. |
+| `createMessageStore()` | None | **Message rendering state owner**: direct and group history; echoes, live edits, tombstones, reactions, send-state, call-log rows and the 1000/800 cap. |
+| `createTransferStore({ now })` | A clock | **Transfer state owner**: ledger mirror (newest 80), by-id map, lazy direction-and-blob index and EWMA rates. |
+| `createSettingsStore()` | None | **Settings state owner**: runtime settings cache, editor hydration/unsaved flags, rendezvous URLs and per-chat preferences. |
+| `createIdentityStore()` | None | **Identity state owner**: the `/api/me` snapshot (with local rename) and the personal device mesh. |
+| `createPollingCluster({ setInterval, clearInterval })` | Interval timers | **Transport state owner** for the background polls: start, pause on a 401 burst, resume once, and `dispose()`, which releases every timer. |
+| `createCallLogBridge(...)` | Message store, peer/selection readers, renderer | `window.__oneLinkCallLog`: the call driver's only route into message state (peer lookup, `CALL_LOG` rows). |
+| `createOwnedRecord(owner, initial)` | A field schema | A closed-schema record with a read-only `view` (a Proxy: writes throw even in sloppy code) plus `set`/`update`/`increment`, which refuse undeclared fields. |
+| `createCallState({ clearInterval })` | Timer release | **Call state owner**. `view` is the driver's `callUI`. It has named transitions for acceptance, signaling bookkeeping, repair diagnosis, bounded logs, per-call tracking, `resetMediaSession()`, and `dispose()` (releases the telemetry timers). |
+| `createCallMediaState()` | None | **Media state owner**. `view` is the driver's `media`. It provides `recordRoutePolicy()` and the three end-of-call resets. Capture and cleanup features own resource lifetime. |
+| `createCallHealth(...)` | The call-state view and owner, the media view, capture profile functions, and presentation/event callbacks | Health classification, quality hysteresis, selected-candidate extraction, and adaptive video functions. Its writes go through the call-state owner. |
 
 Platform primitives such as `Map`, `Date`, `Math`, and `Promise` retain their
 normal JavaScript meaning. Services do not require the owner page to run. The
 Node tests instantiate them in independent VM contexts with explicit inputs
 and exercise lost-response retries, concurrency, cleanup callbacks, independent
-state instances, and call health/adaptation.
+state instances, and call health/adaptation. `tests/js/test_owner_state_contracts.cjs`
+pins every state owner's lifecycle, invariants and `dispose()`. It also runs
+`main/state.js` and proves that every migrated field refuses a raw write.
+
+### Feature state owners (MNT-03)
+
+`main/state.js` is the composition root. It creates the owners and publishes
+their fields read-only on `state`. Every module still *reads*
+`state.messages`, `state.transfers`, `state.runtimeSettings`, `state.me` and
+the rest unchanged, but only the owner can change them, through named
+functions such as `messageStore.receiveDirect(msg)`,
+`transferStore.applyEvent(t)`, `settingsStore.replaceRuntime(...)` and
+`identityStore.replaceMe(me)`. In the call closure, `callUI` and `media` are
+the read-only views of `callState` and `mediaState`. Use a named transition
+where one exists. Scalar fields change through the owner's
+`set`/`update`/`increment`, which reject undeclared fields.
+
+The two closures share no names. The call driver reaches the owner page only
+through two published, frozen bridges built in `main/call_bridges.js`:
+`__oneLinkCallLog`, which writes call bubbles into the message store, and
+`__oneLinkCallHost` (`api.post`/`api.upload`, toasts, error text, navigation).
+`calls/host.js` adapts them. Without a host page they degrade, and call-end
+teardown never depends on them.
+
+### Ownership census and ratchet
+
+`tests/js/ownership_census.js` parses the shipped pages with acorn and does a
+real scope analysis: hoisting, block scopes, shadowing, and local aliases
+followed transitively. For every top-level binding it reports the declaring
+module and every other module that assigns it or mutates it (`=`, `op=`,
+`++/--`, property writes, Array/Map/Set mutators, `Object.assign`). It also
+reports writes to window bridges, and any reference to another closure's
+top-level names. `tests/js/ownership_baseline.json` must match it exactly:
+
+- each remaining cross-module write is listed with its writer, its count and
+  a named rationale;
+- a new write, a larger count, a smaller count left unrecorded, or a
+  cross-closure reference fails;
+- `migratedFeatures` names the owners and the shared state they retired, and a
+  write to either fails.
+
+```sh
+node tests/js/ownership_census.js --check      # the ratchet (also in npm test)
+node tests/js/ownership_census.js --targets    # where the coupling is
+node tests/js/ownership_census.js --json       # everything, per binding
+```
+
+After you remove coupling, lower the counts with `--write-baseline`. It keeps
+the existing rationales, and the test refuses any entry that has none.
 
 ### Feature lifecycle and remaining coupling
 
-Feature files within `main/` still share the owner closure; feature files within
-`calls/` still share the call closure. Their manifest order preserves existing
-initialization and event registration order. Existing public `window` bridges
-between the two lifecycles remain in their original features. This is an
-incremental modular architecture, not a claim that every feature is already an
-independent ES module.
+Feature files within `main/` still share the owner closure, and feature files
+within `calls/` still share the call closure. Their manifest order preserves the
+existing initialization and event registration order. The six MNT-03 features
+(message rendering, transfers, calls, settings, identity and transport state)
+have explicit owners. The rest of the owner `state` bag is still a shared
+namespace: navigation selection, activity filters, composer staging, voice
+recording, command palette, folder workflows, file offers and similar fields.
+The census baseline lists each of its cross-module writes and the reason for
+it. Function declarations remain visible across a closure's modules. The
+census enforces writes, not reads or calls. This is an incremental modular
+architecture, not a claim that every feature is already an independent ES
+module.
 
 For further isolation, move a coherent behavior into a service factory, give
 it explicit collaborators, and add an independent runtime contract before

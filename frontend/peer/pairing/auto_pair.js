@@ -51,6 +51,13 @@
     // The deadline can reject while setup is still awaiting a browser API.
     // Attach a handler now; the original promise still rejects to the caller.
     void flowDone.catch(() => {});
+    // RUN-01: a browser can hold a WebRTC/crypto/fetch call for minutes (a
+    // stalled Firefox parent process held createOffer() from 2 s to 756 s).
+    // Every held step therefore races the flow itself: the deadline or a
+    // cancel rejects the caller's promise at once, and each await below
+    // re-checks `flowSettled` so a late browser result can neither rewrite
+    // the settled status nor start signaling.
+    const step = (promise) => Promise.race([promise, flowDone]);
     const cleanup = () => {
       if (pairingTimer) clearTimeout(pairingTimer);
       if (cancelPairing) {
@@ -94,7 +101,7 @@
     try {
       try {
         mark("ice_config");
-        const iceConfig = await loadPublicIceConfig();
+        const iceConfig = await step(loadPublicIceConfig());
         if (flowSettled) return flowDone;
         const iceServers = iceConfig.iceServers;
         localCandidateAddresses = iceConfig.localCandidateAddresses;
@@ -104,6 +111,7 @@
           rtcpMuxPolicy: "require",
         });
       } catch (e) {
+        if (flowSettled) return flowDone;
         _autopairSetState(
           "bad", "no webrtc",
           `WebRTC unavailable: ${e && e.message ? e.message : e}. Try a current ` +
@@ -149,6 +157,9 @@
           ]);
           if (flowSettled) return;
         } catch (error) {
+          // A channel the settled flow closed rejects its proof too; that is
+          // not a second, different failure.
+          if (flowSettled) return;
           _autopairSetState(
             "bad", "identity rejected",
             `The laptop did not accept this device identity: ${
@@ -205,6 +216,7 @@
 
       controlDc.onopen = () => {
         void finalize().catch((error) => {
+          if (flowSettled) return;
           _autopairSetState("bad", "identity failed", "Device identity verification could not finish.");
           failFlow(error);
         });
@@ -236,9 +248,12 @@
       let offer;
       try {
         mark("creating_offer", pc, controlDc);
-        offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
+        offer = await step(pc.createOffer());
+        if (flowSettled) return flowDone;
+        await step(pc.setLocalDescription(offer));
+        if (flowSettled) return flowDone;
       } catch (e) {
+        if (flowSettled) return flowDone;
         _autopairSetState(
           "bad", "offer failed",
           `Couldn't build offer: ${e && e.message ? e.message : e}`,
@@ -251,7 +266,7 @@
       // complete SDP, but retain already-gathered host candidates if an optional
       // STUN server is unresponsive so same-network pairing still works.
       mark("gathering_ice", pc, controlDc);
-      const iceComplete = await _waitForIceGatheringComplete(pc);
+      const iceComplete = await step(_waitForIceGatheringComplete(pc));
       if (flowSettled) return flowDone;
       if (!iceComplete) {
         _autopairSetState(
@@ -277,11 +292,12 @@
       try {
         mark("signing_offer", pc, controlDc);
         const enc = new TextEncoder();
-        sig = await _signEd25519(
+        sig = await step(_signEd25519(
           rec.private_key_jwk,
           enc.encode(_canonicalJson(offerEnvelope)),
-        );
+        ));
       } catch (e) {
+        if (flowSettled) return flowDone;
         _autopairSetState(
           "bad", "sign failed",
           `Couldn't sign offer: ${e && e.message ? e.message : e}`,
@@ -318,7 +334,7 @@
         }
       };
       ws.onerror = () => {
-        if (!dataChannelOpened) {
+        if (!dataChannelOpened && !flowSettled) {
           _autopairSetState(
             "bad", "ws error",
             "Signaling WebSocket failed. Check the laptop is reachable.",
@@ -342,11 +358,13 @@
             await pc.setRemoteDescription(
               new RTCSessionDescription({ sdp: msg.sdp, type: "answer" }),
             );
+            if (flowSettled) return;
             // Stash the daemon's pubkey for the OPFS save above.
             state._pendingDaemonPubkey = msg.daemon_pubkey_b64u || "";
             // Once setRemoteDescription resolves, ICE proceeds and
             // the DataChannel will fire onopen automatically.
           } catch (e) {
+            if (flowSettled) return;
             _autopairSetState(
               "bad", "answer failed",
               `Couldn't apply answer: ${e && e.message ? e.message : e}`,
@@ -363,6 +381,9 @@
       };
       return flowDone;
     } catch (error) {
+      // A step that lost its race to the deadline or a cancel lands here
+      // after the flow already reported why it stopped.
+      if (flowSettled) return flowDone;
       _autopairSetState(
         "bad", "pairing failed",
         `Pairing could not continue: ${error && error.message ? error.message : error}`,

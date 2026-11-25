@@ -197,7 +197,7 @@ jobs:
         run: |
           uv run --no-sync playwright install --with-deps chromium firefox
           uv run --no-sync python -m pytest tests/e2e/ -v --tb=short --browser chromium --output=test-results/playwright-chromium --junitxml=test-results/browser-chromium.xml --timeout=600 --timeout-method=thread
-          uv run --no-sync python -m pytest tests/e2e/test_peer_live_transport.py::test_two_isolated_peer_pages_complete_manual_webrtc_and_exchange_probe tests/e2e/test_browser_identity_possession_live.py::test_required_mode_live_pair_owner_request_and_immediate_revoke tests/e2e/test_call_local_candidate_live.py::test_call_media_local_candidate_augmentation_uses_real_browser_ice -v --tb=short --browser firefox --output=test-results/playwright-firefox --junitxml=test-results/browser-firefox.xml --timeout=600 --timeout-method=thread
+          uv run --no-sync python -m pytest tests/e2e/test_browser_readiness_gate.py tests/e2e/test_peer_live_transport.py::test_two_isolated_peer_pages_complete_manual_webrtc_and_exchange_probe tests/e2e/test_browser_identity_possession_live.py::test_required_mode_live_pair_owner_request_and_immediate_revoke tests/e2e/test_call_local_candidate_live.py::test_call_media_local_candidate_augmentation_uses_real_browser_ice -v --tb=short --browser firefox --output=test-results/playwright-firefox --junitxml=test-results/browser-firefox.xml --timeout=600 --timeout-method=thread
 
       - name: Verify generated owner UI matches its reviewed source modules
         run: python scripts/build_owner_ui.py --check
@@ -402,7 +402,7 @@ jobs:
         run: |
           uv run --no-sync playwright install chromium firefox
           uv run --no-sync python -m pytest tests/e2e/ -v --tb=short --browser chromium --output=test-results/playwright-chromium --junitxml=test-results/browser-chromium.xml --timeout=600 --timeout-method=thread
-          uv run --no-sync python -m pytest tests/e2e/test_peer_live_transport.py::test_two_isolated_peer_pages_complete_manual_webrtc_and_exchange_probe tests/e2e/test_browser_identity_possession_live.py::test_required_mode_live_pair_owner_request_and_immediate_revoke tests/e2e/test_call_local_candidate_live.py::test_call_media_local_candidate_augmentation_uses_real_browser_ice -v --tb=short --browser firefox --output=test-results/playwright-firefox --junitxml=test-results/browser-firefox.xml --timeout=600 --timeout-method=thread
+          uv run --no-sync python -m pytest tests/e2e/test_browser_readiness_gate.py tests/e2e/test_peer_live_transport.py::test_two_isolated_peer_pages_complete_manual_webrtc_and_exchange_probe tests/e2e/test_browser_identity_possession_live.py::test_required_mode_live_pair_owner_request_and_immediate_revoke tests/e2e/test_call_local_candidate_live.py::test_call_media_local_candidate_augmentation_uses_real_browser_ice -v --tb=short --browser firefox --output=test-results/playwright-firefox --junitxml=test-results/browser-firefox.xml --timeout=600 --timeout-method=thread
 
       - name: Preserve tagged Windows qualification evidence
         if: always()

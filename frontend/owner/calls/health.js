@@ -10,6 +10,6 @@
     chooseTauVideoLevel,
     tuneOutboundMediaForTau,
   } = createCallHealth({
-    callUI, media, setReconnectState, updateCallQuality, targetMediaProfile, applyCaptureProfileForTau, updateOneChip, addOneCallEvent, reportCallEvent,
+    callUI, callState, media, setReconnectState, updateCallQuality, targetMediaProfile, applyCaptureProfileForTau, updateOneChip, addOneCallEvent, reportCallEvent,
   });
 

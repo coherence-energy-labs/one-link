@@ -295,24 +295,14 @@
   // sendCurrent on resolve and by the inline Retry button. Re-
   // renders only if the affected message is in the active thread.
   function _markBubbleState(msgId, sendingState, extras = {}) {
-    const idx = state.messages.findIndex(x => x.id === msgId);
-    if (idx < 0) return;
-    // 2026-05-22 audit Batch AA: don't overwrite send-state on a
-    // message that was already deleted out from under us — that
-    // would render "[message deleted]" with a ✓ "sent" tick.
+    // 2026-05-22 audit Batch AA: messageStore never overwrites
+    // send-state on a message that was already deleted out from under
+    // us — that would render "[message deleted]" with a ✓ "sent" tick.
     // Both ``deleted_at_ms`` (server-side delete) and a body of
-    // ``[message deleted]`` (legacy client-side flag) are signals
-    // that the message has been tombstoned; don't decorate it.
-    const current = state.messages[idx];
-    if (current.deleted_at_ms || current.body === "[message deleted]") {
-      return;
-    }
-    state.messages[idx] = {
-      ...current,
-      _sendingState: sendingState,
-      ...extras,
-    };
-    if (state.messages[idx].peer === state.selectedPeer) renderMessages();
+    // ``[message deleted]`` (legacy client-side flag) are signals that
+    // the message has been tombstoned; it is not decorated.
+    const updated = messageStore.markSendState(msgId, sendingState, extras);
+    if (updated && updated.peer === state.selectedPeer) renderMessages();
   }
   // v0.21.x: render the per-bubble send-state pill (Sending… /
   // Queued / Failed · Retry). Lives inline at the bottom of the

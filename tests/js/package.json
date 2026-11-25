@@ -4,8 +4,9 @@
   "description": "Locked JavaScript tooling for One Link UI contract checks",
   "private": true,
   "scripts": {
-    "test": "node check_undefined_calls.js ../../src/one_link/web/index.html && node check_undefined_calls.js ../../src/one_link/web/peer.html && node --check ../../src/one_link/web/assets/argon2id-worker.js",
-    "audit": "npm audit --audit-level=moderate"
+    "test": "node check_undefined_calls.js ../../src/one_link/web/index.html && node check_undefined_calls.js ../../src/one_link/web/peer.html && node --check ../../src/one_link/web/assets/argon2id-worker.js && node ownership_census.js --check && node --test test_ownership_census.cjs test_check_undefined_calls.cjs test_owner_state_contracts.cjs test_peer_state_contracts.cjs test_call_driver_teardown.cjs test_owner_ui_services.cjs test_peer_ui_services.cjs",
+    "audit": "npm audit --audit-level=moderate",
+    "census": "node ownership_census.js --targets"
   },
   "keywords": [],
   "author": "",

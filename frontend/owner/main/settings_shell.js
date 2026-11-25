@@ -1,7 +1,6 @@
   // ── Settings modal ─────────────────────────────────────────────────
   const settingsBackdrop = $("#settings-backdrop");
-  let _settingsHydrating = false;
-  let _settingsDirty = false;
+  // settingsStore owns the editor's hydration and unsaved-changes flags.
 
   function setSettingsSaveStatus(text, kind = "") {
     const status = $("#settings-save-status");
@@ -12,13 +11,12 @@
   }
 
   function markSettingsDirty() {
-    if (_settingsHydrating) return;
-    _settingsDirty = true;
+    if (!settingsStore.markDirty()) return;
     setSettingsSaveStatus("Unsaved changes.", "dirty");
   }
 
   function markSettingsClean(text = "No changes yet.") {
-    _settingsDirty = false;
+    settingsStore.markClean();
     setSettingsSaveStatus(text);
   }
 

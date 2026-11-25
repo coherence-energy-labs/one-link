@@ -96,13 +96,11 @@
       await api.del(endpoint);
       toast(`${label} cleared`, "good");
       if (scope === "chat") {
-        state.messages = [];
-        state.groupMessages = [];
+        messageStore.clearAll();
         await loadHistory();
       }
       if (scope === "files") {
-        state.transfers = [];
-        state.transfersById = new Map();
+        transferStore.clearRecords();
         await refreshFiles();
         await refreshTransfers();
       }
@@ -130,10 +128,8 @@
     try {
       await api.post("/api/traces/wipe", { confirm: typed });
       toast("Local app traces wiped", "good", 5000);
-      state.messages = [];
-      state.groupMessages = [];
-      state.transfers = [];
-      state.transfersById = new Map();
+      messageStore.clearAll();
+      transferStore.clearRecords();
       state.activityEvents = [];
       await Promise.allSettled([
         loadHistory(),

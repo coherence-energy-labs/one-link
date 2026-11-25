@@ -44,6 +44,7 @@ ONE_LINK_RUN_BROWSER_E2E=1 \
 # Cross-engine, no-public-STUN transport authority.
 ONE_LINK_RUN_BROWSER_E2E=1 \
   uv run --no-sync python -m pytest \
+  tests/e2e/test_browser_readiness_gate.py \
   tests/e2e/test_peer_live_transport.py::test_two_isolated_peer_pages_complete_manual_webrtc_and_exchange_probe \
   tests/e2e/test_browser_identity_possession_live.py::test_required_mode_live_pair_owner_request_and_immediate_revoke \
   tests/e2e/test_call_local_candidate_live.py::test_call_media_local_candidate_augmentation_uses_real_browser_ice \

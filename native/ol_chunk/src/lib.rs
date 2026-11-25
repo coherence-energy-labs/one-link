@@ -47,6 +47,7 @@ pub mod error;
 pub mod format_aware;
 pub mod frame;
 pub mod pcdc;
+mod select;
 pub mod stream;
 mod walk;
 
@@ -67,3 +68,22 @@ pub use frame::{frame_count_for_plaintext, AEAD_FRAME_PLAINTEXT_LEN, AEAD_TAG_LE
 
 /// Crate version embedded for diagnostics.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Version of the format-aware chunk-boundary definition.
+///
+/// A store may record this next to a manifest. Two manifests chunked under
+/// the same value and the same [`CdcParams`] have identical boundaries for
+/// identical bytes; across values they share boundaries only where the rules
+/// agree (for 1 and 2: containers whose records are all at least `min_size`).
+/// Content addressing stays correct either way; only deduplication between
+/// the two differs. It is deliberately independent of the crate version,
+/// which changes for reasons that do not move a boundary.
+///
+/// * `1`: every structural candidate, then min-size absorption. On records
+///   denser than `min_size` that degenerates to fixed-size chunking.
+/// * `2`: local, content-defined candidate selection, then the same
+///   absorption (see `select.rs` and ADR-0014 amendment 1).
+///
+/// Plain CDC ([`scan_to_vec_parallel`], `cdc_file`) is not versioned by this
+/// constant; its boundaries are pinned by `tests/fixtures/cdc_golden_v1.txt`.
+pub const FORMAT_AWARE_CHUNKING_VERSION: u32 = 2;

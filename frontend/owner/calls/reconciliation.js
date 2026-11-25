@@ -3,17 +3,21 @@
     const inboundCallId = callUI.inboundCallId;
     const inboundPeer = callUI.inboundCallPeer;
     const inboundPeerFp = callUI.inboundCallPeerFp;
-    callUI.acceptedCallIds.add(inboundCallId);
+    callState.acceptCall(inboundCallId);
     hideIncomingRing();
-    callUI.activeCallId = inboundCallId;
-    callUI.activeCallPeer = inboundPeer;
-    callUI.activeCallPeerFp = inboundPeerFp;
-    callUI.activeCallLocalRole = "recipient";
+    callState.update({
+      activeCallId: inboundCallId,
+      activeCallPeer: inboundPeer,
+      activeCallPeerFp: inboundPeerFp,
+      activeCallLocalRole: "recipient",
+    });
     showActiveSurface(inboundPeer, "");
     setupRtcPeerConnection();
-    callUI.localMediaReady = false;
-    media.expectRemoteAudio = true;
-    media.expectRemoteVideo = true;
+    callState.set("localMediaReady", false);
+    mediaState.update({
+      expectRemoteAudio: true,
+      expectRemoteVideo: true,
+    });
     const mediaPromise = startLocalMedia({ audio: true, video: true });
     const result = await callApiPost({
       action: "accept", call_id: inboundCallId,
@@ -27,11 +31,11 @@
         await ensureLocalTracksOnPeerConnectionSettled();
         startAttestStream(stream);
       }
-      callUI.localMediaReady = true;
+      callState.set("localMediaReady", true);
       reportCallEvent("local_media_ready", { reason: "accept" });
       if (callUI.pendingRemoteOffer) {
         const offerSdp = callUI.pendingRemoteOffer;
-        callUI.pendingRemoteOffer = null;
+        callState.set("pendingRemoteOffer", null);
         await applyRemoteSdpOffer(offerSdp);
       } else {
         addOneCallEvent("Waiting for media offer...");
@@ -39,18 +43,22 @@
         setTimeout(() => { backfillLivingPresenceCalls().catch(() => {}); }, 250);
       }
     } else {
-      callUI.acceptedCallIds.delete(inboundCallId);
-      callUI.localMediaReady = false;
+      callState.forgetAcceptedCall(inboundCallId);
+      callState.set("localMediaReady", false);
       hideActiveSurface();
       stopAllMedia();
-      callUI.activeCallId = null;
-      callUI.activeCallPeer = null;
-      callUI.activeCallPeerFp = null;
-      callUI.activeCallLocalRole = "";
+      callState.update({
+        activeCallId: null,
+        activeCallPeer: null,
+        activeCallPeerFp: null,
+        activeCallLocalRole: "",
+      });
       if (typeof toast === "function") toast(result.user_message, "warn");
     }
-    callUI.inboundCallId = null;
-    callUI.inboundCallPeerFp = null;
+    callState.update({
+      inboundCallId: null,
+      inboundCallPeerFp: null,
+    });
   }
 
   async function rejoinActiveCallFromSnapshot(call, reason) {
@@ -59,17 +67,21 @@
     const now = Date.now();
     const last = Number(callUI.lastRejoinAttemptMs[callId] || 0);
     if (now - last < 3000) return false;
-    callUI.lastRejoinAttemptMs[callId] = now;
+    callState.stampRejoinAttempt(callId, now);
     const peerLabel = peerLabelFromCall(call);
-    callUI.activeCallId = callId;
-    callUI.activeCallPeer = peerLabel;
-    callUI.activeCallPeerFp = call.peer_master_vk_hex || callUI.activeCallPeerFp;
-    callUI.activeCallLocalRole = call.local_role || (call.is_incoming ? "recipient" : "originator");
-    callUI.acceptedCallIds.add(callId);
+    callState.update({
+      activeCallId: callId,
+      activeCallPeer: peerLabel,
+    });
+    callState.set("activeCallPeerFp", call.peer_master_vk_hex || callUI.activeCallPeerFp);
+    callState.set("activeCallLocalRole", call.local_role || (call.is_incoming ? "recipient" : "originator"));
+    callState.acceptCall(callId);
     const wantsVideo = String(call.kind || call.call_kind || callUI.activeCallKind || "video").toLowerCase() !== "voice";
-    callUI.activeCallKind = wantsVideo ? "video" : "voice";
-    media.expectRemoteAudio = true;
-    media.expectRemoteVideo = wantsVideo;
+    callState.set("activeCallKind", wantsVideo ? "video" : "voice");
+    mediaState.update({
+      expectRemoteAudio: true,
+      expectRemoteVideo: wantsVideo,
+    });
     hideOutgoingOverlay();
     hideIncomingRing();
     showActiveSurface(peerLabel, "");
@@ -83,12 +95,12 @@
       return false;
     }
     setupRtcPeerConnection();
-    callUI.localMediaReady = false;
+    callState.set("localMediaReady", false);
     const stream = await startLocalMedia({ audio: true, video: wantsVideo });
     if (stream && media.pc) {
       await ensureLocalTracksOnPeerConnectionSettled();
       startAttestStream(stream);
-      callUI.localMediaReady = true;
+      callState.set("localMediaReady", true);
       reportCallEvent("client_rejoin_media_ready", {
         reason: reason || "browser_rejoin",
         ok: true,
@@ -133,15 +145,17 @@
       hideOutgoingOverlay();
       hideActiveSurface();
       stopAllMedia();
-      callUI.activeCallId = null;
+      callState.set("activeCallId", null);
       await acceptInboundCall();
       return true;
     }
     await callApiPost({ action: "decline", call_id: inboundCallId });
     if (callUI.inboundCallId === inboundCallId) {
-      callUI.inboundCallId = null;
-      callUI.inboundCallPeer = null;
-      callUI.inboundCallPeerFp = null;
+      callState.update({
+        inboundCallId: null,
+        inboundCallPeer: null,
+        inboundCallPeerFp: null,
+      });
     }
     return true;
   }
@@ -159,13 +173,15 @@
       if (capsuleCapture.active) resetCapsuleCapture();
       stopAllMedia();
       stopCallTelemetry();
-      callUI.activeCallId = null;
-      callUI.activeCallPeer = null;
-      callUI.activeCallPeerFp = null;
-      callUI.activeCallLocalRole = "";
-      callUI.inboundCallId = null;
-      callUI.inboundCallPeer = null;
-      callUI.inboundCallPeerFp = null;
+      callState.update({
+        activeCallId: null,
+        activeCallPeer: null,
+        activeCallPeerFp: null,
+        activeCallLocalRole: "",
+        inboundCallId: null,
+        inboundCallPeer: null,
+        inboundCallPeerFp: null,
+      });
     }
     let inboundStillRinging = false;
     for (const call of calls) {
@@ -173,10 +189,10 @@
       const phase = String(call.phase || "").toLowerCase();
       const incoming = !!call.is_incoming || call.local_role === "recipient";
       if (incoming && call.pending_sdp_offer && !callUI.pendingRemoteOffer) {
-        callUI.pendingRemoteOffer = call.pending_sdp_offer;
+        callState.set("pendingRemoteOffer", call.pending_sdp_offer);
       }
       if (!incoming && call.pending_sdp_answer && media.pc) {
-        callUI.activeCallLocalRole = call.local_role || callUI.activeCallLocalRole || "originator";
+        callState.set("activeCallLocalRole", call.local_role || callUI.activeCallLocalRole || "originator");
         applyRemoteSdpAnswer(call.pending_sdp_answer);
       }
       const pendingIce = Array.isArray(call.pending_ice_candidates)
@@ -198,7 +214,7 @@
           const now = Date.now();
           const last = Number(callUI.lastAcceptRetryMs[call.call_id] || 0);
           if (now - last > 3000) {
-            callUI.lastAcceptRetryMs[call.call_id] = now;
+            callState.stampAcceptRetry(call.call_id, now);
             callApiPost({ action: "accept", call_id: call.call_id }).catch(() => {});
             reportCallEvent("accept_resend", { reason: "ringing_backfill" });
           }
@@ -206,9 +222,9 @@
         }
         inboundStillRinging = true;
         if (callUI.inboundCallId !== call.call_id) {
-          callUI.inboundCallId = call.call_id;
-          callUI.inboundCallPeer = peerLabelFromCall(call);
-          callUI.inboundCallPeerFp = call.peer_master_vk_hex || null;
+          callState.set("inboundCallId", call.call_id);
+          callState.set("inboundCallPeer", peerLabelFromCall(call));
+          callState.set("inboundCallPeerFp", call.peer_master_vk_hex || null);
         }
         if (await resolveSimultaneousCallIfNeeded(
           callUI.inboundCallId,
@@ -220,12 +236,12 @@
         continue;
       }
       if (phase === "active") {
-        callUI.acceptedCallIds.add(call.call_id);
+        callState.acceptCall(call.call_id);
         if (!callUI.activeCallId || callUI.activeCallId === call.call_id) {
-          callUI.activeCallId = call.call_id;
-          callUI.activeCallPeer = peerLabelFromCall(call);
-          callUI.activeCallPeerFp = call.peer_master_vk_hex || callUI.activeCallPeerFp;
-          callUI.activeCallLocalRole = call.local_role || (incoming ? "recipient" : "originator");
+          callState.set("activeCallId", call.call_id);
+          callState.set("activeCallPeer", peerLabelFromCall(call));
+          callState.set("activeCallPeerFp", call.peer_master_vk_hex || callUI.activeCallPeerFp);
+          callState.set("activeCallLocalRole", call.local_role || (incoming ? "recipient" : "originator"));
           hideOutgoingOverlay();
           hideIncomingRing();
           showActiveSurface(callUI.activeCallPeer, "");
@@ -242,10 +258,10 @@
       if (phase === "async_capture") {
         hideOutgoingOverlay();
         hideIncomingRing();
-        callUI.activeCallId = call.call_id;
-        callUI.activeCallPeer = peerLabelFromCall(call);
-        callUI.activeCallPeerFp = call.peer_master_vk_hex || callUI.activeCallPeerFp;
-        callUI.activeCallLocalRole = call.local_role || callUI.activeCallLocalRole;
+        callState.set("activeCallId", call.call_id);
+        callState.set("activeCallPeer", peerLabelFromCall(call));
+        callState.set("activeCallPeerFp", call.peer_master_vk_hex || callUI.activeCallPeerFp);
+        callState.set("activeCallLocalRole", call.local_role || callUI.activeCallLocalRole);
         showActiveSurface(callUI.activeCallPeer, "Voice capsule");
         if (!media.localStream) {
           const stream = await startLocalMedia({ audio: true, video: false });
@@ -259,9 +275,11 @@
         (phase === "ended" || phase === "resumable")
       ) {
         hideIncomingRing();
-        callUI.inboundCallId = null;
-        callUI.inboundCallPeer = null;
-        callUI.inboundCallPeerFp = null;
+        callState.update({
+          inboundCallId: null,
+          inboundCallPeer: null,
+          inboundCallPeerFp: null,
+        });
       }
       if (
         call.call_id === callUI.activeCallId &&
@@ -271,19 +289,23 @@
         hideActiveSurface();
         stopAllMedia();
         stopCallTelemetry();
-        callUI.activeCallId = null;
-        callUI.activeCallPeer = null;
-        callUI.activeCallPeerFp = null;
-        callUI.activeCallLocalRole = "";
+        callState.update({
+          activeCallId: null,
+          activeCallPeer: null,
+          activeCallPeerFp: null,
+          activeCallLocalRole: "",
+        });
       }
     }
     if (callUI.inboundCallId && !inboundStillRinging) {
       const matching = calls.find((c) => c && c.call_id === callUI.inboundCallId);
       if (!matching) {
         hideIncomingRing();
-        callUI.inboundCallId = null;
-        callUI.inboundCallPeer = null;
-        callUI.inboundCallPeerFp = null;
+        callState.update({
+          inboundCallId: null,
+          inboundCallPeer: null,
+          inboundCallPeerFp: null,
+        });
       }
     }
   }

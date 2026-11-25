@@ -64,7 +64,6 @@ import sys
 import threading
 import time
 import traceback
-import unicodedata
 import uuid
 import zlib
 from collections import OrderedDict, deque
@@ -109,6 +108,42 @@ from one_link import (
     wave_forecast_native,
 )
 from one_link.build_identity import runtime_build_identity
+from one_link.call_lifecycle import (
+    CallLifecyclePolicy,
+    CallLifecycleService,
+    CallResumeLedger,
+)
+from one_link.fabric_snapshot import FabricSnapshotCache
+from one_link.folder_manifest_policy import (
+    FOLDER_ARCHIVE_MAX_MEMBER_NAME_BYTES,
+    FOLDER_BLOB_MAX_BYTES,
+    FOLDER_SYNC_MANIFEST_MAX_CLOCK_NODE_BYTES,  # noqa: F401 - compatibility export
+    FOLDER_SYNC_MANIFEST_MAX_CLOCK_NODES,  # noqa: F401 - compatibility export
+    FOLDER_SYNC_MANIFEST_MAX_COUNTER,  # noqa: F401 - compatibility export
+    FOLDER_SYNC_MANIFEST_MAX_ENTRIES,
+    FOLDER_SYNC_MAX_CLOCK_ADVANCE,  # noqa: F401 - compatibility export
+    FOLDER_SYNC_VERIFY_MAX_BYTES,  # noqa: F401 - compatibility export
+    folder_channel_binding,
+    folder_manifest_digest,
+    folder_sync_paths,
+    safe_folder_offer_name,
+    validate_folder_manifest_against_local_paths,
+    validate_folder_manifest_causality,
+    validate_folder_manifest_entries,
+)
+from one_link.folder_sync_receipts import (
+    FOLDER_SYNC_RECEIPT_CONTEXT_MAX,
+    FOLDER_SYNC_RECEIPT_RETAINED_PATHS_MAX,
+    FOLDER_SYNC_RECEIPT_TTL_S,  # noqa: F401 - compatibility export
+    FOLDER_SYNC_RECEIPTS_PER_CHANNEL_MAX,
+    FOLDER_SYNC_SESSION_ABSOLUTE_S,
+    FOLDER_SYNC_VERIFY_CONCURRENCY,  # noqa: F401 - compatibility export
+    FolderReceiptLimits,
+    FolderSyncReceiptContext,
+    FolderSyncReceiptService,
+    FolderVerificationStorage,
+)
+from one_link.folder_sync_scheduler import FolderSyncScheduler
 from one_link.transfer_commit_guard import RemoteCommitGuard
 from one_link.file_source import (
     DescriptorFileSource,
@@ -363,7 +398,8 @@ FILE_COMMIT_PROGRESS_ABSOLUTE_S = 60 * 60.0
 FOLDER_ARCHIVE_MAX_ENTRIES = 4_096
 FOLDER_ARCHIVE_MAX_UNCOMPRESSED_BYTES = 16 * 1024 * 1024 * 1024
 FOLDER_ARCHIVE_MAX_EXPANSION_RATIO = 200
-FOLDER_ARCHIVE_MAX_MEMBER_NAME_BYTES = 1024
+# FOLDER_ARCHIVE_MAX_MEMBER_NAME_BYTES lives in folder_manifest_policy: a
+# manifest wire path must remain representable as an archive member name.
 FOLDER_ARCHIVE_MAX_CENTRAL_DIRECTORY_BYTES = 32 * 1024 * 1024
 FOLDER_ARCHIVE_COMMIT_MIN_DEADLINE_S = 60.0
 FOLDER_ARCHIVE_COMMIT_MAX_DEADLINE_S = 30 * 60.0
@@ -375,11 +411,8 @@ QUIC_CHUNK_RECEIPT_CACHE_MAX = 8192
 BINARY_FRAME_MAGIC = b"OLB1"
 BINARY_FRAME_HEADER_MAX = 64 * 1024
 MAX_INCOMING_FILE_BYTES = 1024 * 1024 * 1024  # match UI upload cap
-# Folder blobs use the streaming CAS and reservation ledger rather than the UI
-# single-file upload path. Keep the production admission ceiling aligned with
-# TransferAdmissionPolicy (16 TiB) so large datasets are supported without an
-# unbounded integer/disk promise.
-FOLDER_BLOB_MAX_BYTES = 16 * 1024 * 1024 * 1024 * 1024
+# FOLDER_BLOB_MAX_BYTES (16 TiB folder CAS admission ceiling) lives in
+# folder_manifest_policy with the rest of the manifest wire contract.
 MAX_DECLARED_FILE_OFFER_BYTES = 16 * 1024 * 1024 * 1024 * 1024
 MAX_TRANSFER_FILE_NAME_BYTES = 240
 MAX_CDC_MANIFEST_CHUNKS = 262_144
@@ -419,24 +452,13 @@ SWARM_PULL_MAX_CONCURRENCY = 16
 SWARM_PULL_MIN_DEADLINE_S = 1.5
 SWARM_PULL_MAX_DEADLINE_S = 8.0
 SWARM_BLOB_MAX_CHUNKS = (MAX_INCOMING_FILE_BYTES + CHUNK_SIZE - 1) // CHUNK_SIZE + 1
-FOLDER_SYNC_SESSION_ABSOLUTE_S = 6 * 60 * 60.0
-FOLDER_SYNC_RECEIPT_TTL_S = FOLDER_SYNC_SESSION_ABSOLUTE_S + 10 * 60.0
-FOLDER_SYNC_RECEIPT_CONTEXT_MAX = 64
-FOLDER_SYNC_RECEIPTS_PER_CHANNEL_MAX = 1
-FOLDER_SYNC_RECEIPT_RETAINED_PATHS_MAX = 262_144
+# Session/receipt bounds (FOLDER_SYNC_SESSION_ABSOLUTE_S, the receipt TTL and
+# capacities, FOLDER_SYNC_VERIFY_CONCURRENCY) live in folder_sync_receipts;
+# manifest bounds (entries, clock nodes, counters, clock advance, the shared
+# durable-verification byte ceiling) live in folder_manifest_policy.
 FOLDER_SYNC_SESSION_MAX_INBOUND_FRAMES = 1_000_000
-FOLDER_SYNC_MANIFEST_MAX_ENTRIES = 65_536
-FOLDER_SYNC_MANIFEST_MAX_CLOCK_NODES = 256
-FOLDER_SYNC_MANIFEST_MAX_CLOCK_NODE_BYTES = 128
-FOLDER_SYNC_MANIFEST_MAX_COUNTER = (1 << 63) - 1
-FOLDER_SYNC_MAX_CLOCK_ADVANCE = 10_000_000
 FOLDER_BLOB_MAX_INFLIGHT_GLOBAL = 128
 FOLDER_BLOB_MAX_INFLIGHT_PER_CHANNEL = 8
-# Admission and final durable verification share one byte ceiling. Accepting a
-# 16 TiB blob and failing only after transfer at the old 128 GiB verification
-# cap was a deterministic post-transfer failure.
-FOLDER_SYNC_VERIFY_MAX_BYTES = FOLDER_BLOB_MAX_BYTES
-FOLDER_SYNC_VERIFY_CONCURRENCY = 2
 FOLDER_SYNC_VERIFY_BYTES_PER_S = 8 * 1024 * 1024
 FOLDER_SYNC_RECEIPT_MIN_WAIT_S = 30.0
 FOLDER_SYNC_FRAME_SEND_TIMEOUT_S = 120.0
@@ -1126,27 +1148,6 @@ class FolderArchiveCommitError(RuntimeError):
         self.retryable = bool(retryable)
 
 
-
-
-@dataclass(frozen=True)
-class FolderSyncReceiptContext:
-    """Bound proof state for one in-channel folder reconciliation."""
-
-    peer_fp: str
-    channel_binding: str
-    sync_id: str
-    folder_name: str
-    source_root: str
-    manifest_digest: str
-    entry_count: int
-    wants: tuple[str, ...]
-    affected_paths: tuple[str, ...]
-    created_at: float
-    offered_hashes: tuple[str, ...] = ()
-    blob_sizes: tuple[tuple[str, int], ...] = ()
-    resume_ranges: tuple[tuple[str, int, int, str], ...] = ()
-    source_proofs: tuple[tuple[str, str | None, tuple[tuple[str, int], ...]], ...] = ()
-    verify_id: str = ""
 
 
 @dataclass
@@ -3104,12 +3105,73 @@ def _harden_process_dumpability() -> None:
         pass
 
 
+class _ServiceState:
+    """Expose state owned by an extracted daemon service under a legacy name.
+
+    ``_ServiceState("_svc_accessor", "book", "inbound")`` resolves
+    ``daemon._svc_accessor().book.inbound`` on every read and assignment, so
+    integrations and tests that read, mutate or replace the historical
+    attribute operate on the service's single copy instead of a stale alias.
+    """
+
+    __slots__ = ("_accessor", "_path")
+
+    def __init__(self, accessor: str, *path: str) -> None:
+        if not path:
+            raise ValueError("a service state alias needs an attribute path")
+        self._accessor = accessor
+        self._path = path
+
+    def _owner(self, obj: Any) -> Any:
+        target = getattr(obj, self._accessor)()
+        for part in self._path[:-1]:
+            target = getattr(target, part)
+        return target
+
+    def __get__(self, obj: Any, objtype: type | None = None) -> Any:
+        if obj is None:
+            return self
+        return getattr(self._owner(obj), self._path[-1])
+
+    def __set__(self, obj: Any, value: Any) -> None:
+        setattr(self._owner(obj), self._path[-1], value)
+
+
 class Daemon:
     CALL_SIGNAL_SEND_TIMEOUT_S = 6.0
     TRUST_SYNC_SEND_TIMEOUT_S = 6.0
     CALL_PREINVITE_TTL_S = 30.0
     CALL_PREINVITE_CACHE_MAX = 64
     CALL_PREINVITE_CACHE_PER_PEER_MAX = 4
+
+    # Historical attribute names for state now owned by extracted services.
+    # Reads and assignments go to the owning service, so there is one copy.
+    _call_sdp_backfill = _ServiceState("_call_lifecycle_service", "backfill", "sdp")
+    _call_ice_backfill = _ServiceState("_call_lifecycle_service", "backfill", "ice")
+    _call_backfill_admissions = _ServiceState(
+        "_call_lifecycle_service", "backfill", "admissions",
+    )
+    _call_resume_path = _ServiceState("_call_lifecycle_service", "ledger", "path")
+    _call_resume_enabled = _ServiceState("_call_lifecycle_service", "ledger", "enabled")
+    _call_resume_lock = _ServiceState("_call_lifecycle_service", "ledger", "lock")
+    _folder_sync_inbound_receipts = _ServiceState(
+        "_folder_sync_receipt_service", "book", "inbound",
+    )
+    _folder_sync_outbound_receipts = _ServiceState(
+        "_folder_sync_receipt_service", "book", "outbound",
+    )
+    _folder_sync_verified_inbound = _ServiceState(
+        "_folder_sync_receipt_service", "book", "verified_inbound",
+    )
+    _folder_sync_verified_outbound = _ServiceState(
+        "_folder_sync_receipt_service", "book", "verified_outbound",
+    )
+    _folder_sync_blob_progress = _ServiceState(
+        "_folder_sync_receipt_service", "book", "blob_progress",
+    )
+    _folder_sync_verify_semaphore = _ServiceState(
+        "_folder_sync_receipt_service", "book", "verify_gate",
+    )
 
     def __init__(self, me: Identity):
         self.me = me
@@ -3260,32 +3322,16 @@ class Daemon:
         self._capsule_completed_replays: OrderedDict[str, tuple[str, str]] = OrderedDict()
         self._capsule_delivery_inflight: set[str] = set()
         self._capsule_delivery_wakeup: asyncio.Event | None = None
-        # Browser media setup must survive missed WebSocket events. The
-        # receiver can discover an incoming call from /api/v1/calls, so
-        # cache the latest SDP per call and expose it through that same
-        # snapshot as a durable backfill path.
-        self._call_sdp_backfill: dict[str, dict[str, str]] = {}
-        self._call_ice_backfill: dict[str, list[dict]] = {}
-        # Pre-invite SDP/ICE can legitimately beat CALL_INVITE on another
-        # encrypted session.  It must never become an attacker-controlled,
-        # unbounded namespace: every provisional cache key is peer/kind-bound,
-        # capability-authorized, globally/per-peer bounded, and monotonic-TTL'd.
-        self._call_backfill_admissions: OrderedDict[str, tuple[str, str, float]] = OrderedDict()
         from one_link.call_reliability import CallReliabilityBackend as _CRB
         from one_link.paths import data_dir as _data_dir
         self._call_reliability: _CRB = _CRB(
             log_path=_data_dir() / "logs" / "call_reliability.jsonl",
         )
-        import threading as _threading_mod
-        self._call_resume_path = _data_dir() / "logs" / "call_resume_ledger.json"
-        self._call_resume_lock: _threading_mod.Lock = _threading_mod.Lock()
-        self._call_resume_enabled = (
-            os.environ.get("ONE_LINK_CALL_RESUME", "").strip().lower()
-            in {"1", "true", "yes", "on"}
-            or "PYTEST_CURRENT_TEST" not in os.environ
-            or bool(os.environ.get("ONE_LINK_HOME"))
-        )
-        if self._call_resume_enabled:
+        # Call orchestration owns the bounded SDP/ICE backfill (browser media
+        # setup survives missed WebSocket events and pre-invite races) and the
+        # restart-resume ledger. See src/one_link/call_lifecycle.py.
+        self._call_lifecycle = _build_call_lifecycle_service(self)
+        if self._call_lifecycle.ledger.enabled:
             self._restore_call_resume_ledger()
         # Living Presence Tier β/γ/δ/ε/η runtime adapters. These
         # are the live-system glue between the pure engine modules
@@ -3550,28 +3596,10 @@ class Daemon:
         # for arbitrary content.
         self._expected_blob_pulls: dict[str, set[str]] = {}
         self._expected_blob_pull_scopes: dict[tuple[str, str], str | None] = {}
-        # In-memory proof contexts are channel-lifetime state: a disconnect
-        # invalidates the attempt and the sender retries from its durable
-        # manifest. Ordered maps make TTL/cap pruning deterministic and prevent
-        # a paired peer from growing receipt state without bound.
-        self._folder_sync_inbound_receipts: OrderedDict[
-            tuple[str, str, str], FolderSyncReceiptContext
-        ] = OrderedDict()
-        self._folder_sync_outbound_receipts: OrderedDict[
-            tuple[str, str, str], FolderSyncReceiptContext
-        ] = OrderedDict()
-        self._folder_sync_verified_inbound: OrderedDict[tuple[str, str, str], float] = OrderedDict()
-        self._folder_sync_verified_outbound: OrderedDict[tuple[str, str, str], float] = (
-            OrderedDict()
-        )
-        # Mutable progress is kept outside the frozen receipt proof. This
-        # avoids re-hashing/re-verifying every wanted CAS object after each
-        # completion (O(n²) for large manifests) without weakening immutable
-        # channel/sync correlation.
-        self._folder_sync_blob_progress: dict[tuple[str, str, str], set[str]] = {}
-        self._folder_sync_verify_semaphore = asyncio.Semaphore(
-            FOLDER_SYNC_VERIFY_CONCURRENCY,
-        )
+        # In-memory folder-sync proof contexts are channel-lifetime state owned
+        # by the receipt service: bounded, TTL'd, channel-bound and one-shot.
+        # See src/one_link/folder_sync_receipts.py.
+        self._folder_sync_receipts = FolderSyncReceiptService(_DaemonFolderSyncPort(self))
         # H3: per-IP handshake throttling. `_handshake_history[ip]` is a
         # deque of recent attempt timestamps; `_handshake_inflight[ip]` is
         # the current count of concurrent in-flight handshakes from that IP.
@@ -3625,9 +3653,9 @@ class Daemon:
         # inventory), so API surfaces read a bounded cache instead of
         # running probes on every poll. The fabric is route intelligence
         # only at this stage; it does not start hotspots, scan BLE, or
-        # transmit RF from this cache path.
-        self._fabric_snapshot_cache: dict | None = None
-        self._fabric_snapshot_cache_ts: float = 0.0
+        # transmit RF from this cache path. Refreshes run on a worker thread
+        # whenever an event loop is running (see fabric_snapshot.py).
+        self._fabric_snapshots = _build_fabric_snapshot_cache(self)
         # v0.7.1: dedup table for capability_request WS events.
         # (peer_fp, cap) -> monotonic ts of last UI prompt fired.
         self._capability_request_seen: dict[tuple[str, str], float] = {}
@@ -4147,167 +4175,21 @@ class Daemon:
             self._lock_file = None
 
     # ─── call resume persistence ────────────────────────────────────────
-    def _snapshot_call_for_resume(self, mgr) -> dict | None:
-        """Return a bounded, local-only call record for restart recovery."""
-        try:
-            lifecycle = mgr.state.lifecycle
-            phase_name = lifecycle.phase.name.lower()
-            if phase_name == "ended":
-                return None
-            call_id = str(getattr(mgr, "call_id", "") or "")
-            if not call_id:
-                return None
-            sdp_backfill = dict(self._call_sdp_backfill.get(call_id, {}))
-            ice_backfill = list(self._call_ice_backfill.get(call_id, []))[-32:]
-            return {
-                "version": 1,
-                "saved_at_ms": int(time.time() * 1000),
-                "call_id": call_id,
-                "peer_master_vk_hex": str(lifecycle.peer_master_vk_hex),
-                "local_role": str(lifecycle.local_role),
-                "call_kind": str(getattr(mgr.state, "call_kind", "voice")),
-                "local_master_vk_hex": str(self.me.fingerprint),
-                "negotiated_capabilities": sorted(
-                    str(x) for x in mgr.state.session.negotiated_capabilities
-                ),
-                "lifecycle": {
-                    "phase": phase_name,
-                    "started_at_ms": int(lifecycle.started_at_ms),
-                    "invite_sent_at_ms": int(lifecycle.invite_sent_at_ms),
-                    "accepted_at_ms": int(lifecycle.accepted_at_ms),
-                    "ended_at_ms": int(lifecycle.ended_at_ms),
-                    "end_cause": lifecycle.end_cause.name.lower(),
-                    "resume_window_close_at_ms": int(lifecycle.resume_window_close_at_ms),
-                    "invite_timeout_ms": int(lifecycle.invite_timeout_ms),
-                    "resume_window_ms": int(lifecycle.resume_window_ms),
-                },
-                "media_backfill": {
-                    "sdp": sdp_backfill,
-                    "ice": ice_backfill,
-                },
-            }
-        except Exception:
-            return None
-
     def _save_call_resume_ledger(self) -> None:
         """Persist active call truth atomically so a daemon restart can rejoin."""
-        if not getattr(self, "_call_resume_enabled", True):
-            return
-        try:
-            with self._call_resume_lock:
-                path = self._call_resume_path
-                records = []
-                for call_id in self._call_registry.active_call_ids():
-                    mgr = self._call_registry.get(call_id)
-                    if mgr is None:
-                        continue
-                    rec = self._snapshot_call_for_resume(mgr)
-                    if rec is not None:
-                        records.append(rec)
-                payload = {
-                    "version": 1,
-                    "saved_at_ms": int(time.time() * 1000),
-                    "calls": records,
-                }
-                path.parent.mkdir(parents=True, exist_ok=True)
-                tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
-                tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
-                _atomic_replace(tmp, path)
-        except Exception as exc:
-            log.debug("call resume ledger save failed: %s", exc)
+        self._call_lifecycle_service().save_resume_ledger()
 
     def _restore_call_resume_ledger(self) -> None:
         """Restore restart-resumable call state from the local ledger."""
-        if not getattr(self, "_call_resume_enabled", True):
-            return
-        try:
-            path = self._call_resume_path
-            if not path.is_file():
-                return
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            calls = payload.get("calls")
-            if not isinstance(calls, list):
-                return
-        except Exception as exc:
-            log.debug("call resume ledger load failed: %s", exc)
-            return
+        self._call_lifecycle_service().restore_resume_ledger()
 
-        try:
-            from one_link.call_signaling import CallPhase, CallState, EndCause
-        except Exception:
-            return
-
-        now_ms = int(time.time() * 1000)
-        max_age_ms = 12 * 60 * 60 * 1000
-        restored = 0
-        for rec in calls:
-            if not isinstance(rec, dict):
-                continue
-            try:
-                saved_at = int(rec.get("saved_at_ms") or 0)
-                if saved_at and now_ms - saved_at > max_age_ms:
-                    continue
-                call_id = str(rec.get("call_id") or "")
-                peer_fp = str(rec.get("peer_master_vk_hex") or "")
-                role = str(rec.get("local_role") or "")
-                if not call_id or not peer_fp or role not in {"originator", "recipient"}:
-                    continue
-                _life = rec.get("lifecycle")
-                life = _life if isinstance(_life, dict) else {}
-                phase = CallPhase[str(life.get("phase") or "").upper()]
-                if phase == CallPhase.ENDED:
-                    continue
-                end_cause_name = str(life.get("end_cause") or "unset").upper()
-                end_cause = EndCause.__members__.get(end_cause_name, EndCause.UNSET)
-                mgr = self._call_registry.open(
-                    call_id=call_id,
-                    peer_master_vk_hex=peer_fp,
-                    local_role=role,
-                    local_master_vk_hex=self.me.fingerprint,
-                    started_at_ms=int(life.get("started_at_ms") or saved_at or now_ms),
-                    negotiated_capabilities=frozenset(
-                        str(x) for x in (rec.get("negotiated_capabilities") or [])
-                    ),
-                    call_kind=str(rec.get("call_kind") or "voice"),
-                )
-                mgr.state.lifecycle = CallState(
-                    call_id=call_id,
-                    peer_master_vk_hex=peer_fp,
-                    local_role=role,
-                    phase=phase,
-                    started_at_ms=int(life.get("started_at_ms") or saved_at or now_ms),
-                    invite_sent_at_ms=int(life.get("invite_sent_at_ms") or 0),
-                    accepted_at_ms=int(life.get("accepted_at_ms") or 0),
-                    ended_at_ms=int(life.get("ended_at_ms") or 0),
-                    end_cause=end_cause,
-                    resume_window_close_at_ms=int(life.get("resume_window_close_at_ms") or 0),
-                    invite_timeout_ms=int(life.get("invite_timeout_ms") or 30_000),
-                    resume_window_ms=int(life.get("resume_window_ms") or 600_000),
-                )
-                _mb = rec.get("media_backfill")
-                media = _mb if isinstance(_mb, dict) else {}
-                _sdp = media.get("sdp")
-                sdp = _sdp if isinstance(_sdp, dict) else {}
-                _ice = media.get("ice")
-                ice = _ice if isinstance(_ice, list) else []
-                self._call_sdp_backfill[call_id] = {
-                    str(k): str(v) for k, v in sdp.items()
-                    if k in {"sdp_offer", "sdp_answer"} and isinstance(v, str)
-                }
-                self._call_ice_backfill[call_id] = [
-                    item for item in ice[-32:] if isinstance(item, dict)
-                ]
-                self._call_reliability.record_event({
-                    "call_id": call_id,
-                    "event": "client_rejoin_requested",
-                    "reason": "daemon_restart",
-                })
-                restored += 1
-            except Exception as exc:
-                log.debug("skipping call resume record: %s", exc)
-                continue
-        if restored:
-            log.info("restored %d active call(s) from resume ledger", restored)
+    def _call_lifecycle_service(self) -> CallLifecycleService:
+        """Call orchestration (``call_lifecycle.py``); built lazily for bare objects."""
+        service = self.__dict__.get("_call_lifecycle")
+        if service is None:
+            service = _build_call_lifecycle_service(self)
+            self._call_lifecycle = service
+        return service
 
     # ─── persistence helper ─────────────────────────────────────────────
     def _persist(self, *, msg: dict, direction: str, peer_fp: str, peer_short_id: str,
@@ -4402,23 +4284,7 @@ class Daemon:
 
     async def _expire_call_invite_if_due(self, mgr, *, now_ms: int) -> bool:
         """Drive the FSM timer for an unanswered outbound/inbound invite."""
-
-        from one_link.call_manager import ManagerEvent, ManagerEventKind
-
-        lifecycle = mgr.state.lifecycle
-        if lifecycle.phase.name not in {"INVITING", "RINGING"}:
-            return False
-        timer_started_ms = lifecycle.invite_sent_at_ms or lifecycle.started_at_ms
-        if timer_started_ms <= 0 or now_ms - timer_started_ms < lifecycle.invite_timeout_ms:
-            return False
-        timeout_output = mgr.handle(
-            ManagerEvent(
-                kind=ManagerEventKind.INVITE_TIMER_EXPIRED,
-                occurred_at_ms=now_ms,
-            )
-        )
-        await self._flush_manager_output(mgr, timeout_output)
-        return True
+        return await self._call_lifecycle_service().expire_invite_if_due(mgr, now_ms=now_ms)
 
     async def _immune_tick_loop(self) -> None:
         """Tick the Immune System for every active call every 100 ms.
@@ -4439,13 +4305,7 @@ class Daemon:
                 raise
 
             try:
-                self._prune_call_backfill_admissions()
-                stale_call_ids = self._call_registry.reap_stale_pending()
-                for stale_call_id in stale_call_ids:
-                    self._remove_call_backfill(stale_call_id)
-                if stale_call_ids:
-                    self._save_call_resume_ledger()
-                active_ids = self._call_registry.active_call_ids()
+                active_ids = self._call_lifecycle_service().maintain_registry()
             except Exception as exc:
                 report_best_effort_failure(
                     log,
@@ -4458,11 +4318,7 @@ class Daemon:
             for call_id in active_ids:
                 try:
                     mgr = self._call_registry.get(call_id)
-                    if mgr is None:
-                        continue
-                    if mgr.phase.name not in (
-                        "INVITING", "RINGING", "ACTIVE", "ASYNC_CAPTURE",
-                    ):
+                    if mgr is None or not CallLifecycleService.is_live_phase(mgr):
                         continue
                     peer_fp = mgr.state.peer_master_vk_hex
                     now_ms = int(time.time() * 1000)
@@ -5618,214 +5474,16 @@ class Daemon:
                 break
 
     async def flush_call_api_response(self, response):
-        """Side-effect step for a CallAPI / CallManager output.
+        """Deliver a CallAPI response: outbound wire, tail events, reaping.
 
-        Takes an :class:`one_link.call_api.ApiResponse`, groups the
-        outbound messages by peer, builds wire dicts via ``make_msg``,
-        dispatches through ``send_to``. Broadcasts each tail event
-        through ``_broadcast_tail`` with a normalised "call_event"
-        envelope.
-
-        Defensive against:
-          - Unknown peers (no record in self.state) → log + skip
-          - send_to raising → log + skip
-          - Malformed payloads in make_msg → log + skip
-          - Empty / None response → no-op
-
-        Returns: tuple of peer_fp_hex values that were successfully
-        passed to send_to (one entry per peer, deduped). Tests
-        + callers can confirm delivery from this set.
+        Returns the peer fingerprints whose messages reached call-signal
+        delivery without raising. See ``CallLifecycleService.flush_api_response``.
         """
-        if response is None:
-            return ()
-        finalized_capsule = getattr(response, "finalized_capsule", None)
-        if finalized_capsule is not None:
-            mgr = self._call_registry.get(finalized_capsule.call_id)
-            await self._commit_outbound_capsule(mgr, finalized_capsule)
-        delivered: list[str] = []
-
-        # Group outbound messages by peer (one send_to call per peer
-        # with a batched message list).
-        outbound = getattr(response, "outbound", ()) or ()
-        if outbound:
-            by_peer: dict[str, list[dict]] = {}
-            for m in outbound:
-                try:
-                    peer_fp = m.peer_master_vk_hex
-                    msg_type = m.type
-                    payload = dict(m.payload or {})
-                except Exception as exc:
-                    log.warning(
-                        "flush_call_api: malformed outbound message: %s", exc,
-                    )
-                    continue
-                try:
-                    wire_msg = make_msg(
-                        msg_type, self.me.short_id, **payload,
-                    )
-                except Exception as exc:
-                    log.warning(
-                        "flush_call_api: make_msg failed for %s: %s",
-                        msg_type, exc,
-                    )
-                    continue
-                by_peer.setdefault(peer_fp, []).append(wire_msg)
-
-            for peer_fp, msgs in by_peer.items():
-                peer = self._resolve_peer_for_outbound(peer_fp)
-                if peer is None:
-                    log.warning(
-                        "flush_call_api: no peer record for %s; dropping %d outbound msg(s)",
-                        peer_fp[:16], len(msgs),
-                    )
-                    continue
-                try:
-                    await self.send_call_signal(peer, msgs)
-                except Exception as exc:
-                    log.warning(
-                        "flush_call_api: call signal delivery failed for %s: %s",
-                        peer_fp[:16], exc,
-                    )
-                    continue
-                delivered.append(peer_fp)
-
-        # Tail events go to the WebSocket-subscribed UIs.
-        tail_events = getattr(response, "tail_events", ()) or ()
-        for ev in tail_events:
-            try:
-                payload = dict(ev.payload or {})
-                payload.setdefault("call_id", response.call_id)
-                if response.call_id:
-                    mgr = self._call_registry.get(response.call_id)
-                    if mgr is not None:
-                        payload.setdefault(
-                            "peer_master_vk_hex",
-                            mgr.state.peer_master_vk_hex,
-                        )
-                        payload.setdefault("call_kind", mgr.state.call_kind)
-                self._broadcast_tail({
-                    "type": "call_event",
-                    "tail_kind": ev.kind.name.lower(),
-                    **payload,
-                })
-            except Exception as exc:
-                log.warning(
-                    "flush_call_api: broadcast_tail failed: %s", exc,
-                )
-
-        if getattr(response, "call_complete", False) and response.call_id:
-            try:
-                self._remove_call_backfill(response.call_id)
-                self._call_registry.close(response.call_id)
-            except Exception as exc:
-                report_best_effort_failure(
-                    log,
-                    "completed_call_registry_close",
-                    exc,
-                )
-        self._save_call_resume_ledger()
-
-        return tuple(delivered)
-
-    @staticmethod
-    def _call_signal_retryable(msgs: list[dict]) -> bool:
-        """Call signaling messages are keyed by call_id, so a one-shot
-        fresh-session retry is safe when the reusable session closed before
-        ACK. Avoid doing this for normal chat/file frames where duplicate
-        user-visible content would be worse than a clear retry prompt.
-        """
-        if not msgs:
-            return False
-        retryable = {
-            "CALL_INVITE",
-            "CALL_ACCEPT",
-            "CALL_DECLINE",
-            "CALL_END",
-            "CALL_SDP_OFFER",
-            "CALL_SDP_ANSWER",
-            "CALL_ICE",
-            "CALL_FRAME_ATTEST",
-            "RECORDING_START",
-            "RECORDING_STOP",
-            "SAS_CONFIRM",
-            "SAS_DECLINE",
-        }
-        return all(str(m.get("t") or "") in retryable for m in msgs)
+        return await self._call_lifecycle_service().flush_api_response(response)
 
     async def send_call_signal(self, peer: Peer, msgs: list[dict]) -> None:
-        """Deliver call signaling over the strongest available path.
-
-        Calls are real-time control traffic. The reusable encrypted session
-        is fastest when it is healthy, but laptops sleep, Wi-Fi roams, and
-        idle sessions can go stale at exactly the moment someone presses
-        Call. If the reusable session fails, send each idempotent call frame
-        over a fresh encrypted control channel before declaring the peer
-        unreachable.
-        """
-        try:
-            await asyncio.wait_for(
-                self.send_to(peer, msgs),
-                timeout=self.CALL_SIGNAL_SEND_TIMEOUT_S,
-            )
-            return
-        except Exception as exc:
-            if not self._call_signal_retryable(msgs):
-                raise
-            log.info(
-                "call_signal: reusable session failed for %s; trying "
-                "reverse/fresh control channel: %s",
-                getattr(peer, "short_id", "?"), exc,
-            )
-        peer_fp = self._peer_fp_from_peer(peer)
-        live_sent = False
-        if peer_fp:
-            live = list(self._inbound_live_channels.get(peer_fp, ()))
-            for channel in reversed(live):
-                try:
-                    for msg in msgs:
-                        await asyncio.wait_for(
-                            channel.send(encode_msg(msg)),
-                            timeout=self.CALL_SIGNAL_SEND_TIMEOUT_S,
-                        )
-                    live_sent = True
-                    log.debug(
-                        "call_signal: sent best-effort reverse frame(s) "
-                        "over existing channel for %s",
-                        peer_fp[:8],
-                    )
-                    break
-                except Exception as exc:
-                    report_best_effort_failure(
-                        log,
-                        "call_signal_existing_channel",
-                        exc,
-                        level=logging.DEBUG,
-                        interval_s=30.0,
-                    )
-                    continue
-        last_exc: Exception | None = None
-        if peer_fp:
-            with contextlib.suppress(Exception):
-                fresh = await self.resolve_for_send(peer_fp)
-                if fresh is not None:
-                    peer = fresh
-        for msg in msgs:
-            try:
-                await asyncio.wait_for(
-                    self._send_control(peer, msg),
-                    timeout=self.CALL_SIGNAL_SEND_TIMEOUT_S,
-                )
-            except Exception as exc:
-                last_exc = exc
-                break
-        if last_exc is not None:
-            if live_sent:
-                log.info(
-                    "call_signal: fresh control failed for %s after best-effort reverse send: %s",
-                    getattr(peer, "short_id", "?"), last_exc,
-                )
-                return
-            raise last_exc
+        """Deliver call signaling over the strongest available path."""
+        await self._call_lifecycle_service().send_call_signal(peer, msgs)
 
     async def _handle_self_mesh_presence(
         self,
@@ -11131,54 +10789,10 @@ class Daemon:
     def _handle_call_frame_attest(
         self, *, msg: dict, peer_fp: str, channel, call_id: str,
     ) -> None:
-        """Tier β — inbound rolling-window FrameProvenance.
-
-        Verifies the sender's signature, then broadcasts a
-        ``frame_provenance`` tail event so the UI can update the
-        Reality dot for the active call. Hash-matching against the
-        locally-aggregated audio stream happens in the browser (it's
-        the only side that sees the raw audio); the daemon just
-        forwards the signed attestation + verification verdict.
-        """
-        try:
-            from one_link.frame_provenance import from_wire_dict, to_ui_dict
-            from one_link.live_frame_provenance import _verify_live_signature
-        except Exception:
-            return
-        raw = msg.get("attestation")
-        if not isinstance(raw, dict):
-            return
-        try:
-            attestation = from_wire_dict(raw)
-        except Exception as exc:
-            log.warning(
-                "CALL_FRAME_ATTEST %s: malformed: %s", call_id[:8], exc,
-            )
-            return
-        try:
-            sender_pub_bytes = channel.peer_ed_pub
-        except Exception:
-            return
-        verified = _verify_live_signature(attestation, sender_pub_bytes)
-        try:
-            ui_dict = to_ui_dict(attestation, verified=verified)
-        except Exception:
-            return
-        try:
-            self._broadcast_tail({
-                "type": "call_event",
-                "tail_kind": "frame_attestation",
-                "call_id": call_id,
-                "peer_master_vk_hex": peer_fp,
-                "verified": verified,
-                **ui_dict,
-            })
-        except Exception as exc:
-            log.warning(
-                "frame attestation evidence broadcast failed for call=%s: %s",
-                call_id,
-                exc,
-            )
+        """Tier β — verify and tail an inbound rolling-window FrameProvenance."""
+        self._call_lifecycle_service().handle_frame_attest(
+            msg=msg, peer_fp=peer_fp, channel=channel, call_id=call_id,
+        )
 
     def _handle_file_provenance(self, *, msg: dict, channel, peer_fp: str) -> None:
         """Dispatch hook for FILE_PROVENANCE wire messages.
@@ -11290,155 +10904,8 @@ class Daemon:
             )
             return False
 
-    def _call_kind_for_payload(
-        self,
-        *,
-        msg: dict,
-        call_id: str,
-        sdp_payload=None,
-    ) -> str:
-        """Resolve and verify a call kind against bound state and SDP truth."""
-
-        from one_link.call_manager import normalize_call_kind
-
-        explicit = None
-        if "call_kind" in msg:
-            explicit = normalize_call_kind(msg.get("call_kind"))
-        video_sdp = False
-        if sdp_payload is not None:
-            normalized_sdp = str(sdp_payload.sdp).replace("\r", "\n").lower()
-            video_sdp = any(
-                line.strip().startswith("m=video") for line in normalized_sdp.split("\n")
-            )
-
-        bound_kind = None
-        mgr = self._call_registry.get(call_id)
-        if mgr is not None:
-            bound_kind = mgr.state.call_kind
-        else:
-            admission = self._call_backfill_admissions.get(call_id)
-            if admission is not None:
-                bound_kind = admission[1]
-
-        if explicit is not None and bound_kind is not None and explicit != bound_kind:
-            raise ValueError("call kind conflicts with bound call")
-        if video_sdp and explicit == "voice":
-            raise ValueError("voice call cannot carry video media")
-        if video_sdp and bound_kind == "voice":
-            raise ValueError("voice call cannot carry video media")
-        if bound_kind is not None:
-            return bound_kind
-        if explicit is not None:
-            return explicit
-        return "video" if video_sdp else "voice"
-
     def _prune_call_backfill_admissions(self) -> tuple[str, ...]:
-        now = time.monotonic()
-        expired: list[str] = []
-        for call_id, (_peer_fp, _kind, admitted_at) in tuple(
-            self._call_backfill_admissions.items()
-        ):
-            if max(0.0, now - admitted_at) < self.CALL_PREINVITE_TTL_S:
-                continue
-            expired.append(call_id)
-            self._call_backfill_admissions.pop(call_id, None)
-            # Never evict media for a manager that was promoted but whose
-            # provisional admission survived an interrupted cleanup.
-            if self._call_registry.get(call_id) is None:
-                self._call_sdp_backfill.pop(call_id, None)
-                self._call_ice_backfill.pop(call_id, None)
-        return tuple(expired)
-
-    def _admit_call_backfill(
-        self,
-        *,
-        call_id: str,
-        peer_fp: str,
-        call_kind: str,
-        trust_checked: bool = False,
-    ) -> bool:
-        """Authorize and reserve one bounded pre-invite media namespace."""
-
-        from one_link.call_manager import (
-            CallIdentityMismatchError,
-            normalize_call_kind,
-            validate_call_id,
-        )
-
-        try:
-            call_id = validate_call_id(call_id)
-            call_kind = normalize_call_kind(call_kind)
-        except (TypeError, ValueError):
-            return False
-        self._prune_call_backfill_admissions()
-        try:
-            mgr = self._call_registry.get_for_peer(call_id, peer_fp)
-        except (CallIdentityMismatchError, ValueError):
-            return False
-        if mgr is not None:
-            return mgr.state.call_kind == call_kind and self._call_capability_allowed(
-                peer_fp, call_kind
-            )
-
-        existing = self._call_backfill_admissions.get(call_id)
-        if existing is not None:
-            if existing[0] != peer_fp or existing[1] != call_kind:
-                return False
-            if not self._call_capability_allowed(peer_fp, call_kind):
-                return False
-            self._call_backfill_admissions.move_to_end(call_id)
-            return True
-
-        # Reject a new namespace at the cheap bounded-admission layer before
-        # consulting disk-backed trust/capability state.
-        if len(self._call_backfill_admissions) >= self.CALL_PREINVITE_CACHE_MAX:
-            return False
-        peer_entries = sum(
-            1
-            for admitted_peer, _kind, _at in self._call_backfill_admissions.values()
-            if admitted_peer == peer_fp
-        )
-        if peer_entries >= self.CALL_PREINVITE_CACHE_PER_PEER_MAX:
-            return False
-        if not trust_checked:
-            decision = self._trust_ledger_check_inbound(peer_fp)
-            if decision is None:
-                if not self._is_pinned(peer_fp):
-                    return False
-            elif not decision.allow_call:
-                return False
-        if not self._call_capability_allowed(peer_fp, call_kind):
-            return False
-        self._call_backfill_admissions[call_id] = (
-            peer_fp,
-            call_kind,
-            time.monotonic(),
-        )
-        return True
-
-    def _promote_call_backfill(self, call_id: str) -> None:
-        self._call_backfill_admissions.pop(call_id, None)
-
-    def _remove_call_backfill(self, call_id: str) -> None:
-        self._call_backfill_admissions.pop(call_id, None)
-        self._call_sdp_backfill.pop(call_id, None)
-        self._call_ice_backfill.pop(call_id, None)
-
-    def _call_media_cache_is_bound(
-        self,
-        *,
-        call_id: str,
-        peer_fp: str,
-    ) -> bool:
-        from one_link.call_manager import CallIdentityMismatchError
-
-        try:
-            if self._call_registry.get_for_peer(call_id, peer_fp) is not None:
-                return True
-        except (CallIdentityMismatchError, ValueError):
-            return False
-        admission = self._call_backfill_admissions.get(call_id)
-        return admission is not None and admission[0] == peer_fp
+        return self._call_lifecycle_service().prune_backfill_admissions()
 
     # ─── Durable async-capsule transport ───────────────────────────────
 
@@ -11936,727 +11403,18 @@ class Daemon:
         peer_fp: str,
         peer_sid: str,
     ) -> None:
-        """Route a CALL_/RECORDING_/CAPSULE_/CALL_ICE wire message into
-        the per-call CallManager + emit any UI tail events.
+        """Route a CALL_/RECORDING_/CAPSULE_/CALL_ICE wire message.
 
-        Pure dispatch: heavy lifting lives in the engine modules. The
-        daemon's job here is to translate wire → ManagerEvent, flush
-        the response through ``flush_call_api_response``, and forward
-        SDP / ICE payloads to the local browser via the WebSocket tail
-        so ``RTCPeerConnection`` on the UI side can act on them.
-
-        Defensive: every failure path returns without raising — the
-        recv loop must keep running.
+        See ``CallLifecycleService.dispatch_wire_message``; never raises into
+        the receive loop.
         """
-        from one_link.call_manager import ManagerEvent, ManagerEventKind
-        from one_link.call_sdp_signaling import (
-            extract_answer,
-            extract_offer,
-            parse_ice_message,
+        await self._call_lifecycle_service().dispatch_wire_message(
+            channel=channel, msg=msg, peer_fp=peer_fp, peer_sid=peer_sid,
         )
-
-        from one_link.call_manager import (
-            CallIdentityMismatchError,
-            CallRegistryError,
-            validate_call_id,
-        )
-
-        t = msg.get("t")
-        if t in {
-            "CAPSULE_OFFER",
-            "CAPSULE_CHUNK",
-            "CAPSULE_COMPLETE",
-            CAPSULE_RECEIPT,
-        }:
-            await self._handle_capsule_transport_message(
-                channel=channel,
-                msg=msg,
-                peer_fp=peer_fp,
-            )
-            return
-        try:
-            call_id = validate_call_id(msg.get("call_id"))
-        except (TypeError, ValueError):
-            log.warning(
-                "living-presence: %s from %s invalid call_id; dropping",
-                t, peer_fp[:8],
-            )
-            return
-
-        now_ms_ = int(time.time() * 1000)
-
-        # CALL_INVITE opens a new manager. Every other type looks up
-        # an existing one.
-        if t == "CALL_INVITE":
-            # Parse every optional media field before allocating a manager.
-            # A malformed attached offer is a malformed invite, not a valid
-            # ring event with its attacker-controlled body silently ignored.
-            try:
-                sdp_offer = extract_offer(msg)
-                call_kind = self._call_kind_for_payload(
-                    msg=msg,
-                    call_id=call_id,
-                    sdp_payload=sdp_offer,
-                )
-            except Exception as exc:
-                log.warning(
-                    "living-presence: CALL_INVITE %s malformed: %s",
-                    call_id[:8],
-                    exc,
-                )
-                return
-            # Audit C2 — route the inbound master_vk through the
-            # TrustLedger BEFORE opening the manager. A
-            # CHAIN_BROKEN decision refuses the call with a
-            # plain-language reason; we never instantiate the
-            # CallManager in that case.
-            decision = self._trust_ledger_check_inbound(peer_fp)
-            if decision is None and not self._is_pinned(peer_fp):
-                # Trust-ledger import/state/verifier failures previously
-                # turned into an implicit allow. Preserve service for peers
-                # already authenticated by the durable SAS pin, but refuse
-                # first-contact calls until the stronger verifier recovers.
-                self._broadcast_tail(
-                    {
-                        "type": "call_event",
-                        "tail_kind": "call_refused",
-                        "call_id": call_id,
-                        "peer_master_vk_hex": peer_fp,
-                        "user_message": (
-                            "Identity verification is temporarily unavailable. "
-                            "Please retry before connecting."
-                        ),
-                    }
-                )
-                log.warning(
-                    "CALL_INVITE refused from unpinned peer %s because "
-                    "trust verification was unavailable",
-                    peer_fp[:8],
-                )
-                return
-            if decision is not None and not decision.allow_call:
-                self._broadcast_tail({
-                    "type": "call_event",
-                    "tail_kind": "call_refused",
-                    "call_id": call_id,
-                    "peer_master_vk_hex": peer_fp,
-                    "user_message": decision.explanation,
-                })
-                log.info(
-                    "CALL_INVITE refused by trust ledger from %s: %s",
-                    peer_fp[:8],
-                    getattr(getattr(decision, "new_state", None), "name", "deny"),
-                )
-                return
-            call_sas_words: Optional[str] = None
-            if decision is not None and decision.needs_reverify:
-                # First-contact calls are allowed only when the user can verify
-                # the same transcript-bound phrase on both endpoints.  A
-                # missing/invalid transcript used to degrade to an empty SAS
-                # after the manager was opened, silently converting TOFU into
-                # an unverifiable call.
-                try:
-                    transcript = getattr(channel, "transcript_hash", None)
-                    if not isinstance(transcript, (bytes, bytearray, memoryview)):
-                        raise TypeError("channel transcript hash is unavailable")
-                    transcript_bytes = bytes(transcript)
-                    if len(transcript_bytes) != 32:
-                        raise ValueError("channel transcript hash must be 32 bytes")
-                    call_sas_words = format_sas_words(
-                        compute_sas_words(
-                            self.me.public_bytes,
-                            channel.peer_ed_pub,
-                            transcript_hash=transcript_bytes,
-                        )
-                    )
-                except (AttributeError, TypeError, ValueError) as exc:
-                    self._broadcast_tail(
-                        {
-                            "type": "call_event",
-                            "tail_kind": "call_refused",
-                            "call_id": call_id,
-                            "peer_master_vk_hex": peer_fp,
-                            "user_message": (
-                                "This first call could not create a secure "
-                                "five-word verification phrase. Please reconnect "
-                                "and try again."
-                            ),
-                        }
-                    )
-                    log.warning(
-                        "CALL_INVITE refused from unpinned peer %s because "
-                        "the transcript-bound SAS was unavailable: %s",
-                        peer_fp[:8],
-                        exc,
-                    )
-                    return
-            already_admitted = call_id in self._call_backfill_admissions
-            if not self._admit_call_backfill(
-                call_id=call_id,
-                peer_fp=peer_fp,
-                call_kind=call_kind,
-                trust_checked=True,
-            ):
-                log.info(
-                    "living-presence: CALL_INVITE %s from %s denied by "
-                    "call capability/capacity policy",
-                    call_id[:8],
-                    peer_fp[:8],
-                )
-                return
-            try:
-                mgr = self._call_registry.open(
-                    call_id=call_id,
-                    peer_master_vk_hex=peer_fp,
-                    local_role="recipient",
-                    local_master_vk_hex=self.me.fingerprint,
-                    started_at_ms=now_ms_,
-                    call_kind=call_kind,
-                )
-            except (CallRegistryError, ValueError) as exc:
-                if not already_admitted:
-                    self._remove_call_backfill(call_id)
-                log.warning(
-                    "living-presence: CALL_INVITE %s admission refused: %s",
-                    call_id[:8],
-                    exc,
-                )
-                return
-            self._promote_call_backfill(call_id)
-            # Open the predictive-continuity engine for this call so
-            # the receive path can immediately start tracking confirm-
-            # ratios. Idempotent.
-            try:
-                self._predictive.open_call(call_id)
-            except Exception as exc:
-                log.debug(
-                    "predictive continuity unavailable for call=%s: %s",
-                    call_id,
-                    exc,
-                )
-            event = ManagerEvent(
-                kind=ManagerEventKind.WIRE_CALL_INVITE,
-                occurred_at_ms=now_ms_,
-                data={"peer_master_vk_hex": peer_fp,
-                    "call_kind": call_kind,
-                },
-            )
-            self._forward_sdp_to_ui(
-                call_id=call_id,
-                peer_master_vk_hex=peer_fp,
-                kind="sdp_offer",
-                sdp_payload=sdp_offer,
-            )
-            # If decision allows but is first-contact, surface the
-            # SAS-required tail so the UI can prompt the user.
-            if decision is not None and decision.needs_reverify:
-                assert call_sas_words is not None
-                self._broadcast_tail({
-                    "type": "call_event",
-                    "tail_kind": "sas_verification_required",
-                    "call_id": call_id,
-                    "peer_master_vk_hex": peer_fp,
-                    "sas_words": call_sas_words,
-                    "user_message": decision.explanation,
-                })
-            await self._handle_call_manager_output(mgr, event)
-            return
-
-        # Media setup may race ahead of CALL_INVITE because SDP and ICE
-        # travel as independent wire messages. Cache + broadcast these
-        # even when the call manager is not open yet; /api/v1/calls will
-        # backfill them after the lifecycle invite arrives.
-        if t == "CALL_SDP_OFFER":
-            try:
-                sdp_offer = extract_offer(msg)
-                if sdp_offer is None:
-                    raise ValueError("missing SDP offer")
-                call_kind = self._call_kind_for_payload(
-                    msg=msg,
-                    call_id=call_id,
-                    sdp_payload=sdp_offer,
-                )
-            except Exception as exc:
-                log.warning(
-                    "living-presence: CALL_SDP_OFFER %s: %s",
-                    call_id[:8], exc,
-                )
-                return
-            if not self._admit_call_backfill(
-                call_id=call_id,
-                peer_fp=peer_fp,
-                call_kind=call_kind,
-            ):
-                log.info(
-                    "living-presence: unauthorized SDP offer %s from %s dropped",
-                    call_id[:8],
-                    peer_fp[:8],
-                )
-                return
-            self._forward_sdp_to_ui(
-                call_id=call_id,
-                peer_master_vk_hex=peer_fp,
-                kind="sdp_offer",
-                sdp_payload=sdp_offer,
-            )
-            return
-
-        if t == "CALL_SDP_ANSWER":
-            try:
-                sdp_answer = extract_answer(msg)
-                if sdp_answer is None:
-                    raise ValueError("missing SDP answer")
-                call_kind = self._call_kind_for_payload(
-                    msg=msg,
-                    call_id=call_id,
-                    sdp_payload=sdp_answer,
-                )
-            except Exception as exc:
-                log.warning(
-                    "living-presence: CALL_SDP_ANSWER %s: %s",
-                    call_id[:8], exc,
-                )
-                return
-            if not self._admit_call_backfill(
-                call_id=call_id,
-                peer_fp=peer_fp,
-                call_kind=call_kind,
-            ):
-                log.info(
-                    "living-presence: unauthorized SDP answer %s from %s dropped",
-                    call_id[:8],
-                    peer_fp[:8],
-                )
-                return
-            self._forward_sdp_to_ui(
-                call_id=call_id,
-                peer_master_vk_hex=peer_fp,
-                kind="sdp_answer",
-                sdp_payload=sdp_answer,
-            )
-            return
-
-        if t == "CALL_ICE":
-            try:
-                _cid, cand = parse_ice_message(msg)
-                call_kind = self._call_kind_for_payload(
-                    msg=msg,
-                    call_id=call_id,
-                )
-            except Exception as exc:
-                log.warning(
-                    "living-presence: CALL_ICE %s: malformed: %s",
-                    call_id[:8], exc,
-                )
-                return
-            if not self._admit_call_backfill(
-                call_id=call_id,
-                peer_fp=peer_fp,
-                call_kind=call_kind,
-            ):
-                log.info(
-                    "living-presence: unauthorized ICE %s from %s dropped",
-                    call_id[:8],
-                    peer_fp[:8],
-                )
-                return
-            self._forward_ice_to_ui(
-                call_id=call_id,
-                peer_master_vk_hex=peer_fp,
-                candidate_payload=cand,
-            )
-            return
-
-        # All other messages require an existing manager.
-        try:
-            existing_mgr = self._call_registry.get_for_peer(call_id, peer_fp)
-        except (CallIdentityMismatchError, ValueError):
-            log.warning(
-                "living-presence: cross-peer call-id collision for %s from %s; dropping %s",
-                call_id[:8],
-                peer_fp[:8],
-                t,
-            )
-            return
-        if existing_mgr is None:
-            log.info(
-                "living-presence: %s for unknown call_id %s from %s; dropping",
-                t, call_id[:8], peer_fp[:8],
-            )
-            return
-        mgr = existing_mgr
-        try:
-            call_kind = self._call_kind_for_payload(
-                msg=msg,
-                call_id=call_id,
-            )
-        except ValueError as exc:
-            log.warning(
-                "living-presence: %s kind mismatch for %s: %s",
-                t,
-                call_id[:8],
-                exc,
-            )
-            return
-        if not self._call_capability_allowed(peer_fp, call_kind):
-            log.info(
-                "living-presence: %s denied after call capability revocation for %s/%s",
-                t,
-                peer_fp[:8],
-                call_id[:8],
-            )
-            return
-
-        if t == "CALL_ACCEPT":
-            try:
-                sdp_answer = extract_answer(msg)
-                # ``None`` is valid for a legacy/audio fallback, but a present
-                # malformed object was already rejected by extract_answer.
-                call_kind = self._call_kind_for_payload(
-                    msg=msg,
-                    call_id=call_id,
-                    sdp_payload=sdp_answer,
-                )
-            except Exception as exc:
-                log.warning(
-                    "living-presence: CALL_ACCEPT %s: bad SDP answer: %s",
-                    call_id[:8], exc,
-                )
-                return
-            if not self._call_capability_allowed(peer_fp, call_kind):
-                return
-            event = ManagerEvent(
-                kind=ManagerEventKind.WIRE_CALL_ACCEPT,
-                occurred_at_ms=now_ms_,
-                data={
-                    "peer_master_vk_hex": peer_fp,
-                    "call_kind": call_kind,
-                },
-            )
-            self._forward_sdp_to_ui(
-                call_id=call_id,
-                peer_master_vk_hex=peer_fp,
-                kind="sdp_answer",
-                sdp_payload=sdp_answer,
-            )
-            await self._handle_call_manager_output(mgr, event)
-            return
-
-        if t == "CALL_DECLINE":
-            event = ManagerEvent(
-                kind=ManagerEventKind.WIRE_CALL_DECLINE,
-                occurred_at_ms=now_ms_,
-                data={"peer_master_vk_hex": peer_fp},
-            )
-            await self._handle_call_manager_output(mgr, event)
-            return
-
-        if t == "CALL_END":
-            event = ManagerEvent(
-                kind=ManagerEventKind.WIRE_CALL_END,
-                occurred_at_ms=now_ms_,
-                data={"peer_master_vk_hex": peer_fp},
-            )
-            await self._handle_call_manager_output(mgr, event)
-            return
-
-        if t == "CALL_RESUME_OFFER":
-            event = ManagerEvent(
-                kind=ManagerEventKind.WIRE_RESUME_OFFER,
-                occurred_at_ms=now_ms_,
-                data={"peer_master_vk_hex": peer_fp},
-            )
-            await self._handle_call_manager_output(mgr, event)
-            return
-
-        if t == "CALL_FRAME_ATTEST":
-            self._handle_call_frame_attest(
-                msg=msg, peer_fp=peer_fp, channel=channel, call_id=call_id,
-            )
-            return
-
-        if t == "RECORDING_REQUEST":
-            event = ManagerEvent(
-                kind=ManagerEventKind.WIRE_RECORDING_REQUEST,
-                occurred_at_ms=now_ms_,
-                data={"peer_master_vk_hex": peer_fp},
-            )
-            await self._handle_call_manager_output(mgr, event)
-            return
-
-        if t == "RECORDING_GRANT":
-            event = ManagerEvent(
-                kind=ManagerEventKind.WIRE_RECORDING_GRANT,
-                occurred_at_ms=now_ms_,
-                data={"peer_master_vk_hex": peer_fp},
-            )
-            await self._handle_call_manager_output(mgr, event)
-            return
-
-        if t == "RECORDING_DECLINE":
-            event = ManagerEvent(
-                kind=ManagerEventKind.WIRE_RECORDING_DECLINE,
-                occurred_at_ms=now_ms_,
-                data={"peer_master_vk_hex": peer_fp},
-            )
-            await self._handle_call_manager_output(mgr, event)
-            return
-
-        if t == "RECORDING_STOP":
-            event = ManagerEvent(
-                kind=ManagerEventKind.WIRE_RECORDING_STOP,
-                occurred_at_ms=now_ms_,
-                data={"peer_master_vk_hex": peer_fp},
-            )
-            await self._handle_call_manager_output(mgr, event)
-            return
-
-    async def _handle_call_manager_output(self, mgr, event) -> None:
-        """Run one event through a CallManager + flush the result."""
-        try:
-            output = mgr.handle(event)
-        except Exception as exc:
-            log.warning(
-                "CallManager.handle raised on %s: %s",
-                event.kind.name, exc,
-            )
-            return
-        # ManagerOutput shape differs from ApiResponse but the flush
-        # helper handles both via duck-typing (outbound + tail_events).
-        try:
-            await self._flush_manager_output(mgr, output)
-        except Exception as exc:
-            log.warning(
-                "flush_manager_output raised for %s: %s",
-                event.kind.name, exc,
-            )
 
     async def _flush_manager_output(self, mgr, output) -> None:
-        """Side-effect step for a CallManager ManagerOutput.
-
-        Mirrors :meth:`flush_call_api_response` but reads
-        ``outbound_msgs`` (ManagerOutput's field name) rather than
-        ``outbound`` (ApiResponse's). Both shapes share semantics."""
-        finalized_capsule = getattr(output, "finalized_capsule", None)
-        if finalized_capsule is not None:
-            await self._commit_outbound_capsule(mgr, finalized_capsule)
-
-        outbound = getattr(output, "outbound_msgs", ()) or ()
-        if outbound:
-            by_peer: dict[str, list[dict]] = {}
-            for m in outbound:
-                try:
-                    peer_fp = m.peer_master_vk_hex
-                    msg_type = m.type
-                    payload = dict(m.payload or {})
-                except Exception as exc:
-                    log.warning(
-                        "flush_manager_output: malformed outbound: %s", exc,
-                    )
-                    continue
-                try:
-                    wire_msg = make_msg(
-                        msg_type, self.me.short_id, **payload,
-                    )
-                except Exception as exc:
-                    log.warning(
-                        "flush_manager_output: make_msg failed for %s: %s",
-                        msg_type, exc,
-                    )
-                    continue
-                by_peer.setdefault(peer_fp, []).append(wire_msg)
-            for peer_fp, msgs in by_peer.items():
-                peer = self._resolve_peer_for_outbound(peer_fp)
-                if peer is None:
-                    continue
-                try:
-                    await asyncio.wait_for(
-                        self.send_to(peer, msgs),
-                        timeout=self.CALL_SIGNAL_SEND_TIMEOUT_S,
-                    )
-                except Exception as exc:
-                    log.warning(
-                        "call signaling delivery failed for %s: %s",
-                        peer_fp[:8],
-                        exc,
-                    )
-                    continue
-
-        # Consent-channel messages (RECORDING_*) ride the same path.
-        consent = getattr(output, "consent_msgs", ()) or ()
-        if consent:
-            by_peer = {}
-            for m in consent:
-                try:
-                    peer_fp = m.peer_master_vk_hex
-                    msg_type = m.type
-                    payload = dict(m.payload or {})
-                except Exception as exc:
-                    log.warning(
-                        "flush_manager_output: malformed consent message: %s",
-                        exc,
-                    )
-                    continue
-                try:
-                    wire_msg = make_msg(
-                        msg_type, self.me.short_id, **payload,
-                    )
-                except Exception as exc:
-                    log.warning(
-                        "flush_manager_output: consent make_msg failed for %s: %s",
-                        msg_type,
-                        exc,
-                    )
-                    continue
-                by_peer.setdefault(peer_fp, []).append(wire_msg)
-            for peer_fp, msgs in by_peer.items():
-                peer = self._resolve_peer_for_outbound(peer_fp)
-                if peer is None:
-                    continue
-                try:
-                    await asyncio.wait_for(
-                        self.send_to(peer, msgs),
-                        timeout=self.CALL_SIGNAL_SEND_TIMEOUT_S,
-                    )
-                except Exception as exc:
-                    log.warning(
-                        "recording-consent delivery failed for %s: %s",
-                        peer_fp[:8],
-                        exc,
-                    )
-                    continue
-
-        # Tail events → broadcast to the WebSocket-subscribed UIs.
-        for ev in getattr(output, "tail_events", ()) or ():
-            try:
-                payload = dict(ev.payload or {})
-                payload.setdefault("call_id", getattr(mgr, "call_id", ""))
-                payload.setdefault(
-                    "peer_master_vk_hex",
-                    getattr(getattr(mgr, "state", None), "peer_master_vk_hex", ""),
-                )
-                payload.setdefault(
-                    "call_kind",
-                    getattr(getattr(mgr, "state", None), "call_kind", "voice"),
-                )
-                self._broadcast_tail({
-                    "type": "call_event",
-                    "tail_kind": ev.kind.name.lower(),
-                    **payload,
-                })
-            except Exception as exc:
-                log.warning(
-                    "call tail event broadcast failed for call=%s: %s",
-                    getattr(mgr, "call_id", ""),
-                    exc,
-                )
-
-        # Reap if the manager declared itself complete.
-        if getattr(output, "call_complete", False):
-            try:
-                self._remove_call_backfill(getattr(mgr, "call_id", ""))
-                self._call_registry.close(getattr(mgr, "call_id", ""))
-            except Exception as exc:
-                log.warning(
-                    "completed call cleanup failed for call=%s: %s",
-                    getattr(mgr, "call_id", ""),
-                    exc,
-                )
-        self._save_call_resume_ledger()
-
-    def _forward_sdp_to_ui(
-        self,
-        *,
-        call_id: str,
-        peer_master_vk_hex: str,
-        kind: str,
-        sdp_payload,
-    ) -> None:
-        """Push an SDP offer or answer to the local browser via the
-        WebSocket tail. The browser's RTCPeerConnection driver picks
-        it up and calls ``setRemoteDescription``."""
-        if sdp_payload is None:
-            return
-        if not self._call_media_cache_is_bound(
-            call_id=call_id,
-            peer_fp=peer_master_vk_hex,
-        ):
-            log.warning(
-                "refusing unbound SDP cache write for call=%s peer=%s",
-                call_id[:8],
-                peer_master_vk_hex[:8],
-            )
-            return
-        try:
-            self._call_sdp_backfill.setdefault(call_id, {})[kind] = sdp_payload.sdp
-            self._save_call_resume_ledger()
-            self._broadcast_tail({
-                "type": "call_event",
-                "tail_kind": kind,
-                "call_id": call_id,
-                "peer_master_vk_hex": peer_master_vk_hex,
-                "sdp": sdp_payload.sdp,
-                "sdp_kind": sdp_payload.kind.to_str(),
-            })
-        except Exception as exc:
-            log.warning(
-                "SDP cache/broadcast failed for call=%s kind=%s: %s",
-                call_id,
-                kind,
-                exc,
-            )
-
-    def _forward_ice_to_ui(
-        self,
-        *,
-        call_id: str,
-        peer_master_vk_hex: str,
-        candidate_payload,
-    ) -> None:
-        """Cache and broadcast a browser ICE candidate.
-
-        ICE often arrives before the remote browser has accepted the call
-        or before a WebSocket is attached. Keeping a small backfill list
-        makes call setup recoverable instead of depending on perfect event
-        ordering.
-        """
-        if not self._call_media_cache_is_bound(
-            call_id=call_id,
-            peer_fp=peer_master_vk_hex,
-        ):
-            log.warning(
-                "refusing unbound ICE cache write for call=%s peer=%s",
-                call_id[:8],
-                peer_master_vk_hex[:8],
-            )
-            return
-        try:
-            ev = {
-                "type": "call_event",
-                "tail_kind": "ice_candidate",
-                "call_id": call_id,
-                "peer_master_vk_hex": peer_master_vk_hex,
-                "candidate": candidate_payload.candidate,
-                "sdp_mid": candidate_payload.sdp_mid,
-                "sdp_m_line_index": candidate_payload.sdp_m_line_index,
-                "end_of_candidates": candidate_payload.end_of_candidates,
-            }
-            pending = self._call_ice_backfill.setdefault(call_id, [])
-            pending.append({
-                "candidate": ev["candidate"],
-                "sdp_mid": ev["sdp_mid"],
-                "sdp_m_line_index": ev["sdp_m_line_index"],
-                "end_of_candidates": ev["end_of_candidates"],
-            })
-            del pending[:-32]
-            self._save_call_resume_ledger()
-            self._broadcast_tail(ev)
-        except Exception as exc:
-            log.warning(
-                "ICE cache/broadcast failed for call=%s: %s",
-                call_id,
-                exc,
-            )
+        """Side-effect step for a CallManager ManagerOutput."""
+        await self._call_lifecycle_service().flush_manager_output(mgr, output)
 
     def _trust_ledger_check_inbound(self, peer_fp: str):
         """Audit C2 — route an inbound CALL_INVITE through the
@@ -13584,72 +12342,19 @@ class Daemon:
         }
 
     def _fabric_snapshot(self, *, max_age_s: float = 30.0) -> dict:
-        """Read-only Universal Comms Fabric truth.
+        """Read-only Universal Comms Fabric truth, never probed on the loop.
 
-        This bridges the new hardware/adapter fabric into the existing daemon
-        without altering live transfer behavior. It is intentionally cached:
-        API dashboards can scrape it often, while OS hardware probes run at a
-        controlled cadence. Failures degrade into a structured unavailable
-        snapshot instead of breaking /api/status or /api/metrics.
+        API dashboards scrape this often while OS hardware probes run at a
+        controlled cadence. On an event-loop thread a stale snapshot is served
+        with its true ``cache_age_s`` while one refresh runs on a worker
+        thread; failures degrade into a structured unavailable snapshot
+        instead of breaking /api/status or /api/metrics.
         """
-
-        now = time.monotonic()
-        cached = getattr(self, "_fabric_snapshot_cache", None)
-        cache_ts = float(getattr(self, "_fabric_snapshot_cache_ts", 0.0) or 0.0)
-        if cached is not None and (now - cache_ts) <= max(0.0, float(max_age_s)):
-            out = dict(cached)
-            out["cache_age_s"] = round(now - cache_ts, 3)
-            return out
-        try:
-            from one_link.hardware_inventory import collect_hardware_inventory
-            from one_link.transport_fabric import UniversalCommsFabric
-
-            inventory = collect_hardware_inventory()
-            route_candidates = []
-            if self.state is not None:
-                with contextlib.suppress(Exception):
-                    route_candidates = self.state.list_route_candidates(
-                        verified_only=True,
-                        limit=24,
-                    )
-            fabric = UniversalCommsFabric.from_inventory_and_candidates(
-                inventory,
-                route_candidates,
-            )
-            plan = fabric.plan(
-                size_bytes=64 * 1024 * 1024,
-                supports_cdc=True,
-                supports_swarm=True,
-                prior_hit_rate=0.0,
-            )
-            snapshot = {
-                "ok": True,
-                "cache_age_s": 0.0,
-                "inventory": inventory.to_dict(),
-                "route_truth": plan.route_truth(),
-                "scores": [s.to_dict() for s in plan.scores],
-                "activation": [a.to_dict() for a in plan.activation],
-                "probes": [p.to_dict() for p in plan.probes],
-                "performance": dict(plan.timing_ms or {}),
-            }
-        except Exception as exc:
-            snapshot = {
-                "ok": False,
-                "cache_age_s": 0.0,
-                "error": str(exc),
-                "inventory": {"paths": []},
-                "route_truth": {
-                    "state": "Waiting for device",
-                    "reason": "fabric probe unavailable",
-                },
-                "scores": [],
-                "activation": [],
-                "probes": [],
-                "performance": {},
-            }
-        self._fabric_snapshot_cache = dict(snapshot)
-        self._fabric_snapshot_cache_ts = now
-        return snapshot
+        cache = self.__dict__.get("_fabric_snapshots")
+        if cache is None:
+            cache = _build_fabric_snapshot_cache(self)
+            self._fabric_snapshots = cache
+        return cache.snapshot(max_age_s=max_age_s)
 
     def _prune_chunk_cache(self, max_bytes: int = CDC_CACHE_MAX_BYTES) -> dict:
         """LRU eviction over the global chunk cache, layered on the
@@ -17118,114 +15823,41 @@ class Daemon:
         return str(manifest["id"])
 
     def _prune_folder_sync_receipt_contexts(self) -> None:
-        def _abort_inbound_writers(receipt_key: tuple[str, str, str]) -> None:
-            peer_fp, channel_binding, sync_id = receipt_key
-            for blob_key in tuple(getattr(self, "_incoming_blobs", {})):
-                if blob_key[:3] == (peer_fp, channel_binding, sync_id):
-                    self._abort_blob_key(blob_key, preserve_partial=True)
-            getattr(self, "_folder_sync_blob_progress", {}).pop(receipt_key, None)
-
-        now = time.monotonic()
-        specs = (
-            ("_folder_sync_inbound_receipts", True),
-            ("_folder_sync_outbound_receipts", True),
-            ("_folder_sync_verified_inbound", False),
-            ("_folder_sync_verified_outbound", False),
-        )
-        for attr, stores_context in specs:
-            mapping = getattr(self, attr, None)
-            if not isinstance(mapping, OrderedDict):
-                mapping = OrderedDict()
-                setattr(self, attr, mapping)
-            expired = [
-                key
-                for key, value in mapping.items()
-                if now - (value.created_at if stores_context else float(value))
-                > FOLDER_SYNC_RECEIPT_TTL_S
-            ]
-            for key in expired:
-                mapping.pop(key, None)
-                if attr == "_folder_sync_inbound_receipts":
-                    _abort_inbound_writers(key)
-            while len(mapping) > FOLDER_SYNC_RECEIPT_CONTEXT_MAX:
-                evicted_key, _evicted_value = mapping.popitem(last=False)
-                if attr == "_folder_sync_inbound_receipts":
-                    _abort_inbound_writers(evicted_key)
+        self._folder_sync_receipt_service().prune()
 
     def _cleanup_folder_channel_state(self, channel, peer_fp: str) -> None:
         """Release every receipt, writer, and reservation bound to a channel."""
+        self._folder_sync_receipt_service().release_channel(channel, peer_fp)
 
-        binding = self._folder_channel_binding(channel)
-        for key in tuple(getattr(self, "_incoming_blobs", {})):
-            if key[0] == peer_fp and key[1] == binding:
-                self._abort_blob_key(key, preserve_partial=True)
-        for attr in (
-            "_folder_sync_inbound_receipts",
-            "_folder_sync_outbound_receipts",
-            "_folder_sync_verified_inbound",
-            "_folder_sync_verified_outbound",
-        ):
-            mapping = getattr(self, attr, None)
-            if not isinstance(mapping, OrderedDict):
-                continue
-            for key in tuple(mapping):
-                if key[0] == peer_fp and key[1] == binding:
-                    mapping.pop(key, None)
-                    getattr(self, "_folder_sync_blob_progress", {}).pop(key, None)
+    def _folder_sync_receipt_service(self) -> FolderSyncReceiptService:
+        """Folder-sync proof protocol (``folder_sync_receipts.py``), built lazily."""
+        service = self.__dict__.get("_folder_sync_receipts")
+        if service is None:
+            service = FolderSyncReceiptService(_DaemonFolderSyncPort(self))
+            self._folder_sync_receipts = service
+        return service
 
-    def _folder_verify_gate(self) -> asyncio.Semaphore:
-        gate = getattr(self, "_folder_sync_verify_semaphore", None)
-        if not isinstance(gate, asyncio.Semaphore):
-            gate = asyncio.Semaphore(FOLDER_SYNC_VERIFY_CONCURRENCY)
-            self._folder_sync_verify_semaphore = gate
-        return gate
+    def _folder_sync_scheduler(self) -> FolderSyncScheduler:
+        """Folder-sync cadence (``folder_sync_scheduler.py``), built lazily."""
+        scheduler = self.__dict__.get("_folder_scheduler")
+        if scheduler is None:
+            scheduler = FolderSyncScheduler(_DaemonFolderSchedulerPort(self), logger=log)
+            self._folder_scheduler = scheduler
+        return scheduler
 
     @staticmethod
     def _folder_sync_paths(entries: Iterable[dict]) -> tuple[str, ...]:
-        paths: list[str] = []
-        seen: set[str] = set()
-        for entry in entries:
-            path = entry.get("file_path") if isinstance(entry, dict) else None
-            if not isinstance(path, str) or not path or path in seen:
-                continue
-            seen.add(path)
-            paths.append(path)
-        return tuple(paths)
+        return folder_sync_paths(entries)
 
     @staticmethod
     def _folder_manifest_digest(entries: Iterable[dict]) -> str:
         """Bind every manifest field, not only its content Merkle leaves."""
-
-        encoded = json.dumps(
-            list(entries),
-            ensure_ascii=False,
-            allow_nan=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        return blake3.blake3(b"one-link-folder-manifest-v1\0" + encoded).hexdigest()
+        return folder_manifest_digest(entries)
 
     @staticmethod
     def _folder_channel_binding(channel) -> str:
         """Return a non-reusable binding for one authenticated channel."""
-
-        transcript = getattr(channel, "transcript_hex", None)
-        if (
-            isinstance(transcript, str)
-            and len(transcript) == 64
-            and transcript == transcript.lower()
-        ):
-            try:
-                int(transcript, 16)
-            except ValueError:
-                pass
-            else:
-                return transcript
-        fallback = getattr(channel, "_one_link_folder_binding", None)
-        if not isinstance(fallback, str) or len(fallback) != 64:
-            fallback = secrets.token_hex(32)
-            setattr(channel, "_one_link_folder_binding", fallback)
-        return fallback
+        return folder_channel_binding(channel)
 
     async def _folder_blob_resume_claims(
         self,
@@ -17363,176 +15995,13 @@ class Daemon:
         return parsed
 
     @staticmethod
-    def _canonical_folder_wire_path(value: object) -> str | None:
-        """Return the protocol-canonical relative path or reject it.
-
-        Folder manifests are cross-platform.  Requiring forward-slash,
-        component-canonical paths closes aliases such as ``a/./b``, UNC and
-        drive paths, Windows device names, normalization/case collisions, and
-        traversal before either pending-offer persistence or CRDT mutation.
-        """
-
-        if not isinstance(value, str) or not value or "\\" in value:
-            return None
-        if value.startswith("/") or (len(value) > 1 and value[1] == ":"):
-            return None
-        if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
-            return None
-        try:
-            encoded = value.encode("utf-8")
-        except UnicodeError:
-            return None
-        if len(encoded) > FOLDER_ARCHIVE_MAX_MEMBER_NAME_BYTES:
-            return None
-        parts = value.split("/")
-        if len(parts) > 64 or any(part in {"", ".", ".."} for part in parts):
-            return None
-        reserved_windows = frozenset(
-            {
-                "CON",
-                "PRN",
-                "AUX",
-                "NUL",
-                "CLOCK$",
-                "CONIN$",
-                "CONOUT$",
-                *(f"COM{i}" for i in range(10)),
-                *(f"LPT{i}" for i in range(10)),
-                *(f"COM{i}" for i in "¹²³"),
-                *(f"LPT{i}" for i in "¹²³"),
-            }
-        )
-        for part in parts:
-            try:
-                if len(part.encode("utf-8")) > 255:
-                    return None
-            except UnicodeError:
-                return None
-            if (
-                part != part.rstrip(". ")
-                or any(char in '<>:"|?*' for char in part)
-                or part.split(".", 1)[0].upper() in reserved_windows
-            ):
-                return None
-        return value
-
-    @staticmethod
     def _safe_folder_offer_name(value: object) -> str | None:
         """Validate a peer-controlled folder name as one portable leaf."""
-
-        if not isinstance(value, str):
-            return None
-        if (
-            not value
-            or value != value.strip()
-            or value in {".", ".."}
-            or len(value) > 255
-            or value.endswith((".", " "))
-            or any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
-            or any(char in '<>:"/\\|?*' for char in value)
-            or Path(value).name != value
-            or Path(value).is_absolute()
-        ):
-            return None
-        reserved = {
-            "CON",
-            "PRN",
-            "AUX",
-            "NUL",
-            "CLOCK$",
-            "CONIN$",
-            "CONOUT$",
-            *(f"COM{i}" for i in range(10)),
-            *(f"LPT{i}" for i in range(10)),
-            *(f"COM{i}" for i in "¹²³"),
-            *(f"LPT{i}" for i in "¹²³"),
-        }
-        if value.split(".", 1)[0].upper() in reserved:
-            return None
-        return value
+        return safe_folder_offer_name(value)
 
     def _validate_folder_manifest_entries(self, entries: list[dict]) -> None:
         """Fail closed on ambiguous or resource-hostile manifest rows."""
-
-        if len(entries) > FOLDER_SYNC_MANIFEST_MAX_ENTRIES:
-            raise RuntimeError("folder manifest entry count exceeds limit")
-        wire_keys = {"file_path", "blob_hash", "size", "mtime_ms", "vclock"}
-        path_keys: set[str] = set()
-        path_parent_keys: set[str] = set()
-        hash_sizes: dict[str, int] = {}
-        total_materialized_bytes = 0
-        for entry in entries:
-            if not isinstance(entry, dict) or set(entry) != wire_keys:
-                raise RuntimeError("folder manifest has a non-canonical entry schema")
-            file_path = self._canonical_folder_wire_path(entry.get("file_path"))
-            if file_path is None:
-                raise RuntimeError("folder manifest contains an unsafe path")
-            if any(
-                part.startswith(".one-link-") and part.endswith(".tmp")
-                for part in file_path.split("/")
-            ):
-                raise RuntimeError("folder manifest uses a reserved internal path")
-            collision_key = unicodedata.normalize("NFC", file_path).casefold()
-            collision_parts = collision_key.split("/")
-            collision_parents = {
-                "/".join(collision_parts[:index]) for index in range(1, len(collision_parts))
-            }
-            if (
-                collision_key in path_keys
-                or collision_key in path_parent_keys
-                or any(parent in path_keys for parent in collision_parents)
-            ):
-                raise RuntimeError("folder manifest contains a path collision")
-            path_keys.add(collision_key)
-            path_parent_keys.update(collision_parents)
-
-            blob_hash = entry.get("blob_hash")
-            size = entry.get("size")
-            if blob_hash is None:
-                if size is not None and not (type(size) is int and size == 0):
-                    raise RuntimeError("folder tombstone declares live content size")
-            elif (
-                not isinstance(blob_hash, str)
-                or blob_hash != blob_hash.lower()
-                or not self._valid_blob_hex(blob_hash)
-                or type(size) is not int
-                or size < 0
-                or size > FOLDER_BLOB_MAX_BYTES
-            ):
-                raise RuntimeError("folder manifest contains invalid content metadata")
-            else:
-                prior_size = hash_sizes.setdefault(blob_hash, size)
-                if prior_size != size:
-                    raise RuntimeError("folder manifest assigns conflicting sizes to one hash")
-                total_materialized_bytes += size
-                if total_materialized_bytes > FOLDER_SYNC_VERIFY_MAX_BYTES:
-                    raise RuntimeError("folder manifest exceeds durable verification byte limit")
-
-            mtime_ms = entry.get("mtime_ms")
-            if mtime_ms is not None and (
-                type(mtime_ms) is not int
-                or mtime_ms < 0
-                or mtime_ms > FOLDER_SYNC_MANIFEST_MAX_COUNTER
-            ):
-                raise RuntimeError("folder manifest contains invalid timestamp metadata")
-
-            clock = entry.get("vclock")
-            if not isinstance(clock, dict) or len(clock) > FOLDER_SYNC_MANIFEST_MAX_CLOCK_NODES:
-                raise RuntimeError("folder manifest contains an invalid vector clock")
-            for node, counter in clock.items():
-                try:
-                    node_bytes = node.encode("utf-8") if isinstance(node, str) else b""
-                except UnicodeError:
-                    node_bytes = b""
-                if (
-                    not node_bytes
-                    or len(node_bytes) > FOLDER_SYNC_MANIFEST_MAX_CLOCK_NODE_BYTES
-                    or any(byte < 0x20 or byte == 0x7F for byte in node_bytes)
-                    or type(counter) is not int
-                    or counter <= 0
-                    or counter > FOLDER_SYNC_MANIFEST_MAX_COUNTER
-                ):
-                    raise RuntimeError("folder manifest contains an invalid vector clock")
+        validate_folder_manifest_entries(entries)
 
     def _validate_folder_manifest_causality(
         self,
@@ -17541,28 +16010,10 @@ class Daemon:
         entries: Iterable[dict],
         peer_fp: str,
     ) -> None:
-        """Prevent an authenticated peer from forging other devices' clocks.
-
-        Until manifest operations carry independent device signatures, a peer
-        may advance only its own vector-clock component. Components belonging
-        to other devices must already be present locally at an equal-or-newer
-        counter. This preserves direct multi-device convergence without giving
-        one compromised peer a permanent causal-dominance primitive.
-        """
-
-        if self.state is None:
-            raise RuntimeError("folder state is unavailable")
-        for entry in entries:
-            file_path = str(entry["file_path"])
-            local = self.state.get_manifest_entry(folder_name, file_path)
-            local_clock = dict(local.get("vclock") or {}) if local else {}
-            for node, counter in dict(entry.get("vclock") or {}).items():
-                local_counter = int(local_clock.get(node, 0) or 0)
-                if node == peer_fp:
-                    if counter > local_counter + FOLDER_SYNC_MAX_CLOCK_ADVANCE:
-                        raise RuntimeError("folder manifest vector clock jump exceeds policy")
-                elif counter > local_counter:
-                    raise RuntimeError("folder manifest advances an unauthenticated clock node")
+        """Prevent an authenticated peer from forging other devices' clocks."""
+        validate_folder_manifest_causality(
+            folder_name=folder_name, entries=entries, peer_fp=peer_fp, local=self.state,
+        )
 
     def _validate_folder_manifest_against_local_paths(
         self,
@@ -17571,33 +16022,9 @@ class Daemon:
         entries: Iterable[dict],
     ) -> None:
         """Reject portable aliases and file/descendant collisions pre-merge."""
-
-        if self.state is None:
-            raise RuntimeError("folder state is unavailable")
-        local_keys: dict[str, str] = {}
-        local_parent_keys: set[str] = set()
-        for row in self.state.list_manifest(folder_name):
-            local_path = self._canonical_folder_wire_path(row.get("file_path"))
-            if local_path is None:
-                raise RuntimeError("local folder manifest contains an unsafe path")
-            key = unicodedata.normalize("NFC", local_path).casefold()
-            prior = local_keys.setdefault(key, local_path)
-            if prior != local_path:
-                raise RuntimeError("local folder manifest has a portable path collision")
-            parts = key.split("/")
-            local_parent_keys.update("/".join(parts[:index]) for index in range(1, len(parts)))
-
-        for entry in entries:
-            remote_path = str(entry["file_path"])
-            key = unicodedata.normalize("NFC", remote_path).casefold()
-            local_path = local_keys.get(key)
-            if local_path is not None and local_path != remote_path:
-                raise RuntimeError("remote folder path aliases an existing local path")
-            parents = {"/".join(key.split("/")[:index]) for index in range(1, len(key.split("/")))}
-            if any(parent in local_keys for parent in parents):
-                raise RuntimeError("remote folder path descends from an existing local file")
-            if key in local_parent_keys:
-                raise RuntimeError("remote folder file collides with an existing local descendant")
+        validate_folder_manifest_against_local_paths(
+            folder_name=folder_name, entries=entries, local=self.state,
+        )
 
     def _register_inbound_folder_sync_receipt(
         self,
@@ -17615,114 +16042,20 @@ class Daemon:
         source_entries: Iterable[dict],
         resume_ranges: Iterable[tuple[str, int, int, str]] = (),
     ) -> FolderSyncReceiptContext:
-        if (
-            not _valid_delivery_id(sync_id)
-            or not self._valid_blob_hex(source_root)
-            or not self._valid_blob_hex(manifest_digest)
-            or self._safe_folder_offer_name(folder_name) is None
-            or type(entry_count) is not int
-            or entry_count < 0
-            or entry_count > FOLDER_SYNC_MANIFEST_MAX_ENTRIES
-        ):
-            raise RuntimeError("invalid folder sync receipt contract")
-        raw_wants = tuple(wants)
-        if any(not isinstance(value, str) for value in raw_wants):
-            raise RuntimeError("folder sync wanted hashes must be strings")
-        clean_wants = tuple(dict.fromkeys(raw_wants))
-        if any(not self._valid_blob_hex(value) for value in clean_wants):
-            raise RuntimeError("invalid folder sync wanted hash")
-        clean_sizes: dict[str, int] = {}
-        for blob_hash, size in blob_sizes:
-            if (
-                blob_hash not in clean_wants
-                or type(size) is not int
-                or size < 0
-                or size > FOLDER_BLOB_MAX_BYTES
-                or (blob_hash in clean_sizes and clean_sizes[blob_hash] != size)
-            ):
-                raise RuntimeError("invalid folder sync wanted size contract")
-            clean_sizes[blob_hash] = size
-        if set(clean_sizes) != set(clean_wants):
-            raise RuntimeError("folder sync wanted size contract is incomplete")
-        clean_resume: dict[str, tuple[int, int, str]] = {}
-        for blob_hash, size, offset, prefix_digest in resume_ranges:
-            if (
-                blob_hash not in clean_wants
-                or clean_sizes.get(blob_hash) != size
-                or type(offset) is not int
-                or offset < 0
-                or offset > size
-                or (offset % CHUNK_SIZE != 0 and offset != size)
-                or not isinstance(prefix_digest, str)
-                or not self._valid_blob_hex(prefix_digest)
-                or blob_hash in clean_resume
-            ):
-                raise RuntimeError("invalid folder blob resume contract")
-            clean_resume[blob_hash] = (size, offset, prefix_digest)
-        if clean_resume and set(clean_resume) != set(clean_wants):
-            raise RuntimeError("folder blob resume contract is incomplete")
-        clean_paths = tuple(dict.fromkeys(str(value) for value in affected_paths))
-        if len(clean_paths) > FOLDER_SYNC_MANIFEST_MAX_ENTRIES:
-            raise RuntimeError("folder sync path count exceeds receipt bound")
-        source_proofs = tuple(
-            (
-                str(entry["file_path"]),
-                entry.get("blob_hash"),
-                tuple(sorted(dict(entry.get("vclock") or {}).items())),
-            )
-            for entry in source_entries
-        )
-        if (
-            len(source_proofs) != entry_count
-            or tuple(path for path, _blob, _clock in source_proofs) != clean_paths
-        ):
-            raise RuntimeError("folder sync source proof contract is incomplete")
-        context = FolderSyncReceiptContext(
+        return self._folder_sync_receipt_service().register_inbound(
+            channel=channel,
             peer_fp=peer_fp,
-            channel_binding=self._folder_channel_binding(channel),
             sync_id=sync_id,
             folder_name=folder_name,
-            source_root=str(source_root),
+            source_root=source_root,
             manifest_digest=manifest_digest,
-            entry_count=int(entry_count),
-            wants=clean_wants,
-            affected_paths=clean_paths,
-            created_at=time.monotonic(),
-            blob_sizes=tuple(clean_sizes.items()),
-            resume_ranges=tuple(
-                (blob_hash, *clean_resume[blob_hash])
-                for blob_hash in clean_wants
-                if blob_hash in clean_resume
-            ),
-            source_proofs=source_proofs,
+            entry_count=entry_count,
+            wants=wants,
+            blob_sizes=blob_sizes,
+            affected_paths=affected_paths,
+            source_entries=source_entries,
+            resume_ranges=resume_ranges,
         )
-        self._prune_folder_sync_receipt_contexts()
-        key = (peer_fp, self._folder_channel_binding(channel), sync_id)
-        channel_contexts = sum(
-            1 for existing_key in self._folder_sync_inbound_receipts if existing_key[:2] == key[:2]
-        )
-        retained_paths = sum(
-            len(existing.affected_paths) + len(existing.wants)
-            for existing in self._folder_sync_inbound_receipts.values()
-        )
-        if (
-            key in self._folder_sync_inbound_receipts
-            or key in self._folder_sync_verified_inbound
-            or len(self._folder_sync_inbound_receipts) >= FOLDER_SYNC_RECEIPT_CONTEXT_MAX
-            or channel_contexts >= FOLDER_SYNC_RECEIPTS_PER_CHANNEL_MAX
-            or retained_paths + len(clean_paths) + len(clean_wants)
-            > FOLDER_SYNC_RECEIPT_RETAINED_PATHS_MAX
-        ):
-            raise RuntimeError("folder sync receipt admission refused")
-        self._folder_sync_inbound_receipts[key] = context
-        self._folder_sync_inbound_receipts.move_to_end(key)
-        progress = getattr(self, "_folder_sync_blob_progress", None)
-        if not isinstance(progress, dict):
-            progress = {}
-            self._folder_sync_blob_progress = progress
-        progress[key] = set()
-        self._prune_folder_sync_receipt_contexts()
-        return context
 
     def _register_outbound_folder_sync_offer(
         self,
@@ -17735,77 +16068,15 @@ class Daemon:
         manifest_digest: str,
         entries: Iterable[dict],
     ) -> FolderSyncReceiptContext:
-        entry_list = list(entries)
-        self._validate_folder_manifest_entries(entry_list)
-        if (
-            not _valid_delivery_id(sync_id)
-            or not self._valid_blob_hex(source_root)
-            or not self._valid_blob_hex(manifest_digest)
-            or len(entry_list) > FOLDER_SYNC_MANIFEST_MAX_ENTRIES
-        ):
-            raise RuntimeError("invalid outbound folder manifest proof context")
-        if (
-            foldersync.manifest_root_for_entries(entry_list) != source_root
-            or self._folder_manifest_digest(entry_list) != manifest_digest
-        ):
-            raise RuntimeError("outbound folder proof does not bind its manifest")
-        offered = tuple(
-            dict.fromkeys(
-                str(entry.get("blob_hash"))
-                for entry in entry_list
-                if (
-                    isinstance(entry, dict)
-                    and entry.get("blob_hash") is not None
-                    and self._valid_blob_hex(str(entry.get("blob_hash")))
-                )
-            )
-        )
-        offered_sizes: dict[str, int] = {}
-        for entry in entry_list:
-            blob_hash = entry.get("blob_hash")
-            if blob_hash is None:
-                continue
-            size = entry.get("size")
-            assert isinstance(blob_hash, str) and type(size) is int
-            prior_size = offered_sizes.setdefault(blob_hash, size)
-            if prior_size != size:
-                raise RuntimeError("one folder hash has conflicting offered sizes")
-        context = FolderSyncReceiptContext(
+        return self._folder_sync_receipt_service().register_outbound(
+            channel=channel,
             peer_fp=peer_fp,
-            channel_binding=self._folder_channel_binding(channel),
             sync_id=sync_id,
             folder_name=folder_name,
             source_root=source_root,
             manifest_digest=manifest_digest,
-            entry_count=len(entry_list),
-            wants=(),
-            affected_paths=self._folder_sync_paths(entry_list),
-            created_at=time.monotonic(),
-            offered_hashes=offered,
-            blob_sizes=tuple(offered_sizes.items()),
+            entries=entries,
         )
-        self._prune_folder_sync_receipt_contexts()
-        key = (peer_fp, self._folder_channel_binding(channel), sync_id)
-        channel_contexts = sum(
-            1 for existing_key in self._folder_sync_outbound_receipts if existing_key[:2] == key[:2]
-        )
-        retained_paths = sum(
-            len(existing.affected_paths) + len(existing.offered_hashes)
-            for existing in self._folder_sync_outbound_receipts.values()
-        )
-        if (
-            key in self._folder_sync_outbound_receipts
-            or key in self._folder_sync_verified_outbound
-            or len(self._folder_sync_outbound_receipts) >= FOLDER_SYNC_RECEIPT_CONTEXT_MAX
-            or channel_contexts >= FOLDER_SYNC_RECEIPTS_PER_CHANNEL_MAX
-            or retained_paths + len(context.affected_paths) + len(context.offered_hashes)
-            > FOLDER_SYNC_RECEIPT_RETAINED_PATHS_MAX
-        ):
-            raise RuntimeError("outbound folder sync receipt admission refused")
-        self._folder_sync_outbound_receipts[key] = context
-        self._folder_sync_outbound_receipts.move_to_end(key)
-        self._prune_folder_sync_receipt_contexts()
-        return context
 
     async def _send_folder_sync_verify(
         self,
@@ -17820,57 +16091,17 @@ class Daemon:
         wants: Iterable[str],
         deadline: float | None = None,
     ) -> str:
-        if not _valid_delivery_id(sync_id):
-            raise RuntimeError("cannot verify an invalid folder sync id")
-        raw_wants = tuple(wants)
-        if any(not isinstance(value, str) for value in raw_wants):
-            raise RuntimeError("folder verification hashes must be strings")
-        clean_wants = tuple(dict.fromkeys(raw_wants))
-        if any(not self._valid_blob_hex(value) for value in clean_wants):
-            raise RuntimeError("cannot verify invalid folder blob hashes")
-        verify = make_msg(
-            "FOLDER_SYNC_VERIFY",
-            self.me.short_id,
-            sync_id=sync_id,
-            folder=folder_name,
-            source_root=str(source_root),
-            manifest_digest=manifest_digest,
-            entry_count=int(entry_count),
-            wants=list(clean_wants),
-        )
-        self._prune_folder_sync_receipt_contexts()
-        key = (peer_fp, self._folder_channel_binding(channel), sync_id)
-        offered_context = self._folder_sync_outbound_receipts.get(key)
-        if (
-            offered_context is None
-            or offered_context.verify_id
-            or offered_context.folder_name != folder_name
-            or offered_context.source_root != str(source_root)
-            or offered_context.manifest_digest != manifest_digest
-            or offered_context.entry_count != int(entry_count)
-            or any(value not in offered_context.offered_hashes for value in clean_wants)
-        ):
-            raise RuntimeError("folder verification does not match outbound offer")
-        context = FolderSyncReceiptContext(
+        return await self._folder_sync_receipt_service().send_verify(
+            channel=channel,
             peer_fp=peer_fp,
-            channel_binding=self._folder_channel_binding(channel),
             sync_id=sync_id,
             folder_name=folder_name,
-            source_root=str(source_root),
+            source_root=source_root,
             manifest_digest=manifest_digest,
-            entry_count=int(entry_count),
-            wants=clean_wants,
-            affected_paths=offered_context.affected_paths,
-            created_at=time.monotonic(),
-            offered_hashes=offered_context.offered_hashes,
-            blob_sizes=offered_context.blob_sizes,
-            verify_id=str(verify["id"]),
+            entry_count=entry_count,
+            wants=wants,
+            deadline=deadline,
         )
-        self._folder_sync_outbound_receipts[key] = context
-        self._folder_sync_outbound_receipts.move_to_end(key)
-        self._prune_folder_sync_receipt_contexts()
-        await self._send_folder_message(channel, verify, deadline=deadline)
-        return context.verify_id
 
     async def _handle_folder_sync_verify(
         self,
@@ -17878,139 +16109,7 @@ class Daemon:
         msg: dict,
         peer_fp: str,
     ) -> None:
-        sync_id = str(msg.get("sync_id") or "")
-        key = (peer_fp, self._folder_channel_binding(channel), sync_id)
-        self._prune_folder_sync_receipt_contexts()
-        context = self._folder_sync_inbound_receipts.get(key)
-        if context is None:
-            raise RuntimeError("folder verification has no active proof context")
-        reason = "receipt_context_missing"
-        ok = False
-        applied_root = ""
-        source_outcome = "unverified"
-        conflict_count = 0
-        if context is not None:
-            wire_wants = msg.get("wants")
-            exact_contract = (
-                _valid_delivery_id(str(msg.get("id") or ""))
-                and msg.get("folder") == context.folder_name
-                and msg.get("source_root") == context.source_root
-                and msg.get("manifest_digest") == context.manifest_digest
-                and type(msg.get("entry_count")) is int
-                and int(msg["entry_count"]) == context.entry_count
-                and isinstance(wire_wants, list)
-                and tuple(wire_wants) == context.wants
-            )
-            if not exact_contract:
-                reason = "receipt_contract_mismatch"
-            elif self.blob_store is None or self.state is None or self.folder_engine is None:
-                reason = "folder_storage_unavailable"
-            else:
-                blob_store = self.blob_store
-                state = self.state
-                folder_engine = self.folder_engine
-                verification_deadline = time.monotonic() + FOLDER_SYNC_SESSION_ABSOLUTE_S
-
-                def _verify_durable_folder_state() -> tuple[bool, str, str, str, int]:
-                    missing = [
-                        blob_hash for blob_hash in context.wants if not blob_store.has(blob_hash)
-                    ]
-                    if missing:
-                        return (
-                            False,
-                            "requested_blob_not_durable",
-                            "",
-                            "unverified",
-                            0,
-                        )
-                    materialized, materialize_reason, snapshot_root = (
-                        folder_engine.verify_materialized_paths(
-                            folder_name=context.folder_name,
-                            paths=context.affected_paths,
-                            max_paths=FOLDER_SYNC_MANIFEST_MAX_ENTRIES,
-                            max_total_bytes=FOLDER_SYNC_VERIFY_MAX_BYTES,
-                            deadline_monotonic=verification_deadline,
-                        )
-                    )
-                    if not materialized:
-                        return (
-                            False,
-                            materialize_reason,
-                            "",
-                            "unverified",
-                            0,
-                        )
-                    conflicts = 0
-                    for source_path, source_hash, source_clock_pairs in context.source_proofs:
-                        current = state.get_manifest_entry(
-                            context.folder_name,
-                            source_path,
-                        )
-                        if current is None:
-                            return (
-                                False,
-                                "source_projection_missing",
-                                "",
-                                "unverified",
-                                0,
-                            )
-                        current_clock = dict(current.get("vclock") or {})
-                        if any(
-                            int(current_clock.get(node, 0) or 0) < counter
-                            for node, counter in source_clock_pairs
-                        ):
-                            return (
-                                False,
-                                "source_projection_not_reconciled",
-                                "",
-                                "unverified",
-                                0,
-                            )
-                        if current.get("blob_hash") != source_hash:
-                            conflicts += 1
-                    outcome = "exact" if conflicts == 0 else "reconciled_conflict"
-                    return True, "", snapshot_root, outcome, conflicts
-
-                async with self._folder_verify_gate():
-                    (
-                        ok,
-                        reason,
-                        applied_root,
-                        source_outcome,
-                        conflict_count,
-                    ) = await asyncio.to_thread(_verify_durable_folder_state)
-        commit = make_msg(
-            "FOLDER_SYNC_COMMIT",
-            self.me.short_id,
-            of=msg.get("id"),
-            sync_id=sync_id,
-            folder=(context.folder_name if context else msg.get("folder")),
-            source_root=(context.source_root if context else msg.get("source_root")),
-            manifest_digest=(context.manifest_digest if context else msg.get("manifest_digest")),
-            applied_root=applied_root,
-            entry_count=(context.entry_count if context else msg.get("entry_count")),
-            wanted_count=(len(context.wants) if context else 0),
-            paths_verified=(len(context.affected_paths) if context else 0),
-            source_outcome=source_outcome,
-            conflict_count=conflict_count,
-            ok=ok,
-            durable=ok,
-            reason=reason,
-        )
-        # VERIFY is one-shot for a sync id.  Consume its proof context before
-        # replying so a paired peer cannot replay an expensive disk proof or
-        # race multiple VERIFY frames against one materialization attempt.
-        self._folder_sync_inbound_receipts.pop(key, None)
-        getattr(self, "_folder_sync_blob_progress", {}).pop(key, None)
-        if ok:
-            self._folder_sync_verified_inbound[key] = time.monotonic()
-            self._folder_sync_verified_inbound.move_to_end(key)
-        else:
-            for blob_key in tuple(getattr(self, "_incoming_blobs", {})):
-                if blob_key[:3] == key:
-                    self._abort_blob_key(blob_key)
-        self._prune_folder_sync_receipt_contexts()
-        await self._send_folder_message(channel, commit)
+        await self._folder_sync_receipt_service().handle_verify(channel, msg, peer_fp)
 
     def _accept_folder_sync_commit(
         self,
@@ -18019,54 +16118,9 @@ class Daemon:
         msg: dict,
         peer_fp: str,
     ) -> FolderSyncReceiptContext:
-        sync_id = str(msg.get("sync_id") or "")
-        key = (peer_fp, self._folder_channel_binding(channel), sync_id)
-        self._prune_folder_sync_receipt_contexts()
-        context = self._folder_sync_outbound_receipts.get(key)
-        if context is None:
-            raise RuntimeError("folder sync commit has no active proof context")
-        if (
-            msg.get("of") != context.verify_id
-            or msg.get("folder") != context.folder_name
-            or msg.get("source_root") != context.source_root
-            or msg.get("manifest_digest") != context.manifest_digest
-            or type(msg.get("entry_count")) is not int
-            or int(msg["entry_count"]) != context.entry_count
-            or type(msg.get("wanted_count")) is not int
-            or int(msg["wanted_count"]) != len(context.wants)
-            or type(msg.get("paths_verified")) is not int
-            or int(msg["paths_verified"]) != len(context.affected_paths)
-            or type(msg.get("conflict_count")) is not int
-            or int(msg["conflict_count"]) < 0
-            or int(msg["conflict_count"]) > len(context.affected_paths)
-            or not isinstance(msg.get("source_outcome"), str)
-        ):
-            raise RuntimeError("crossed or malformed folder sync commit receipt")
-        if msg.get("ok") is not True or msg.get("durable") is not True:
-            negative_root = msg.get("applied_root")
-            if negative_root not in {None, ""} and not self._valid_blob_hex(
-                str(negative_root),
-            ):
-                raise RuntimeError("malformed negative folder sync receipt")
-            raise RuntimeError(
-                "receiver could not commit folder sync: "
-                + str(msg.get("reason") or "unverified")[:128]
-            )
-        if not self._valid_blob_hex(str(msg.get("applied_root") or "")):
-            raise RuntimeError("positive folder receipt has no applied root")
-        source_outcome = str(msg["source_outcome"])
-        conflict_count = int(msg["conflict_count"])
-        if (
-            source_outcome not in {"exact", "reconciled_conflict"}
-            or (source_outcome == "exact" and conflict_count != 0)
-            or (source_outcome == "reconciled_conflict" and conflict_count == 0)
-        ):
-            raise RuntimeError("folder receipt has an inconsistent source outcome")
-        self._folder_sync_outbound_receipts.pop(key, None)
-        self._folder_sync_verified_outbound[key] = time.monotonic()
-        self._folder_sync_verified_outbound.move_to_end(key)
-        self._prune_folder_sync_receipt_contexts()
-        return context
+        return self._folder_sync_receipt_service().accept_commit(
+            channel=channel, msg=msg, peer_fp=peer_fp,
+        )
 
     async def _handle_folder_sync_commit(
         self,
@@ -33184,8 +31238,15 @@ class Daemon:
             def _send_path_probe_runner(argv: list[str], timeout: float) -> tuple[int, str, str]:
                 return 127, "", "send path skips slow OS hardware probes"
 
+            # Even without OS tool probes, the inventory resolves this host's
+            # own name (bounded at 5 s per address family on a degraded
+            # network): collect it on a worker thread, never on the loop.
+            send_path_inventory = await asyncio.to_thread(
+                collect_hardware_inventory,
+                runner=_send_path_probe_runner,
+            )
             fabric = UniversalCommsFabric.from_inventory_and_candidates(
-                collect_hardware_inventory(runner=_send_path_probe_runner),
+                send_path_inventory,
                 durable_route_candidates,
             )
             fabric_decision = fabric.plan(
@@ -37706,6 +35767,10 @@ class Daemon:
         # daemon's transport_choice_for_peer() selects per-peer.
         self._ensure_quic_endpoint()
 
+        # Start the first hardware/fabric probe now, on a worker thread, so
+        # the first /api/status poll finds a real snapshot.
+        self._fabric_snapshot()
+
         # Start UI server if available. Import lazily so CLI/status paths do
         # not pay aiohttp's Windows platform/WMI import cost before the daemon
         # has even published its control socket.
@@ -37727,6 +35792,11 @@ class Daemon:
                     exc,
                 )
         except Exception as e:
+            if getattr(e, "fatal_startup", False):
+                # An explicit configuration (ONE_LINK_UI_PORT) that cannot be
+                # honored must stop startup, never degrade to a headless run.
+                log.error("UI server cannot start as configured: %s", e)
+                raise
             log.warning("UI server failed to start: %s", e)
             self.ui_server = None
             ui_port = 0
@@ -37776,68 +35846,17 @@ class Daemon:
             self._hardening_findings = findings
 
     async def _on_local_folder_change(self, folder_name: str, entry) -> None:
-        """Called by the FolderEngine when a watched file is added / changed
-        / deleted. Notify the UI so the folder status indicator updates;
-        peer push happens on the next sync tick."""
-        if self.ui_server is not None:
-            try:
-                self.ui_server.broadcast({
-                    "type": "folder_change",
-                    "folder": folder_name,
-                    "file": entry.file_path,
-                    "deleted": entry.blob_hash is None,
-                })
-            except Exception as exc:
-                report_best_effort_failure(
-                    log,
-                    "folder_change_broadcast",
-                    exc,
-                    level=logging.DEBUG,
-                )
+        """FolderEngine callback for a watched file add/change/delete: notify
+        the UI now; the peer push happens on the next sync cycle."""
+        await self._folder_sync_scheduler().on_local_change(folder_name, entry)
 
     async def _folder_sync_loop(self) -> None:
-        """Periodically push our manifest for each shared folder to every
-        pinned peer that's currently reachable. One-way per cycle; the
-        reverse direction happens when the peer initiates."""
-        # Initial settle delay so discovery + state are fully up.
-        try:
-            await asyncio.sleep(8.0)
-            while True:
-                await self._run_one_folder_sync_cycle()
-                await asyncio.sleep(30.0)
-        except asyncio.CancelledError:
-            pass
+        """Periodically push each shared folder's manifest to every pinned,
+        reachable peer (full duplex per connection)."""
+        await self._folder_sync_scheduler().run_forever()
 
     async def _run_one_folder_sync_cycle(self) -> None:
-        if self.folder_engine is None or self.state is None or self.discovery is None:
-            return
-        folders = self.state.list_folders()
-        if not folders:
-            return
-        for folder in folders:
-            for peer_fp in folder["shared_with"]:
-                if not self._is_pinned(peer_fp):
-                    continue
-                # Find the peer in discovery.
-                peer = None
-                for p in self.discovery.registry.list():
-                    cand_fp = self._peer_fp_from_peer(p)
-                    if cand_fp == peer_fp:
-                        peer = p
-                        break
-                if peer is None:
-                    continue
-                try:
-                    # Full-duplex: one connection syncs BOTH directions
-                    # (we push our changes + pull theirs). Falls back to
-                    # half-duplex automatically against legacy peers that
-                    # don't advertise FOLDER_SYNC_BIDI_V1.
-                    await self.push_folder_to_peer(
-                        peer, folder["name"], bidirectional=True,
-                        background=True,
-                    )
-                except Exception as e:
-                    log.info("folder sync to %s failed: %s", peer.short_id, e)
+        await self._folder_sync_scheduler().run_cycle()
 
     async def serve_forever(self) -> None:
         assert self._peer_server and self._control_server
@@ -39015,6 +37034,205 @@ class Daemon:
             self._loop_watchdog_stop.set()
             self._loop_watchdog_stop = None
         self._release_instance_lock()
+
+
+# ─── extracted-service composition ─────────────────────────────────────
+# Each adapter implements one service's Protocol over a live Daemon. Every
+# operation reads the daemon at call time, so replaced stores, monkeypatched
+# seams and instance-level policy overrides are always observed.
+
+
+def _build_fabric_snapshot_cache(daemon: "Daemon") -> FabricSnapshotCache:
+    def route_candidates() -> list:
+        state = daemon.state
+        if state is None:
+            return []
+        return list(state.list_route_candidates(verified_only=True, limit=24))
+
+    return FabricSnapshotCache(route_candidates=route_candidates)
+
+
+def _call_resume_enabled_by_environment() -> bool:
+    return (
+        os.environ.get("ONE_LINK_CALL_RESUME", "").strip().lower() in {"1", "true", "yes", "on"}
+        or "PYTEST_CURRENT_TEST" not in os.environ
+        or bool(os.environ.get("ONE_LINK_HOME"))
+    )
+
+
+def _build_call_lifecycle_service(daemon: "Daemon") -> CallLifecycleService:
+    from one_link.paths import data_dir as _data_dir
+
+    return CallLifecycleService(
+        _DaemonCallPort(daemon),
+        ledger=CallResumeLedger(
+            _data_dir() / "logs" / "call_resume_ledger.json",
+            enabled=_call_resume_enabled_by_environment(),
+            replace=lambda source, target: _atomic_replace(source, target),
+        ),
+        logger=log,
+    )
+
+
+class _DaemonCallPort:
+    """``CallLifecyclePort`` over a live :class:`Daemon`."""
+
+    __slots__ = ("_daemon",)
+
+    def __init__(self, daemon: "Daemon") -> None:
+        self._daemon = daemon
+
+    def local_short_id(self) -> str:
+        return self._daemon.me.short_id
+
+    def local_fingerprint(self) -> str:
+        return self._daemon.me.fingerprint
+
+    def local_public_bytes(self) -> bytes:
+        return self._daemon.me.public_bytes
+
+    def call_registry(self) -> Any:
+        return self._daemon._call_registry
+
+    def call_reliability(self) -> Any:
+        return self._daemon._call_reliability
+
+    def call_policy(self) -> CallLifecyclePolicy:
+        daemon = self._daemon
+        return CallLifecyclePolicy(
+            preinvite_ttl_s=float(daemon.CALL_PREINVITE_TTL_S),
+            preinvite_cache_max=int(daemon.CALL_PREINVITE_CACHE_MAX),
+            preinvite_cache_per_peer_max=int(daemon.CALL_PREINVITE_CACHE_PER_PEER_MAX),
+            signal_send_timeout_s=float(daemon.CALL_SIGNAL_SEND_TIMEOUT_S),
+        )
+
+    def call_capability_allowed(self, peer_fp: str, call_kind: str) -> bool:
+        return self._daemon._call_capability_allowed(peer_fp, call_kind)
+
+    def trust_decision_for_inbound(self, peer_fp: str) -> Any | None:
+        return self._daemon._trust_ledger_check_inbound(peer_fp)
+
+    def is_pinned(self, peer_fp: str) -> bool:
+        return self._daemon._is_pinned(peer_fp)
+
+    def resolve_peer_for_outbound(self, peer_fp: str) -> Any | None:
+        return self._daemon._resolve_peer_for_outbound(peer_fp)
+
+    async def resolve_for_send(self, peer_fp: str) -> Any | None:
+        return await self._daemon.resolve_for_send(peer_fp)
+
+    def peer_fp_from_peer(self, peer: Any) -> str | None:
+        return self._daemon._peer_fp_from_peer(peer)
+
+    def live_inbound_channels(self, peer_fp: str) -> Any:
+        return self._daemon._inbound_live_channels.get(peer_fp, ())
+
+    async def send_to(self, peer: Any, msgs: list[dict]) -> Any:
+        return await self._daemon.send_to(peer, msgs)
+
+    async def send_control(self, peer: Any, msg: dict) -> Any:
+        return await self._daemon._send_control(peer, msg)
+
+    def broadcast_tail(self, event: dict) -> None:
+        self._daemon._broadcast_tail(event)
+
+    def save_resume_ledger(self) -> None:
+        self._daemon._save_call_resume_ledger()
+
+    async def commit_outbound_capsule(self, mgr: Any, capsule: Any) -> None:
+        await self._daemon._commit_outbound_capsule(mgr, capsule)
+
+    async def handle_capsule_transport_message(
+        self, *, channel: Any, msg: dict, peer_fp: str
+    ) -> None:
+        await self._daemon._handle_capsule_transport_message(
+            channel=channel, msg=msg, peer_fp=peer_fp,
+        )
+
+    def open_predictive_call(self, call_id: str) -> None:
+        self._daemon._predictive.open_call(call_id)
+
+
+class _DaemonFolderSyncPort:
+    """``FolderSyncReceiptPort`` over a live :class:`Daemon`."""
+
+    __slots__ = ("_daemon",)
+
+    def __init__(self, daemon: "Daemon") -> None:
+        self._daemon = daemon
+
+    def local_short_id(self) -> str:
+        return self._daemon.me.short_id
+
+    def receipt_limits(self) -> FolderReceiptLimits:
+        return FolderReceiptLimits(resume_alignment=CHUNK_SIZE)
+
+    def incoming_blob_keys(self) -> tuple:
+        return tuple(getattr(self._daemon, "_incoming_blobs", {}))
+
+    def abort_blob_key(self, key: tuple, *, preserve_partial: bool = False) -> None:
+        self._daemon._abort_blob_key(key, preserve_partial=preserve_partial)
+
+    def validate_manifest_entries(self, entries: list[dict]) -> None:
+        self._daemon._validate_folder_manifest_entries(entries)
+
+    def verification_storage(self) -> FolderVerificationStorage | None:
+        daemon = self._daemon
+        blob_store, state, engine = daemon.blob_store, daemon.state, daemon.folder_engine
+        if blob_store is None or state is None or engine is None:
+            return None
+        return FolderVerificationStorage(blobs=blob_store, state=state, engine=engine)
+
+    async def send_folder_message(
+        self, channel: Any, msg: dict, *, deadline: float | None = None
+    ) -> None:
+        await self._daemon._send_folder_message(channel, msg, deadline=deadline)
+
+
+class _DaemonFolderSchedulerPort:
+    """``FolderSyncSchedulerPort`` over a live :class:`Daemon`."""
+
+    __slots__ = ("_daemon",)
+
+    def __init__(self, daemon: "Daemon") -> None:
+        self._daemon = daemon
+
+    def sync_ready(self) -> bool:
+        daemon = self._daemon
+        return not (
+            daemon.folder_engine is None or daemon.state is None or daemon.discovery is None
+        )
+
+    def list_folders(self) -> Any:
+        state = self._daemon.state
+        if state is None:
+            raise RuntimeError("folder sync asked for folders before state was open; sync_ready() says when")
+        return state.list_folders()
+
+    def discovered_peers(self) -> Any:
+        discovery = self._daemon.discovery
+        if discovery is None:
+            raise RuntimeError("folder sync asked for peers before discovery was up; sync_ready() says when")
+        return discovery.registry.list()
+
+    def peer_fp_from_peer(self, peer: Any) -> str | None:
+        return self._daemon._peer_fp_from_peer(peer)
+
+    def is_pinned(self, peer_fp: str) -> bool:
+        return self._daemon._is_pinned(peer_fp)
+
+    async def push_folder_to_peer(
+        self, peer: Any, folder_name: str, *, bidirectional: bool, background: bool
+    ) -> Any:
+        return await self._daemon.push_folder_to_peer(
+            peer, folder_name, bidirectional=bidirectional, background=background,
+        )
+
+    def ui_broadcaster(self) -> Any:
+        daemon = self._daemon
+        if daemon.ui_server is None:
+            return None
+        return lambda event: daemon.ui_server.broadcast(event)
 
 
 HEARTBEAT_FILE = "daemon.heartbeat"

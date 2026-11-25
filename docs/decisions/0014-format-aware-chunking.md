@@ -93,3 +93,109 @@ This is the verification gate. Phase B doesn't ship without it.
 - ZIP spec (PKWARE APPNOTE 6.3.10): https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT
 - ADR-0001 (CDC kernel) — the kernel format-aware chunking augments.
 - ADR-0003 (on-disk format) — the `FORMAT_AWARE` flag bit.
+
+---
+
+## Amendment 1 (2026-11-25): format-aware chunking v2 -- local, content-defined cut selection
+
+**Status:** ACCEPTED. **Changes format-aware chunk boundaries** (format-aware chunking v2). Plain CDC boundaries
+(ADR-0001, `ol_chunk/tests/fixtures/cdc_golden_v1.txt`) are byte-identical.
+
+### Context: the measured defect
+
+The injector above keeps every structural boundary unless it lies within `min_size` of the previously accepted one.
+On a container whose records are denser than `min_size` that rule is a chain anchored only on the previous accepted
+cut, i.e. fixed-size chunking at record granularity, with no content-defined resynchronisation. Witness (MEASURED,
+`dense_resync.py`, release build): a valid 64 MiB MCAP of equal records with one record inserted after record 1000.
+Bytes of v2 whose chunk address is not among v1's:
+
+| Record size | Format-aware v1 | Plain FastCDC |
+| --- | --- | --- |
+| 32 B | 63.98 MiB (100%) | 0.08 MiB |
+| 100 B | 63.91 MiB (99.9%) | 0.10 MiB |
+| 1,024 B | 63.02 MiB (98.5%) | 0.13 MiB |
+
+A 4 GiB dense MCAP gave 524,287 chunks, every one exactly `min_size`. The same holds for a ZIP of many small members
+and for dense H.264. The real 50 MB MCAP corpus never showed it because its records are large. (Measured nuance: with
+strongly varying record sizes the chain does converge, as FastCDC's own min-size skip does; with equal or periodic
+record sizes, common in robotics logs, it never does.)
+
+### Decision
+
+Each candidate `c_i` (unit `i` = `[c_i, c_{i+1})`, length `L_i`; the last unit ends at EOF) is decided from local
+facts, then the v1 absorption is applied unchanged:
+
+1. **Structural** if `max(L_{i-1}, L_i) >= min_size`: kept. Absorption only chains through gaps shorter than
+   `min_size`, so wherever every unit is at least `min_size` long v2 equals v1 exactly, and records of at least
+   `avg_size` still start a format-forced chunk.
+2. **Dense** otherwise. `fp_i` is a fixed 64-bit mix (wyhash-style 128-bit multiply-fold) of the unit's first
+   `min(32, L_i)` bytes and `L_i`: a pure function of the unit's own bytes. The candidate *survives* iff
+   `fp_i * avg_size < L_i * 16 * 2^64` (exact `u128`), and is kept iff it survives and `fp_i` is strictly greater
+   than the fingerprint of every other surviving dense candidate within `h = max(avg_size / 2, min_size)` bytes.
+
+This is local-maximum content-defined chunking (Bjørner, Blass, Gurevich, "Content-dependent chunking for
+differential compression: the local maximum approach") applied over structural candidates, after a size-weighted
+thinning. One implementation (`ol_chunk/src/select.rs`) serves the in-memory and seekable scanners, fed the same
+candidates and head bytes by the shared pull-style walkers; in-memory == file == seekable holds by construction and
+is tested.
+
+### Why this rule (DERIVED; each property is tested)
+
+- **No chain.** Two kept dense cuts are at least `h >= min_size` apart (two survivors within `h` cannot both be the
+  strict maximum), so absorption keeps every kept dense cut and converges at each one.
+- **Locality.** A dense decision depends only on candidates within `h`, so an insertion, deletion or edit of `L`
+  bytes at `p` changes decisions only in `[p - h, p + L + h]`. Every chunk outside that interval and its two
+  straddling chunks is unchanged: **re-sent <= 2h + L + 2 * max_size** (576 KiB + `L` for 8/64/256 KiB), and in
+  expectation `<= 2h + L + E[S^2]/E[S]` for chunk size `S`.
+- **Degenerate input falls back to plain CDC.** Candidates that fingerprint alike tie, and ties keep nothing, so a
+  run of identical heads gets no dense cut and plain FastCDC (which resynchronises on content) chunks it.
+- **Target granularity.** In a uniform dense run about 16 survivors fall in each `2h` window, so kept cuts are about
+  `avg_size` apart whatever the record size, plain FastCDC's granularity.
+- **Cost.** One compare per candidate decides survival; only `16 L / avg_size` of the candidates (0.8% for 32-byte
+  records) reach the branchy monotonic deque. Selector state is the dense survivors within `h` (bounded by `h / 4`).
+
+### Alternatives measured
+
+`cargo test -p ol_chunk --release --lib rule_comparison -- --ignored --nocapture` (16 MiB logs, default profile,
+24 edit positions each; re-sent KiB, mean / worst, after one inserted record):
+
+| Workload | v1 chain | S1: keep iff `fp * avg < L * 2^64` (structural at `>= avg`) | local maximum, unthinned | **v2** |
+| --- | --- | --- | --- | --- |
+| MCAP, 32 B records | 8,469 / 14,752 | 97 / 203 | 74 / 131 | **75 / 125** |
+| MCAP, 100 B records | 8,468 / 14,751 | 119 / 252 | 72 / 132 | **74 / 153** |
+| MCAP, 1,024 B records | 8,470 / 14,753 | 105 / 241 | 74 / 150 | **67 / 138** |
+| ZIP, 2,000 members of 1-6 KB | 35 / 110 | 115 / 244 | 71 / 164 | **79 / 158** |
+| MCAP, all heads identical | 8,468 / 14,751 | 95 / 217 | 103 / 217 | **95 / 217** |
+| MCAP, a shared head S1 keeps | 8,468 / 14,751 | **6,763 / 14,751** | 148 / 275 | **99 / 174** |
+
+- **S1** (keep each dense candidate with probability `L / avg`, as first proposed) is KILLED by a constructive
+  witness: records sharing a head that S1 keeps (found by search; probability `L / avg` per head) make S1 keep
+  every record, which is the v1 chain again. Its mean re-sent on random dense logs is also 1.3-1.6x v2's.
+- **Unthinned local maximum** matches v2 within about 10% on random logs, is worse on degenerate insertions
+  (identical or alternating heads), and costs 12 ns per candidate for the deque against v2's thinned path.
+- **Structural threshold `avg_size` instead of `min_size`** would change chunking of logs whose records are between
+  `min_size` and `avg_size` for no resync gain (absorption cannot chain through gaps of at least `min_size`); it was
+  not adopted.
+
+### Consequences
+
+- Format-aware boundaries change for containers with runs of two or more consecutive sub-`min_size` units, and only
+  there. Peers chunking with v1 and v2 dedup each other only where the boundaries agree (sparse containers). A
+  deliberate future change needs a new version and amendment; `ol_chunk/tests/dense_resync.rs` pins v2 digests for
+  dense MCAP, ZIP and fragmented MP4.
+- In dense regions chunks are about `avg_size` instead of `min_size`: one eighth as many chunks, and an in-place
+  edit there re-sends about 64 KiB instead of about 8 KiB (plain FastCDC's behaviour).
+- Throughput, 256 MiB dense MCAP of 32-byte records, three interleaved rounds, medians (v1 -> v2): in-memory
+  1,073 -> 2,341 MiB/s; real file (`format_aware_file`) 754 -> 1,207 MiB/s; the seekable API over an in-memory
+  `Cursor` 2,041 -> 1,759 MiB/s (-14%: v1 did no per-record selection work, and a `Cursor` has no read syscalls for
+  v2's read-once window to save). The seekable scanner now slides its header window over dense records and hashes
+  short segments from it, reading a dense source once.
+
+### Verification
+
+`ol_chunk/tests/dense_resync.rs` (the witness as a Rust test; insert/delete/edit on dense MCAP of 32, 100 and
+1,024-byte records and on a ZIP of 2,000 small members against the per-edit bound; the mean against the expected
+bound; the v1 rule failing the same bound on the same bytes; sparse containers equal to v1; pinned v2 digests),
+`ol_chunk/src/select.rs` (streaming selector equal to the rule in quadratic form; fingerprint purity; spacing; ties),
+`ol_chunk/tests/stream_contracts.rs` and `ol_chunk/tests/walker_differential.rs` (file == in-memory on every payload
+path, dense logs of every format, fragmented and interrupted reads, read-once).

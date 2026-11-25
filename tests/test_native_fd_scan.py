@@ -264,3 +264,56 @@ def test_profiles_fastcdc_refuses_raise_valueerror_and_never_abort(tmp_path: Pat
     proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr[-2000:])
     assert "refused 8 of 8" in proc.stdout
+
+
+def _dense_mcap(record_payloads: list[bytes]) -> bytes:
+    magic = b"\x89MCAP0\r\n"
+    parts = [magic, b"\x01" + struct.pack("<Q", 4) + b"ros2"]
+    parts.extend(b"\x05" + struct.pack("<Q", len(p)) + p for p in record_payloads)
+    parts.append(magic)
+    return b"".join(parts)
+
+
+def _resent_bytes(old: bytes, new: bytes, fmt: str) -> tuple[int, int]:
+    known = {bytes(b.raw_address) for b in chunk.format_aware_boundaries(old, fmt)}
+    chunks = chunk.format_aware_boundaries(new, fmt)
+    return sum(b.end - b.start for b in chunks if bytes(b.raw_address) not in known), len(chunks)
+
+
+@pytest.mark.parametrize("record_bytes", [23, 91, 1015])
+def test_dense_record_log_resynchronises_after_one_inserted_record(record_bytes: int):
+    """Format-aware chunking v2: an insertion re-sends a bounded neighbourhood, not the file.
+
+    Under v1 (every candidate, then min-size absorption) the accepted cuts of a
+    dense log formed a chain anchored on the previous cut, so one inserted
+    record shifted every later chunk: 98.5-100% of a 64 MiB log was re-sent.
+    The bound is the selector's own: 2h + L + 2*max at the default profile
+    (h = max(avg/2, min) = 32 KiB, max = 256 KiB), i.e. 576 KiB + L.
+    """
+    assert chunk.FORMAT_AWARE_CHUNKING_VERSION == 2
+    rng = random.Random(7)
+    count = (16 << 20) // (record_bytes + 9)
+    payloads = [rng.randbytes(record_bytes) for _ in range(count)]
+    old = _dense_mcap(payloads)
+    edited = payloads[:1000] + [rng.randbytes(record_bytes)] + payloads[1000:]
+    new = _dense_mcap(edited)
+    resent, chunks = _resent_bytes(old, new, "mcap")
+    bound = 576 * 1024 + record_bytes + 9
+    assert resent <= bound, f"re-sent {resent} of {len(new)} bytes after one insertion (bound {bound})"
+    assert resent < len(new) // 16, "the insertion must not shift the tail of the log"
+    # Not fixed-size chunking: the dense region is cut near avg_size, not at min_size.
+    mean_chunk = len(new) / chunks
+    assert chunk.CDC_AVG_SIZE // 4 <= mean_chunk <= chunk.CDC_MAX_SIZE, mean_chunk
+
+
+def test_sparse_records_still_start_format_forced_chunks():
+    rng = random.Random(11)
+    payloads = [rng.randbytes(300_000) for _ in range(12)]
+    data = _dense_mcap(payloads)
+    boundaries = chunk.format_aware_boundaries(data, "mcap")
+    forced_starts = {b.start for b in boundaries if b.format_forced}
+    record_starts, pos = [], 8 + 13
+    for payload in payloads:
+        record_starts.append(pos)
+        pos += 9 + len(payload)
+    assert set(record_starts[1:]) <= forced_starts, "every large record must begin a forced chunk"

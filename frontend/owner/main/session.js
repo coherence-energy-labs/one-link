@@ -184,29 +184,26 @@
     });
   }
 
+  // The background polling cluster: [refresh, period ms]. Boot starts
+  // it; a 401 burst pauses it; explicit recovery resumes it.
+  function _mainPollTasks() {
+    return [
+      [refreshPeers, 5000],
+      [refreshTransfers, 4000],
+      [refreshStatus, 8000],
+      [refreshOneHealth, 15000],
+      [refreshFabricTruth, 30000],
+      [refreshGroups, 12000],
+    ];
+  }
   function _pauseMainPollTimers() {
-    const timers = state._mainPollTimers;
-    if (!Array.isArray(timers) || !timers.length) return;
-    for (const id of timers) {
-      try { clearInterval(id); } catch (_) {}
-    }
-    // Empty the array; ``_resumeMainPollTimers`` re-schedules
-    // fresh intervals so we don't accidentally double-fire after
-    // a partial pause/resume cycle.
-    state._mainPollTimers = [];
-    state._mainPollTimersPaused = true;
+    // pollingCluster empties its timers; ``_resumeMainPollTimers``
+    // re-schedules fresh intervals so we don't accidentally
+    // double-fire after a partial pause/resume cycle.
+    pollingCluster.pause();
   }
   function _resumeMainPollTimers() {
-    if (!state._mainPollTimersPaused) return;
-    state._mainPollTimersPaused = false;
-    state._mainPollTimers = [
-      setInterval(refreshPeers, 5000),
-      setInterval(refreshTransfers, 4000),
-      setInterval(refreshStatus, 8000),
-      setInterval(refreshOneHealth, 15000),
-      setInterval(refreshFabricTruth, 30000),
-      setInterval(refreshGroups, 12000),
-    ];
+    pollingCluster.resume(_mainPollTasks());
   }
 
   function showSessionExpiredBanner() {

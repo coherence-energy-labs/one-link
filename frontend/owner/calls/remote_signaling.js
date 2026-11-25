@@ -2,11 +2,10 @@
     const localStream = media.localStream;
     if (media.pc) {
       try { media.pc.close(); } catch (_) {}
-      media.pc = null;
+      mediaState.set("pc", null);
     }
-    media.iceConfigReady = null;
-    callUI.pendingIceCandidates = [];
-    callUI.appliedIceKeys.clear();
+    mediaState.set("iceConfigReady", null);
+    callState.forgetIceSignals();
     const pc = setupRtcPeerConnection();
     if (!pc) return false;
     if (localStream) ensureLocalTracksOnPeerConnection();
@@ -50,7 +49,7 @@
   }
 
   async function recoverRemoteOfferCollision(sdp, key) {
-    callUI.remoteOfferCollisionCount += 1;
+    callState.increment("remoteOfferCollisionCount", 1);
     const ageMs = Date.now() - Number(callUI.lastLocalOfferCreatedMs || 0);
     const shouldRecover = callUI.remoteOfferCollisionCount >= 2 || ageMs > 7000;
     reportCallEvent("offer_collision", {
@@ -76,11 +75,13 @@
     }
     try {
       await media.pc.setRemoteDescription({ type: "offer", sdp });
-      if (key) callUI.appliedRemoteOfferKeys.add(key);
-      callUI.remoteOfferCollisionCount = 0;
-      callUI.lastLocalOfferSdp = "";
-      callUI.lastOfferSendMs = 0;
-      callUI.lastLocalOfferCreatedMs = 0;
+      if (key) callState.markRemoteOfferApplied(key);
+      callState.update({
+        remoteOfferCollisionCount: 0,
+        lastLocalOfferSdp: "",
+        lastOfferSendMs: 0,
+        lastLocalOfferCreatedMs: 0,
+      });
       await flushPendingIceCandidates();
       await sendLocalSdpAnswer();
       reportCallEvent("offer_collision_recovered");
@@ -123,7 +124,7 @@
       && media.pc.remoteDescription.type === "offer"
       && sdpKey(media.pc.remoteDescription.sdp) === key
     ) {
-      if (key) callUI.appliedRemoteOfferKeys.add(key);
+      if (key) callState.markRemoteOfferApplied(key);
       const hasLocalAnswer = !!(
         callUI.lastLocalAnswerSdp
         || (media.pc.localDescription && media.pc.localDescription.type === "answer")
@@ -154,8 +155,8 @@
     }
     try {
       await media.pc.setRemoteDescription({ type: "offer", sdp });
-      if (key) callUI.appliedRemoteOfferKeys.add(key);
-      callUI.remoteOfferCollisionCount = 0;
+      if (key) callState.markRemoteOfferApplied(key);
+      callState.set("remoteOfferCollisionCount", 0);
       await flushPendingIceCandidates();
       await sendLocalSdpAnswer();
     } catch (_) { /* fall through */ }
@@ -170,14 +171,14 @@
       && media.pc.remoteDescription.type === "answer"
       && sdpKey(media.pc.remoteDescription.sdp) === key
     ) {
-      if (key) callUI.appliedRemoteAnswerKeys.add(key);
+      if (key) callState.markRemoteAnswerApplied(key);
       return;
     }
     if (media.pc.signalingState !== "have-local-offer") return;
     try {
       await media.pc.setRemoteDescription({ type: "answer", sdp });
-      if (key) callUI.appliedRemoteAnswerKeys.add(key);
-      callUI.remoteOfferCollisionCount = 0;
+      if (key) callState.markRemoteAnswerApplied(key);
+      callState.set("remoteOfferCollisionCount", 0);
       await flushPendingIceCandidates();
     } catch (_) { /* fall through */ }
   }
@@ -188,12 +189,12 @@
       if (!iceKey || !callUI.pendingIceCandidates.some((item) => (
         `${item.call_id || callUI.activeCallId || ""}|${item.sdp_mid || ""}|${item.sdp_m_line_index ?? ""}|${item.candidate || ""}|${item.end_of_candidates ? "end" : ""}`
       ) === iceKey)) {
-        callUI.pendingIceCandidates.push(data);
+        callState.queueIceCandidate(data);
       }
       return;
     }
     if (iceKey && callUI.appliedIceKeys.has(iceKey)) return;
-    if (iceKey) callUI.appliedIceKeys.add(iceKey);
+    if (iceKey) callState.markIceApplied(iceKey);
     // end_of_candidates → addIceCandidate(null) signals completion.
     if (data && data.end_of_candidates) {
       try { await media.pc.addIceCandidate(null); } catch (_) {}
@@ -210,7 +211,7 @@
 
   async function flushPendingIceCandidates() {
     if (!media.pc || !media.pc.remoteDescription) return;
-    const queued = callUI.pendingIceCandidates.splice(0);
+    const queued = callState.takeQueuedIceCandidates();
     for (const item of queued) {
       await applyRemoteIceCandidate(item);
     }

@@ -156,7 +156,7 @@
     if (statusEl) statusEl.textContent = "Leaving group...";
     try {
       await leaveDaemonGroup(group.group_id);
-      state.daemon_active_group = null;
+      daemonConversation.leaveGroup();
       await _refreshDaemonRoster();
       _showOnly("#daemon-roster-card");
     } catch (e) {
@@ -176,7 +176,7 @@
       const reply = await setDaemonPeerAlias(peer.fingerprint, alias);
       // Update the in-memory peer record so the chat title reflects
       // the new alias without a full roster refetch.
-      peer.alias = reply.alias || "";
+      daemonConversation.updatePeer(peer, { alias: reply.alias || "" });
       const titleEl = $("#daemon-chat-title");
       if (titleEl) {
         titleEl.textContent =
@@ -199,7 +199,7 @@
     if (statusEl) statusEl.textContent = muted ? "Muting…" : "Unmuting…";
     try {
       const reply = await setDaemonPeerMute(peer.fingerprint, muted);
-      peer.muted = !!reply.muted;
+      daemonConversation.updatePeer(peer, { muted: !!reply.muted });
       if (statusEl) statusEl.textContent = peer.muted ? "Muted." : "Unmuted.";
     } catch (e) {
       // Roll back the toggle on failure.

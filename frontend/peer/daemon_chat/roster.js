@@ -17,8 +17,7 @@
         `Couldn't fetch chats: ${e && e.message ? e.message : e}`);
       return;
     }
-    state.daemon_roster_peers = peers.slice();
-    state.daemon_roster_groups = groups.slice();
+    daemonConversation.replaceRoster(peers, groups);
     if (!peers.length && !groups.length) {
       text(status, "No chats yet on this device. Pair a peer on your laptop first.");
       return;

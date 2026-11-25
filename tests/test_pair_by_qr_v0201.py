@@ -372,7 +372,7 @@ def test_autopair_waits_for_ice_gathering(peer_html: str):
     refactor cannot silently send a host-candidate-incomplete offer.
     """
     snippet = _autopair_flow(peer_html)
-    assert "await _waitForIceGatheringComplete(pc)" in snippet
+    assert "await step(_waitForIceGatheringComplete(pc))" in snippet
     assert "if (!iceComplete)" in snippet
     waiter = _snippet(peer_html, "function _waitForIceGatheringComplete", 2000)
     assert 'iceGatheringState === "complete"' in waiter
@@ -443,7 +443,7 @@ def test_boot_chains_autopair_after_identity(peer_html: str):
     idx = peer_html.find("const _pairQuery = _detectPairQuery();")
     dispatch_idx = peer_html.find("function _dispatchPostIdentityFlow()", idx)
     gate_idx = peer_html.find(
-        "if (!state.rec || state.post_identity_flow_started) return;",
+        "if (!peerIdentity.beginPostIdentityFlow()) return;",
         dispatch_idx,
     )
     run_idx = peer_html.find("_runAutoPairFlow(_pairQuery)", dispatch_idx)

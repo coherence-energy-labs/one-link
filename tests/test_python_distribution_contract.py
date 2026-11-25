@@ -81,7 +81,10 @@ def test_stable_distribution_contract_exactly_matches_source_tree() -> None:
     # 208: one_link.reachability_doctor added 2026-08-27. Being in this tuple
     # is also what bundles it as a PyInstaller hidden import, so the diagnosis
     # ships with the app rather than only existing in a source checkout.
-    assert len(build_identity.EXPECTED_STABLE_RUNTIME_MODULES) == 215
+    # 222: seven MNT-01/RUN-01 runtime services added 2026-11-25 (call_lifecycle,
+    # call_routes, fabric_snapshot, folder_manifest_policy, folder_sync_receipts,
+    # folder_sync_scheduler, off_loop_import); each is imported by daemon/server.
+    assert len(build_identity.EXPECTED_STABLE_RUNTIME_MODULES) == 222
     assert build_identity.EXPECTED_STABLE_RUNTIME_MODULES == tuple(
         sorted(set(build_identity.EXPECTED_STABLE_RUNTIME_MODULES))
     )
@@ -155,9 +158,12 @@ def test_distribution_source_contract_hashes_every_packaged_python_file() -> Non
     # peer row's proven layout table, laws discharged over every integer input.)
     # (221 / 240 before it: env_bounds.py, 2026-08-05. 220 / 239: bounded_resolver.py.)
     # Eight new reviewed modules: benchmark contract plus seven runtime services.
-    assert len(source_python) == 232
+    # MNT-01/RUN-01 (2026-11-25): seven more runtime services -- call_lifecycle,
+    # call_routes, fabric_snapshot, folder_manifest_policy, folder_sync_receipts,
+    # folder_sync_scheduler, off_loop_import.
+    assert len(source_python) == 239
     assert packaged_python == source_python
-    assert len(contract.payload_hashes) == 255
+    assert len(contract.payload_hashes) == 262
 
 
 def test_developer_only_modules_are_not_stable_distribution_requirements() -> None:

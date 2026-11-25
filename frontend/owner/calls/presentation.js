@@ -13,7 +13,7 @@
 
   function setReconnectState(on, text) {
     // doctrine-ok: §3.2.a internal state class; visible copy stays repair-oriented.
-    media.reconnecting = !!on;
+    mediaState.set("reconnecting", !!on);
     const surface = $$("#call-active-surface");
     const banner = $$("#call-reconnect-banner");
     surface?.classList.toggle("reconnecting", !!on);
@@ -56,11 +56,10 @@
   }
 
   function rememberCallHistory(label, outcome) {
-    callUI.callHistory.unshift({
+    callState.recordCallHistory({
       label: `${outcome || "Call"} · ${label || callUI.activeCallPeer || "Device"}`,
       when: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
     });
-    callUI.callHistory = callUI.callHistory.slice(0, 10);
     renderCallHistory();
   }
 
@@ -77,7 +76,7 @@
   $$("#btn-call-settings-close")?.addEventListener("click", () => toggleCallSettings(false));
   $$("#btn-call-refresh-devices")?.addEventListener("click", () => refreshCallDevicePickers().catch(() => {}));
   $$("#btn-call-video-fit")?.addEventListener("click", () => {
-    media.videoFit = media.videoFit === "contain" ? "cover" : "contain";
+    mediaState.set("videoFit", media.videoFit === "contain" ? "cover" : "contain");
     const surface = $$("#call-active-surface");
     if (surface) surface.classList.toggle("video-fit-contain", media.videoFit === "contain");
     const btn = $$("#btn-call-video-fit");
@@ -91,10 +90,10 @@
   $$("#btn-call-layout")?.addEventListener("click", () => cycleCallLayout());
   $$("#btn-call-captions")?.addEventListener("click", () => toggleCaptions());
   $$("#call-notes")?.addEventListener("input", (ev) => {
-    callUI.callNotes = ev.target.value || "";
+    callState.set("callNotes", ev.target.value || "");
   });
   $$("#call-noise-select")?.addEventListener("change", async (ev) => {
-    media.voiceProcessing = ev.target.value === "raw" ? "raw" : "smart";
+    mediaState.set("voiceProcessing", ev.target.value === "raw" ? "raw" : "smart");
     await replaceLocalMediaTracks("audio");
     reportCallEvent("voice_processing_changed", { state: media.voiceProcessing });
   });
@@ -172,7 +171,7 @@
     if (callUI.inboundCallId) {
       const callId = callUI.inboundCallId;
       hideIncomingRing();
-      callUI.inboundCallId = null;
+      callState.set("inboundCallId", null);
       await callApiPost({ action: "decline", call_id: callId });
       rememberCallHistory(callUI.inboundCallPeer, "Capsule");
     }
@@ -191,7 +190,7 @@
         hideIncomingRing();
         if (callUI.inboundCallId) {
           callApiPost({ action: "decline", call_id: callUI.inboundCallId }).catch(() => {});
-          callUI.inboundCallId = null;
+          callState.set("inboundCallId", null);
         }
         if (data.peer && typeof selectPeer === "function") selectPeer(data.peer);
         const composer = $$("#msg-input");
@@ -202,15 +201,15 @@
     });
   }
   $$("#call-mic-select")?.addEventListener("change", async (ev) => {
-    media.selectedAudioInputId = ev.target.value || "";
+    mediaState.set("selectedAudioInputId", ev.target.value || "");
     await replaceLocalMediaTracks("audio");
   });
   $$("#call-camera-select")?.addEventListener("change", async (ev) => {
-    media.selectedVideoInputId = ev.target.value || "";
+    mediaState.set("selectedVideoInputId", ev.target.value || "");
     await replaceLocalMediaTracks("video");
   });
   $$("#call-speaker-select")?.addEventListener("change", async (ev) => {
-    media.selectedAudioOutputId = ev.target.value || "";
+    mediaState.set("selectedAudioOutputId", ev.target.value || "");
     await applyAudioOutputDevice($$("#call-remote-audio"));
   });
   if (navigator.mediaDevices && typeof navigator.mediaDevices.addEventListener === "function") {

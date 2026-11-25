@@ -91,15 +91,69 @@ ZIP and H.264 Annex B cuts come from byte scans with no length arithmetic on
 untrusted fields; the seekable scanner reads those formats whole and runs the
 in-memory scanner.
 
+The walkers are pull-style (`RecordWalk::next`) and return each record start
+with the first `min(32, len - pos)` bytes there, from the same window access
+that read the record header: the cut selector needs those bytes, and the
+seekable scan never seeks per record to get them.
+
+## Format-aware chunking v2: which candidates become cuts
+
+**This changes format-aware boundaries** (ADR-0014, v2 amendment). Plain CDC
+boundaries, including `tests/fixtures/cdc_golden_v1.txt`, are unchanged.
+
+Every structural candidate (record, box, local-file-header or keyframe start)
+is a candidate cut; unit `i` is `[c_i, c_{i+1})` of length `L_i`. Format-aware
+v1 kept every candidate and dropped any closer than `min_size` to the previously
+accepted cut. On a dense container that is a cut chain anchored only on the
+previous cut, fixed-size chunking at record granularity: one inserted record
+shifted every later chunk, and a 64 MiB MCAP of 32-byte records re-sent 100% of
+itself (plain `FastCDC`: 0.1%). v2 decides each candidate from local facts and
+then applies v1's absorption unchanged (`src/select.rs`, one implementation for
+the in-memory and seekable scanners):
+
+- **Structural**, `max(L_{i-1}, L_i) >= min_size`: kept. Where every unit is at
+  least `min_size` long, v2 equals v1 exactly; records of at least `avg_size`
+  still start a format-forced chunk.
+- **Dense**, both neighbouring units shorter than `min_size`: with a fixed 64-bit
+  fingerprint `fp_i` of the unit's first `min(32, L_i)` bytes and `L_i`, the
+  candidate survives iff `fp_i * avg_size < L_i * 16 * 2^64` (exact `u128`), and
+  is kept iff it survives and `fp_i` is strictly greater than every other
+  surviving dense candidate's within `h = max(avg_size / 2, min_size)` bytes.
+
+Consequences: kept dense cuts are at least `h >= min_size` apart, so absorption
+cannot chain inside a dense run; an edit changes decisions only within `h` of
+itself; candidates that all fingerprint alike (identical heads and lengths) tie
+and get no dense cut, so plain `FastCDC` chunks them; kept cuts fall about
+`avg_size` apart whatever the record size. One edit of `L` bytes re-sends at most
+`2h + L + 2 * max_size` (576 KiB + `L` with the default profile), assuming that
+inside a segment longer than `max_size` plain `FastCDC` resynchronises within one
+chunk, and on average about one chunk; the derivation is in
+`tests/dense_resync.rs`.
+
+Measured (default profile, release build, one inserted record):
+
+| 64 MiB MCAP, record size | v1 re-sent | v2 re-sent | plain FastCDC |
+| --- | --- | --- | --- |
+| 32 B | 63.98 MiB (100%) | 0.03 MiB | 0.08 MiB |
+| 100 B | 63.91 MiB (99.9%) | 0.05 MiB | 0.10 MiB |
+| 1,024 B | 63.02 MiB (98.5%) | 0.12 MiB | 0.13 MiB |
+
+The tradeoff: in a dense region v1's chain made `min_size` chunks, so an
+in-place edit there re-sent about 8 KiB; v2 makes `avg_size`-scale chunks
+(plain `FastCDC`'s granularity, one eighth as many chunks), so it re-sends about
+64 KiB. Sparse containers are unaffected.
+
 ## Memory behavior
 
 | Component | Bound |
 | --- | --- |
 | Plain CDC payload window | `min(file_length, max(32 MiB, 4 * max_size))` |
-| Header read-ahead for MCAP/MP4/WAV | 64 KiB |
-| Forced-cut candidate/accepted/segment lists in the seekable scanner | None: online coalescing and immediate segment scanning |
+| Header window for MCAP/MP4/WAV, walk that jumps (sparse records) | 64 KiB |
+| Header window, sequential walk (dense records) | the unhashed span, at most `8 MiB + 2 * max_size + 2h + 64 KiB`, plus one 16 MiB read-ahead block; short segments are hashed from it, so a dense source is read once |
+| v2 cut selector | dense candidates within the last `h = max(avg_size / 2, min_size)` bytes (at most `h / 4 + 1`) and the structural cuts waiting behind them |
+| Forced-cut candidate/accepted/segment lists in the seekable scanner | None: online selection and immediate segment hashing |
 | Parallel CDC candidate workspace | O(payload window); depends on bytes and sizing, not total file length |
-| Scratch for a short forced segment | At most `max_size` |
+| Short-segment batch buffer, used only when the header window does not hold the batch | At most `8 MiB + max_size` |
 | Returned boundaries/hashes/format flags | O(output chunks), including corresponding Python objects |
 | ZIP/H.264 whole-buffer path | Input up to the explicit limit, plus in-memory scanner/output workspace |
 
@@ -124,9 +178,26 @@ explicit compatibility review and versioning.
 `tests/stream_contracts.rs` covers short/growing sources, read fragmentation,
 interruption and error propagation, whole-file limits and dense-record online
 behavior. Its two-million-record MCAP reader generates bytes on demand and
-asserts payload scanning begins before the header walk completes. This detects
-regression to collecting a full record-offset vector without materializing a
-large test corpus.
+asserts the source is read exactly once plus a derived 128 KiB + 8 bytes (the
+first header window twice and the trailing magic): collecting candidates or
+segments before hashing would read the payload a second time. It also checks
+every payload path of the file scanner (hashed from the header window, read by
+the writer after a jump, retention exceeded by one huge record) against the
+in-memory scanner under fragmented and interrupted reads, and truncation during
+a 16 MiB slide.
+
+`tests/dense_resync.rs` is the dense-resync witness as a Rust test (64 MiB of
+32-byte records, one inserted) plus insert, delete and edit on dense MCAP of
+32, 100 and 1,024-byte records and on a ZIP of 2,000 small members, each against
+the derived per-edit bound; the mean over 16 edit positions against
+`2h + L + E[S^2]/E[S]` computed from the log's own chunks; the v1 rule failing the
+same bound on the same bytes (the negative control); sparse containers
+chunking exactly as v1; and pinned v2 digests for dense MCAP, ZIP and fragmented
+MP4 (drift detection, not evidence of correctness). `src/select.rs` checks the
+streaming selector against the rule stated in quadratic form on 400 random
+candidate sets, the fingerprint's purity, the spacing bound and the tie rule.
+`cargo test -p ol_chunk --release --lib rule_comparison -- --ignored --nocapture`
+prints the measured comparison of v2 with the alternatives in ADR-0014.
 
 `tests/param_validation.rs` checks every kernel limit (one past it rejected, the
 limit and one inside accepted), the witnessed profiles, agreement with the
@@ -158,10 +229,30 @@ For bounded resource measurements run:
 cargo run --release -p ol_chunk --example stream_memory_probe -- 1000000
 ```
 
-The probe generates a virtual dense MCAP with zero-length record bodies, emits
-scan time, chunk count and a digest over every start/end/hash/flag, and caps
-input at ten million records. Compare identical probe binaries linked against
-baseline and candidate libraries, preserve each observation, and collect peak
-RSS in separate processes. Matching `output_digest` is required before
-interpreting a resource difference. This synthetic measurement does not claim
-disk, network or general file-transfer throughput.
+The probe generates a virtual dense MCAP of 17-byte records whose 8-byte body is
+the record's sequence number (identical records would, by design, get no v2
+dense cut), emits scan time, chunk count and a digest over every
+start/end/hash/flag, and caps input at ten million records. Compare identical
+probe binaries linked against baseline and candidate libraries, preserve each
+observation, and collect peak RSS in separate processes. Matching
+`output_digest` is required before interpreting a resource difference. This
+synthetic measurement does not claim disk, network or general file-transfer
+throughput.
+
+For dense-log resync and throughput across every scan path run:
+
+```sh
+cargo run --release -p ol_chunk --example dense_resync_probe -- <scratch_dir>
+```
+
+It prints the witness table above and best-of-three MiB/s over a 256 MiB MCAP
+of 32-byte records for the in-memory, `Cursor` and real-file paths, format-aware
+and plain, and checks in-memory == seekable. Compare builds only within one
+batch, interleaved: load from other processes moved unchanged code by 2x
+between runs. Measured that way (three interleaved rounds, medians, v1 -> v2):
+in-memory format-aware 1,073 -> 2,341 MiB/s; real file (`format_aware_file`)
+754 -> 1,207 MiB/s; seekable over a `Cursor` 2,041 -> 1,759 MiB/s. That last
+path is 14% slower: v1 did no per-record work beyond the walk (its cut choice
+was the defect), v2 spends about 6 ns per record on the fingerprint and
+selection, and a `Cursor` source has no read-syscall cost for v2's read-once
+window to save.

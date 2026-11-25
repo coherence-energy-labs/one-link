@@ -40,10 +40,16 @@ test("encoding preserves exact bytes and URL-safe presentation", () => {
 
 test("peer identity state is fresh and progress belongs to the injected instance", () => {
   const makeState = service("state").createPeerState;
+  const makeIdentity = service("identity").createPeerIdentity;
   const first = makeState();
   const second = makeState();
-  first.rec = { fingerprint: "fixture" };
-  assert.equal(second.rec, null);
+  const firstIdentity = makeIdentity();
+  const secondIdentity = makeIdentity();
+  firstIdentity.unlock({ fingerprint: "fixture" }, { v: 2 });
+  assert.equal(firstIdentity.rec().fingerprint, "fixture");
+  assert.equal(secondIdentity.rec(), null);
+  assert.equal(secondIdentity.envelope(), null);
+  assert.notEqual(first, second);
   let tick = 0;
   const progress = service("progress").createPeerProgress({
     state: first, performance: { now: () => tick++ * 10 },

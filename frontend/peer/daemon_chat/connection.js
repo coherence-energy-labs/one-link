@@ -69,8 +69,7 @@
     // don't want to lose any v0.19.x dispatch coverage.
     const rid = msg.rid || "";
     if (rid && state.daemon_pending.has(rid)) {
-      const pending = state.daemon_pending.get(rid);
-      state.daemon_pending.delete(rid);
+      const pending = daemonLink.takePending(rid);
       clearTimeout(pending.timer);
       if (msg.t === "error") {
         const error = new Error(msg.message || msg.code || "daemon error");
@@ -102,16 +101,15 @@
     const timeoutMs = (opts && opts.timeoutMs) || DAEMON_REQUEST_TIMEOUT_MS;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        if (state.daemon_pending.has(rid)) {
-          state.daemon_pending.delete(rid);
+        if (daemonLink.dropPending(rid)) {
           reject(new Error(`${t} timed out after ${timeoutMs}ms`));
         }
       }, timeoutMs);
-      state.daemon_pending.set(rid, { resolve, reject, timer });
+      daemonLink.addPending(rid, { resolve, reject, timer });
       try {
         dc.send(JSON.stringify(envelope));
       } catch (e) {
-        state.daemon_pending.delete(rid);
+        daemonLink.dropPending(rid);
         clearTimeout(timer);
         reject(e);
       }

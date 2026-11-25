@@ -31,7 +31,9 @@ use crate::cdc::{Boundary, CdcParams};
 use crate::error::ChunkError;
 use crate::format_aware::{scan_format_aware, ContainerFormat, FormatAwareChunkSet};
 use crate::pcdc;
-use crate::walk::{find_wav_data, walk_mcap_records, walk_mp4_boxes, ByteSource};
+use crate::select::{CutSelector, HEAD_BYTES};
+use crate::walk::{find_wav_data, ByteSource, RecordWalk};
+use rayon::prelude::*;
 
 /// Default payload window for [`scan_stream`]. Custom parameters use at least
 /// four maximum chunks; the allocation never exceeds the declared source length.
@@ -161,12 +163,26 @@ fn scan_stream_windowed<R: Read>(
 }
 
 /// Random access to a seekable source through a forward read-ahead window.
+///
+/// A walk that jumps (sparse records) refills a 64 KiB window at each jump. A
+/// walk that runs off the end of the window (dense records) instead slides it:
+/// the bytes from `retain_from` on are kept and the next `SEQUENTIAL_READ`
+/// bytes appended, so the segment writer can hash short segments from the
+/// window rather than read the source a second time. Retention is an
+/// optimisation only: whatever is not held is read from the source.
 struct Headers<'a, R> {
     source: &'a mut R,
     len: usize,
     window: Vec<u8>,
     window_start: usize,
+    /// First byte still wanted by the segment writer (`usize::MAX`: none).
+    retain_from: usize,
+    /// Most bytes a slide keeps behind the window end (the unhashed span).
+    retain_limit: usize,
 }
+
+/// Bytes appended when a dense walk slides the window.
+const SEQUENTIAL_READ: usize = 16 << 20;
 
 impl<'a, R: Read + Seek> Headers<'a, R> {
     fn new(source: &'a mut R, len: usize) -> Self {
@@ -175,27 +191,84 @@ impl<'a, R: Read + Seek> Headers<'a, R> {
             len,
             window: Vec::new(),
             window_start: 0,
+            retain_from: usize::MAX,
+            retain_limit: 0,
         }
+    }
+
+    /// `[start, end)` if the window holds it.
+    fn held(&self, start: usize, end: usize) -> Option<&[u8]> {
+        let from = start.checked_sub(self.window_start)?;
+        let to = end.checked_sub(self.window_start)?;
+        self.window.get(from..to)
     }
 }
 
 impl<R: Read + Seek> ByteSource for Headers<'_, R> {
     type Error = io::Error;
 
+    #[inline]
     fn len(&self) -> usize {
         self.len
     }
 
     /// The `n` bytes at `pos`, or `None` if they run past the source.
+    #[inline]
     fn at(&mut self, pos: usize, n: usize) -> io::Result<Option<&[u8]>> {
-        let Some(end) = pos.checked_add(n) else {
+        // Fast path: inside the window (which never extends past the source).
+        if let Some(offset) = pos.checked_sub(self.window_start) {
+            if offset
+                .checked_add(n)
+                .is_some_and(|end| end <= self.window.len())
+            {
+                return Ok(Some(&self.window[offset..offset + n]));
+            }
+        }
+        self.refill(pos, n)
+    }
+}
+
+impl<R: Read + Seek> Headers<'_, R> {
+    /// Make the window hold `[pos, pos + n)` and return those bytes.
+    #[cold]
+    #[inline(never)]
+    fn refill(&mut self, pos: usize, n: usize) -> io::Result<Option<&[u8]>> {
+        let Some(end) = pos.checked_add(n).filter(|&end| end <= self.len) else {
             return Ok(None);
         };
-        if end > self.len {
-            return Ok(None);
-        }
-        let held = pos >= self.window_start && end <= self.window_start + self.window.len();
-        if !held {
+        let window_end = self.window_start + self.window.len();
+        // A sequential walk (it ran off the end of the window rather than
+        // jumping past it) whose unhashed span is bounded slides the window.
+        let slide = !self.window.is_empty()
+            && (self.window_start..=window_end).contains(&pos)
+            && self.retain_from <= pos
+            && window_end.max(pos) - self.retain_from <= self.retain_limit;
+        if slide {
+            let new_end = (window_end + SEQUENTIAL_READ).max(end).min(self.len);
+            // Keep what the window already holds from `retain_from` on; when
+            // it lost that prefix (the walk read the trailing magic first, or
+            // jumped), reload it once: at most one window is read again.
+            let append_from = if self.retain_from >= self.window_start {
+                self.window.drain(..self.retain_from - self.window_start);
+                window_end
+            } else {
+                self.window.clear();
+                self.retain_from
+            };
+            self.window_start = self.retain_from;
+            let held = self.window.len();
+            self.source.seek(SeekFrom::Start(append_from as u64))?;
+            // Read into spare capacity: no zero-fill of the appended block.
+            (&mut *self.source)
+                .take((new_end - append_from) as u64)
+                .read_to_end(&mut self.window)?;
+            if self.window.len() - held != new_end - append_from {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "source shrank while its record headers were read",
+                ));
+            }
+        } else {
             let want = HEADER_READ_AHEAD.max(n).min(self.len - pos);
             self.source.seek(SeekFrom::Start(pos as u64))?;
             self.window.resize(want, 0);
@@ -209,56 +282,35 @@ impl<R: Read + Seek> ByteSource for Headers<'_, R> {
 
 /// [`crate::format_aware::mcap_record_offsets`] over a seekable source of
 /// `len` bytes, reading only record headers. This explicit list API returns
-/// O(records) offsets; the chunk scanner uses the online visitor instead.
+/// O(records) offsets; the chunk scanner consumes the walk online instead.
 pub fn mcap_record_offsets_seekable<R: Read + Seek>(
     source: &mut R,
     len: usize,
 ) -> io::Result<Vec<usize>> {
-    let mut offsets = Vec::new();
-    visit_mcap_record_offsets(source, len, |_, pos| {
-        offsets.push(pos);
-        Ok(())
-    })?;
-    Ok(offsets)
-}
-
-/// The shared MCAP walker over the header window. A visitor may seek/read
-/// payload through the source: the window is position-independent and every
-/// refill seeks explicitly.
-fn visit_mcap_record_offsets<R: Read + Seek>(
-    source: &mut R,
-    len: usize,
-    mut visit: impl FnMut(&mut R, usize) -> io::Result<()>,
-) -> io::Result<()> {
-    walk_mcap_records(&mut Headers::new(source, len), |h, pos| {
-        visit(h.source, pos)
-    })
+    collect_offsets(source, len, RecordWalk::mcap())
 }
 
 /// [`crate::format_aware::mp4_box_offsets`] over a seekable source. This list
-/// API retains O(boxes) offsets; the chunk scanner uses the online visitor.
+/// API retains O(boxes) offsets; the chunk scanner consumes the walk online.
 pub fn mp4_box_offsets_seekable<R: Read + Seek>(
     source: &mut R,
     len: usize,
 ) -> io::Result<Vec<usize>> {
-    let mut offsets = Vec::new();
-    visit_mp4_box_offsets(source, len, |_, pos| {
-        offsets.push(pos);
-        Ok(())
-    })?;
-    Ok(offsets)
+    collect_offsets(source, len, RecordWalk::mp4())
 }
 
-/// The shared ISO BMFF walker over the header window (see
-/// [`visit_mcap_record_offsets`] for the visitor contract).
-fn visit_mp4_box_offsets<R: Read + Seek>(
+/// Every record start the shared walker yields over the header window.
+fn collect_offsets<R: Read + Seek>(
     source: &mut R,
     len: usize,
-    mut visit: impl FnMut(&mut R, usize) -> io::Result<()>,
-) -> io::Result<()> {
-    walk_mp4_boxes(&mut Headers::new(source, len), |h, pos| {
-        visit(h.source, pos)
-    })
+    mut walk: RecordWalk,
+) -> io::Result<Vec<usize>> {
+    let mut headers = Headers::new(source, len);
+    let mut offsets = Vec::new();
+    while let Some((pos, _)) = walk.next(&mut headers)? {
+        offsets.push(pos);
+    }
+    Ok(offsets)
 }
 
 /// [`crate::format_aware::wav_data_offset`] over a seekable source.
@@ -288,58 +340,130 @@ fn verify_source_length<R: Seek>(source: &mut R, len: usize) -> io::Result<()> {
     Ok(())
 }
 
-/// Append one segment ending at a format-forced cut (or EOF). Keeping the
-/// small-segment scratch buffer avoids one payload allocation per tiny record.
-fn append_segment<R: Read + Seek>(
-    source: &mut R,
-    start: usize,
-    end: usize,
+/// Short segments (at most `max_size`) are hashed together, in parallel, once
+/// this many bytes of them are pending.
+const SEGMENT_BATCH: usize = 8 << 20;
+
+/// Turns accepted cuts into chunks over a seekable source, in order. Short
+/// segments are batched and hashed in parallel, from the header window when it
+/// holds them and otherwise after one read of the batch (at most
+/// `SEGMENT_BATCH + max_size` bytes); a segment longer than `max_size` is
+/// chunked by [`scan_stream`] over its own byte range.
+struct SegmentWriter {
     params: CdcParams,
-    scratch: &mut Vec<u8>,
-    out: &mut FormatAwareChunkSet,
-) -> io::Result<()> {
-    if start == end {
-        return Ok(());
-    }
-    source.seek(SeekFrom::Start(start as u64))?;
-    if end - start <= params.max_size as usize {
-        scratch.resize(end - start, 0);
-        source.read_exact(scratch)?;
-        out.boundaries.push(Boundary {
-            start,
-            end,
-            raw_address: blake3_wrap::chunk_address_raw(scratch),
-        });
-        out.format_aware.push(start != 0);
-    } else {
-        for (i, b) in scan_stream(
-            (&mut *source).take((end - start) as u64),
-            end - start,
+    /// End of the last segment handed over (the last accepted cut).
+    last: usize,
+    /// Start of the pending batch of short segments.
+    batch_start: usize,
+    /// Ends of the pending short segments, in order.
+    batch_ends: Vec<usize>,
+    buffer: Vec<u8>,
+    out: FormatAwareChunkSet,
+}
+
+impl SegmentWriter {
+    fn new(params: CdcParams) -> Self {
+        Self {
             params,
-        )?
-        .into_iter()
-        .enumerate()
-        {
-            out.boundaries.push(Boundary {
-                start: b.start + start,
-                end: b.end + start,
-                raw_address: b.raw_address,
-            });
-            out.format_aware.push(i == 0 && start != 0);
+            last: 0,
+            batch_start: 0,
+            batch_ends: Vec::new(),
+            buffer: Vec::new(),
+            out: FormatAwareChunkSet {
+                boundaries: Vec::new(),
+                format_aware: Vec::new(),
+            },
         }
     }
-    Ok(())
+
+    /// The segment `[last, end)` is complete.
+    fn segment_to<R: Read + Seek>(
+        &mut self,
+        headers: &mut Headers<'_, R>,
+        end: usize,
+    ) -> io::Result<()> {
+        if end - self.last <= self.params.max_size as usize {
+            self.batch_ends.push(end);
+            if end - self.batch_start >= SEGMENT_BATCH {
+                self.flush(headers)?;
+            }
+        } else {
+            self.flush(headers)?;
+            let start = self.last;
+            headers.source.seek(SeekFrom::Start(start as u64))?;
+            let chunks = scan_stream(
+                (&mut *headers.source).take((end - start) as u64),
+                end - start,
+                self.params,
+            )?;
+            for (i, b) in chunks.into_iter().enumerate() {
+                self.out.boundaries.push(Boundary {
+                    start: b.start + start,
+                    end: b.end + start,
+                    raw_address: b.raw_address,
+                });
+                self.out.format_aware.push(i == 0 && start != 0);
+            }
+            self.batch_start = end;
+        }
+        self.last = end;
+        // Everything before the pending batch has been hashed.
+        headers.retain_from = self.batch_start;
+        Ok(())
+    }
+
+    /// Hash the pending short segments in parallel.
+    fn flush<R: Read + Seek>(&mut self, headers: &mut Headers<'_, R>) -> io::Result<()> {
+        let Some(&end) = self.batch_ends.last() else {
+            return Ok(());
+        };
+        let start = self.batch_start;
+        let bytes = if let Some(held) = headers.held(start, end) {
+            held
+        } else {
+            self.buffer.resize(end - start, 0);
+            headers.source.seek(SeekFrom::Start(start as u64))?;
+            headers.source.read_exact(&mut self.buffer)?;
+            &self.buffer
+        };
+        let ranges: Vec<(usize, usize)> = std::iter::once(start)
+            .chain(self.batch_ends.iter().copied())
+            .zip(self.batch_ends.iter().copied())
+            .collect();
+        let addresses: Vec<[u8; 32]> = ranges
+            .par_iter()
+            .map(|&(s, e)| blake3_wrap::chunk_address_raw(&bytes[s - start..e - start]))
+            .collect();
+        for (&(s, e), raw_address) in ranges.iter().zip(addresses) {
+            self.out.boundaries.push(Boundary {
+                start: s,
+                end: e,
+                raw_address,
+            });
+            self.out.format_aware.push(s != 0);
+        }
+        self.batch_start = end;
+        self.batch_ends.clear();
+        headers.retain_from = end;
+        Ok(())
+    }
 }
 
 /// [`scan_format_aware`] over an immutable seekable source of exactly `len`
 /// bytes. Boundaries and format flags equal the in-memory scanner's. Shrinkage,
 /// growth and read/seek failures are errors, never a successful partial result.
 ///
-/// Record headers are coalesced online using the same minimum-distance rule as
-/// the in-memory implementation. No candidate, accepted-cut or segment list is
-/// retained. Payload/kernel workspace is bounded independently of source size;
-/// returned boundaries/flags still require O(output chunks) memory. ZIP/H264
-/// retain the explicit whole-file limit (see the module documentation).
+/// Record headers feed the same v2 cut selector as the in-memory scanner
+/// (`select.rs`), online: no candidate, accepted-cut or segment list is
+/// retained. Held workspace is the header window (64 KiB for a walk that jumps;
+/// for a dense walk, the unhashed bytes, at most 8 MiB + `max_size` + the
+/// horizon + 64 KiB, plus a 16 MiB read-ahead block), the selector's horizon of
+/// candidates (at most `max(avg_size / 2, min_size) / 4 + 1`), a short-segment
+/// batch buffer used only when the window does not hold the batch (at most
+/// 8 MiB + `max_size`) and the plain-CDC window for long segments, all
+/// independent of source size; returned boundaries and flags still require
+/// O(output chunks) memory. ZIP/H264 retain the explicit whole-file limit (see
+/// the module documentation).
 pub fn scan_format_aware_seekable<R: Read + Seek>(
     source: &mut R,
     len: usize,
@@ -367,45 +491,57 @@ pub fn scan_format_aware_seekable<R: Read + Seek>(
     }
 
     verify_source_length(source, len)?;
-    let mut out = FormatAwareChunkSet {
-        boundaries: Vec::new(),
-        format_aware: Vec::new(),
+    let mut selector = CutSelector::new(len, params);
+    let mut writer = SegmentWriter::new(params);
+    let mut headers = Headers::new(source, len);
+    headers.retain_from = 0;
+    headers.retain_limit = SEGMENT_BATCH
+        + 2 * params.max_size as usize
+        + 2 * crate::select::horizon(params)
+        + HEADER_READ_AHEAD;
+    let walk = match format {
+        Some(ContainerFormat::Mcap) => Some(RecordWalk::mcap()),
+        Some(ContainerFormat::Mp4) => Some(RecordWalk::mp4()),
+        _ => None,
     };
-    let mut scratch = Vec::new();
-    let mut last_accepted = 0usize;
-    let min = params.min_size as usize;
-    // The same absorption rule as scan_format_aware, with no O(records) list.
-    // A visitor may seek/read payload through the header reader's source: its
-    // cached window is position-independent and every refill seeks explicitly.
-    let mut accept = |source: &mut R, cut: usize| -> io::Result<()> {
-        if cut.saturating_sub(last_accepted) >= min && cut <= len.saturating_sub(min) {
-            append_segment(source, last_accepted, cut, params, &mut scratch, &mut out)?;
-            last_accepted = cut;
-        }
-        Ok(())
-    };
-    match format {
-        Some(ContainerFormat::Mcap) => visit_mcap_record_offsets(source, len, &mut accept)?,
-        Some(ContainerFormat::Mp4) => visit_mp4_box_offsets(source, len, &mut accept)?,
-        Some(ContainerFormat::Wav) => {
-            if let Some(cut) = wav_data_offset_seekable(source, len)? {
-                accept(source, cut)?;
+    if let Some(mut walk) = walk {
+        // A cut is written as soon as it is decided, once the walk is a
+        // horizon past it.
+        while let Some((pos, head)) = walk.next(&mut headers)? {
+            selector.offer(pos, head);
+            while let Some(cut) = selector.pop_accepted() {
+                writer.segment_to(&mut headers, cut)?;
             }
         }
-        None => {}
-        Some(ContainerFormat::Zip | ContainerFormat::H264AnnexB) => unreachable!(),
+    } else if format == Some(ContainerFormat::Wav) {
+        if let Some(pos) = find_wav_data(&mut headers)? {
+            let n = HEAD_BYTES.min(len - pos);
+            if let Some(head) = headers.at(pos, n)? {
+                selector.offer(pos, head);
+            }
+        }
     }
-    if last_accepted == 0 {
-        // With no accepted forced cuts use plain CDC, including natural cuts
-        // in inputs shorter than max_size. The forced-segment shortcut above
-        // intentionally treats such segments as one chunk, matching the oracle.
-        source.seek(SeekFrom::Start(0))?;
-        out.boundaries = scan_stream(&mut *source, len, params)?;
-        out.format_aware = vec![false; out.boundaries.len()];
+    selector.finish();
+    while let Some(cut) = selector.pop_accepted() {
+        writer.segment_to(&mut headers, cut)?;
+    }
+    let out = if writer.last == 0 {
+        // No accepted cut: plain CDC of the whole source, including natural
+        // cuts in inputs shorter than max_size (a forced segment that short is
+        // one chunk, matching the in-memory scanner).
+        headers.source.seek(SeekFrom::Start(0))?;
+        let boundaries = scan_stream(&mut *headers.source, len, params)?;
+        let format_aware = vec![false; boundaries.len()];
+        FormatAwareChunkSet {
+            boundaries,
+            format_aware,
+        }
     } else {
-        append_segment(source, last_accepted, len, params, &mut scratch, &mut out)?;
-    }
-    verify_source_length(source, len)?;
+        writer.segment_to(&mut headers, len)?;
+        writer.flush(&mut headers)?;
+        writer.out
+    };
+    verify_source_length(headers.source, len)?;
     Ok(out)
 }
 

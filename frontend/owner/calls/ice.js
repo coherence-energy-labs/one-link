@@ -94,7 +94,7 @@
   function _queueCallIcePayloads(payloads) {
     const bounded = Array.isArray(payloads) ? payloads.slice(0, 9) : [];
     const previous = media.iceSignalChain || Promise.resolve();
-    media.iceSignalChain = previous
+    mediaState.set("iceSignalChain", previous
       .catch(() => undefined)
       .then(async () => {
         for (const payload of bounded) {
@@ -105,7 +105,7 @@
             });
           }
         }
-      });
+      }));
     return media.iceSignalChain;
   }
 
@@ -118,8 +118,8 @@
     // ``call_event`` tail messages over the existing WebSocket.
     if (!window.RTCPeerConnection) return null;
     if (media.pc && media.pc.signalingState !== "closed") return media.pc;
-    media.localCandidateAddresses = [];
-    media.iceSignalChain = Promise.resolve();
+    mediaState.set("localCandidateAddresses", []);
+    mediaState.set("iceSignalChain", Promise.resolve());
     // Sovereignty default: no third-party STUN servers. The daemon may return
     // its private LAN-only Binding responder plus its OS-observed address;
     // together those preserve a direct same-LAN route when Firefox masks host
@@ -135,7 +135,7 @@
     // Resolve both local assistance and any explicitly configured public
     // STUN/TURN before the offer. Failure remains host-only and is observable;
     // it never triggers an undisclosed third-party fallback.
-    media.iceConfigReady = (async () => {
+    mediaState.set("iceConfigReady", (async () => {
       try {
         const iceUrl = callUI.activeCallId
           ? `/api/peer-rtc/ice-config?call_id=${encodeURIComponent(callUI.activeCallId)}`
@@ -145,21 +145,16 @@
         });
         if (!r.ok) return;
         const cfg = await r.json();
-        media.localCandidateAddresses = _callLocalAddressesFromIceConfig(cfg);
-        media.iceRelayReady = Array.isArray(cfg.iceServers)
+        mediaState.set("localCandidateAddresses", _callLocalAddressesFromIceConfig(cfg));
+        mediaState.set("iceRelayReady", Array.isArray(cfg.iceServers)
           && cfg.iceServers.some((srv) => {
             const urls = Array.isArray(srv.urls) ? srv.urls : [srv.urls];
             return urls.some((u) => String(u || "").toLowerCase().startsWith("turn:") || String(u || "").toLowerCase().startsWith("turns:"));
-          });
-        media.iceHelperReady = Array.isArray(cfg.iceServers) && cfg.iceServers.length > 0;
-        media.routePolicy = String(cfg.routePolicy?.mode || "direct_first");
-        media.routePolicyDetail = cfg.routePolicy || null;
-        media.bestRelayHealth = String(cfg.routePolicy?.best_relay_health || "");
-        media.bestRelayScore = Number.isFinite(Number(cfg.routePolicy?.best_relay_score))
-          ? Number(cfg.routePolicy.best_relay_score)
-          : null;
-        media.turnCredentialExpiresAtMs = Number(cfg.routePolicy?.credential_expires_at_ms || 0) || null;
-        media.forceRelayOnRepair = cfg.routePolicy?.force_relay_on_repair === true;
+          }));
+        mediaState.set("iceHelperReady", Array.isArray(cfg.iceServers) && cfg.iceServers.length > 0);
+        mediaState.set("routePolicy", String(cfg.routePolicy?.mode || "direct_first"));
+        mediaState.recordRoutePolicy(cfg.routePolicy);
+        mediaState.set("forceRelayOnRepair", cfg.routePolicy?.force_relay_on_repair === true);
         if (Array.isArray(cfg.iceServers) && cfg.iceServers.length > 0) {
           pc.setConfiguration({ iceServers: cfg.iceServers });
           if (media.iceRelayReady) {
@@ -172,7 +167,7 @@
       } catch (_) {
         reportCallEvent("ice_config_unavailable", { state: "host_only" });
       }
-    })();
+    })());
     pc.ontrack = (ev) => {
       bindRemoteTrackDiagnostics(ev.track);
       bindRemoteVideoElementDiagnostics();
@@ -232,7 +227,7 @@
       if (pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed") {
         repairMediaPath("ice_state_changed").catch(() => {});
       } else if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
-        callUI.qualityGoodTicks += 1;
+        callState.increment("qualityGoodTicks", 1);
       }
     };
     pc.onconnectionstatechange = () => {
@@ -240,10 +235,10 @@
       if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
         repairMediaPath("connection_state_changed").catch(() => {});
       } else if (pc.connectionState === "connected") {
-        callUI.qualityGoodTicks += 1;
+        callState.increment("qualityGoodTicks", 1);
       }
     };
-    media.pc = pc;
+    mediaState.set("pc", pc);
     ensureMediaTransceivers();
     return pc;
   }

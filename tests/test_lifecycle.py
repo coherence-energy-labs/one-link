@@ -62,6 +62,20 @@ def _assert_well_known_or_saturated_fallback(port: int) -> None:
     assert port > 0, "daemon failed to bind any port"
 
 
+def _assert_os_assigned(port: int) -> None:
+    """ONE_LINK_UI_PORT=0: a real port, and not one from the well-known range."""
+    assert 0 < port <= 65535, f"daemon published an impossible UI port {port}"
+    assert not _WELL_KNOWN_BASE <= port <= _WELL_KNOWN_BASE + _WELL_KNOWN_SPAN, (
+        f"daemon bound {port} in the well-known range although an OS-assigned port was requested"
+    )
+
+
+def _free_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
 def _control_request(
     port: int,
     cmd: str,
@@ -128,13 +142,23 @@ def _owner_api_status(port: int, token: str) -> int:
         return int(exc.code)
 
 
-def _spawn_daemon(home: Path, log: Path) -> subprocess.Popen:
+def _spawn_daemon(home: Path, log: Path, *, ui_port: str | None = "0") -> subprocess.Popen:
+    """Start a real daemon. ``ui_port`` is its ONE_LINK_UI_PORT; None leaves the variable unset.
+
+    The default is an OS-assigned port, so a test daemon never takes the
+    product's well-known UI port on a machine that also runs a real one. Only
+    the test of the default port policy passes None.
+    """
     # Live-daemon lane only: skip in the default hermetic gate.
     from tests.harness import private_mdns_type, require_live_daemon
 
     require_live_daemon()
     env = dict(os.environ)
     env["ONE_LINK_HOME"] = str(home)
+    if ui_port is None:
+        env.pop("ONE_LINK_UI_PORT", None)
+    else:
+        env["ONE_LINK_UI_PORT"] = ui_port
     # Private mDNS scope so this daemon never cross-discovers ambient
     # daemons on the LAN while the lifecycle test exercises port/token.
     env["ONE_LINK_MDNS_SERVICE_TYPE"] = private_mdns_type()
@@ -198,7 +222,7 @@ def test_owner_bootstrap_token_rotates_across_daemon_restart():
             token1 = _read_text(home, "ui.token")
             port1 = _read_port(home, "server.port")
             assert len(token1) >= 32
-            _assert_well_known_or_saturated_fallback(port1)
+            _assert_os_assigned(port1)
         finally:
             _stop(proc, home=home)
 
@@ -225,20 +249,94 @@ def test_owner_bootstrap_token_rotates_across_daemon_restart():
 def test_ui_port_is_in_well_known_range():
     """The daemon must prefer the well-known range when a slot is free.
     When the range is saturated by other daemons, an OS-assigned
-    fallback port is correct (the daemon must still start)."""
+    fallback port is correct (the daemon must still start).
+
+    This is the product's default policy, so it is the one live test that
+    leaves ONE_LINK_UI_PORT unset and lets a test daemon take a well-known
+    port, for the seconds this test runs."""
     tmp = Path(tempfile.mkdtemp(prefix="ol_port_"))
     try:
         home = tmp / "H"
         home.mkdir()
         log = tmp / "out.log"
 
-        proc = _spawn_daemon(home, log)
+        proc = _spawn_daemon(home, log, ui_port=None)
         try:
             port = _read_port(home, "server.port")
             _assert_well_known_or_saturated_fallback(port)
         finally:
             _stop(proc, home=home)
     finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@pytest.mark.live_daemon
+@pytest.mark.timeout(60)
+def test_ui_port_zero_gives_a_real_daemon_an_os_assigned_port():
+    """ONE_LINK_UI_PORT=0: the daemon serves its owner API on a port outside the well-known range."""
+    tmp = Path(tempfile.mkdtemp(prefix="ol_port0_"))
+    try:
+        home = tmp / "H"
+        home.mkdir()
+        proc = _spawn_daemon(home, tmp / "out.log", ui_port="0")
+        try:
+            port = _read_port(home, "server.port")
+            _assert_os_assigned(port)
+            assert _owner_api_status(port, _read_text(home, "ui.token")) == 200
+        finally:
+            _stop(proc, home=home)
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@pytest.mark.live_daemon
+@pytest.mark.timeout(60)
+def test_ui_port_exact_is_bound_exactly_by_a_real_daemon():
+    """ONE_LINK_UI_PORT=N: the daemon serves on N and nowhere else."""
+    tmp = Path(tempfile.mkdtemp(prefix="ol_portn_"))
+    try:
+        home = tmp / "H"
+        home.mkdir()
+        wanted = _free_loopback_port()
+        proc = _spawn_daemon(home, tmp / "out.log", ui_port=str(wanted))
+        try:
+            assert _read_port(home, "server.port") == wanted
+            assert _owner_api_status(wanted, _read_text(home, "ui.token")) == 200
+        finally:
+            _stop(proc, home=home)
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@pytest.mark.live_daemon
+@pytest.mark.timeout(90)
+def test_ui_port_in_use_stops_a_real_daemon_instead_of_moving_it():
+    """An exact port that is taken is a startup failure: no fallback port, no headless daemon."""
+    tmp = Path(tempfile.mkdtemp(prefix="ol_portbusy_"))
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        home = tmp / "H"
+        home.mkdir()
+        log = tmp / "out.log"
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        taken = int(holder.getsockname()[1])
+        proc = _spawn_daemon(home, log, ui_port=str(taken))
+        try:
+            try:
+                code = proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                pytest.fail("the daemon kept running although its exact UI port was taken")
+            assert code != 0, "the daemon reported success without its UI port"
+            assert not (home / "data" / "server.port").exists(), "a UI port was published anyway"
+            assert "ONE_LINK_UI_PORT" in log.read_text(encoding="utf-8", errors="replace")
+        finally:
+            _stop(proc, home=home)
+    finally:
+        holder.close()
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)
 

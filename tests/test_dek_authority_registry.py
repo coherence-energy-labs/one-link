@@ -85,9 +85,12 @@ def test_passphrase_on_unseeded_silent_install_refuses_and_keeps_rows(
     assert master_seed.provision_seed_before_derived_authority(
         root, identity_path=tmp_path / "identity.key",
     ) == (None, False)
-    # ... and the key-minting step itself refuses to replace the DRK.
-    with pytest.raises(KeyMaterialProtectionError, match=MIGRATION):
+    # ... and the key-minting step itself refuses to replace the DRK, naming
+    # the commands that perform the migration on an unseeded install.
+    with pytest.raises(KeyMaterialProtectionError, match=MIGRATION) as refused:
         lockbox.acquire_lockbox(root)
+    assert "`one-link backup init`" in str(refused.value)
+    assert "`one-link recovery set-passphrase`" in str(refused.value)
     with pytest.raises(KeyMaterialProtectionError, match=MIGRATION):
         lockbox.lockbox_from_env(root)
     assert _authority_files(root) == before
@@ -198,10 +201,13 @@ def test_probe_arm_b_capsule_key_without_state_db_is_existing_data(
     assert not (root / "state.db").exists()
 
     monkeypatch.setenv(lockbox.PASSPHRASE_ENV, "probe passphrase")
-    with pytest.raises(KeyMaterialProtectionError, match=MIGRATION):
+    with pytest.raises(KeyMaterialProtectionError, match=MIGRATION) as refused:
         master_seed.provision_seed_before_derived_authority(
             root, identity_path=root.parent / "identity.key",
         )
+    # A seeded install is pointed straight at the command that migrates it.
+    assert "`one-link recovery set-passphrase`" in str(refused.value)
+    assert "backup init" not in str(refused.value)
     # The library entry point refuses the same mint, not only the bootstrap.
     with pytest.raises(KeyMaterialProtectionError, match=MIGRATION):
         lockbox.acquire_lockbox(root)

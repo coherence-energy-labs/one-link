@@ -10,7 +10,8 @@
 //! source too large to hold: for record-framed containers (MCAP, ISO BMFF,
 //! RIFF/WAV) the forced cuts are found by walking record HEADERS -- a seek and
 //! a few bytes per record -- and every segment between cuts is chunked by
-//! [`scan_stream`] over its byte range. The result equals `scan_format_aware`
+//! the same windowed CDC kernel over its byte range, with a smaller payload
+//! window for record-format fallbacks. The result equals `scan_format_aware`
 //! on the whole file's bytes. Containers whose cuts need a full byte scan (ZIP,
 //! H.264 Annex B) are read whole up to `in_memory_limit`; above it the scan
 //! reports [`StreamScanError::NeedsWholeFile`] and the caller decides. Header
@@ -39,6 +40,12 @@ use rayon::prelude::*;
 /// Default payload window for [`scan_stream`]. Custom parameters use at least
 /// four maximum chunks; the allocation never exceeds the declared source length.
 pub const STREAM_WINDOW: usize = 32 << 20;
+
+/// Record formats can contain a long identical run with no selected cuts.
+/// Keep its fallback payload window small rather than allocating the whole
+/// run alongside the header workspace. The kernel still uses at least four
+/// maximum chunks for custom profiles; ordinary plain CDC retains its window.
+const RECORD_STREAM_WINDOW: usize = 1 << 20;
 
 /// Read-ahead used to walk record headers.
 const HEADER_READ_AHEAD: usize = 64 << 10;
@@ -374,8 +381,8 @@ const PARALLEL_HASH_BYTES: usize = 1 << 20;
 /// Turns accepted cuts into chunks over a seekable source, in order. Short
 /// segments are batched and hashed from the header window when it
 /// holds them and otherwise after one read of the batch (at most
-/// `SEGMENT_BATCH + max_size` bytes); a segment longer than `max_size` is
-/// chunked by [`scan_stream`] over its own byte range.
+/// `SEGMENT_BATCH + max_size` bytes); a segment longer than `max_size` uses
+/// the windowed CDC kernel with a 1 MiB default payload window.
 struct SegmentWriter {
     params: CdcParams,
     /// End of the last segment handed over (the last accepted cut).
@@ -418,10 +425,11 @@ impl SegmentWriter {
             self.flush(headers)?;
             let start = self.last;
             headers.source.seek(SeekFrom::Start(start as u64))?;
-            let chunks = scan_stream(
+            let chunks = scan_stream_windowed(
                 (&mut *headers.source).take((end - start) as u64),
                 end - start,
                 self.params,
+                RECORD_STREAM_WINDOW,
             )?;
             for (i, b) in chunks.into_iter().enumerate() {
                 self.out.boundaries.push(Boundary {
@@ -494,8 +502,9 @@ impl SegmentWriter {
 /// including the unhashed bytes and 64 KiB read-ahead), the selector's horizon of
 /// candidates (at most `max(avg_size / 2, min_size) / 4 + 1`), a short-segment
 /// batch buffer used only when the window does not hold the batch (at most
-/// 64 KiB + `max_size`) and the plain-CDC window for long segments, all
-/// independent of source size; returned boundaries and flags still require
+/// 64 KiB + `max_size`) and a payload window of at most
+/// `max(1 MiB, 4 * max_size)` for record-format fallbacks, all independent of
+/// source size; returned boundaries and flags still require
 /// O(output chunks) memory. ZIP/H264 retain the explicit whole-file limit (see
 /// the module documentation).
 pub fn scan_format_aware_seekable<R: Read + Seek>(
@@ -561,7 +570,12 @@ pub fn scan_format_aware_seekable<R: Read + Seek>(
         // The completed header walk will not use its allocation again.
         headers.release_window();
         headers.source.seek(SeekFrom::Start(0))?;
-        let boundaries = scan_stream(&mut *headers.source, len, params)?;
+        let window = if format.is_some() {
+            RECORD_STREAM_WINDOW
+        } else {
+            STREAM_WINDOW
+        };
+        let boundaries = scan_stream_windowed(&mut *headers.source, len, params, window)?;
         let format_aware = vec![false; boundaries.len()];
         FormatAwareChunkSet {
             boundaries,

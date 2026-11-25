@@ -614,18 +614,20 @@ def test_rolling_archives_have_noncolliding_archive_sidecars():
     # the format the product actually parses. The inline version wrote classic
     # sha256sum output with no header, so every bundle built here failed
     # validate_installed_bundle and the in-app updater was dead. What this
-    # test cares about is unchanged: the manifest lands INSIDE dist/one-link,
+    # test cares about is unchanged: the manifest lands INSIDE the final bundle,
     # the .zip.sha256 sidecar is separate, and neither name collides.
     assert "scripts/write_bundle_manifest.py" in text
-    assert "--bundle dist/one-link" in text
+    assert '--bundle "${BUNDLE_PATH}"' in text
     assert '"${ARTIFACT_NAME}.zip.sha256"' in text
     assert "dist/${{ matrix.artifact-name }}.zip.sha256" in text
     assert "dist/one-link.sha256" not in text
     assert "| sort -z" not in text
 
 
-def test_continuous_zip_step_preserves_stamps_and_framework_links(tmp_path):
-    """Run the real CI shell step against the observed failing link shape."""
+@pytest.mark.parametrize("runner", ["ubuntu-latest", "macos-latest"])
+@pytest.mark.parametrize("helper_kind", ["file", "missing", "directory", "symlink"])
+def test_continuous_zip_step_preserves_stamps_and_framework_links(tmp_path, runner, helper_kind):
+    """Archive the finalized layout, including its helper and framework chain."""
     import hashlib
     import os
     import shutil
@@ -636,7 +638,14 @@ def test_continuous_zip_step_preserves_stamps_and_framework_links(tmp_path):
     if os.name == "nt" or shutil.which("bash") is None:
         pytest.skip("executes the Bash workflow fixture on a POSIX host")
     workflows = dict(_workflow_documents())
-    steps = workflows[_WORKFLOWS / "auto_build.yml"]["jobs"]["build"]["steps"]
+    build_job = workflows[_WORKFLOWS / "auto_build.yml"]["jobs"]["build"]
+    steps = build_job["steps"]
+    matrix = next(row for row in build_job["strategy"]["matrix"]["include"] if row["os"] == runner)
+    root = "one-link.app" if runner == "macos-latest" else "one-link"
+    executable_relative = "Contents/MacOS/one-link" if runner == "macos-latest" else "one-link"
+    assert matrix["bundle-path"] == "dist/" + root
+    assert matrix["bundle-root"] == root
+    assert matrix["exe-name"] == executable_relative
     matches = [step for step in steps
                if "scripts/package_standalone_bundle.py" in step.get("run", "")]
     assert len(matches) == 1
@@ -648,19 +657,31 @@ def test_continuous_zip_step_preserves_stamps_and_framework_links(tmp_path):
     assert command.index("package_standalone_bundle.py") < command.index("write_bundle_manifest.py")
     assert "zip -r" not in command and "Compress-Archive -Path" not in command
 
-    bundle = tmp_path / "dist" / "one-link"
-    framework = bundle / "_internal" / "Python.framework" / "Versions"
+    bundle = tmp_path / matrix["bundle-path"]
+    runtime = bundle / ("Contents/Frameworks" if runner == "macos-latest" else "_internal")
+    framework = runtime / "Python.framework" / "Versions"
     (framework / "3.12").mkdir(parents=True)
     (framework / "3.12" / "Python").write_bytes(b"framework binary fixture")
     (framework / "Current").symlink_to("3.12", target_is_directory=True)
-    (bundle / "_internal" / "Python").symlink_to("Python.framework/Versions/Current/Python")
-    executable = bundle / "one-link"
+    (runtime / "Python").symlink_to("Python.framework/Versions/Current/Python")
+    executable = bundle / executable_relative
+    executable.parent.mkdir(parents=True, exist_ok=True)
     executable.write_bytes(b"launcher fixture")
     executable.chmod(0o755)
-    build_info = b"commit: " + b"a" * 40 + b"\nrun_id: 123\n"
-    (bundle / "BUILD_INFO.txt").write_bytes(build_info)
-    stamp = bundle / "_internal" / "one_link_build_stamp.json"
+    helper = executable.with_name("one-link-update-helper")
+    if helper_kind == "file":
+        helper.write_bytes(b"required finished helper")
+    elif helper_kind == "directory":
+        helper.mkdir()
+        (helper / "not-a-helper").write_bytes(b"directory with content")
+    elif helper_kind == "symlink":
+        helper.symlink_to(executable.name)
+    stamp = runtime / "one_link_build_stamp.json"
     stamp.write_text(json.dumps({"schema": 1, "commit": "a" * 40, "channel": "rolling"}))
+    if runner == "macos-latest":
+        intermediate = tmp_path / "dist" / "one-link"
+        intermediate.mkdir()
+        (intermediate / "one-link").write_bytes(b"unfinalized COLLECT intermediate")
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     for name in ("package_standalone_bundle.py", "write_bundle_manifest.py"):
@@ -679,23 +700,44 @@ def test_continuous_zip_step_preserves_stamps_and_framework_links(tmp_path):
         shim.chmod(0o755)
     env = dict(os.environ, PATH=str(shims) + os.pathsep + os.environ["PATH"],
                PYTHONPATH=str(_REPO / "src"), ONE_LINK_TEST_PYTHON=sys.executable,
-               ARTIFACT_NAME="one-link-test", EXE_NAME="one-link")
-    completed = subprocess.run(["bash", "-c", command], cwd=tmp_path, env=env,
-                               text=True, capture_output=True, check=False)
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    archive_path = tmp_path / "dist" / "one-link-test.zip"
+               GITHUB_SHA="a" * 40, GITHUB_REF="refs/heads/test", GITHUB_RUN_ID="123")
+    step_names = ["stamp build metadata", "compute SHA-256 of the bundle", step["name"]]
+    for step_name in step_names:
+        current = next(item for item in steps if item.get("name") == step_name)
+        step_env = {key: matrix[value.removeprefix("${{ matrix.").removesuffix(" }}")]
+                    for key, value in current["env"].items()}
+        completed = subprocess.run(["bash", "-c", current["run"]], cwd=tmp_path, env=env | step_env,
+                                   text=True, capture_output=True, check=False)
+        if step_name == step["name"] and helper_kind != "file":
+            assert completed.returncode != 0
+            assert not (tmp_path / "dist" / (matrix["artifact-name"] + ".zip")).exists()
+            return
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+    archive_path = tmp_path / "dist" / (matrix["artifact-name"] + ".zip")
     digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
     assert (archive_path.with_suffix(".zip.sha256")).read_text().split() == [digest, archive_path.name]
     with zipfile.ZipFile(archive_path) as archive:
         assert all(not member.is_dir() and "\\" not in member.filename for member in archive.infolist())
-        assert archive.read("one-link/BUILD_INFO.txt") == build_info
-        assert archive.read("one-link/_internal/one_link_build_stamp.json") == stamp.read_bytes()
-        link = archive.getinfo("one-link/_internal/Python")
+        assert {name.split("/", 1)[0] for name in archive.namelist()} == {root}
+        build_info = archive.read(root + "/BUILD_INFO.txt").decode()
+        assert f"commit: {'a' * 40}\n" in build_info and "run_id: 123\n" in build_info
+        assert f"runner: {runner}\n" in build_info
+        assert archive.read(root + "/" + stamp.relative_to(bundle).as_posix()) == stamp.read_bytes()
+        helper_member = root + "/" + helper.relative_to(bundle).as_posix()
+        assert archive.read(helper_member) == b"required finished helper"
+        launcher_member = root + "/" + executable_relative
+        assert archive.read(launcher_member + ".sha256").decode().split() == [
+            hashlib.sha256(executable.read_bytes()).hexdigest(), launcher_member,
+        ]
+        link = archive.getinfo(root + "/" + runtime.relative_to(bundle).as_posix() + "/Python")
         assert stat.S_ISLNK(link.external_attr >> 16)
         assert archive.read(link) == b"Python.framework/Versions/Current/Python"
         from one_link.update_transaction import _validate_zip_index
 
-        _validate_zip_index(archive, expected_executable="one-link")
+        _, _, rows = _validate_zip_index(
+            archive, expected_executable=executable_relative, expected_bundle_root=root,
+        )
+        assert rows[helper_member].digest == hashlib.sha256(helper.read_bytes()).hexdigest()
     assert (bundle / "BUNDLE_SHA256SUMS").is_file()
 
 

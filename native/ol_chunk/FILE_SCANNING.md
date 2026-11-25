@@ -149,6 +149,7 @@ in-place edit there re-sent about 8 KiB; v2 makes `avg_size`-scale chunks
 | Component | Bound |
 | --- | --- |
 | Plain CDC payload window | `min(file_length, max(32 MiB, 4 * max_size))` |
+| Record-format payload fallback, for a long segment or a walk with no selected cuts | `min(segment_length, max(1 MiB, 4 * max_size))`; the whole source is the segment when no cuts are selected |
 | Header window for MCAP/MP4/WAV, walk that jumps (sparse records) | 64 KiB |
 | Header window, sequential walk (dense records) | capacity at most `192 KiB + 2 * max_size + 2h` (768 KiB at default parameters), including the unhashed span and a 64 KiB read-ahead block; short segments are hashed from it, so a dense source is read once |
 | v2 cut selector | dense candidates within the last `h = max(avg_size / 2, min_size)` bytes (at most `h / 4 + 1`) and the structural cuts waiting behind them |
@@ -160,11 +161,24 @@ in-place edit there re-sent about 8 KiB; v2 makes `avg_size`-scale chunks
 
 Payload buffers reserve their bounded capacities explicitly, rather than
 growing geometrically as a batch becomes slightly larger. The header window is
-released before a no-cut fallback allocates its plain-CDC window. During a long
-segment, the bounded header and batch buffers can coexist with the plain-CDC
-window. Short batches below 1 MiB are hashed directly; larger custom profiles
+released before a no-cut fallback allocates its payload window. During a long
+segment, the bounded header and batch buffers can coexist with the smaller
+record-format payload window. Short batches below 1 MiB are hashed directly; larger custom profiles
 can still use parallel hashing. These scheduling choices do not alter cuts,
 addresses, or format flags.
+
+The preserved periodic MCAP corpus ends with almost 8 MiB of identical records.
+V2 deliberately selects no cuts within that run. Previously, the record path
+used the ordinary 32 MiB streaming ceiling and allocated the entire tail;
+Windows measured roughly 9 MiB more peak memory than the sparse corpus. The
+record fallback now processes that tail across 1 MiB windows at default
+parameters. Its regression compares every boundary, hash and format flag with
+the in-memory scanner, bounds actual payload read requests, and checks
+fragmented/interrupted reads and length changes during the fallback. An
+entirely identical-record log uses the same smaller fallback. The plain CDC
+API retains its 32 MiB default. Smaller fallback windows can increase read and
+kernel-dispatch frequency; the earlier throughput figures below do not
+qualify this change.
 
 The API does **not** promise constant total RAM or a 32 MiB total process RSS
 ceiling. A low minimum chunk size can produce a large output. The separate

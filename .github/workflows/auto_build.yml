@@ -59,9 +59,13 @@ jobs:
           # ── x86_64 — the historical baseline ──────────────────
           - os: windows-latest
             artifact-name: one-link-windows-x86_64
+            bundle-path: dist/one-link
+            bundle-root: one-link
             exe-name: one-link.exe
           - os: ubuntu-latest
             artifact-name: one-link-linux-x86_64
+            bundle-path: dist/one-link
+            bundle-root: one-link
             exe-name: one-link
           # Intel macOS is intentionally absent: GitHub's hosted Intel pool is
           # retired for this repository and Intel is not a supported release
@@ -71,18 +75,26 @@ jobs:
           # ── arm64 — added to close the coverage gap ───────────
           - os: macos-latest
             artifact-name: one-link-macos-arm64
-            exe-name: one-link
+            # Archive the finalized app, as release.yml does. The sibling
+            # COLLECT directory lacks post-signing sidecars and the helper.
+            bundle-path: dist/one-link.app
+            bundle-root: one-link.app
+            exe-name: Contents/MacOS/one-link
           # GitHub-hosted Linux ARM64 runner — GA Jan 2025, free
           # for public repos. Covers Raspberry Pi 4/5 (64-bit OS),
           # Apple Silicon under Asahi/UTM, and ARM cloud servers.
           - os: ubuntu-24.04-arm
             artifact-name: one-link-linux-arm64
+            bundle-path: dist/one-link
+            bundle-root: one-link
             exe-name: one-link
           # GitHub-hosted Windows ARM64 runner — GA April 2025,
           # free for public repos. Covers Surface Pro X / Copilot+
           # ARM laptops (Snapdragon X / SQ3).
           - os: windows-11-arm
             artifact-name: one-link-windows-arm64
+            bundle-path: dist/one-link
+            bundle-root: one-link
             exe-name: one-link.exe
 
     steps:
@@ -292,48 +304,57 @@ jobs:
         shell: bash
         env:
           MATRIX_OS: ${{ matrix.os }}
+          BUNDLE_PATH: ${{ matrix.bundle-path }}
         run: |
           # A small marker file in the bundle so a user looking at
-          # dist/one-link/ can tell which commit they're running.
-          mkdir -p dist/one-link
+          # the finalized output can tell which commit they're running.
+          test -d "${BUNDLE_PATH}"
           {
             echo "commit: ${GITHUB_SHA}"
             echo "ref: ${GITHUB_REF}"
             echo "run_id: ${GITHUB_RUN_ID}"
             echo "built_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "runner: ${MATRIX_OS}"
-          } > dist/one-link/BUILD_INFO.txt
+          } > "${BUNDLE_PATH}/BUILD_INFO.txt"
 
       - name: compute SHA-256 of the bundle
         shell: bash
         env:
           EXE_NAME: ${{ matrix.exe-name }}
+          BUNDLE_ROOT: ${{ matrix.bundle-root }}
         run: |
           cd dist
           # Also produce a single-file digest of the main exe so
           # users can verify it after extracting the bundle.
-          if [ -n "${EXE_NAME}" ] && [ -f "one-link/${EXE_NAME}" ]; then
-            if command -v sha256sum >/dev/null 2>&1; then
-              sha256sum "one-link/${EXE_NAME}" \
-                > "one-link/${EXE_NAME}.sha256"
-            else
-              shasum -a 256 "one-link/${EXE_NAME}" \
-                > "one-link/${EXE_NAME}.sha256"
-            fi
+          test -f "${BUNDLE_ROOT}/${EXE_NAME}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${BUNDLE_ROOT}/${EXE_NAME}" \
+              > "${BUNDLE_ROOT}/${EXE_NAME}.sha256"
+          else
+            shasum -a 256 "${BUNDLE_ROOT}/${EXE_NAME}" \
+              > "${BUNDLE_ROOT}/${EXE_NAME}.sha256"
           fi
       - name: package and verify the complete CI bundle
         shell: bash
         env:
           ARTIFACT_NAME: ${{ matrix.artifact-name }}
           EXE_NAME: ${{ matrix.exe-name }}
+          BUNDLE_PATH: ${{ matrix.bundle-path }}
+          BUNDLE_ROOT: ${{ matrix.bundle-root }}
         run: |
           set -euo pipefail
           # Use the tagged pipeline's canonical packager: ordinary zip follows
           # macOS links, and Compress-Archive emits Windows-only path spelling.
           # The packager writes and verifies the ZIP's complete member manifest.
+          # Refuse an unfinalized intermediate without the external updater.
+          helper="${BUNDLE_PATH}/$(dirname "${EXE_NAME}")/one-link-update-helper"
+          if [[ "${EXE_NAME}" == *.exe ]]; then helper="${helper}.exe"; fi
+          test -f "${helper}"
+          test -s "${helper}"
+          test ! -L "${helper}"
           SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
           uv run --frozen --extra release python scripts/package_standalone_bundle.py \
-            --bundle dist/one-link \
+            --bundle "${BUNDLE_PATH}" \
             --output "dist/${ARTIFACT_NAME}.zip" \
             --executable "${EXE_NAME}" \
             --epoch "${SOURCE_DATE_EPOCH}"
@@ -341,8 +362,8 @@ jobs:
           # The canonical packager refuses a pre-existing reserved manifest.
           ONE_LINK_BUNDLE_EXECUTABLE="${EXE_NAME}" \
             uv run --frozen --extra release python scripts/write_bundle_manifest.py \
-              --bundle dist/one-link \
-              --root-name one-link \
+              --bundle "${BUNDLE_PATH}" \
+              --root-name "${BUNDLE_ROOT}" \
               --verify
           cd dist
           # This is the release-page sidecar: hash the archive itself, not an

@@ -125,6 +125,7 @@ def _spawn_daemon(home: Path, log: Path, label: str) -> tuple[subprocess.Popen, 
             subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
         ),
     )
+    _STARTED[home] = (proc, log)
     return proc, f
 
 
@@ -153,17 +154,21 @@ def _stop_daemon(proc: subprocess.Popen) -> None:
             pass
 
 
+# The daemon and log behind each home, so a missing port file can say why.
+_STARTED: dict[Path, tuple[subprocess.Popen, Path]] = {}
+
+
 def _read_port(home: Path, name: str, timeout: float = 15.0) -> int:
-    p = home / "data" / name
-    end = time.time() + timeout
-    while time.time() < end:
-        if p.exists():
-            try:
-                return int(p.read_text().strip())
-            except (ValueError, OSError):
-                pass
-        time.sleep(0.05)
-    raise RuntimeError(f"port file did not appear: {p}")
+    """Wait for a port file; on failure say whether the daemon is alive and what it logged.
+
+    A daemon that is slow to start logs which startup step it is in. A bare
+    "port file did not appear" throws that away, and this intermittent failure
+    on hosted Windows runners stays unexplained.
+    """
+    from tests.harness import _read_port as read_port_with_evidence
+
+    proc, log = _STARTED.get(home, (None, None))
+    return read_port_with_evidence(home, name, timeout, proc=proc, log=log)
 
 
 def _request(control_port: int, *, timeout: float = 30.0, **req) -> dict:

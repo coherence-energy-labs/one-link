@@ -61,10 +61,11 @@ import os
 import secrets
 import hashlib
 import sys
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -75,6 +76,7 @@ from one_link.key_material import (
     KeyMaterialIntegrityError,
     KeyMaterialPersistenceError,
     KeyMaterialProtectionError,
+    artifact_exists,
     atomic_create_bytes,
     atomic_replace_bytes,
     read_bytes_if_exists,
@@ -595,6 +597,406 @@ def maybe_wrap(plaintext: bytes, lockbox: Optional["LockBox"]) -> bytes:
     return lockbox.wrap(plaintext)
 
 
+# ─── the application DEK's protected-artifact registry ─────────────
+#
+# Every key-minting decision below asks one question: "does data protected by
+# the current data key exist?"  That question is answered here and nowhere
+# else.  A module that persists LockBox ciphertext registers its artifact in
+# this table; ``tests/test_dek_authority_registry.py`` fails if any LockBox
+# wrap site in the package belongs to a module with no entry, if an entry's
+# path drifts from its writer's own filename constant, or if a real writer
+# leaves a DEK envelope on disk at an unregistered path.
+
+PROTECTION_ENVELOPE = "envelope"
+PROTECTION_ENVELOPE_OR_LEGACY_CLEARTEXT = "envelope_or_legacy_cleartext"
+PROTECTION_EMBEDDED = "embedded"
+PROTECTION_REGENERABLE = "regenerable"
+ENVELOPE_PROTECTIONS = frozenset(
+    {PROTECTION_ENVELOPE, PROTECTION_ENVELOPE_OR_LEGACY_CLEARTEXT}
+)
+
+# Confirmed authority replacements move artifacts the converged key cannot
+# open here (never delete them): the user confirmed replacing the authority
+# that protected them, and their bytes stay available for forensic recovery.
+RETIRED_ARTIFACTS_DIRNAME = "retired-dek-artifacts"
+
+
+@dataclass(frozen=True)
+class DekProtectedArtifact:
+    """One persisted artifact whose readability depends on the application DEK.
+
+    ``relpath`` is POSIX-relative to the data root.  ``protection`` says what
+    a key mint can learn from it:
+
+    * ``envelope``: the whole file is one LockBox wrap, so AES-GCM
+      authentication proves which key protects it (a witness).
+    * ``envelope_or_legacy_cleartext``: as above once migrated; a historical
+      cleartext copy carries no key and is not a witness.
+    * ``embedded``: wrapped values live inside a container (SQLite columns);
+      presence is evidence, but only file names can be inspected cheaply.
+    * ``regenerable``: rewritten on every boot, so losing it orphans nothing
+      and its presence is not evidence of protected data.
+
+    ``retire_with`` names paths whose content is protected transitively by
+    this artifact and must move with it; ``retirable`` is False when moving
+    the artifact aside would itself weaken security (the update authority
+    MACs the rollback high-water mark).
+    """
+
+    name: str
+    relpath: str
+    writer: str
+    protection: str
+    max_bytes: int = 4096
+    retirable: bool = False
+    retire_with: tuple[str, ...] = ()
+
+    @property
+    def regenerable(self) -> bool:
+        return self.protection == PROTECTION_REGENERABLE
+
+    def path(self, data_dir: Path) -> Path:
+        return Path(data_dir).joinpath(*self.relpath.split("/"))
+
+
+DEK_PROTECTED_ARTIFACTS: tuple[DekProtectedArtifact, ...] = (
+    DekProtectedArtifact(
+        "state_db", "state.db", "one_link.state", PROTECTION_EMBEDDED,
+    ),
+    DekProtectedArtifact(
+        "state_wal", "state.db-wal", "one_link.state", PROTECTION_EMBEDDED,
+    ),
+    DekProtectedArtifact(
+        "state_shm", "state.db-shm", "one_link.state", PROTECTION_EMBEDDED,
+    ),
+    DekProtectedArtifact(
+        "capsule_master_key",
+        "capsule-master-key.bin",
+        "one_link.capsule_store",
+        PROTECTION_ENVELOPE,
+        retirable=True,
+        retire_with=("capsules",),
+    ),
+    DekProtectedArtifact(
+        "tls_root_authority",
+        "peer_https/root_ca_key.pem",
+        "one_link.peer_https",
+        PROTECTION_ENVELOPE_OR_LEGACY_CLEARTEXT,
+        max_bytes=128 * 1024,
+        retirable=True,
+        retire_with=("peer_https/root_ca.pem",),
+    ),
+    DekProtectedArtifact(
+        "update_state_authority",
+        "updates/update-authority.key.wrapped",
+        "one_link.update_transaction",
+        PROTECTION_ENVELOPE,
+    ),
+    DekProtectedArtifact(
+        "ui_token", "ui.token", "one_link.server", PROTECTION_REGENERABLE,
+    ),
+)
+
+
+def present_dek_protected_artifacts(
+    data_dir: Path,
+    *,
+    include_regenerable: bool = False,
+) -> tuple[DekProtectedArtifact, ...]:
+    """Registered artifacts present under ``data_dir``.
+
+    Absence must be proven: an artifact that cannot be inspected raises
+    (``KeyMaterialAccessError``) rather than being treated as missing.
+    """
+    root = Path(data_dir)
+    return tuple(
+        artifact
+        for artifact in DEK_PROTECTED_ARTIFACTS
+        if (include_regenerable or not artifact.regenerable)
+        and artifact_exists(
+            artifact.path(root), label=f"DEK-protected {artifact.name}"
+        )
+    )
+
+
+def _read_dek_envelope_artifact(
+    data_dir: Path, artifact: DekProtectedArtifact
+) -> Optional[bytes]:
+    """Bounded read of one envelope artifact.
+
+    ``None`` means absent, or a legacy cleartext copy that carries no key.
+    Anything else is returned as read: a damaged file that is not a LockBox
+    envelope opens under no key, so it proves nothing to a mint guard and is
+    "unopenable" to a key replacement -- never silently accepted.
+    """
+    blob = read_bytes_if_exists(
+        artifact.path(Path(data_dir)),
+        label=f"DEK-protected {artifact.name}",
+        max_bytes=artifact.max_bytes,
+    )
+    if blob is None:
+        return None
+    if (
+        not is_wrapped(blob)
+        and artifact.protection == PROTECTION_ENVELOPE_OR_LEGACY_CLEARTEXT
+    ):
+        return None
+    return blob
+
+
+def _opens(data_key: Optional[bytes], blob: bytes) -> bool:
+    if data_key is None:
+        return False
+    try:
+        LockBox(data_key).unwrap(blob)
+    except LockBoxError:
+        return False
+    return True
+
+
+def dek_artifacts_unopenable_by(
+    data_dir: Path, box: "LockBox"
+) -> tuple[DekProtectedArtifact, ...]:
+    """Present envelope artifacts that ``box`` cannot authenticate.
+
+    This is a proof, not an inference: AES-GCM authentication either succeeds
+    under the given data key or it does not.
+    """
+    root = Path(data_dir)
+    rejected = []
+    for artifact in present_dek_protected_artifacts(root):
+        if artifact.protection not in ENVELOPE_PROTECTIONS:
+            continue
+        blob = _read_dek_envelope_artifact(root, artifact)
+        if blob is None:
+            continue
+        try:
+            box.unwrap(blob)
+        except LockBoxError:
+            rejected.append(artifact)
+    return tuple(rejected)
+
+
+def _existing_data_refusal(paths: list[str]) -> KeyMaterialProtectionError:
+    return KeyMaterialProtectionError(
+        "passphrase recovery envelope is missing for existing application "
+        f"data ({', '.join(sorted(paths))}); explicit recovery migration is "
+        "required"
+    )
+
+
+def _silent_key_on_disk(data_dir: Path) -> Optional[bytes]:
+    """The persisted silent DRK, or ``None`` when it is proven absent."""
+    blob = read_bytes_if_exists(
+        _drk_path(Path(data_dir)),
+        label="data root key",
+        max_bytes=65536,
+        harden_path=_harden_drk_path,
+    )
+    return None if blob is None else _decode_drk_blob(blob)
+
+
+def _surviving_silent_key(
+    data_dir: Path,
+    *,
+    seed: bytes,
+    replacing_data_root: bool,
+) -> Callable[[], Optional[bytes]]:
+    """The silent key that would keep a seeded install's existing data readable.
+
+    Ordinarily that is the persisted DRK; when it is missing, the next silent
+    boot re-derives ``derive_drk(seed)``, so data under it is still readable
+    and still protected.  A confirmed recovery (``replacing_data_root``)
+    installs ``derive_drk(seed)``: data under any other persisted DRK is what
+    the user confirmed replacing (``None``), and a DRK this process cannot
+    unprotect -- a bundle member DPAPI-bound to another machine -- cannot
+    prove the data is under a different key, so it counts as the seed's own
+    and the mint is refused.
+    """
+
+    def surviving() -> Optional[bytes]:
+        from one_link import master_seed
+
+        derived = master_seed.derive_drk(bytes(seed))
+        try:
+            on_disk = _silent_key_on_disk(Path(data_dir))
+        except (KeyMaterialProtectionError, KeyMaterialIntegrityError):
+            if not replacing_data_root:
+                raise
+            return derived
+        if on_disk is None:
+            return derived
+        if not replacing_data_root:
+            return on_disk
+        return derived if secrets.compare_digest(on_disk, derived) else None
+
+    return surviving
+
+
+def _refuse_passphrase_dek_over_silent_data(
+    data_dir: Path,
+    *,
+    surviving_silent_key: Callable[[], Optional[bytes]],
+    salt_preexisted: bool,
+    candidate: Optional[bytes],
+) -> None:
+    """Refuse to make scrypt(passphrase) the DEK while a silent key protects data.
+
+    Publishing a passphrase envelope makes its DEK the install's data key for
+    every later boot, silent boots included (they open it through the seed
+    slot).  That is a key replacement unless the candidate already is the key
+    protecting the data.  ``surviving_silent_key`` returns the silent key that
+    would otherwise keep the existing data readable, or ``None`` when no such
+    key survives (data a confirmed recovery is replacing).
+
+    * No salt before this call: the candidate is brand new, so any registered
+      data under a surviving silent key would be orphaned.  Refuse.
+    * Salt already present: either legacy passphrase rows (the candidate IS
+      their key; migration is byte-preserving) or an interrupted bootstrap's
+      salt over silent rows.  File names cannot tell these apart; a
+      whole-file witness can, so refuse iff some witness opens under the
+      silent key and not under the candidate.
+    """
+    root = Path(data_dir)
+    present = present_dek_protected_artifacts(root)
+    if not present:
+        return
+    silent_key = surviving_silent_key()
+    if silent_key is None:
+        return
+    if not salt_preexisted:
+        raise _existing_data_refusal([artifact.relpath for artifact in present])
+    if candidate is None:
+        raise ValueError("a pre-existing salt requires its candidate data key")
+    orphaned = []
+    for artifact in present:
+        if artifact.protection not in ENVELOPE_PROTECTIONS:
+            continue
+        blob = _read_dek_envelope_artifact(root, artifact)
+        if blob is not None and _opens(silent_key, blob) and not _opens(candidate, blob):
+            orphaned.append(artifact.relpath)
+    if orphaned:
+        raise _existing_data_refusal(orphaned)
+
+
+def _durable_move(source: Path, target: Path) -> None:
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.replace(source, target)
+    for directory in {source.parent, target.parent}:
+        if sys.platform == "win32":
+            # Windows has no directory fsync; os.replace is a single
+            # MoveFileEx(MOVEFILE_REPLACE_EXISTING) on the same volume.
+            continue
+        fd = os.open(str(directory), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def carry_dek_protected_envelopes(
+    data_dir: Path,
+    *,
+    previous_key: Optional[bytes],
+    target_key: bytes,
+) -> dict[str, list[str]]:
+    """Leave no envelope artifact the converged data key cannot open.
+
+    Called by a confirmed seed/authority replacement while the previous key
+    still exists on disk and before it is replaced.  For each registered
+    whole-file envelope:
+
+    * it opens under ``target_key``: kept (also the idempotent replay case);
+    * it opens under ``previous_key``: re-wrapped under ``target_key``,
+      atomically and read back, so the replacement carries it instead of
+      orphaning it (identity rotation in silent mode replaces the DRK);
+    * it opens under neither: it was protected by an authority this
+      transaction does not hold and the user confirmed replacing.  A
+      retirable artifact moves, with what it protects, under
+      ``RETIRED_ARTIFACTS_DIRNAME``; a non-retirable one stays in place.
+
+    Returns ``{"carried": [...], "retired": [...], "unopenable": [...]}`` as
+    registry names.  Embedded artifacts (state.db columns) are outside this
+    layer's reach and are not touched.
+    """
+    if len(target_key) != 32:
+        raise ValueError("target_key must be 32 bytes")
+    if previous_key is not None and len(previous_key) != 32:
+        raise ValueError("previous_key must be 32 bytes")
+    root = Path(data_dir)
+    target = LockBox(target_key)
+    outcome: dict[str, list[str]] = {"carried": [], "retired": [], "unopenable": []}
+    retire_root: Optional[Path] = None
+    for artifact in present_dek_protected_artifacts(root):
+        if artifact.protection not in ENVELOPE_PROTECTIONS:
+            continue
+        blob = _read_dek_envelope_artifact(root, artifact)
+        if blob is None or _opens(target_key, blob):
+            continue
+        if previous_key is not None and _opens(previous_key, blob):
+            plaintext = LockBox(previous_key).unwrap(blob)
+            label = f"DEK-protected {artifact.name}"
+
+            def _validate(
+                candidate: bytes, _expected: bytes = plaintext, _label: str = label,
+            ) -> None:
+                try:
+                    recovered = target.unwrap(candidate)
+                except LockBoxError as exc:
+                    raise KeyMaterialIntegrityError(
+                        f"re-wrapped {_label} does not open under the converged key"
+                    ) from exc
+                if not secrets.compare_digest(recovered, _expected):
+                    raise KeyMaterialIntegrityError(
+                        f"re-wrapped {_label} failed exact read-back"
+                    )
+
+            atomic_replace_bytes(
+                artifact.path(root),
+                target.wrap(plaintext),
+                label=label,
+                validate=_validate,
+                harden_path=_harden_envelope_path,
+            )
+            outcome["carried"].append(artifact.name)
+            continue
+        if not artifact.retirable:
+            outcome["unopenable"].append(artifact.name)
+            continue
+        if retire_root is None:
+            retire_root = root / RETIRED_ARTIFACTS_DIRNAME / (
+                f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-"
+                f"{secrets.token_hex(4)}"
+            )
+        for relpath in (artifact.relpath, *artifact.retire_with):
+            source = root.joinpath(*relpath.split("/"))
+            if artifact_exists(source, label=f"retiring {relpath}"):
+                _durable_move(source, retire_root.joinpath(*relpath.split("/")))
+        outcome["retired"].append(artifact.name)
+    return outcome
+
+
+def envelope_data_key_for_seed(data_dir: Path, seed: bytes) -> Optional[bytes]:
+    """The stable DEK held by the envelope's seed slot, ``None`` if no envelope.
+
+    An envelope the seed cannot open raises: callers use this to learn the
+    converged data key, and must not guess one.
+    """
+    if not isinstance(seed, (bytes, bytearray)) or len(seed) != 32:
+        raise ValueError("seed must be 32 bytes")
+    envelope = _load_envelope(Path(data_dir))
+    if envelope is None:
+        return None
+    dek = _decrypt_dek_slot(
+        envelope, wrapping_key=_seed_wrap_key(bytes(seed)), seed_slot=True,
+    )
+    if dek is None:
+        raise KeyMaterialProtectionError(
+            "lockbox DEK envelope is not recoverable by this master seed"
+        )
+    return dek
+
+
 # ─── per-install salt persistence ──────────────────────────────────
 
 
@@ -748,12 +1150,13 @@ def prepare_bootstrap_recovery_envelope(data_dir: Path, *, seed: bytes) -> bool:
 
     Existing application data without an envelope needs explicit migration.
     In particular, setting a passphrase on a previously silent installation
-    must not replace the key that already encrypts its rows.
+    must not replace the key that already encrypts its rows.  "Existing
+    application data" is every non-regenerable entry of
+    ``DEK_PROTECTED_ARTIFACTS``, not only the SQLite files: the capsule key,
+    TLS root authority and update authority are wrapped by the same key.
     """
     if not isinstance(seed, (bytes, bytearray)) or len(seed) != 32:
         raise ValueError("seed must be 32 bytes")
-    from one_link.key_material import artifact_exists
-
     root = Path(data_dir)
     with _envelope_mutation_lock(root):
         envelope = _load_envelope(root)
@@ -761,12 +1164,11 @@ def prepare_bootstrap_recovery_envelope(data_dir: Path, *, seed: bytes) -> bool:
             passphrase = os.environ.get(PASSPHRASE_ENV, "")
             if not passphrase:
                 return False
-            for filename in ("state.db", "state.db-wal", "state.db-shm"):
-                if artifact_exists(root / filename, label="application database"):
-                    raise KeyMaterialProtectionError(
-                        "passphrase recovery envelope is missing for existing "
-                        "application data; explicit recovery migration is required"
-                    )
+            present = present_dek_protected_artifacts(root)
+            if present:
+                raise _existing_data_refusal(
+                    [artifact.relpath for artifact in present]
+                )
             salt = load_or_create_salt(root)
             dek = _derive_legacy_passphrase_dek(passphrase.encode("utf-8"), salt)
             envelope = _publish_new_envelope(
@@ -790,13 +1192,26 @@ def prepare_bootstrap_recovery_envelope(data_dir: Path, *, seed: bytes) -> bool:
         return True
 
 
-def ensure_recovery_envelope_for_backup(data_dir: Path, *, seed: bytes) -> bool:
+def ensure_recovery_envelope_for_backup(
+    data_dir: Path,
+    *,
+    seed: bytes,
+    replacing_data_root: bool = False,
+) -> bool:
     """Ensure passphrase-mode application rows are portable in a backup.
 
     Returns True when an envelope exists and its seed slot is proven usable,
     False for ordinary silent-DRK mode.  Existing direct-scrypt installs are
     migrated without rewriting a single row: the exact legacy key becomes the
     stable DEK and is atomically dual-wrapped before export continues.
+
+    A passphrase present in the environment never turns a silent install
+    into a passphrase one here: the first envelope would replace the DRK as
+    the data key of every later boot.  ``replacing_data_root`` is set only by
+    a confirmed recovery transaction, which installs ``derive_drk(seed)`` as
+    the silent key; data under any other DRK is what that transaction was
+    confirmed to replace, so only data the seed's own DRK protects (a restored
+    bundle, a replay) still blocks the mint.
     """
 
     if not isinstance(seed, (bytes, bytearray)) or len(seed) != 32:
@@ -806,14 +1221,26 @@ def ensure_recovery_envelope_for_backup(data_dir: Path, *, seed: bytes) -> bool:
     with _envelope_mutation_lock(root):
         envelope = _load_envelope(root)
         if envelope is None and not passphrase:
-            from one_link.key_material import artifact_exists
-
             if artifact_exists(root / SALT_FILENAME, label="lockbox KDF salt"):
                 raise KeyMaterialProtectionError(
                     "legacy passphrase-mode LockBox has no DEK recovery "
                     "envelope; set the source ONE_LINK_PASSPHRASE before backup"
                 )
             return False
+        surviving = _surviving_silent_key(
+            root, seed=bytes(seed), replacing_data_root=replacing_data_root,
+        )
+        salt_preexisted = artifact_exists(
+            root / SALT_FILENAME, label="lockbox KDF salt"
+        )
+        if envelope is None and not salt_preexisted:
+            # Checked before the salt exists: minting it is the new authority.
+            _refuse_passphrase_dek_over_silent_data(
+                root,
+                surviving_silent_key=surviving,
+                salt_preexisted=False,
+                candidate=None,
+            )
         if not passphrase:
             if envelope is None:
                 raise KeyMaterialIntegrityError(
@@ -836,6 +1263,13 @@ def ensure_recovery_envelope_for_backup(data_dir: Path, *, seed: bytes) -> bool:
         )
         passphrase_key = _passphrase_wrap_key(legacy_dek)
         if envelope is None:
+            if salt_preexisted:
+                _refuse_passphrase_dek_over_silent_data(
+                    root,
+                    surviving_silent_key=surviving,
+                    salt_preexisted=True,
+                    candidate=legacy_dek,
+                )
             envelope = _publish_new_envelope(
                 root,
                 _new_envelope(
@@ -1122,6 +1556,21 @@ def acquire_or_create_silent_drk(data_dir: Path) -> bytes:
     if seed is not None:
         fresh = _ms.derive_drk(seed)
     if fresh is None:
+        # A random DRK is a brand-new data-key authority.  On an install whose
+        # data key is a passphrase authority it would silently become the key
+        # of every later silent boot while the passphrase-era data stays
+        # unreadable (the mirror image of a passphrase replacing a DRK).
+        for name, label in (
+            (SALT_FILENAME, "lockbox KDF salt"),
+            (DEK_ENVELOPE_FILENAME, "lockbox DEK envelope"),
+        ):
+            if artifact_exists(Path(data_dir) / name, label=label):
+                raise KeyMaterialProtectionError(
+                    f"this installation's data key is a passphrase authority "
+                    f"({name}); refusing to mint a silent data root key over "
+                    "it. Set ONE_LINK_PASSPHRASE to the passphrase that "
+                    "protects this installation"
+                )
         fresh = secrets.token_bytes(32)
     payload = _encode_drk(fresh)
 
@@ -1165,7 +1614,12 @@ def acquire_lockbox(data_dir: Path) -> "LockBox":
         historical scrypt key, atomically dual-wrap it under the passphrase and
         master seed, then keep using it as the DEK.  Existing rows remain
         byte-for-byte readable while paper-seed recovery becomes truthful.
-      - Otherwise: silent DRK from ``acquire_or_create_silent_drk``.
+      - A passphrase never replaces a data key that already protects data.  An
+        unseeded install with a silent DRK, or a seeded one whose registered
+        ``DEK_PROTECTED_ARTIFACTS`` are under its DRK, refuses with the
+        explicit-migration error instead of minting a salt or envelope.
+      - Otherwise: silent DRK from ``acquire_or_create_silent_drk``, which in
+        turn refuses to mint a random DRK over a passphrase authority.
         DPAPI-wrapped on Windows (so a stolen disk without the
         user's login credentials cannot unwrap), file-with-strict-
         perms on macOS/Linux (improvement over cleartext sqlite
@@ -1183,6 +1637,27 @@ def acquire_lockbox(data_dir: Path) -> "LockBox":
     with _envelope_mutation_lock(root):
         envelope = _load_envelope(root)
         if pw:
+            salt_preexisted = artifact_exists(
+                root / SALT_FILENAME, label="lockbox KDF salt"
+            )
+            if envelope is None and not salt_preexisted:
+                # Minting the salt here mints scrypt(passphrase) as the data
+                # key, so the decision is made before the salt exists.
+                if seed is None:
+                    # Without a seed nothing derives the DRK: it exists only
+                    # because a silent LockBox was issued, and no envelope
+                    # will ever arbitrate between it and a passphrase key.
+                    if artifact_exists(_drk_path(root), label="data root key"):
+                        raise _existing_data_refusal([DRK_FILENAME])
+                else:
+                    _refuse_passphrase_dek_over_silent_data(
+                        root,
+                        surviving_silent_key=_surviving_silent_key(
+                            root, seed=seed, replacing_data_root=False,
+                        ),
+                        salt_preexisted=False,
+                        candidate=None,
+                    )
             salt = load_or_create_salt(root)
             legacy_dek = _derive_legacy_passphrase_dek(pw.encode("utf-8"), salt)
             passphrase_key = _passphrase_wrap_key(legacy_dek)
@@ -1192,6 +1667,15 @@ def acquire_lockbox(data_dir: Path) -> "LockBox":
                     # deliberately not called recoverable until explicit seed
                     # migration can publish the second authenticated slot.
                     return LockBox(legacy_dek, is_silent=False)
+                if salt_preexisted:
+                    _refuse_passphrase_dek_over_silent_data(
+                        root,
+                        surviving_silent_key=_surviving_silent_key(
+                            root, seed=seed, replacing_data_root=False,
+                        ),
+                        salt_preexisted=True,
+                        candidate=legacy_dek,
+                    )
                 envelope = _publish_new_envelope(
                     root,
                     _new_envelope(
@@ -1253,5 +1737,8 @@ def acquire_lockbox(data_dir: Path) -> "LockBox":
             # recovery slot happened to open it on this boot.
             return LockBox(dek, is_silent=False)
 
-    drk = acquire_or_create_silent_drk(root)
+        # Under the same lock as salt and envelope publication: whether a
+        # random DRK may be minted depends on no passphrase authority existing,
+        # and that answer must not change between the check and the mint.
+        drk = acquire_or_create_silent_drk(root)
     return LockBox(drk)

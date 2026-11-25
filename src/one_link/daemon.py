@@ -30799,6 +30799,43 @@ class Daemon:
             self._resume_lock_dict[peer_fp] = lk
         return lk
 
+    @staticmethod
+    def retry_send_kwargs(
+        metadata: Optional[dict[str, Any]],
+        *,
+        fallback_display_name: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Rebuild ``send_file`` keyword arguments from a durable outbound row.
+
+        Every path that re-runs a persisted delivery intent (reconnect and
+        backoff resume, the manual HTTP retry) derives its arguments here, so
+        a request field ``send_file`` persisted cannot be honoured by one
+        caller and silently dropped by another.
+
+        ``transport_requested`` is the selection ``send_file`` validated and
+        recorded on the first attempt.  It is re-validated rather than
+        trusted, because a resumed attempt must meet the same "explicit and
+        qualified" contract as the first.  A row without it predates
+        transport selection, or is a queued intent that never had one, and
+        keeps ``send_file``'s ``auto`` default; nothing is invented for it.
+
+        Raises ``ValueError`` (``invalid_file_transport`` or
+        ``unsupported_file_transport``) for a persisted selection the first
+        attempt could not have accepted.
+        """
+        row = dict(metadata or {})
+        kwargs: dict[str, Any] = {}
+        display_name = row.get("display_name") or fallback_display_name
+        if display_name:
+            kwargs["display_name"] = str(display_name)
+        if "chat_inline" in row:
+            kwargs["chat_inline"] = bool(row["chat_inline"])
+        if row.get("rel_path"):
+            kwargs["rel_path"] = str(row["rel_path"])
+        if "transport_requested" in row:
+            kwargs["transport"] = validate_file_transport(row["transport_requested"])
+        return kwargs
+
     async def resume_paused_transfers_for(
         self,
         peer_fp: str,
@@ -30910,6 +30947,32 @@ class Daemon:
                     errors += 1
                     continue
                 try:
+                    retry_kwargs = self.retry_send_kwargs(row_metadata)
+                except ValueError as exc:
+                    # The ledger can only hold a selection send_file accepted,
+                    # so this row is corrupt or names a lane that is no longer
+                    # qualified. Resuming it as "auto" would deliver over a
+                    # route nobody asked for; leaving it paused would retry it
+                    # on every pump. Fail it visibly, as send_file itself does
+                    # for an unavailable route, and keep draining the queue.
+                    log.warning(
+                        "resume refused %s: persisted transport selection "
+                        "is not qualified (%s)",
+                        r.id, exc,
+                    )
+                    self._update_transfer(
+                        r.id, status="failed",
+                        metadata={
+                            **row_metadata,
+                            "error": str(exc)[:500],
+                            "error_class": "UnsupportedFileTransport",
+                            "transient": False,
+                            "delivery_state": "needs_attention",
+                        },
+                    )
+                    errors += 1
+                    continue
+                try:
                     self._update_transfer(
                         r.id,
                         status="paused",
@@ -30918,13 +30981,6 @@ class Daemon:
                             "delivery_state": "resuming",
                         },
                     )
-                    retry_kwargs: dict[str, Any] = {}
-                    if row_metadata.get("display_name"):
-                        retry_kwargs["display_name"] = str(row_metadata["display_name"])
-                    if "chat_inline" in row_metadata:
-                        retry_kwargs["chat_inline"] = bool(row_metadata["chat_inline"])
-                    if row_metadata.get("rel_path"):
-                        retry_kwargs["rel_path"] = str(row_metadata["rel_path"])
                     await self.send_file(peer, src, transfer_id=r.id,
                         **retry_kwargs,
                     )
@@ -36727,14 +36783,40 @@ class Daemon:
                 lb = acquire_lockbox(data_dir())
                 self.state.set_lockbox(lb)
                 from one_link.capsule_store import (
+                    CAPSULE_KEY_FILENAME,
                     CapsuleRepository,
                     load_or_create_capsule_master_seed,
                 )
-
-                capsule_seed = load_or_create_capsule_master_seed(
-                    data_dir(),
-                    lb,
+                from one_link.key_material import (
+                    KeyMaterialProtectionError,
+                    artifact_exists,
                 )
+
+                # An EXISTING capsule key is data the install's data key
+                # protects (lockbox.DEK_PROTECTED_ARTIFACTS).  If this boot's
+                # key cannot open it, this boot holds a different data key
+                # than the one protecting the install, and every row written
+                # from here on would deepen the split; that is fatal, like any
+                # other unusable key authority.  Only failing to create a NEW
+                # capsule key degrades to "capture disabled": nothing exists
+                # that could be orphaned.
+                capsule_authority_existed = artifact_exists(
+                    data_dir() / CAPSULE_KEY_FILENAME,
+                    label="capsule master key",
+                )
+                try:
+                    capsule_seed = load_or_create_capsule_master_seed(
+                        data_dir(),
+                        lb,
+                    )
+                except Exception as exc:
+                    if capsule_authority_existed:
+                        raise KeyMaterialProtectionError(
+                            "the existing capsule master key cannot be opened "
+                            "with this installation's data key; refusing to "
+                            "start under a key that does not protect its data"
+                        ) from exc
+                    raise
                 self._capsule_store = CapsuleRepository(
                     data_dir() / "capsules",
                     master_seed=capsule_seed,
@@ -37036,6 +37118,12 @@ class Daemon:
             # daemon behavior (custom download folder, log level).
             self._apply_settings_at_boot()
             self._load_persisted_route_memory()
+        except KeyMaterialError:
+            # Every "except KeyMaterialError: raise" inside this block (data
+            # key, capsule key, path-PII and sealed-seed authority) means
+            # "refuse to start".  Degrading to a stateless daemon here turned
+            # each of them into a warning; key authority failures propagate.
+            raise
         except Exception as e:
             log.warning("state init failed (continuing without persistence): %s", e)
             self.state = None

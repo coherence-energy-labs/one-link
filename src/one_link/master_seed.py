@@ -203,9 +203,14 @@ def _legacy_authority_artifacts(
         root / lockbox.DRK_FILENAME,
         root / lockbox.SALT_FILENAME,
         root / lockbox.DEK_ENVELOPE_FILENAME,
-        root / "state.db",
-        root / "state.db-wal",
-        root / "state.db-shm",
+        # Everything the current data key protects, from the one registry the
+        # key-minting guards use, so a new protected artifact cannot be
+        # forgotten here either.
+        *(
+            artifact.path(root)
+            for artifact in lockbox.DEK_PROTECTED_ARTIFACTS
+            if not artifact.regenerable
+        ),
         root / keychain.LOCAL_KEY_FILENAME,
         root / keychain.RECOVERY_KEY_FILENAME,
         root / "recovery-authority.intent.json",
@@ -428,6 +433,12 @@ def install_seed_derived_authority(
 ) -> None:
     """Converge seed, Ed25519 identity, and silent DRK on one root.
 
+    The application data key either survives (an envelope's stable DEK is
+    rebound, never re-minted) or, in silent mode with a different seed, is
+    replaced by the seed's DRK; registered whole-file envelopes are then
+    re-wrapped under it before the old DRK is overwritten (see
+    ``lockbox.carry_dek_protected_envelopes``).
+
     Each individual artifact is atomically replaced and read back.  Recovery
     callers must keep their durable intent journal present until this function
     returns; after a process or power failure the next boot can then replay the
@@ -452,16 +463,42 @@ def install_seed_derived_authority(
         # A fresh explicit-passphrase target can publish its first dual wrap
         # now.  Conversely, a legacy salt with no supplied passphrase proves
         # an additional source factor is required; fail before replacing any
-        # seed/identity/DRK bytes.
+        # seed/identity/DRK bytes.  The mint is still refused over data the
+        # seed's own DRK protects (a restored silent bundle, a replay).
         lockbox.ensure_recovery_envelope_for_backup(
             Path(data_dir),
             seed=expected,
+            replacing_data_root=True,
         )
         if lockbox.requires_legacy_passphrase_recovery(Path(data_dir)):
             raise KeyMaterialProtectionError(
                 "legacy application data requires the source "
                 "ONE_LINK_PASSPHRASE before recovery can replace authority"
             )
+    # The data key this transaction converges on: the envelope's stable DEK,
+    # or, in silent mode, the seed's DRK -- which differs from the persisted
+    # one whenever the seed changes (identity rotation, phrase restore).
+    # While the previous DRK still exists, carry every registered envelope
+    # artifact across instead of orphaning it; retire what neither key opens.
+    target_key = lockbox.envelope_data_key_for_seed(Path(data_dir), expected)
+    if target_key is None:
+        target_key = derive_drk(expected)
+    previous_key: Optional[bytes] = None
+    if not envelope_present:
+        # Before this transaction the data key was the silent DRK -- also
+        # when the step above has just published the first envelope.
+        try:
+            previous_key = lockbox._silent_key_on_disk(Path(data_dir))
+        except (KeyMaterialProtectionError, KeyMaterialIntegrityError):
+            # A restored member bound to another machine's DPAPI scope, or a
+            # damaged DRK, cannot be opened; what only it protected is retired
+            # (moved aside, never deleted) rather than guessed at.
+            previous_key = None
+    lockbox.carry_dek_protected_envelopes(
+        Path(data_dir),
+        previous_key=previous_key,
+        target_key=target_key,
+    )
     store_seed(Path(data_dir), expected)
     identity.store_seed_derived_identity(Path(identity_path), expected)
     _store_seed_derived_drk(Path(data_dir), expected)

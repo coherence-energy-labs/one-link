@@ -1996,9 +1996,13 @@ def restore_artifact_evidence(
         "data_root_key_artifact": root / lockbox.DRK_FILENAME,
         "lockbox_salt_artifact": root / lockbox.SALT_FILENAME,
         "lockbox_dek_envelope_artifact": root / lockbox.DEK_ENVELOPE_FILENAME,
-        "state_db_artifact": root / "state.db",
-        "state_wal_artifact": root / "state.db-wal",
-        "state_shm_artifact": root / "state.db-shm",
+        # Everything the current data key protects, from the registry the
+        # key-minting guards use (state.db and its sidecars included).
+        **{
+            f"{artifact.name}_artifact": artifact.path(root)
+            for artifact in lockbox.DEK_PROTECTED_ARTIFACTS
+            if not artifact.regenerable
+        },
         "state_key_artifact": root / keychain.LOCAL_KEY_FILENAME,
         "state_recovery_key_artifact": root / keychain.RECOVERY_KEY_FILENAME,
         "pending_recovery_artifact": _intent_path(root),

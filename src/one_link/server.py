@@ -26834,6 +26834,29 @@ class UIServer:
                 {"error": f"source file no longer exists: {path}"},
                 status=410,
             )
+        # The retry re-issues the original request, including any explicit
+        # transport selection; the daemon owns that reconstruction so this
+        # path and durable resume cannot drift apart.
+        from one_link.daemon import Daemon as _Daemon
+
+        try:
+            retry_kwargs = _Daemon.retry_send_kwargs(
+                metadata, fallback_display_name=rec.name,
+            )
+        except ValueError as exc:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": str(exc),
+                    "code": "unsupported_file_transport",
+                    "transfer_id": rec.id,
+                    "hint": (
+                        "This delivery recorded a transport that is not a "
+                        "qualified file route; send the file again to choose one."
+                    ),
+                },
+                status=409,
+            )
         # Resolve peer fresh — don't trust the cached endpoint that
         # might have caused the original failure.
         try:
@@ -26849,9 +26872,7 @@ class UIServer:
             return web.json_response({"error": "peer offline"}, status=404)
         try:
             result = await self.daemon.send_file(peer, path, transfer_id=rec.id,
-                display_name=metadata.get("display_name") or rec.name,
-                chat_inline=bool(metadata.get("chat_inline")),
-                rel_path=metadata.get("rel_path"),
+                **retry_kwargs,
             )
             return web.json_response({"ok": True, "result": result})
         except Exception as e:

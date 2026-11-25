@@ -81,7 +81,7 @@ def test_stable_distribution_contract_exactly_matches_source_tree() -> None:
     # 208: one_link.reachability_doctor added 2026-08-27. Being in this tuple
     # is also what bundles it as a PyInstaller hidden import, so the diagnosis
     # ships with the app rather than only existing in a source checkout.
-    assert len(build_identity.EXPECTED_STABLE_RUNTIME_MODULES) == 208
+    assert len(build_identity.EXPECTED_STABLE_RUNTIME_MODULES) == 215
     assert build_identity.EXPECTED_STABLE_RUNTIME_MODULES == tuple(
         sorted(set(build_identity.EXPECTED_STABLE_RUNTIME_MODULES))
     )

@@ -17,10 +17,19 @@ _FINGERPRINT_FILES = (
     "cli.py",
     "daemon.py",
     "server.py",
+    "cdc.py",
+    "courier_files.py",
+    "courier_ledger.py",
+    "courier_service.py",
+    "file_preparation.py",
+    "file_source.py",
+    "transfer_commit_guard.py",
+    "transfer_routes.py",
     "state.py",
     "personal_device_mesh.py",
     "self_mesh_enrollment.py",
     "web/index.html",
+    "web/peer.html",
 )
 
 
@@ -32,6 +41,7 @@ _FINGERPRINT_FILES = (
 # self-consistent but accidentally stripped artifact.
 STABLE_RUNTIME_EXCLUDED_MODULES = frozenset(
     {
+        "one_link.benchmark_contract",
         "one_link.call_reliability_soak",
         "one_link.neural_extrapolator",
         "one_link.perf_lab",
@@ -43,6 +53,7 @@ STABLE_RUNTIME_EXCLUDED_MODULES = frozenset(
 )
 STABLE_RUNTIME_EXCLUDED_PREFIXES = ("one_link.ml",)
 STABLE_RUNTIME_FORBIDDEN_MODULES: tuple[str, ...] = (
+    "one_link.benchmark_contract",
     "one_link.call_reliability_soak",
     "one_link.ml",
     "one_link.neural_extrapolator",
@@ -98,6 +109,7 @@ STABLE_FROZEN_EXCLUDED_MODULE_PREFIXES: tuple[str, ...] = tuple(
             "numpy",
             "nvidia",
             "onnxruntime",
+            "one_link.benchmark_contract",
             "one_link.call_reliability_soak",
             "one_link.ml",
             "one_link.neural_extrapolator",
@@ -380,6 +392,9 @@ EXPECTED_STABLE_RUNTIME_MODULES: tuple[str, ...] = (
     "one_link.control_ipc",
     "one_link.conversation_object",
     "one_link.courier_bundle",
+    "one_link.courier_files",
+    "one_link.courier_ledger",
+    "one_link.courier_service",
     "one_link.cover_traffic",
     "one_link.crash_log",
     "one_link.crdt",
@@ -405,6 +420,8 @@ EXPECTED_STABLE_RUNTIME_MODULES: tuple[str, ...] = (
     "one_link.fec_native",
     "one_link.field_observations_native",
     "one_link.field_snapshot",
+    "one_link.file_preparation",
+    "one_link.file_source",
     "one_link.folder_native",
     "one_link.foldersync",
     "one_link.fountain",
@@ -510,8 +527,10 @@ EXPECTED_STABLE_RUNTIME_MODULES: tuple[str, ...] = (
     "one_link.threshold_recovery_native",
     "one_link.traffic_shaper",
     "one_link.transfer_brain",
+    "one_link.transfer_commit_guard",
     "one_link.transfer_doctor",
     "one_link.transfer_intent",
+    "one_link.transfer_routes",
     "one_link.transfer_safety",
     "one_link.transport_activation",
     "one_link.transport_adapters",

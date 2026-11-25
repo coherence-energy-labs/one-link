@@ -108,6 +108,12 @@ measured afresh; changing it does not alter or delete older evidence.
 
 The coherence-field snapshot has its own provenance contract and absolute
 five-second-tick-derived SLO gate in `scripts/coherence_field_slo_gate.py`.
+Relative coherence-field comparisons with `scripts/bench_gate.py` are
+**dedicated-runner tooling only**; the historical JSON is not a portable release
+threshold. **Do not rebase this file from a busy workstation** to make a
+regression disappear. A new controlled-lab reference must be a separately dated
+artifact with matching workload and complete runner/build provenance, preserving
+the historical snapshot and the measured failures.
 Native solver regressions still require a controlled Criterion runner. OS,
 CPU model/power state, Python/native ABI, compiler flags, storage and competing
 load all affect measurement; a JSON report does not make unlike hosts comparable.

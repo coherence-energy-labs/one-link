@@ -28,8 +28,10 @@ use std::io::{self, Read, Seek, SeekFrom};
 
 use crate::blake3_wrap;
 use crate::cdc::{Boundary, CdcParams};
-use crate::format_aware::{scan_format_aware, ContainerFormat, FormatAwareChunkSet, MCAP_MAGIC};
+use crate::error::ChunkError;
+use crate::format_aware::{scan_format_aware, ContainerFormat, FormatAwareChunkSet};
 use crate::pcdc;
+use crate::walk::{find_wav_data, walk_mcap_records, walk_mp4_boxes, ByteSource};
 
 /// Default payload window for [`scan_stream`]. Custom parameters use at least
 /// four maximum chunks; the allocation never exceeds the declared source length.
@@ -85,15 +87,25 @@ pub fn scan_stream<R: Read>(reader: R, len: usize, params: CdcParams) -> io::Res
     scan_stream_windowed(reader, len, params, STREAM_WINDOW)
 }
 
+/// A chunk-layer error as an `io::Error` that keeps it as the source: an
+/// invalid profile is `InvalidInput`, a kernel that stalled is `Other`.
+fn kernel_error(err: ChunkError) -> io::Error {
+    let kind = match err {
+        ChunkError::InvalidParameters(_) | ChunkError::SizeOutOfRange { .. } => {
+            io::ErrorKind::InvalidInput
+        }
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, err)
+}
+
 fn scan_stream_windowed<R: Read>(
     mut reader: R,
     len: usize,
     params: CdcParams,
     window: usize,
 ) -> io::Result<Vec<Boundary>> {
-    params
-        .validate()
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
+    params.validate().map_err(kernel_error)?;
     let max_size = params.max_size as usize;
     // Sized to the source when it is small (a fixed window was zero-filled
     // for every small file once, halving ingest).
@@ -108,6 +120,7 @@ fn scan_stream_windowed<R: Read>(
         reader.read_exact(&mut buffer[held..])?;
         let final_window = wanted == len - base;
         let ranges: Vec<(usize, usize)> = pcdc::chunk_ranges(&buffer, params)
+            .map_err(kernel_error)?
             .into_iter()
             .take_while(|&(s, _)| final_window || s + max_size <= buffer.len())
             .collect();
@@ -164,6 +177,14 @@ impl<'a, R: Read + Seek> Headers<'a, R> {
             window_start: 0,
         }
     }
+}
+
+impl<R: Read + Seek> ByteSource for Headers<'_, R> {
+    type Error = io::Error;
+
+    fn len(&self) -> usize {
+        self.len
+    }
 
     /// The `n` bytes at `pos`, or `None` if they run past the source.
     fn at(&mut self, pos: usize, n: usize) -> io::Result<Option<&[u8]>> {
@@ -201,58 +222,17 @@ pub fn mcap_record_offsets_seekable<R: Read + Seek>(
     Ok(offsets)
 }
 
+/// The shared MCAP walker over the header window. A visitor may seek/read
+/// payload through the source: the window is position-independent and every
+/// refill seeks explicitly.
 fn visit_mcap_record_offsets<R: Read + Seek>(
     source: &mut R,
     len: usize,
     mut visit: impl FnMut(&mut R, usize) -> io::Result<()>,
 ) -> io::Result<()> {
-    const RECORD_HEADER: usize = 9;
-    let magic_len = MCAP_MAGIC.len();
-    let mut h = Headers::new(source, len);
-    if len < magic_len + RECORD_HEADER {
-        return Ok(());
-    }
-    match h.at(0, magic_len + 1)? {
-        Some(head) if head[..magic_len] == MCAP_MAGIC && head[magic_len] == 0x01 => {}
-        _ => return Ok(()),
-    }
-    let data_end = if len >= 2 * magic_len
-        && h.at(len - magic_len, magic_len)?
-            .is_some_and(|tail| tail == MCAP_MAGIC)
-    {
-        len - magic_len
-    } else {
-        len
-    };
-    let mut pos = magic_len;
-    while pos
-        .checked_add(RECORD_HEADER)
-        .is_some_and(|end| end <= data_end)
-    {
-        let Some(header) = h.at(pos, RECORD_HEADER)? else {
-            break;
-        };
-        if header[0] == 0 {
-            break;
-        }
-        let mut raw_len = [0u8; 8];
-        raw_len.copy_from_slice(&header[1..RECORD_HEADER]);
-        let Ok(content_len) = usize::try_from(u64::from_le_bytes(raw_len)) else {
-            break;
-        };
-        let Some(next) = pos
-            .checked_add(RECORD_HEADER)
-            .and_then(|value| value.checked_add(content_len))
-        else {
-            break;
-        };
-        if next > data_end {
-            break;
-        }
-        visit(h.source, pos)?;
-        pos = next;
-    }
-    Ok(())
+    walk_mcap_records(&mut Headers::new(source, len), |h, pos| {
+        visit(h.source, pos)
+    })
 }
 
 /// [`crate::format_aware::mp4_box_offsets`] over a seekable source. This list
@@ -269,51 +249,16 @@ pub fn mp4_box_offsets_seekable<R: Read + Seek>(
     Ok(offsets)
 }
 
+/// The shared ISO BMFF walker over the header window (see
+/// [`visit_mcap_record_offsets`] for the visitor contract).
 fn visit_mp4_box_offsets<R: Read + Seek>(
     source: &mut R,
     len: usize,
     mut visit: impl FnMut(&mut R, usize) -> io::Result<()>,
 ) -> io::Result<()> {
-    let mut h = Headers::new(source, len);
-    let mut pos = 0usize;
-    while pos.checked_add(8).is_some_and(|end| end <= len) {
-        let Some(header) = h.at(pos, 8)? else {
-            break;
-        };
-        let size = u64::from(u32::from_be_bytes([
-            header[0], header[1], header[2], header[3],
-        ]));
-        if !header[4..8]
-            .iter()
-            .all(|b| b.is_ascii_alphanumeric() || *b == b' ')
-        {
-            break;
-        }
-        visit(h.source, pos)?;
-        let advance = match size {
-            1 => {
-                let Some(large) = h.at(pos + 8, 8)? else {
-                    break;
-                };
-                let mut be = [0u8; 8];
-                be.copy_from_slice(large);
-                u64::from_be_bytes(be)
-            }
-            0 => break,
-            _ => size,
-        };
-        if advance < 8 {
-            break;
-        }
-        let Ok(advance) = usize::try_from(advance) else {
-            break;
-        };
-        let Some(next) = pos.checked_add(advance) else {
-            break;
-        };
-        pos = next;
-    }
-    Ok(())
+    walk_mp4_boxes(&mut Headers::new(source, len), |h, pos| {
+        visit(h.source, pos)
+    })
 }
 
 /// [`crate::format_aware::wav_data_offset`] over a seekable source.
@@ -321,24 +266,7 @@ pub fn wav_data_offset_seekable<R: Read + Seek>(
     source: &mut R,
     len: usize,
 ) -> io::Result<Option<usize>> {
-    let mut h = Headers::new(source, len);
-    match h.at(0, 12)? {
-        Some(head) if &head[0..4] == b"RIFF" && &head[8..12] == b"WAVE" => {}
-        _ => return Ok(None),
-    }
-    let mut pos = 12usize;
-    while pos + 8 <= len {
-        let Some(chunk) = h.at(pos, 8)? else {
-            break;
-        };
-        if &chunk[0..4] == b"data" {
-            return Ok(Some(pos));
-        }
-        let size = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]) as usize;
-        let advance = 8 + size + (size & 1);
-        pos = pos.saturating_add(advance);
-    }
-    Ok(None)
+    find_wav_data(&mut Headers::new(source, len))
 }
 
 /// Verify the declared whole-source size before and after scanning. This
@@ -486,7 +414,7 @@ pub fn scan_format_aware_seekable<R: Read + Seek>(
 mod tests {
     use super::*;
     use crate::cdc::ChunkScanner;
-    use crate::format_aware::{mcap_record_offsets, mp4_box_offsets, wav_data_offset};
+    use crate::format_aware::{mcap_record_offsets, mp4_box_offsets, wav_data_offset, MCAP_MAGIC};
     use std::io::Cursor;
 
     fn bytes(n: usize, seed: u64) -> Vec<u8> {

@@ -18,13 +18,78 @@ format is a separate compatibility contract.
   same-length rewrites, including truncate-and-regrow races, through snapshot or
   file-lifecycle ownership; length checks alone do not establish immutability.
 - Fragmented reads and `Interrupted` reads are supported. Other read/seek errors
-  are propagated. Invalid CDC parameters are rejected before scanning.
+  are propagated. Invalid CDC parameters are rejected before scanning (see
+  "Parameter validation").
 - ZIP/H.264 need whole-buffer scanning. The Rust caller supplies a limit. The
   Python file API permits at most 256 MiB and raises `ValueError` above that;
   algorithm fallback is an explicit caller choice.
 - Python file I/O/length failures raise `OSError`, invalid sizing/format names
   raise `ValueError`. Names `none`, the empty string, and the historical `auto`
   alias select plain CDC; they do not perform magic detection in this API.
+
+## Parameter validation
+
+`CdcParams::validate` accepts a profile exactly when the `FastCDC` v2020 kernel's
+constructor accepts it and `min_size < avg_size < max_size`:
+
+| Size | Accepted range (bytes) | Source |
+| --- | --- | --- |
+| `min_size` | 64 ..= 1,048,576 | `fastcdc::v2020::{MINIMUM_MIN, MINIMUM_MAX}` |
+| `avg_size` | 256 ..= 4,194,304 | `fastcdc::v2020::{AVERAGE_MIN, AVERAGE_MAX}` |
+| `max_size` | 1,024 ..= 16,777,216 | `fastcdc::v2020::{MAXIMUM_MIN, MAXIMUM_MAX}` |
+
+The ranges are the library's exported constants, re-exported as
+`CdcParams::{MIN,AVG,MAX}_SIZE_RANGE`, so they cannot drift from the kernel. A
+size outside its range is `ChunkError::SizeOutOfRange { field, value, min, max }`
+(checked first, in field order); a violated ordering is
+`ChunkError::InvalidParameters`. Every scan entry point (`ChunkScanner::with_params`,
+`scan_to_vec_parallel_with_params`, `pcdc::chunk_ranges`, `scan_format_aware`,
+`scan_stream`, `scan_format_aware_seekable`) validates before any byte reaches
+a kernel. The stream APIs report an invalid profile as `io::ErrorKind::InvalidInput`
+(the seekable format scanner as `StreamScanError::Params`) and keep the
+`ChunkError` as the `io::Error`'s source. The Python binding validates first and
+raises `ValueError`.
+
+Earlier validation required only non-zero, ordered sizes with `max_size <= 16
+MiB`. Profiles such as `(1, 2, 4)`, `(63, 256, 1024)` and `(1 MiB + 1, 2 MiB, 4
+MiB)` then reached the kernel's `assert!`s, which abort the process under the
+release profile's `panic = "abort"`, or, in the parallel kernel the file
+scanner uses, made a zero-length cut: `avg_size = 2` selects all-zero masks, so
+offset 0 is a cut and the loop pushed `(0, 0)` until a 100-byte file's scan
+requested 27,380,416,512 bytes.
+
+Defence in depth: the parallel kernel returns `ChunkError::NoProgress` for a cut
+that does not advance (in the stream APIs, `io::ErrorKind::Other`) and refuses
+an average with no mask, instead of looping or indexing out of bounds. Neither
+is reachable with a validated profile: every valid average selects two non-zero
+masks and `min_size >= 64` puts the first possible cut at byte 64.
+
+## Container walkers
+
+The record-framed formats (ISO BMFF, MCAP, RIFF/WAV) are walked by one
+implementation per format (`src/walk.rs`) over two byte sources: an in-memory
+slice (`format_aware::{mp4_box_offsets, mcap_record_offsets, wav_data_offset}`)
+and the seekable reader's header window (`stream::*_seekable` and the file
+scanner). The file API therefore equals the in-memory API on every input. When
+these were two copies, the in-memory MP4 walker evaluated `pos + 8` after a
+64-bit box size had moved `pos` near `usize::MAX`; the sum wrapped and the
+16-byte input `0000000166747970fffffffffffffffc` indexed out of bounds, while
+the file walker returned `[(0, 16, False)]`. Both now return that.
+
+Every length field is untrusted. A byte range is requested as `(pos, n)` and
+refused if `pos + n` overflows or passes the end; each advance is widened to
+`u64`, converted with `usize::try_from` and added with `checked_add`. Each walk
+stops, keeping the offsets found so far, at:
+
+| Format | Stop conditions |
+| --- | --- |
+| ISO BMFF | box type not 4 ASCII alphanumerics/spaces; size 0 (box runs to EOF; its offset is kept); size below 8; size 1 without room for the 64-bit size; a box end that is not a representable position or lies past the end |
+| MCAP | missing leading magic or Header opcode; opcode 0; a record that does not end within the record area (trailing magic excluded) |
+| RIFF/WAV | missing `RIFF....WAVE`; a sub-chunk header that does not fit; the `data` header (the result) |
+
+ZIP and H.264 Annex B cuts come from byte scans with no length arithmetic on
+untrusted fields; the seekable scanner reads those formats whole and runs the
+in-memory scanner.
 
 ## Memory behavior
 
@@ -62,6 +127,23 @@ behavior. Its two-million-record MCAP reader generates bytes on demand and
 asserts payload scanning begins before the header walk completes. This detects
 regression to collecting a full record-offset vector without materializing a
 large test corpus.
+
+`tests/param_validation.rs` checks every kernel limit (one past it rejected, the
+limit and one inside accepted), the witnessed profiles, agreement with the
+`FastCDC` constructor itself (caught panics) on all 24^3 combinations of limit
+and extreme values, an error from every entry point for invalid profiles, and
+identical output from every entry point at the extreme valid profiles.
+
+`tests/walker_differential.rs` compares the in-memory walkers, the seekable
+walkers and an independent reference written in `u128` arithmetic (no position
+can wrap) on the 16-byte witness, on 64-bit sizes whose end lands on either side
+of 2^64, on every boundary value of each length field (0, 1, 7, 8, header-only,
+exactly to EOF, one past EOF, `u32::MAX`, `u64::MAX`), on walks that refill the
+64 KiB header window, and on 6,000 seeded hostile inputs across all formats. It
+also requires the in-memory and file format-aware scans to return identical
+boundaries and flags; for the record-framed formats these run different code
+(serial `FastCDC` and collected cuts versus the windowed parallel kernel and
+online cut absorption).
 
 Repository `tests/test_native_format_aware_file.py` exercises the installed
 Python exports for every format, custom profiles, aliases, path/error mapping,

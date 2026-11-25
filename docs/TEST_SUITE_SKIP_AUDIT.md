@@ -1,5 +1,14 @@
 # Test Suite Skip Audit (Windows, May 21 2026)
 
+> **Historical snapshot, not current qualification evidence.** The counts,
+> line numbers, feature gates and xfail below describe the May 21 run only.
+> They must not be quoted as the current suite outcome or used to approve a
+> release. The November audit found that the current tree no longer has the
+> historical xfail declaration. Current execution inventories come from the
+> explicit `scripts/live_suite.py` lane and that run's JUnit artifacts; retain
+> the tested commit, installed native identity, selected cases, outcomes and
+> skip reasons together. An individual rerun does not erase an earlier failure.
+
 This document categorises every skip the Python test suite produces
 on a Windows developer machine and explains whether each skip is
 legitimate (cannot run in this environment) or broken (should run

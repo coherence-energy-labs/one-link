@@ -98,9 +98,26 @@ class CaseResult:
         return False
 
 
+def parse_dtd_free_xml(text: str) -> ET.Element:
+    """Parse XML that carries no document type declaration; refuse any that does.
+
+    Entity-expansion and external-entity attacks both need a DTD: an internal
+    subset to declare entities, or an external one to fetch. A DTD can only be
+    introduced by the literal ``<!DOCTYPE`` (XML is case-sensitive, and the
+    input here is already-decoded text, so no encoding trick hides it).
+    Memcheck's protocol never emits one. Without it, only the five predefined
+    entities and character references exist, which cannot expand or resolve
+    anything. The literal inside a comment or CDATA is refused too: fail
+    closed.
+    """
+    if "<!DOCTYPE" in text or "<!ENTITY" in text:
+        raise ET.ParseError("document type and entity declarations are not accepted in Memcheck XML")
+    return ET.fromstring(text)  # nosec B314 - DTD-free by the check above; see docstring
+
+
 def parse_memcheck_xml(text: str) -> tuple[list[Report], str | None]:
     """Parse Memcheck protocol-4 XML into reports (with occurrence counts)."""
-    root = ET.fromstring(text)
+    root = parse_dtd_free_xml(text)
     status = None
     for st in root.iter("status"):
         state = st.findtext("state")

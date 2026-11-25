@@ -97,6 +97,24 @@ class KeyProtectedField:
     aad: bytes = b""
     plaintext_len: int = 32
 
+    def __post_init__(self) -> None:
+        # The re-key transaction composes SQL from `table` and `column` (SQLite
+        # cannot bind identifiers). They are therefore restricted, at
+        # construction, to plain lowercase ASCII identifiers: no quoting,
+        # whitespace, punctuation or statement text can ever reach that SQL,
+        # whoever adds a field later.
+        for role, identifier in (("table", self.table), ("column", self.column)):
+            if not (
+                identifier.isascii()
+                and identifier.isidentifier()
+                and identifier == identifier.lower()
+            ):
+                raise ValueError(
+                    f"key-protected field {self.name!r}: {role} {identifier!r} is not a plain SQL identifier"
+                )
+        if self.family not in (FIELD_FAMILY_DATA_KEY, FIELD_FAMILY_PATH_PII):
+            raise ValueError(f"key-protected field {self.name!r}: unknown key family {self.family!r}")
+
 
 GROUP_SENDER_CHAIN_KEY = KeyProtectedField(
     "group_sender_chains.chain_key", "group_sender_chains", "chain_key",
@@ -982,14 +1000,20 @@ class State:
                 # an undecryptable row further down.
                 field_previous_box = previous_box if field.family == FIELD_FAMILY_DATA_KEY else None
                 field_previous_paths = previous_paths if field.family != FIELD_FAMILY_DATA_KEY else None
+                # SQLite cannot bind identifiers, so the statements are composed
+                # from the registry entry. KeyProtectedField.__post_init__
+                # admits only plain lowercase ASCII identifiers, and the
+                # registry is a module constant; every value is still bound.
+                select_page = (
+                    f"SELECT rowid, {field.column} FROM {field.table} "  # nosec B608
+                    f"WHERE rowid > ? AND {field.column} IS NOT NULL ORDER BY rowid LIMIT 512"
+                )
+                update_row = (
+                    f"UPDATE OR REPLACE {field.table} SET {field.column} = ? WHERE rowid = ?"  # nosec B608
+                )
                 last_rowid = 0
                 while True:
-                    rows = self._conn.execute(
-                        f"SELECT rowid, {field.column} FROM {field.table} "
-                        "WHERE rowid > ? AND "
-                        f"{field.column} IS NOT NULL ORDER BY rowid LIMIT 512",
-                        (last_rowid,),
-                    ).fetchall()
+                    rows = self._conn.execute(select_page, (last_rowid,)).fetchall()
                     if not rows:
                         break
                     for rowid, stored in rows:
@@ -1063,11 +1087,7 @@ class State:
                         # key column (chunk_sources, file_index_cache); if the
                         # same plaintext path already has a current-key row,
                         # the two rows describe one path and one survives.
-                        self._conn.execute(
-                            f"UPDATE OR REPLACE {field.table} SET {field.column} = ? "
-                            "WHERE rowid = ?",
-                            (sealed, rowid),
-                        )
+                        self._conn.execute(update_row, (sealed, rowid))
                         counts["rekeyed"] += 1
         return report
 

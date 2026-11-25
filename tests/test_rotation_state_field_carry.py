@@ -397,6 +397,38 @@ def _state_seal_calls() -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
     return stray, unregistered
 
 
+@pytest.mark.parametrize(
+    "table,column",
+    [
+        ("transfers; DROP TABLE transfers", "path"),
+        ("transfers", "path = path --"),
+        ('"transfers"', "path"),
+        ("transfers", "metadata_json, rowid"),
+        ("Transfers", "path"),
+        ("transfers", ""),
+        ("tränsfers", "path"),
+        ("1transfers", "path"),
+    ],
+)
+def test_a_registry_entry_admits_only_plain_sql_identifiers(table, column):
+    """The re-key transaction composes SQL from these names; nothing else may reach it."""
+    from one_link import state as state_module
+
+    with pytest.raises(ValueError, match="not a plain SQL identifier"):
+        state_module.KeyProtectedField(
+            "probe", table, column, state_module.FIELD_FAMILY_DATA_KEY, label="probe",
+        )
+
+
+def test_a_registry_entry_refuses_an_unknown_key_family():
+    from one_link import state as state_module
+
+    with pytest.raises(ValueError, match="unknown key family"):
+        state_module.KeyProtectedField("probe", "transfers", "path", "plaintext", label="probe")
+    for field in state_module.KEY_PROTECTED_FIELDS:
+        assert field.table.isidentifier() and field.column.isidentifier()
+
+
 def test_every_state_seal_goes_through_the_registry():
     stray, unregistered = _state_seal_calls()
     assert stray == [], f"key-protected values sealed/opened outside the registry: {stray}"

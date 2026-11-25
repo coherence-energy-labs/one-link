@@ -230,3 +230,22 @@ def test_case_verdicts_fail_closed():
     with_problem = audit.CaseResult(name="p", expect="clean", covers=[], what="", **complete)
     with_problem.problems.append("Memcheck status 'RUNNING', expected 'FINISHED'")
     assert not with_problem.passed
+
+
+def test_memcheck_xml_with_a_document_type_or_entity_declaration_is_refused():
+    plain = _xml([("f", "/x/src/lib.rs", 1)])
+    assert audit.parse_dtd_free_xml(plain).tag == "valgrindoutput"
+    bomb = (
+        '<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY lol "lol">'
+        '<!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">]>'
+        "<valgrindoutput><what>&lol2;</what></valgrindoutput>"
+    )
+    external = (
+        '<?xml version="1.0"?><!DOCTYPE valgrindoutput SYSTEM "http://127.0.0.1:9/x.dtd">'
+        "<valgrindoutput/>"
+    )
+    for hostile in (bomb, external, "<valgrindoutput><!ENTITY x 'y'></valgrindoutput>"):
+        with pytest.raises(audit.ET.ParseError):
+            audit.parse_dtd_free_xml(hostile)
+        with pytest.raises(audit.ET.ParseError):
+            audit.parse_memcheck_xml(hostile)

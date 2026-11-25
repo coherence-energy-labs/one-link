@@ -154,9 +154,10 @@ def test_distribution_source_contract_hashes_every_packaged_python_file() -> Non
     # (222 / 242 before it: certified_surface.py + data/certified/peer_row.json, the
     # peer row's proven layout table, laws discharged over every integer input.)
     # (221 / 240 before it: env_bounds.py, 2026-08-05. 220 / 239: bounded_resolver.py.)
-    assert len(source_python) == 224
+    # Eight new reviewed modules: benchmark contract plus seven runtime services.
+    assert len(source_python) == 232
     assert packaged_python == source_python
-    assert len(contract.payload_hashes) == 247
+    assert len(contract.payload_hashes) == 255
 
 
 def test_developer_only_modules_are_not_stable_distribution_requirements() -> None:

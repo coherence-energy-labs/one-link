@@ -28,10 +28,10 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections import deque
+from collections.abc import Callable, Mapping
 import contextlib
 from functools import wraps
 import hashlib
-import heapq
 import hmac
 import ipaddress
 import json
@@ -58,6 +58,16 @@ from aiohttp import WSMsgType, web
 
 from one_link import certified_surface, control_ipc
 from one_link.build_identity import runtime_build_identity
+from one_link.courier_files import (
+    COURIER_FILE_MAX_BYTES, CourierDirectoryMonitor, CourierFileCatalog, CourierFileInfo,
+)
+from one_link.courier_ledger import (
+    COURIER_LEDGER_FILE, COURIER_LEDGER_MAX_EVENTS, CourierReplayLedger,
+    CourierLedgerUnavailable,  # noqa: F401 - compatibility import for embedders
+)
+from one_link.courier_service import (
+    CourierFailure, CourierIdentity, CourierOperationError, CourierService,
+)
 from one_link.device_relogin import (
     DeviceReloginChallengeCapacityError,
     DeviceReloginChallengeError,
@@ -108,16 +118,9 @@ log = logging.getLogger("one_link.server")
 WEB_DIR = Path(__file__).resolve().parent / "web"
 TOKEN_FILE = "ui.token"
 SERVER_PORT_FILE = "server.port"
-COURIER_LEDGER_FILE = "courier_ledger.json"
-COURIER_LEDGER_MAX_EVENTS = 512
-COURIER_FILE_MAX_BYTES = 768 * 1024 * 1024
 HIDDEN_INBOX_FILES_SETTING = "hidden_inbox_files_json"
 WIPE_LOCAL_TRACES_CONFIRM = "wipe local traces"
 DISPLAY_NAME_MAX_LENGTH = 128
-
-
-class CourierLedgerUnavailable(RuntimeError):
-    """The durable courier replay authority cannot be trusted."""
 
 
 class _SettingsUpdateRejected(ValueError):
@@ -2812,10 +2815,13 @@ class UIServer:
         # LAUNCH NONCES -- see `mint_launch_nonce`. Kept beside the invite store
         # because they are the same species: short-lived, single-use, capacity-bounded.
         self._launch_nonces: dict[str, float] = {}
-        self._courier_seen_bundle_ids: set[str] = set()
-        self._courier_events: list[dict] = []
-        self._courier_ledger_error: str | None = None
-        self._load_courier_ledger()
+        self._courier_ledger = CourierReplayLedger(
+            data_dir() / COURIER_LEDGER_FILE, max_events=COURIER_LEDGER_MAX_EVENTS,
+        )
+        self._courier_files = CourierFileCatalog(
+            data_dir() / "courier", max_file_bytes=COURIER_FILE_MAX_BYTES,
+        )
+        self._courier_directory_monitor = CourierDirectoryMonitor(self._courier_files)
         self._courier_monitor_task: asyncio.Task | None = None
         self._ui_delivery_tasks: set[asyncio.Task] = set()
         self._peer_dc_tasks: set[asyncio.Task] = set()
@@ -2823,10 +2829,6 @@ class UIServer:
         self._phone_upload_sweeper_task: asyncio.Task | None = None
         self._closing = False
         self._courier_monitor_interval_s = 2.0
-        self._courier_drop_signature: tuple[str, ...] = ()
-        self._courier_outbox_signature: tuple[str, ...] = ()
-        self._courier_monitor_last_ms = 0
-        self._courier_monitor_events = 0
         self._setup_device_invites: dict[str, dict[str, Any]] = {}
         self._setup_device_invites_lock = asyncio.Lock()
         self._device_relogin_challenges = DeviceReloginChallengeStore()
@@ -3520,135 +3522,52 @@ class UIServer:
         del daemon
         return secrets.token_urlsafe(32)
 
+    def _courier_service(self) -> CourierService:
+        """Adapt live daemon capabilities into a courier-only use-case boundary."""
+        return CourierService(
+            ledger=self._courier_ledger,
+            files=self._courier_files,
+            identity=CourierIdentity(self.daemon.me.fingerprint, self.daemon.me.private),
+            index=self.daemon.state,
+            read_chunk=self.daemon._read_chunk_cache,
+            store_chunk=self.daemon._store_chunk_cache,
+            valid_hash=self.daemon._valid_blob_hex,
+            safe_name=self.daemon._safe_transfer_name,
+            inbox_path=self.daemon._unique_inbox_path,
+        )
+
+    @property
+    def _courier_seen_bundle_ids(self) -> set[str]:
+        return self._courier_ledger.seen_bundle_ids
+
+    @property
+    def _courier_events(self) -> list[dict]:
+        return self._courier_ledger.events
+
+    @property
+    def _courier_ledger_error(self) -> str | None:
+        return self._courier_ledger.error
+
+    @property
+    def _courier_monitor_last_ms(self) -> int:
+        return self._courier_directory_monitor.last_scan_ms
+
+    @property
+    def _courier_monitor_events(self) -> int:
+        return self._courier_directory_monitor.events
+
     def _courier_ledger_path(self) -> Path:
-        return data_dir() / COURIER_LEDGER_FILE
+        return self._courier_ledger.path
 
     @staticmethod
     def _valid_courier_bundle_id(value: object) -> bool:
-        text = str(value or "").strip().lower()
-        if len(text) != 32:
-            return False
-        try:
-            int(text, 16)
-            return True
-        except ValueError:
-            return False
+        return CourierReplayLedger.valid_bundle_id(value)
 
     def _load_courier_ledger(self) -> None:
-        path = self._courier_ledger_path()
-        try:
-            info = path.lstat()
-        except FileNotFoundError:
-            self._courier_seen_bundle_ids = set()
-            self._courier_events = []
-            self._courier_ledger_error = None
-            return
-        except OSError as exc:
-            self._courier_seen_bundle_ids = set()
-            self._courier_events = []
-            self._courier_ledger_error = "unreadable"
-            log.error("courier replay ledger metadata is unreadable: %s", exc)
-            return
-
-        try:
-            if not stat.S_ISREG(info.st_mode) or info.st_size > 8 * 1024 * 1024:
-                raise CourierLedgerUnavailable("ledger is not a bounded regular file")
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(raw, dict) or set(raw) != {
-                "version",
-                "seen_bundle_ids",
-                "events",
-            }:
-                raise CourierLedgerUnavailable("ledger schema is invalid")
-            if raw.get("version") != 1:
-                raise CourierLedgerUnavailable("ledger version is unsupported")
-            seen = raw.get("seen_bundle_ids")
-            events = raw.get("events")
-            if not isinstance(seen, list) or not isinstance(events, list):
-                raise CourierLedgerUnavailable("ledger collections are invalid")
-            if len(events) > COURIER_LEDGER_MAX_EVENTS:
-                raise CourierLedgerUnavailable("ledger event count exceeds its bound")
-            if any(not self._valid_courier_bundle_id(value) for value in seen):
-                raise CourierLedgerUnavailable("ledger contains an invalid replay id")
-            if any(
-                not isinstance(event, dict)
-                or not self._valid_courier_bundle_id(event.get("bundle_id"))
-                for event in events
-            ):
-                raise CourierLedgerUnavailable("ledger contains an invalid event")
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError,
-            CourierLedgerUnavailable,
-        ) as exc:
-            self._courier_seen_bundle_ids = set()
-            self._courier_events = []
-            self._courier_ledger_error = "invalid_or_unreadable"
-            log.error("courier replay ledger cannot be trusted: %s", exc)
-            return
-
-        self._courier_seen_bundle_ids = {
-            str(value).strip().lower()
-            for value in seen}
-        self._courier_events = list(events)
-        self._courier_ledger_error = None
+        self._courier_ledger.load()
 
     def _save_courier_ledger(self) -> None:
-        if self._courier_ledger_error is not None:
-            raise CourierLedgerUnavailable(
-                "refusing to overwrite an unreadable courier replay ledger"
-            )
-        path = self._courier_ledger_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "version": 1,
-            "seen_bundle_ids": sorted(self._courier_seen_bundle_ids),
-            "events": self._courier_events[-COURIER_LEDGER_MAX_EVENTS:],
-        }
-        encoded = json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_BINARY"):
-            flags |= os.O_BINARY
-        descriptor: int | None = None
-        try:
-            descriptor = os.open(tmp, flags, 0o600)
-            view = memoryview(encoded)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:
-                    raise OSError("short write while persisting courier ledger")
-                view = view[written:]
-            os.fsync(descriptor)
-            os.close(descriptor)
-            descriptor = None
-            if os.name == "nt":
-                from one_link.identity import _restrict_windows_acl
-
-                _restrict_windows_acl(tmp)
-            else:
-                os.chmod(tmp, 0o600)
-            if tmp.read_bytes() != encoded:
-                raise OSError("courier ledger read-back mismatch")
-            from one_link.namespace_durability import replace_path
-
-            replace_path(tmp, path)
-            if os.name != "nt":
-                directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-            if path.read_bytes() != encoded:
-                raise OSError("published courier ledger read-back mismatch")
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
-            with contextlib.suppress(FileNotFoundError):
-                tmp.unlink()
+        self._courier_ledger.save()
 
     def _record_courier_event(
         self,
@@ -3658,97 +3577,58 @@ class UIServer:
         bundle_bytes: int | None = None,
         stored_chunks: int | None = None,
     ) -> None:
-        bundle_id = str(manifest.get("bundle_id") or "").strip().lower()
-        if not self._valid_courier_bundle_id(bundle_id):
-            return
-        event = {
-            "kind": kind,
-            "bundle_id": bundle_id,
-            "ts_ms": int(time.time() * 1000),
-            "sender_fp": manifest.get("sender_fp"),
-            "recipient_fp": manifest.get("recipient_fp"),
-            "chunk_count": manifest.get("chunk_count"),
-            "total_bytes": manifest.get("total_bytes"),
-            "expires_ms": manifest.get("expires_ms"),
-        }
-        if bundle_bytes is not None:
-            event["bundle_bytes"] = int(bundle_bytes)
-        if stored_chunks is not None:
-            event["stored_chunks"] = int(stored_chunks)
-        self._courier_events.append(event)
-        self._courier_events = self._courier_events[-COURIER_LEDGER_MAX_EVENTS:]
-        self._save_courier_ledger()
+        self._courier_ledger.record_event(
+            kind,
+            manifest,
+            bundle_bytes=bundle_bytes,
+            stored_chunks=stored_chunks,
+        )
 
     def _mark_courier_imported(self, manifest: dict) -> None:
-        bundle_id = str(manifest.get("bundle_id") or "").strip().lower()
-        if not self._valid_courier_bundle_id(bundle_id):
-            raise ValueError("invalid courier bundle id")
-        self._courier_seen_bundle_ids.add(bundle_id)
-        self._save_courier_ledger()
+        self._courier_ledger.mark_imported(manifest)
 
     def _courier_dir(self) -> Path:
-        path = data_dir() / "courier"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        return self._courier_files.directory()
 
     def _courier_drop_dir(self) -> Path:
-        path = self._courier_dir() / "drop"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        return self._courier_files.drop_directory()
 
     def _courier_outbox_dir(self) -> Path:
-        path = self._courier_dir() / "outbox"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        return self._courier_files.outbox_directory()
 
     def _courier_file_id(self, path: Path) -> str:
-        st = path.stat()
-        return self._courier_file_id_from_stat(path.name, int(st.st_size), int(st.st_mtime_ns))
+        return self._courier_files.file_id(path)
 
     @staticmethod
     def _courier_file_id_from_stat(name: str, size: int, mtime_ns: int) -> str:
-        seed = f"{name}\0{int(size)}\0{int(mtime_ns)}".encode("utf-8", "surrogatepass")
-        return hashlib.sha256(seed).hexdigest()[:24]
+        return CourierFileCatalog.file_id_from_stat(name, size, mtime_ns)
 
-    def _scan_courier_files(self) -> list[dict]:
-        return self._scan_courier_dir(self._courier_drop_dir())
+    def _scan_courier_files(self) -> list[CourierFileInfo]:
+        return self._courier_files.scan_drop()
 
-    def _scan_courier_outbox(self) -> list[dict]:
-        return self._scan_courier_dir(self._courier_outbox_dir())
+    def _scan_courier_outbox(self) -> list[CourierFileInfo]:
+        return self._courier_files.scan_outbox()
 
     @staticmethod
-    def _courier_signature(files: list[dict]) -> tuple[str, ...]:
-        return tuple(
-            f"{f.get('id')}:{f.get('bytes')}:{f.get('mtime_ms')}"
-            for f in files
-        )
+    def _courier_signature(files: list[CourierFileInfo]) -> tuple[str, ...]:
+        return CourierDirectoryMonitor.signature(files)
 
     def _courier_monitor_tick(self, *, broadcast: bool = True) -> dict:
-        drop_files = self._scan_courier_files()
-        outbox_files = self._scan_courier_outbox()
-        drop_sig = self._courier_signature(drop_files)
-        outbox_sig = self._courier_signature(outbox_files)
-        changed = (
-            drop_sig != self._courier_drop_signature
-            or outbox_sig != self._courier_outbox_signature
-        )
-        self._courier_drop_signature = drop_sig
-        self._courier_outbox_signature = outbox_sig
-        self._courier_monitor_last_ms = int(time.time() * 1000)
-        if changed:
-            self._courier_monitor_events += 1
-            if broadcast:
-                self.broadcast({
+        snapshot = self._courier_directory_monitor.poll()
+        if snapshot.changed and broadcast:
+            self.broadcast(
+                {
                     "type": "courier_files",
-                    "drop_files": len(drop_files),
-                    "outbox_files": len(outbox_files),
+                    "drop_files": len(snapshot.drop_files),
+                    "outbox_files": len(snapshot.outbox_files),
                     "drop_dir": str(self._courier_drop_dir()),
                     "outbox_dir": str(self._courier_outbox_dir()),
-                })
+                }
+            )
         return {
-            "changed": changed,
-            "drop_files": drop_files,
-            "outbox_files": outbox_files,
+            "changed": snapshot.changed,
+            "drop_files": snapshot.drop_files,
+            "outbox_files": snapshot.outbox_files,
         }
 
     def _removable_monitor_tick(self, *, broadcast: bool = True) -> dict:
@@ -3783,115 +3663,27 @@ class UIServer:
         except Exception:
             log.exception("courier monitor stopped unexpectedly")
 
-    def _scan_courier_dir(self, directory: Path) -> list[dict]:
-        root = directory.resolve()
-        if not root.is_dir():
-            return []
-        newest: list[tuple[int, Path, os.stat_result]] = []
-        try:
-            iterator = root.iterdir()
-        except OSError:
-            return []
-        for path in iterator:
-            try:
-                if path.is_symlink():
-                    continue
-                resolved = path.resolve()
-                if not resolved.is_file() or resolved.parent != root:
-                    continue
-                if resolved.suffix.lower() not in {".json", ".olcb",
-                } and not resolved.name.lower().endswith(".olcb.json"):
-                    continue
-                st = resolved.stat()
-                if st.st_size <= 0 or st.st_size > COURIER_FILE_MAX_BYTES:
-                    continue
-                item = (int(st.st_mtime_ns), resolved, st)
-                if len(newest) < 64:
-                    heapq.heappush(newest, item)
-                elif item[0] > newest[0][0]:
-                    heapq.heapreplace(newest, item)
-            except OSError:
-                continue
-        out: list[dict] = []
-        for _mtime_ns, resolved, st in sorted(newest, key=lambda item: item[0], reverse=True):
-            try:
-                out.append({
-                    "id": self._courier_file_id_from_stat(
-                        resolved.name,
-                        int(st.st_size),
-                        int(st.st_mtime_ns),
-                    ),
-                    "name": resolved.name,
-                    "bytes": int(st.st_size),
-                    "mtime_ms": int(st.st_mtime * 1000),
-                })
-            except OSError:
-                continue
-        return out
+    def _scan_courier_dir(self, directory: Path) -> list[CourierFileInfo]:
+        return self._courier_files.scan(directory)
 
     def _resolve_courier_file_id(self, file_id: str) -> Path | None:
-        want = str(file_id or "").strip().lower()
-        if len(want) != 24:
-            return None
-        for item in self._scan_courier_files():
-            if item.get("id") == want:
-                path = (self._courier_drop_dir() / str(item["name"])).resolve()
-                root = self._courier_drop_dir().resolve()
-                if path.parent == root and path.is_file():
-                    return path
-        return None
+        return self._courier_files.resolve_drop(file_id)
 
     def _resolve_courier_outbox_file_id(self, file_id: str) -> Path | None:
-        want = str(file_id or "").strip().lower()
-        if len(want) != 24:
-            return None
-        root = self._courier_outbox_dir().resolve()
-        for item in self._scan_courier_outbox():
-            if item.get("id") == want:
-                path = (root / str(item["name"])).resolve()
-                if path.parent == root and path.is_file():
-                    return path
-        return None
+        return self._courier_files.resolve_outbox(file_id)
 
     def _removable_courier_dir(self, target_path: Path) -> Path:
-        return (target_path / "One Link Courier").resolve()
+        return self._courier_files.removable_directory(target_path)
 
-    def _scan_removable_courier_files(self, target_path: Path) -> list[dict]:
-        root = self._removable_courier_dir(target_path)
-        target_root = target_path.resolve()
-        if target_root not in {root, *root.parents} or not root.is_dir():
-            return []
-        return self._scan_courier_dir(root)
+    def _scan_removable_courier_files(self, target_path: Path) -> list[CourierFileInfo]:
+        return self._courier_files.scan_removable(target_path)
 
     def _resolve_removable_courier_file_id(self, target_path: Path, file_id: str) -> Path | None:
-        want = str(file_id or "").strip().lower()
-        if len(want) != 24:
-            return None
-        root = self._removable_courier_dir(target_path)
-        target_root = target_path.resolve()
-        if target_root not in {root, *root.parents}:
-            return None
-        for item in self._scan_removable_courier_files(target_path):
-            if item.get("id") == want:
-                path = (root / str(item["name"])).resolve()
-                if path.parent == root and path.is_file():
-                    return path
-        return None
+        return self._courier_files.resolve_removable(target_path, file_id)
 
     @staticmethod
     def _extract_courier_bundle_text(text: str) -> str:
-        stripped = text.strip()
-        if not stripped:
-            raise ValueError("courier file is empty")
-        try:
-            parsed = json.loads(stripped)
-            if isinstance(parsed, dict):
-                bundle = parsed.get("bundle_b64") or parsed.get("bundle")
-                if bundle:
-                    return str(bundle).strip()
-        except json.JSONDecodeError:
-            pass
-        return stripped
+        return CourierFileCatalog.extract_bundle_text(text)
 
     # ─── routes ───────────────────────────────────────────────────────
     def _setup_routes(self) -> None:
@@ -18129,603 +17921,157 @@ class UIServer:
         })
 
     async def api_courier_export(self, request: web.Request) -> web.Response:
-        """Export cached CDC chunks into an encrypted offline courier bundle."""
-
-        from one_link.courier_bundle import (
-            CourierBundleError,
-            encode_bundle_b64,
-            export_courier_bundle,
+        return await self._courier_json_operation(
+            request,
+            lambda data: self._courier_service().export(data),
+            json_message="Expected JSON with a chunks array.",
+            object_message="Courier export expects a JSON object.",
         )
-
-        try:
-            data = await request.json()
-        except Exception:
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Expected JSON with a chunks array.",
-            }, status=400,
-            )
-        if not isinstance(data, dict):
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Courier export expects a JSON object.",
-            }, status=400,
-            )
-        raw_chunks = data.get("chunks")
-        export_blob_hash = str(data.get("blob_hash") or "").strip().lower()
-        export_name = str(data.get("name") or "").strip() or None
-        if (not isinstance(raw_chunks, list) or not raw_chunks) and self.daemon.state is not None:
-            blob_hash = export_blob_hash
-            transfer_id = str(data.get("transfer_id") or "").strip()
-            if transfer_id:
-                rec = self.daemon.state.get_transfer(transfer_id)
-                if rec is not None:
-                    blob_hash = str(rec.blob_hash or "").strip().lower()
-                    export_name = rec.name or export_name
-            if blob_hash and getattr(self.daemon, "_valid_blob_hex")(blob_hash):
-                export_blob_hash = blob_hash
-                raw_chunks = [
-                    str(c.get("chunk_hash") or "")
-                    for c in self.daemon.state.list_chunks_for_blob(blob_hash)
-                ]
-        if not isinstance(raw_chunks, list) or not raw_chunks:
-            return web.json_response({
-                "ok": False,
-                "error": "missing_chunks",
-                "message": "Choose a cached transfer or at least one cached chunk to courier.",
-            }, status=400,
-            )
-        chunks: list[tuple[str, bytes]] = []
-        missing: list[str] = []
-        for raw_hash in raw_chunks:
-            h = str(raw_hash or "").strip().lower()
-            if not getattr(self.daemon, "_valid_blob_hex")(h):
-                return web.json_response({
-                    "ok": False,
-                    "error": "invalid_chunk_hash",
-                    "message": "Courier export received a malformed chunk hash.",
-                }, status=400,
-                )
-            data_bytes = self.daemon._read_chunk_cache(h)
-            if data_bytes is None:
-                missing.append(h)
-            else:
-                chunks.append((h, data_bytes))
-        if missing:
-            return web.json_response({
-                "ok": False,
-                "error": "missing_cached_chunks",
-                "message": "One Link has not cached every requested chunk yet.",
-                "missing": missing[:64],
-                "missing_count": len(missing),
-            }, status=409,
-            )
-        try:
-            ttl_s = int(data.get("ttl_s") or 24 * 60 * 60)
-        except (TypeError, ValueError, OverflowError):
-            ttl_s = 24 * 60 * 60
-        try:
-            export = export_courier_bundle(
-                chunks,
-                sender_fp=self.daemon.me.fingerprint,
-                recipient_fp=data.get("recipient_fp") or None,
-                blob_hash=export_blob_hash if export_blob_hash else None,
-                name=export_name,
-                ttl_s=ttl_s,
-                signing_key=self.daemon.me.private,
-            )
-        except CourierBundleError as exc:
-            return web.json_response({
-                "ok": False,
-                "error": "courier_export_rejected",
-                "message": str(exc),
-            }, status=400,
-            )
-        except Exception as exc:
-            return web.json_response({
-                "ok": False,
-                "error": "courier_export_failed",
-                "message": str(exc),
-            }, status=500,
-            )
-        with contextlib.suppress(Exception):
-            self._record_courier_event(
-                "export",
-                dict(export.manifest),
-                bundle_bytes=len(export.bundle),
-            )
-        return web.json_response({
-            "ok": True,
-            "bundle_b64": encode_bundle_b64(export.bundle),
-            "key_token": export.key_token,
-            "manifest": export.manifest,
-            "bundle_bytes": len(export.bundle),
-            "chunk_count": export.manifest.get("chunk_count"),
-            "total_bytes": export.manifest.get("total_bytes"),
-        })
 
     async def api_courier_export_file(self, request: web.Request) -> web.Response:
-        """Stage an encrypted courier bundle into the local courier outbox."""
-
-        try:
-            data = await request.json()
-        except Exception:
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Expected JSON with export options.",
-            }, status=400,
-            )
-        if not isinstance(data, dict):
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Courier export-file expects a JSON object.",
-            }, status=400,
-            )
-        class _MemoryRequest:
-            async def json(self_nonlocal):
-                return data
-        response = await self.api_courier_export(_MemoryRequest())  # type: ignore[arg-type]
-        if response.status != 200:
-            return response
-        try:
-            payload = json.loads(response.text or "{}")
-            bundle_b64 = str(payload["bundle_b64"])
-            manifest = payload.get("manifest") if isinstance(payload.get("manifest"), dict) else {}
-        except Exception as exc:
-            return web.json_response({
-                "ok": False,
-                "error": "courier_export_file_failed",
-                "message": str(exc),
-            }, status=500,
-            )
-        bundle_id = str(manifest.get("bundle_id") or secrets.token_hex(16))
-        name = self.daemon._safe_transfer_name(manifest.get("name") or f"{bundle_id}.olcb.json")
-        if not name.lower().endswith(".olcb.json"):
-            name = f"{Path(name).stem or bundle_id}.olcb.json"
-        out_dir = self._courier_outbox_dir()
-        out_path = (out_dir / name).resolve()
-        if out_path.parent != out_dir.resolve():
-            out_path = out_dir / f"{bundle_id}.olcb.json"
-        if out_path.exists():
-            out_path = out_dir / f"{Path(out_path.name).stem}.{bundle_id[:8]}.olcb.json"
-        body = json.dumps({
-            "type": "one-link-courier-bundle",
-            "version": 1,
-            "bundle_b64": bundle_b64,
-            "manifest": manifest,
-        }, ensure_ascii=False, indent=2,
+        return await self._courier_json_operation(
+            request,
+            lambda data: self._courier_service().export_file(data),
+            json_message="Expected JSON with export options.",
+            object_message="Courier export-file expects a JSON object.",
         )
-        tmp = out_path.with_name(f".{out_path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
-        tmp.write_text(body, encoding="utf-8")
-        os.replace(tmp, out_path)
-        return web.json_response({
-            "ok": True,
-            "path": str(out_path),
-            "name": out_path.name,
-            "outbox_dir": str(out_dir),
-            "key_token": payload.get("key_token"),
-            "manifest": manifest,
-            "bundle_bytes": payload.get("bundle_bytes"),
-        })
 
     async def api_courier_copy_to_removable(self, request: web.Request) -> web.Response:
-        """Copy a staged courier outbox file to a selected removable target."""
-
-        import shutil
         from one_link.removable_media import find_removable_target
 
-        try:
-            data = await request.json()
-        except Exception:
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Expected JSON with file_id and target_id.",
-            }, status=400,
-            )
-        if not isinstance(data, dict):
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Courier removable copy expects a JSON object.",
-            }, status=400,
-            )
-        src = self._resolve_courier_outbox_file_id(str(data.get("file_id") or ""))
-        if src is None:
-            return web.json_response({
-                "ok": False,
-                "error": "courier_outbox_file_not_found",
-                "message": "That staged courier file is not in the outbox anymore.",
-            }, status=404,
-            )
-        target = find_removable_target(str(data.get("target_id") or ""))
-        if target is None:
-            return web.json_response({
-                "ok": False,
-                "error": "removable_target_not_found",
-                "message": "That removable target is not available.",
-            }, status=404,
-            )
-        try:
-            dest_root = (target.path / "One Link Courier").resolve()
-            target_root = target.path.resolve()
-            if target_root not in {dest_root, *dest_root.parents}:
-                return web.json_response({
-                    "ok": False,
-                    "error": "removable_target_rejected",
-                    "message": "Courier target resolved outside the removable drive.",
-                }, status=400,
+        def copy(data: dict) -> dict:
+            source = self._courier_files.resolve_outbox(str(data.get("file_id") or ""))
+            if source is None:
+                raise CourierOperationError(
+                    CourierFailure.MISSING,
+                    "courier_outbox_file_not_found",
+                    "That staged courier file is not in the outbox anymore.",
                 )
-            dest_root.mkdir(parents=True, exist_ok=True)
-            dest = (dest_root / src.name).resolve()
-            if dest.parent != dest_root:
-                raise ValueError("destination escaped courier folder")
-            if dest.exists():
-                dest = dest_root / f"{src.stem}.{secrets.token_hex(4)}{src.suffix}"
-            tmp = dest.with_name(f".{dest.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
-            shutil.copyfile(src, tmp)
-            os.replace(tmp, dest)
-        except Exception as exc:
-            return web.json_response({
-                "ok": False,
-                "error": "courier_removable_copy_failed",
-                "message": str(exc),
-            }, status=500,
-            )
-        return web.json_response({
-            "ok": True,
-            "path": str(dest),
-            "name": dest.name,
-            "target_id": target.id,
-            "target_label": target.label,
-            "bytes": int(dest.stat().st_size),
-        })
+            target = find_removable_target(str(data.get("target_id") or ""))
+            if target is None:
+                raise CourierOperationError(
+                    CourierFailure.MISSING,
+                    "removable_target_not_found",
+                    "That removable target is not available.",
+                )
+            dest = self._courier_service().copy_to_removable(source, target.path)
+            return {
+                "path": str(dest),
+                "name": dest.name,
+                "target_id": target.id,
+                "target_label": target.label,
+                "bytes": int(dest.stat().st_size),
+            }
 
-    async def api_courier_copy_from_removable(self, request: web.Request) -> web.Response:
-        """Copy a courier bundle from removable media into the local drop folder."""
-
-        import shutil
-        from one_link.removable_media import find_removable_target
-
-        try:
-            data = await request.json()
-        except Exception:
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Expected JSON with target_id and file_id.",
-            }, status=400,
-            )
-        if not isinstance(data, dict):
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Courier removable copy expects a JSON object.",
-            }, status=400,
-            )
-        target = find_removable_target(str(data.get("target_id") or ""))
-        if target is None:
-            return web.json_response({
-                "ok": False,
-                "error": "removable_target_not_found",
-                "message": "That removable target is not available.",
-            }, status=404,
-            )
-        src = self._resolve_removable_courier_file_id(target.path, str(data.get("file_id") or ""))
-        if src is None:
-            return web.json_response({
-                "ok": False,
-                "error": "removable_courier_file_not_found",
-                "message": "That courier file is not available on the removable target.",
-            }, status=404,
-            )
-        try:
-            drop = self._courier_drop_dir().resolve()
-            dest = (drop / src.name).resolve()
-            if dest.parent != drop:
-                raise ValueError("destination escaped courier drop folder")
-            if dest.exists():
-                dest = drop / f"{src.stem}.{secrets.token_hex(4)}{src.suffix}"
-            tmp = dest.with_name(f".{dest.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
-            shutil.copyfile(src, tmp)
-            os.replace(tmp, dest)
-            self._courier_monitor_tick(broadcast=True)
-        except Exception as exc:
-            return web.json_response({
-                "ok": False,
-                "error": "courier_removable_copy_failed",
-                "message": str(exc),
-            }, status=500,
-            )
-        return web.json_response({
-            "ok": True,
-            "path": str(dest),
-            "name": dest.name,
-            "target_id": target.id,
-            "target_label": target.label,
-            "bytes": int(dest.stat().st_size),
-        })
-
-    async def api_courier_import(self, request: web.Request) -> web.Response:
-        """Import an encrypted offline courier bundle into the chunk cache."""
-
-        try:
-            data = await request.json()
-        except Exception:
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Expected JSON with bundle_b64 and key_token.",
-            }, status=400,
-            )
-        if not isinstance(data, dict):
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Courier import expects a JSON object.",
-            }, status=400,
-            )
-        return self._import_courier_payload(data)
-
-    def _import_courier_payload(self, data: dict) -> web.Response:
-        from one_link.courier_bundle import (
-            CourierBundleError,
-            decode_bundle_b64,
-            import_courier_bundle,
+        return await self._courier_json_operation(
+            request,
+            copy,
+            json_message="Expected JSON with file_id and target_id.",
+            object_message="Courier removable copy expects a JSON object.",
         )
 
-        if self._courier_ledger_error is not None:
+    async def api_courier_copy_from_removable(self, request: web.Request) -> web.Response:
+        from one_link.removable_media import find_removable_target
+
+        def copy(data: dict) -> dict:
+            target = find_removable_target(str(data.get("target_id") or ""))
+            if target is None:
+                raise CourierOperationError(
+                    CourierFailure.MISSING,
+                    "removable_target_not_found",
+                    "That removable target is not available.",
+                )
+            dest = self._courier_service().copy_from_removable(
+                str(data.get("file_id") or ""),
+                target.path,
+            )
+            try:
+                self._courier_monitor_tick(broadcast=True)
+            except Exception as exc:
+                raise CourierOperationError(
+                    CourierFailure.FAILED,
+                    "courier_removable_copy_failed",
+                    str(exc),
+                ) from exc
+            return {
+                "path": str(dest),
+                "name": dest.name,
+                "target_id": target.id,
+                "target_label": target.label,
+                "bytes": int(dest.stat().st_size),
+            }
+
+        return await self._courier_json_operation(
+            request,
+            copy,
+            json_message="Expected JSON with target_id and file_id.",
+            object_message="Courier removable copy expects a JSON object.",
+        )
+
+    async def api_courier_import(self, request: web.Request) -> web.Response:
+        return await self._courier_json_operation(
+            request,
+            lambda data: self._courier_service().import_payload(data),
+            json_message="Expected JSON with bundle_b64 and key_token.",
+            object_message="Courier import expects a JSON object.",
+        )
+
+    def _courier_operation(self, operation: Callable[[], Mapping[str, object]]) -> web.Response:
+        try:
+            return web.json_response({"ok": True, **operation()})
+        except CourierOperationError as exc:
+            status = {
+                CourierFailure.INVALID: 400,
+                CourierFailure.MISSING: 404,
+                CourierFailure.CONFLICT: 409,
+                CourierFailure.UNAVAILABLE: 503,
+                CourierFailure.FAILED: 500,
+            }[exc.kind]
             return web.json_response(
-                {
-                    "ok": False,
-                    "error": "courier_replay_ledger_unavailable",
-                    "message": (
-                        "Courier import is blocked because its durable replay "
-                        "ledger is unreadable or invalid. Preserve the ledger "
-                        "and restore it from a trusted backup before importing."
-                    ),
-                },
-                status=503,
+                {"ok": False, "error": exc.code, "message": str(exc), **exc.details},
+                status=status,
             )
 
-        bundle_text = data.get("bundle_b64") or data.get("bundle")
-        key_token = str(data.get("key_token") or "").strip()
-        if not bundle_text or not key_token:
-            return web.json_response({
-                "ok": False,
-                "error": "missing_courier_fields",
-                "message": "Courier import needs both the encrypted bundle and its unlock token.",
-            }, status=400,
-            )
-        expected_recipient = data.get("expected_recipient_fp")
-        if expected_recipient is None and data.get("enforce_recipient", True):
-            expected_recipient = self.daemon.me.fingerprint
+    async def _courier_json_operation(
+        self,
+        request: web.Request,
+        operation: Callable[[dict], Mapping[str, object]],
+        *,
+        json_message: str,
+        object_message: str,
+    ) -> web.Response:
         try:
-            bundle = decode_bundle_b64(str(bundle_text))
-            imported = import_courier_bundle(
-                bundle,
-                key_token,
-                expected_recipient_fp=expected_recipient,
-                expected_sender_fp=data.get("expected_sender_fp") or None,
-                require_sender_signature=bool(data.get("require_sender_signature", False)),
+            data = await request.json()
+        except Exception:
+            return web.json_response(
+                {"ok": False, "error": "bad_json", "message": json_message},
+                status=400,
             )
-            bundle_id = str(imported.manifest.get("bundle_id") or "").strip().lower()
-            if bundle_id in self._courier_seen_bundle_ids:
-                raise CourierBundleError("courier bundle was already imported")
-            # Persist replay admission before any chunk-cache side effect. If
-            # durability fails, the import fails with zero admitted chunks;
-            # a crash can never apply payload bytes without first recording
-            # the bundle id in the durable replay authority.
-            self._mark_courier_imported(dict(imported.manifest))
-            stored = 0
-            import_blob_hash = imported.manifest.get("blob_hash")
-            for chunk_hash, chunk_data in imported.chunks:
-                self.daemon._store_chunk_cache(
-                    chunk_hash,
-                    chunk_data,
-                    blob_hash=import_blob_hash if isinstance(import_blob_hash, str) else None,
-                    chunk_index=stored if isinstance(import_blob_hash, str) else None,
-                )
-                stored += 1
-            self._record_courier_event(
-                "import",
-                dict(imported.manifest),
-                bundle_bytes=len(bundle),
-                stored_chunks=stored,
+        if not isinstance(data, dict):
+            return web.json_response(
+                {"ok": False, "error": "bad_json", "message": object_message},
+                status=400,
             )
-        except CourierBundleError as exc:
-            return web.json_response({
-                "ok": False,
-                "error": "courier_import_rejected",
-                "message": str(exc),
-            }, status=400,
-            )
-        except Exception as exc:
-            return web.json_response({
-                "ok": False,
-                "error": "courier_import_failed",
-                "message": str(exc),
-            }, status=500,
-            )
-        return web.json_response({
-            "ok": True,
-            "manifest": imported.manifest,
-            "stored_chunks": stored,
-            "chunk_count": imported.manifest.get("chunk_count"),
-            "total_bytes": imported.manifest.get("total_bytes"),
-        })
+        return self._courier_operation(lambda: operation(data))
+
+    def _import_courier_payload(self, data: dict) -> web.Response:
+        return self._courier_operation(lambda: self._courier_service().import_payload(data))
 
     async def api_courier_import_file(self, request: web.Request) -> web.Response:
-        """Import a courier bundle from the local courier drop directory."""
-
-        try:
-            data = await request.json()
-        except Exception:
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Expected JSON with file_id and key_token.",
-            }, status=400,
-            )
-        if not isinstance(data, dict):
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Courier file import expects a JSON object.",
-            }, status=400,
-            )
-        path = self._resolve_courier_file_id(str(data.get("file_id") or ""))
-        if path is None:
-            return web.json_response({
-                "ok": False,
-                "error": "courier_file_not_found",
-                "message": "That courier file is not in the drop folder anymore.",
-            }, status=404,
-            )
-        try:
-            if path.stat().st_size > COURIER_FILE_MAX_BYTES:
-                raise ValueError("courier file exceeds the size limit")
-            bundle_b64 = self._extract_courier_bundle_text(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, ValueError) as exc:
-            return web.json_response({
-                "ok": False,
-                "error": "courier_file_unreadable",
-                "message": str(exc),
-            }, status=400,
-            )
-        return self._import_courier_payload({
-            "bundle_b64": bundle_b64,
-            "key_token": data.get("key_token"),
-            "expected_recipient_fp": data.get("expected_recipient_fp"),
-            "enforce_recipient": data.get("enforce_recipient", True),
-        })
+        return await self._courier_json_operation(
+            request,
+            lambda data: self._courier_service().import_file(data),
+            json_message="Expected JSON with file_id and key_token.",
+            object_message="Courier file import expects a JSON object.",
+        )
 
     async def api_courier_assemble(self, request: web.Request) -> web.Response:
-        """Assemble a fully cached courier-imported blob into the inbox."""
-
-        try:
-            from one_link.courier_bundle import (
-                CourierBundleError,
-                assemble_courier_chunks,
-            )
-
-            data = await request.json()
-        except Exception:
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Expected JSON with a blob_hash field.",
-            }, status=400,
-            )
-        if not isinstance(data, dict):
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Courier assemble expects a JSON object.",
-            }, status=400,
-            )
-        blob_hash = str(data.get("blob_hash") or "").strip().lower()
-        if not getattr(self.daemon, "_valid_blob_hex")(blob_hash):
-            return web.json_response({
-                "ok": False,
-                "error": "invalid_blob_hash",
-                "message": "Courier assemble received a malformed blob hash.",
-            }, status=400,
-            )
-        state = getattr(self.daemon, "state", None)
-        if state is None:
-            return web.json_response({
-                "ok": False,
-                "error": "state_unavailable",
-                "message": "Chunk index is not available yet.",
-            }, status=503,
-            )
-        rows = state.list_chunks_for_blob(blob_hash)
-        if not rows:
-            return web.json_response({
-                "ok": False,
-                "error": "missing_chunk_index",
-                "message": "No chunk index is known for this courier blob.",
-            }, status=404,
-            )
-        name = self.daemon._safe_transfer_name(data.get("name") or f"{blob_hash[:12]}.bin")
-        out_path = self.daemon._unique_inbox_path(blob_hash, name)
-
-        def cached_chunks():
-            for row in rows:
-                chunk_hash = str(row.get("chunk_hash") or "").strip().lower()
-                if not getattr(self.daemon, "_valid_blob_hex")(chunk_hash):
-                    raise CourierBundleError("courier chunk index contains an invalid hash")
-                chunk_data = self.daemon._read_chunk_cache(chunk_hash)
-                if chunk_data is None:
-                    raise KeyError(chunk_hash)
-                yield chunk_hash, chunk_data
-
-        written = 0
-        try:
-            with open(out_path, "xb") as fh:
-                written = assemble_courier_chunks(
-                    cached_chunks(),
-                    fh,
-                    expected_blob_hash=blob_hash,
-                )
-                fh.flush()
-                os.fsync(fh.fileno())
-        except KeyError as exc:
-            with contextlib.suppress(OSError):
-                out_path.unlink()
-            missing_hash = str(exc.args[0]) if exc.args else ""
-            return web.json_response(
-                {
-                    "ok": False,
-                    "error": "missing_cached_chunks",
-                    "message": "Courier import has not received every chunk for this file yet.",
-                    "missing_count": 1,
-                    "missing": [missing_hash] if missing_hash else [],
-                },
-                status=409,
-            )
-        except CourierBundleError as exc:
-            with contextlib.suppress(OSError):
-                out_path.unlink()
-            return web.json_response(
-                {
-                    "ok": False,
-                    "error": "courier_assemble_rejected",
-                    "message": str(exc),
-                },
-                status=409,
-            )
-        except OSError as exc:
-            with contextlib.suppress(OSError):
-                out_path.unlink()
-            return web.json_response(
-                {
-                    "ok": False,
-                    "error": "courier_assemble_failed",
-                    "message": str(exc),
-                },
-                status=500,
-            )
-        if os.name != "nt":
-            with contextlib.suppress(OSError):
-                dir_fd = os.open(out_path.parent, os.O_RDONLY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
-        return web.json_response({
-            "ok": True,
-            "path": str(out_path),
-            "name": out_path.name,
-            "blob_hash": blob_hash,
-            "bytes": written,
-            "chunks": len(rows),
-        })
+        return await self._courier_json_operation(
+            request,
+            lambda data: self._courier_service().assemble(data),
+            json_message="Expected JSON with a blob_hash field.",
+            object_message="Courier assemble expects a JSON object.",
+        )
 
     async def api_route_bootstrap(self, request: web.Request) -> web.Response:
         """Mint a signed route-bootstrap token for QR/audio/BLE paths.

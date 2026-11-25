@@ -1,0 +1,162 @@
+{
+  "classes": {
+    "Daemon": {
+      "class_lines": 33845,
+      "domains": {
+        "call": {
+          "lines": 660,
+          "methods": 21
+        },
+        "capability": {
+          "lines": 705,
+          "methods": 12
+        },
+        "courier": {
+          "lines": 0,
+          "methods": 0
+        },
+        "folder": {
+          "lines": 3216,
+          "methods": 48
+        },
+        "group": {
+          "lines": 1612,
+          "methods": 18
+        },
+        "mesh": {
+          "lines": 983,
+          "methods": 21
+        },
+        "other": {
+          "lines": 10859,
+          "methods": 205
+        },
+        "peer": {
+          "lines": 4411,
+          "methods": 35
+        },
+        "recovery": {
+          "lines": 53,
+          "methods": 1
+        },
+        "send": {
+          "lines": 795,
+          "methods": 13
+        },
+        "transfer": {
+          "lines": 9875,
+          "methods": 124
+        }
+      },
+      "method_lines": 33169,
+      "methods": 498,
+      "self_attributes_assigned": 190
+    },
+    "UIServer": {
+      "class_lines": 25820,
+      "domains": {
+        "call": {
+          "lines": 537,
+          "methods": 16
+        },
+        "capability": {
+          "lines": 148,
+          "methods": 6
+        },
+        "courier": {
+          "lines": 365,
+          "methods": 44
+        },
+        "folder": {
+          "lines": 3025,
+          "methods": 51
+        },
+        "group": {
+          "lines": 619,
+          "methods": 19
+        },
+        "mesh": {
+          "lines": 1007,
+          "methods": 19
+        },
+        "other": {
+          "lines": 11336,
+          "methods": 213
+        },
+        "peer": {
+          "lines": 4003,
+          "methods": 23
+        },
+        "recovery": {
+          "lines": 1582,
+          "methods": 25
+        },
+        "send": {
+          "lines": 151,
+          "methods": 2
+        },
+        "transfer": {
+          "lines": 2238,
+          "methods": 26
+        }
+      },
+      "method_lines": 25011,
+      "methods": 444,
+      "self_attributes_assigned": 52
+    }
+  },
+  "classifier_digest": "65e8d1f4633b683f9526d7b8dd580396b824e5d9d3ae05401a4dc14f057d6da6",
+  "history": [
+    {
+      "label": "pre-extraction baseline at dff1fa5 (MNT-01 measurement)",
+      "totals": {
+        "Daemon": {
+          "method_lines": 35162,
+          "methods": 506
+        },
+        "UIServer": {
+          "method_lines": 25683,
+          "methods": 450
+        }
+      }
+    },
+    {
+      "label": "MNT-01: call lifecycle, folder sync receipts/scheduler/manifest policy and /api/v1/calls router extracted; RUN-01 fabric snapshot + optional imports off-loop; ONE_LINK_UI_PORT; includes Codex f55576f (+1 Daemon method)",
+      "totals": {
+        "Daemon": {
+          "method_lines": 33169,
+          "methods": 498
+        },
+        "UIServer": {
+          "method_lines": 25009,
+          "methods": 444
+        }
+      }
+    },
+    {
+      "growth_reason": "UIServer +2 lines: a None guard on self.runner that the whole-package mypy gate requires once the bind loop is its own method; no behaviour added",
+      "label": "type-check repair of the extraction: UIServer._bind_ui_listener refuses to bind before its runner exists",
+      "totals": {
+        "Daemon": {
+          "method_lines": 33169,
+          "methods": 498
+        },
+        "UIServer": {
+          "method_lines": 25011,
+          "methods": 444
+        }
+      }
+    }
+  ],
+  "schema": "one-link-class-census-v1",
+  "targets": [
+    [
+      "src/one_link/daemon.py",
+      "Daemon"
+    ],
+    [
+      "src/one_link/server.py",
+      "UIServer"
+    ]
+  ]
+}

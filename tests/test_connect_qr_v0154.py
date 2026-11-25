@@ -85,6 +85,9 @@ async def http_lan(tmp_path: Path, monkeypatch):
     `lan_bound: true` and require a short-lived invite."""
     monkeypatch.setenv("ONE_LINK_HOME", str(tmp_path))
     monkeypatch.setenv("ONE_LINK_BIND_HOST", "0.0.0.0")
+    # This is a TestClient routing contract, not a real-interface test. Make
+    # the declared LAN fixture independent of host network enumeration.
+    monkeypatch.setattr("one_link.server._detect_lan_ip", lambda: "192.0.2.10")
     me = _identity()
     state = State(db_path=tmp_path / "state.db")
     daemon = Daemon(me)

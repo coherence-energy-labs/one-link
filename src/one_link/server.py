@@ -5686,7 +5686,7 @@ class UIServer:
         it deliberately omits the owner token and directs callers to mint a
         short-lived device invite through ``/api/setup/device-invite``.
         """
-        return web.json_response(self._connect_info())
+        return web.json_response(self._connect_info(), headers={"Cache-Control": "no-store"})
 
     async def api_connect_info_qr(self, request: web.Request) -> web.Response:
         """Return only safe legacy QR data; never encode an owner LAN bearer."""
@@ -5705,6 +5705,7 @@ class UIServer:
                     ),
                 },
                 status=409,
+                headers={"Cache-Control": "no-store"},
             )
         if info["requires_short_lived_invite"]:
             return web.json_response(

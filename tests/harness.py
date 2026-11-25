@@ -676,6 +676,24 @@ def _pin_test_peer(source: DaemonHandle, peer: DaemonHandle) -> None:
         )
 
 
+def _attach_daemon_logs(exc: BaseException, logs: dict[str, Path]) -> None:
+    """Add each daemon's log tail to a failing live test's exception.
+
+    pytest prints exception notes under the traceback, so the evidence reaches
+    the hosted job log with no artifact to fetch. Reading the logs must never
+    replace the original failure, and a generator being closed or an interrupt
+    is not a test failure.
+    """
+    if isinstance(exc, (GeneratorExit, KeyboardInterrupt)):
+        return
+    for label, path in logs.items():
+        try:
+            tail = _read_log(path)
+        except Exception as read_error:
+            tail = f"<log unreadable: {type(read_error).__name__}: {read_error}>"
+        exc.add_note(f"--- daemon {label} log tail ---\n{tail}")
+
+
 @contextmanager
 def daemon_pair(
     *, pin_trust: bool = False, periodic_folder_sync: bool = True,
@@ -735,7 +753,14 @@ def daemon_pair(
         if pin_trust:
             _pin_test_peer(a, b)
             _pin_test_peer(b, a)
-        yield DaemonPair(a=a, b=b, tmp=tmp)
+        try:
+            yield DaemonPair(a=a, b=b, tmp=tmp)
+        except BaseException as exc:
+            # A live test that fails on a hosted runner leaves only its
+            # assertion ("a.txt didn't land on B within 30s") unless the
+            # daemons' own account travels with it.
+            _attach_daemon_logs(exc, {"A": a_log, "B": b_log})
+            raise
     finally:
         if a is not None:
             _stop(

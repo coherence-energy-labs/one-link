@@ -37197,6 +37197,10 @@ class Daemon:
             # key, capsule key, path-PII and sealed-seed authority) means
             # "refuse to start".  Degrading to a stateless daemon here turned
             # each of them into a warning; key authority failures propagate.
+            # These checks follow early QUIC/database allocation. Release
+            # only those resources while the instance lock still belongs to
+            # this start attempt; full stop() has unrelated transfer effects.
+            await self._abort_authority_startup()
             raise
         except Exception as e:
             log.warning("state init failed (continuing without persistence): %s", e)
@@ -38235,6 +38239,54 @@ class Daemon:
             except Exception as e:
                 log.debug("QUIC dial to %s failed: %s", peer_fp[:8], e)
                 return None
+
+    async def _abort_authority_startup(self) -> None:
+        """Close resources allocated before the peer/control listeners open.
+
+        Called only by start()'s fatal authority check, while its instance
+        lock is still held. No recovery, authority replacement, transfer
+        reconciliation or runtime-publication retirement belongs here.
+        State.close() retains its ordinary database clean-close marker.
+        """
+        accept = self._quic_accept_task
+        if accept is not None:
+            accept.cancel()
+        endpoint = self._quic_server_endpoint
+        self._quic_server_endpoint = None
+        self._quic_local_port = None
+        if endpoint is not None:
+            try:
+                # Close before yielding so the cancelled accept worker cannot
+                # retain a listening native endpoint after the failed start.
+                endpoint.close(0, b"authority startup refused")
+            except Exception as exc:
+                report_best_effort_failure(log, "abort_start_quic_endpoint", exc)
+        if accept is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await accept
+            self._quic_accept_task = None
+        cover = self._cover_traffic
+        if cover is not None:
+            try:
+                cover.stop(join_timeout=2.0)
+            except Exception as exc:
+                report_best_effort_failure(log, "abort_start_cover_traffic", exc)
+            self._cover_traffic = None
+        capsule_store = self._capsule_store
+        if capsule_store is not None:
+            try:
+                capsule_store.close()
+            except Exception as exc:
+                report_best_effort_failure(log, "abort_start_capsule_store", exc)
+            self._capsule_store = None
+        state = self.state
+        if state is not None:
+            try:
+                state.close()
+            except Exception as exc:
+                report_best_effort_failure(log, "abort_start_state_store", exc)
+            self.state = None
+        self.sealed_master = None
 
     async def _quic_accept_loop(self) -> None:
         """Wave 2d: accept inbound QUIC connections + spawn a

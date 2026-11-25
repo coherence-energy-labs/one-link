@@ -22,6 +22,7 @@ from enum import Enum
 from typing import Any, Iterable, Mapping
 
 from one_link.fault_observability import report_best_effort_failure
+from one_link.transfer_routes import PAYLOAD_ATTEMPT_WINDOW, resumed_share
 
 log = logging.getLogger(__name__)
 
@@ -649,26 +650,41 @@ def transfer_result_report(
     wire_bytes: int,
     elapsed_s: float,
     skipped_bytes: int = 0,
-) -> dict[str, int | float]:
-    """Summarize real transfer efficiency for route learning and UI.
+    resumed_bytes: int = 0,
+) -> dict[str, int | float | str]:
+    """Summarize ONE send attempt's efficiency for route learning and UI.
+
+    The report says so itself (``accounting_window``): on a ledger row that
+    took several attempts it describes the last one, and the row's
+    ``raw_bytes``/``wire_bytes`` and ``payload_transfer_totals`` describe the
+    transfer.
 
     ``raw_bytes`` is what this sender actually read and pushed. ``wire_bytes``
     is what crossed the channel after compression/protocol choice.
-    ``skipped_bytes`` is payload the peer already had, which matters because
-    the user experiences it as delivered even though the network did not carry
-    it again.
+    ``skipped_bytes`` is payload the peer already had when this attempt was
+    offered, which matters because the user experiences it as delivered even
+    though the network did not carry it again.
+
+    ``resumed_bytes`` is what earlier attempts of the same transfer moved.
+    The part of it the peer kept was carried by the network, in another
+    attempt's time: it is reported as ``resumed_bytes`` and counts neither as
+    skipped, as saved, nor as this attempt's effective payload.  Without that
+    split a resumed send reports its own earlier work as prior knowledge.
     """
 
     raw = max(0, int(raw_bytes))
     wire = max(0, int(wire_bytes))
-    skipped = max(0, int(skipped_bytes))
+    resumed = resumed_share(skipped_bytes, resumed_bytes)
+    skipped = max(0, int(skipped_bytes)) - resumed
     elapsed = max(0.001, float(elapsed_s))
     effective = raw + skipped
     saved = max(0, effective - wire)
     return {
+        "accounting_window": PAYLOAD_ATTEMPT_WINDOW,
         "raw_bytes_sent": raw,
         "wire_bytes_sent": wire,
         "skipped_bytes": skipped,
+        "resumed_bytes": resumed,
         "effective_payload_bytes": effective,
         "saved_bytes": saved,
         "raw_throughput_bps": round((raw * 8.0) / elapsed, 3),

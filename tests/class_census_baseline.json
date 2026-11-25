@@ -1,7 +1,7 @@
 {
   "classes": {
     "Daemon": {
-      "class_lines": 33897,
+      "class_lines": 33877,
       "domains": {
         "call": {
           "lines": 660,
@@ -44,11 +44,11 @@
           "methods": 13
         },
         "transfer": {
-          "lines": 9875,
+          "lines": 9855,
           "methods": 124
         }
       },
-      "method_lines": 33220,
+      "method_lines": 33200,
       "methods": 499,
       "self_attributes_assigned": 190
     },
@@ -153,6 +153,19 @@
       "totals": {
         "Daemon": {
           "method_lines": 33220,
+          "methods": 499
+        },
+        "UIServer": {
+          "method_lines": 25032,
+          "methods": 445
+        }
+      }
+    },
+    {
+      "label": "send path: per-transfer byte and route totals live in transfer_routes.PayloadRouteAccounting; one CDC-over-QUIC fallback helper replaces two copies (Daemon -20 lines)",
+      "totals": {
+        "Daemon": {
+          "method_lines": 33200,
           "methods": 499
         },
         "UIServer": {

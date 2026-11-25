@@ -51,6 +51,10 @@ def receipt(payload, route="tcp"):
     return {"ok": True, "result": {"confirmed": True, "size": len(payload), "blob": blake3.blake3(payload).hexdigest(),
         "payload_transport": route, "payload_bytes_by_transport": {route: len(payload)},
         "payload_chunks_by_transport": {route: 1}, "payload_fallbacks": 0,
+        "payload_bytes_unit": "encoded_payload_bytes", "payload_accounting_window": "attempt",
+        "payload_transfer_totals": {"payload_transport": route, "payload_bytes_by_transport": {route: len(payload)},
+            "payload_chunks_by_transport": {route: 1}, "payload_fallbacks": 0,
+            "raw_bytes": len(payload), "wire_bytes": len(payload), "chunks": 1},
         "wire_bytes_sent": len(payload), "raw_bytes_sent": len(payload)}}
 
 
@@ -70,6 +74,10 @@ def test_complete_attempt_verifies_bytes_and_receipt(monkeypatch, tmp_path):
     assert result["receiver_verified"] and result["payload_transport_verified"]
     assert result["source_sha256"] == hashlib.sha256(data).hexdigest()
     assert result["logical_goodput_bps"] > 0
+    # The stored row keeps the receipt's own unit and window labels.
+    assert result["payload_bytes_unit"] == "encoded_payload_bytes"
+    assert result["payload_accounting_window"] == "attempt"
+    assert result["payload_transfer_totals"]["wire_bytes"] == result["application_wire_bytes"] == len(data)
 
 
 @pytest.mark.parametrize("failure", ["missing_file", "wrong_hash", "unconfirmed", "wrong_route", "missing_route_accounting"])

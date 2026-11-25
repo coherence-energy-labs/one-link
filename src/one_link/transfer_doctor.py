@@ -401,12 +401,17 @@ def transfer_autopilot_truth(
         _as_int(md.get("saved_bytes")),
         _as_int(assist.get("assisted_bytes")),
     )
+    # On a resumed attempt the receiver's chunk hit rate at the offer counts
+    # chunks this same transfer delivered earlier.  The network carried those,
+    # so they are not prior knowledge, and a count of chunks cannot be split
+    # by bytes; ``skipped_ratio`` is already net of them and stands alone.
+    resumed_bytes = max(_as_int(report.get("resumed_bytes")), _as_int(md.get("resumed_bytes")))
     savings_ratio = max(
         _as_float(perf.get("bandwidth_savings_ratio")),
         _as_float(report.get("bandwidth_savings_ratio")),
         _as_float(plan.get("estimated_savings_ratio")),
         _as_float(md.get("bandwidth_savings_ratio")),
-        _as_float(md.get("prior_hit_rate_actual")),
+        0.0 if resumed_bytes > 0 else _as_float(md.get("prior_hit_rate_actual")),
         _as_float(md.get("skipped_ratio")),
     )
     if savings_ratio <= 0 and total_bytes > 0 and (skipped_bytes > 0 or saved_bytes > 0):

@@ -233,7 +233,11 @@ def _transfer_attempt(pair: Any, src: Path, payload: bytes, *, transport: str = 
         row["skipped_chunks"] = result.get("cdc_skipped")
         row["transfer_report"] = result.get("transfer_report")
         row["performance_summary"] = result.get("performance_summary")
-        for key in ("payload_transport", "payload_bytes_by_transport", "payload_chunks_by_transport", "payload_fallbacks"):
+        # The route fields describe this one call (window "attempt") in encoded
+        # payload bytes; keep the receipt's own unit, window and whole-transfer
+        # totals beside them so a stored row cannot be read in another unit.
+        for key in ("payload_transport", "payload_bytes_by_transport", "payload_chunks_by_transport", "payload_fallbacks",
+                    "payload_bytes_unit", "payload_accounting_window", "payload_transfer_totals"):
             row[key] = result.get(key)
         byte_counts = result.get("payload_bytes_by_transport")
         chunk_counts = result.get("payload_chunks_by_transport")

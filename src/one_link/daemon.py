@@ -381,6 +381,10 @@ STREAM_PIPELINE_MAX_CHUNKS = 16
 STREAM_PIPELINE_RUNTIME_MAX_CHUNKS = 384
 FILE_ACK_BATCH_MAX = 32
 FILE_QUIC_CHUNKS_ENABLED = False
+# CDC chunks per QUIC dispatch while that lane is enabled.  At 1 every chunk
+# is its own batch; above 1 the chunks left over when the manifest ends are
+# flushed after the send loop, and that flush falls back like any other.
+QUIC_CDC_BATCH_SIZE = 1
 QUIC_CHUNK_RECEIPT_VERSION = 1
 FILE_COMMIT_RECEIPT_VERSION = 1
 FILE_COMMIT_REPLAY_REHASH_MAX_BYTES = 4 * 1024 * 1024 * 1024
@@ -1234,6 +1238,9 @@ _OUTBOUND_DELIVERY_RESERVED_METADATA_KEYS = frozenset(
         "payload_chunks_by_transport",
         "payload_fallbacks",
         "payload_accounting_scope",
+        "payload_bytes_unit",
+        "payload_accounting_window",
+        "payload_transfer_totals",
         "source_index_engine",
     }
 )
@@ -30637,7 +30644,6 @@ class Daemon:
         clicked Send on a 10 GB folder, you want it to go.
         """
         transport = validate_file_transport(transport)
-        payload_routes = PayloadRouteAccounting(transport)
 
         # The clean on-wire / ledger name. Strip the internal staging
         # prefix the upload pipeline adds (<ts>_<hex>_<orig>) — that
@@ -30758,6 +30764,7 @@ class Daemon:
             if preexisting is not None
             else (self.state.get_transfer(transfer_id) if self.state else None)
         )
+        payload_routes = PayloadRouteAccounting.continuing(transport, existing)
         if existing is not None:
             existing_metadata = dict(existing.metadata or {})
             legacy_unhashed_source_match = False
@@ -30890,6 +30897,7 @@ class Daemon:
             total_bytes=size,
             chunks_done=existing_chunks_done,
             chunks_total=max(stream_chunks_total, existing_chunks_total),
+            **payload_routes.ledger_counters(),
             metadata=base_metadata,
         )
 
@@ -31779,6 +31787,7 @@ class Daemon:
                             planned_chunks_total,
                             existing_chunks_total,
                         ),
+                        **payload_routes.ledger_counters(),
                         metadata=base_metadata,
                     )
                 else:
@@ -31870,8 +31879,7 @@ class Daemon:
                             total_bytes=size,
                             chunks_done=planned_chunks_total,
                             chunks_total=planned_chunks_total,
-                            raw_bytes=0,
-                            wire_bytes=0,
+                            **payload_routes.ledger_counters(),
                             metadata={
                                 **base_metadata,
                                 "mode": planned_wire_mode,
@@ -32107,10 +32115,7 @@ class Daemon:
                         "cdc_window_bytes": cdc_window_bytes,
                         "pipeline_tuning": cdc_profile,
                         "prior_hit_rate_actual": actual_prior_hit_rate,
-                        "skipped_bytes": skipped_bytes,
-                        "skipped_ratio": round(
-                            skipped_bytes / max(1, size), 6,
-                        ),
+                        **payload_routes.skipped_at_offer(skipped_bytes, size),
                         "binary_frame": cdc_binary_used,
                         "ack_batch": negotiated_ack_batch,
                     }
@@ -32157,7 +32162,7 @@ class Daemon:
                             chunks_sent += 1
                             raw_bytes_sent += raw_size
                             wire_bytes_sent += wire_size
-                            payload_routes.acknowledge(stream_transport, wire_size)
+                            payload_routes.acknowledge(stream_transport, wire_size, raw_size)
                             self._update_transfer(
                                 transfer_id,
                                 status="active",
@@ -32165,10 +32170,10 @@ class Daemon:
                                 total_bytes=size,
                                 chunks_done=(len(cdc_chunks) - len(wanted_indexes)) + chunks_sent,
                                 chunks_total=len(cdc_chunks),
-                                raw_bytes=raw_bytes_sent,
-                                wire_bytes=wire_bytes_sent,
+                                **payload_routes.ledger_counters(),
                                 metadata={
                                     **base_metadata,
+                                    **payload_routes.snapshot(),
                                     "delivery_state": "sending",
                                     "actual_method": actual_method,
                                     "in_flight_chunks": len(pending_cdc_sizes),
@@ -32192,7 +32197,6 @@ class Daemon:
                         # serves as the real ACK. On any QUIC failure
                         # the rest of the transfer degrades to WebRTC
                         # — no retry loop, just graceful fallback.
-                        QUIC_CDC_BATCH_SIZE = 1
                         QUIC_CDC_BATCH_LANES = 1
                         # Pre-dial QUIC once if conditions allow. The
                         # CDC branch had no pre-dial historically (the
@@ -32287,7 +32291,7 @@ class Daemon:
                                 chunks_sent += 1
                                 raw_bytes_sent += raw_sz
                                 wire_bytes_sent += wire_sz
-                                payload_routes.acknowledge("quic", wire_sz)
+                                payload_routes.acknowledge("quic", wire_sz, raw_sz)
                                 cdc_scheduler.observe_ack(
                                     ack_ms=elapsed_ms / max(1, len(cdc_quic_sizes)),
                                     raw_bytes=raw_sz,
@@ -32304,10 +32308,10 @@ class Daemon:
                                         (len(cdc_chunks) - len(wanted_indexes)) + chunks_sent
                                     ),
                                     chunks_total=len(cdc_chunks),
-                                    raw_bytes=raw_bytes_sent,
-                                    wire_bytes=wire_bytes_sent,
+                                    **payload_routes.ledger_counters(),
                                     metadata={
                                         **base_metadata,
+                                        **payload_routes.snapshot(),
                                         "delivery_state": "sending",
                                         "actual_method": "file_cdc_quic",
                                         "in_flight_chunks": 0,
@@ -32327,6 +32331,37 @@ class Daemon:
                             cdc_quic_batch.clear()
                             cdc_quic_sizes.clear()
                             return True
+
+                        async def _fall_back_cdc_quic_batch(kind: str, reason: str) -> None:
+                            """Re-ship the unresolved QUIC batch on the session
+                            stream. The only place a CDC fallback is recorded,
+                            so a batch that fails mid-transfer and the batch
+                            left over at the end are counted alike."""
+                            log.info(
+                                "CDC-over-QUIC %s; %s continues over %s",
+                                kind, blob_hex[:8], stream_transport,
+                            )
+                            self._degradation_events.append({
+                                "at_ms": int(time.time() * 1000),
+                                "kind": kind,
+                                "peer_fp": peer_fp_for_policy[:16]
+                                    if peer_fp_for_policy else None,
+                                "reason": reason,
+                                "expected": "FILE_CDC_CHUNK over QUIC",
+                                "actual": f"FILE_CDC_CHUNK over {stream_transport}",
+                            })
+                            payload_routes.fallbacks += 1
+                            for fb_msg, (fb_raw, fb_wire) in zip(
+                                cdc_quic_batch, cdc_quic_sizes,
+                            ):
+                                await _queue_or_send(channel, encode_msg(fb_msg))
+                                pending_cdc_sizes.append((
+                                    str(fb_msg.get("id")),
+                                    fb_raw, fb_wire,
+                                    time.perf_counter(),
+                                ))
+                            cdc_quic_batch.clear()
+                            cdc_quic_sizes.clear()
 
                         for c in cdc_chunks:
                             if c.index not in wanted_indexes:
@@ -32423,36 +32458,11 @@ class Daemon:
                                         # rest of this transfer to
                                         # WebRTC and re-ship the failed
                                         # batch through the legacy path.
-                                        log.info(
-                                            "CDC-over-QUIC batch failed, "
-                                            "falling back to WebRTC for "
-                                            "remainder of %s", blob_hex[:8],
-                                        )
-                                        self._degradation_events.append({
-                                            "at_ms": int(time.time() * 1000),
-                                            "kind": "cdc_quic_batch_failed",
-                                            "peer_fp": peer_fp_for_policy[:16]
-                                                if peer_fp_for_policy else None,
-                                            "reason": "send_chunk_via_quic batch returned not-ok",
-                                            "expected": "FILE_CDC_CHUNK over QUIC",
-                                            "actual": f"FILE_CDC_CHUNK over {stream_transport}",
-                                        })
-                                        payload_routes.fallbacks += 1
                                         cdc_quic_eligible = False
-                                        for fb_msg, (fb_raw, fb_wire) in zip(
-                                            cdc_quic_batch, cdc_quic_sizes,
-                                        ):
-                                            fb_wire_payload = encode_msg(fb_msg)
-                                            queued_write = await _queue_or_send(
-                                                channel, fb_wire_payload,
-                                            )
-                                            pending_cdc_sizes.append((
-                                                str(fb_msg.get("id")),
-                                                fb_raw, fb_wire,
-                                                time.perf_counter(),
-                                            ))
-                                        cdc_quic_batch.clear()
-                                        cdc_quic_sizes.clear()
+                                        await _fall_back_cdc_quic_batch(
+                                            "cdc_quic_batch_failed",
+                                            "send_chunk_via_quic batch returned not-ok",
+                                        )
                                 continue  # skip the WebRTC dispatch below
                             if cdc_binary_used:
                                 wire_payload = _encode_binary_frame(chunk_msg, payload)
@@ -32479,34 +32489,10 @@ class Daemon:
                         if cdc_quic_batch:
                             ok = await _flush_cdc_quic_batch()
                             if not ok:
-                                log.info(
-                                    "CDC-over-QUIC final-batch flush failed, "
-                                    "tailing through WebRTC for %s",
-                                    blob_hex[:8],
+                                await _fall_back_cdc_quic_batch(
+                                    "cdc_quic_final_flush_failed",
+                                    "send_chunk_via_quic final batch returned not-ok",
                                 )
-                                self._degradation_events.append({
-                                    "at_ms": int(time.time() * 1000),
-                                    "kind": "cdc_quic_final_flush_failed",
-                                    "peer_fp": peer_fp_for_policy[:16]
-                                        if peer_fp_for_policy else None,
-                                    "reason": "send_chunk_via_quic final batch returned not-ok",
-                                    "expected": "FILE_CDC_CHUNK over QUIC",
-                                    "actual": f"FILE_CDC_CHUNK over {stream_transport}",
-                                })
-                                for fb_msg, (fb_raw, fb_wire) in zip(
-                                    cdc_quic_batch, cdc_quic_sizes,
-                                ):
-                                    fb_wire_payload = encode_msg(fb_msg)
-                                    queued_write = await _queue_or_send(
-                                        channel, fb_wire_payload,
-                                    )
-                                    pending_cdc_sizes.append((
-                                        str(fb_msg.get("id")),
-                                        fb_raw, fb_wire,
-                                        time.perf_counter(),
-                                    ))
-                                cdc_quic_batch.clear()
-                                cdc_quic_sizes.clear()
                         while pending_cdc_sizes:
                             await _flush_if_queued(channel, True)
                             await _settle_one_cdc_ack()
@@ -32658,10 +32644,10 @@ class Daemon:
                                 total_bytes=size,
                                 chunks_done=chunks_sent,
                                 chunks_total=total_stream_chunks,
-                                raw_bytes=raw_bytes_sent,
-                                wire_bytes=wire_bytes_sent,
+                                **payload_routes.ledger_counters(),
                                 metadata={
                                     **base_metadata,
+                                    **payload_routes.snapshot(),
                                     "delivery_state": "sending",
                                     "actual_method": (
                                         "file_binary_frame" if binary_stream_used
@@ -33018,6 +33004,7 @@ class Daemon:
                     wire_bytes=wire_bytes_sent,
                     elapsed_s=elapsed_s,
                     skipped_bytes=skipped_bytes,
+                    resumed_bytes=payload_routes.earlier_raw_bytes,
                 )
                 performance_summary = transfer_performance_summary(
                     report=transfer_report,
@@ -33053,8 +33040,7 @@ class Daemon:
                 total_bytes=size,
                 chunks_done=len(cdc_chunks) if cdc_used else chunks_sent,
                 chunks_total=len(cdc_chunks) if cdc_used else chunks_sent,
-                raw_bytes=raw_bytes_sent,
-                wire_bytes=wire_bytes_sent,
+                **payload_routes.ledger_counters(),
                 metadata={
                     **base_metadata,
                     "mode": "cdc" if cdc_used else "stream",
@@ -33155,6 +33141,7 @@ class Daemon:
             err_str = str(e)
             err_class = type(e).__name__
             transient = _is_transient_send_error(e)
+            base_metadata = {**base_metadata, **payload_routes.snapshot()}
             if adaptive_scheduler is not None:
                 with contextlib.suppress(Exception):
                     adaptive_scheduler.observe_retry(

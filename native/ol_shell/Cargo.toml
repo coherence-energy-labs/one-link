@@ -19,20 +19,27 @@ description = "Native window host for the One Link UI (WebView2 / WKWebView / We
 license = "Apache-2.0"
 publish = false
 
-# Empty table => this directory is its own workspace root, so `cargo` does not try to attach it to
-# the parent workspace it physically sits inside.
+# The first-party regression harness uses this lock without importing upstream
+# benchmark / UI-test tooling into the window's dependency graph.
 [workspace]
+members = ["regression/glib_variant_backport"]
+exclude = ["vendor/glib-0.18.5"]
+default-members = ["."]
 
-# Remaining upstream warnings, reviewed 2026-11-25:
-# RUSTSEC-2024-0429 / GHSA-wrw7-89jp-8q8g: glib 0.18.5 VariantStrIter
-# unsoundness, a known medium advisory; fixed in >=0.20.0. RustSec places this
-# in its warnings category, which does not make the dependency advisory-free.
+[patch.crates-io]
+glib = { path = "vendor/glib-0.18.5" }
+
+[package.metadata.one-link.vendored-patches]
+glib = "patches/glib-0.18.5.json"
+
+# The official two-line fix for RUSTSEC-2024-0429 / GHSA-wrw7-89jp-8q8g
+# is backported to the original glib 0.18.5 source, with its version/license
+# unchanged. This is a One Link maintained patch, not an upstream 0.18 release.
+# CI verifies every source byte and queries the registry ancestor's advisories:
+# cargo-audit alone omits local path packages. See patches/glib-0.18.5.json and
+# docs/DEPENDENCY_QUALIFICATION.md for qualification and migration obligations.
 # RUSTSEC-2024-0370: proc-macro-error 1.x is unmaintained, with no patched release.
-# The Linux GTK 0.18 chain still appears in current tao/wry upstream manifests.
-# This crate has no direct VariantStrIter use, but that does not prove absence
-# of transitive reachability. Separate workspace resolution is not a security
-# boundary for the shipped UI. Keep both warnings in audit output; do not call
-# this graph warning-free. See docs/DEPENDENCY_QUALIFICATION.md for exact scope.
+# This remaining warning stays visible; there are no globally ignored IDs.
 
 [dependencies]
 ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }

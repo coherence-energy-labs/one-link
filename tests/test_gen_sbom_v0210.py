@@ -445,8 +445,30 @@ def test_all_three_real_cargo_graphs_are_complete_and_schema_valid(tmp_path: Pat
         expected = gen_sbom._parse_cargo_packages(REPO / path / "Cargo.lock")
         actual = [row for row in merged["components"]
                   if _property_map(row).get("one-link:cargo:graph") == name]
-        assert {row["purl"] for row in actual} == {package.ref for package in expected}
+        assert {(row["name"], row["version"]) for row in actual} == {
+            (package.name, package.version) for package in expected}
+        assert all(row["purl"].startswith("pkg:cargo/") for row in actual)
         assert _property_map(merged["metadata"])[f"one-link:sbom:cargo-graph:{name}:package-count"] == str(len(expected))
+    if importlib.util.find_spec("cyclonedx") is not None:
+        gen_sbom._strict_schema_validate(gen_sbom._canonical_json(merged))
+
+
+def test_vendored_glib_sbom_identifies_actual_bytes_and_original_advisory_identity(tmp_path: Path):
+    merged = gen_sbom.augment_sbom(
+        copy.deepcopy(_base_bom()),
+        additional_cargo=[("shell", REPO / "native/ol_shell/Cargo.toml")],
+        output_path=tmp_path / "sbom.json",
+    )
+    glib = next(row for row in merged["components"] if row["name"] == "glib")
+    proof = json.loads((REPO / "native/ol_shell/patches/glib-0.18.5.json").read_text(encoding="utf-8"))
+    assert glib["version"] == "0.18.5"
+    assert glib["purl"] == "pkg:cargo/glib@0.18.5"
+    assert glib["modified"] is True
+    assert glib["licenses"] == [{"license": {"id": "MIT"}}]
+    assert _property_map(glib)["one-link:cargo:source"] == "vendored"
+    assert glib["hashes"][0]["content"] == proof["source_tree_sha256"]
+    assert glib["pedigree"]["ancestors"][0]["hashes"][0]["content"] == proof["upstream"]["crate_sha256"]
+    assert glib["pedigree"]["patches"][0]["type"] == "backport"
     if importlib.util.find_spec("cyclonedx") is not None:
         gen_sbom._strict_schema_validate(gen_sbom._canonical_json(merged))
 

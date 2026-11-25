@@ -41,11 +41,15 @@ that any release has passed it.
       pip-audit against the frozen lock export, bandit SAST, and SBOM generation.
       Medium-or-higher Bandit findings and advisories classified by the scanners
       as vulnerabilities fail their gates. Main native and fuzz RustSec warnings
-      also fail the gate. The shell retains a known medium glib advisory
-      (classified by RustSec as an unsoundness warning) plus an unmaintained
-      dependency warning. These remain explicit production qualification gaps
-      in [DEPENDENCY_QUALIFICATION.md](DEPENDENCY_QUALIFICATION.md); a green
-      vulnerability gate does not resolve or approve those risks.
+      also fail the gate. The shell's original glib version remains listed for
+      a known medium advisory; its official two-line source fix is backported
+      locally with unchanged version/license, exact provenance, optimized
+      regression tests and a live original-version advisory query. The query
+      retains all replies and fails on new findings or query failure. Qualify
+      the real Linux shell build/window job as well as the scoped iterator
+      tests. The separate unmaintained macro dependency and future upstream
+      migration remain documented in
+      [DEPENDENCY_QUALIFICATION.md](DEPENDENCY_QUALIFICATION.md).
 
 - [ ] **`synthetic_monitor.yml` green for the past 7 days.**
       No transient failures in the morning + evening runs - if

@@ -26,11 +26,17 @@ on:
       - 'native/ol_shell/**'
       - 'src/one_link/web/index.html'      # the pin's input: a change here must rebuild
       - '.github/workflows/native_shell.yml'
+      - '.gitattributes'
+      - 'scripts/verify_vendor_patches.py'
+      - 'scripts/audit_vendor_advisories.py'
   pull_request:
     paths:
       - 'native/ol_shell/**'
       - 'src/one_link/web/index.html'
       - '.github/workflows/native_shell.yml'
+      - '.gitattributes'
+      - 'scripts/verify_vendor_patches.py'
+      - 'scripts/audit_vendor_advisories.py'
 
 permissions:
   contents: read
@@ -79,6 +85,19 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: native/ol_shell
+
+      - name: verify reviewed vendor source and upstream patch
+        run: python scripts/verify_vendor_patches.py --fetch-upstream --report test-results/vendor-provenance.json
+
+      - name: optimized GLib Variant iterator regression tests
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: '3'
+        run: |
+          mkdir -p test-results
+          cargo test --manifest-path native/ol_shell/Cargo.toml --locked --release \
+            -p ol_shell_glib_regression 2>&1 | tee test-results/glib-optimized.log
 
       - name: build the window
         working-directory: native/ol_shell
@@ -133,3 +152,11 @@ jobs:
           else
             python scripts/smoke_native_shell.py --timeout 120
           fi
+
+      - name: retain vendor and native window qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-shell-qualification-${{ matrix.os }}
+          path: test-results/
+          if-no-files-found: warn

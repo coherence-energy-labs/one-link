@@ -27,10 +27,15 @@ import sys
 import tempfile
 import tomllib
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 from urllib.parse import quote, urlencode
+
+if __package__:
+    from .verify_vendor_patches import VendorError, inspect_patches
+else:
+    from verify_vendor_patches import VendorError, inspect_patches
 
 
 CYCLONEDX_SPEC_VERSION = "1.6"
@@ -310,6 +315,14 @@ def _cargo_inventory(
     workspace_manifest: Path,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, str]]:
     packages = _parse_cargo_packages(lock_path)
+    try:
+        vendors = inspect_patches(workspace_manifest)
+    except (OSError, ValueError, KeyError, TypeError, VendorError) as exc:
+        raise SbomError(f"vendored dependency provenance failed: {exc}") from exc
+    packages = [replace(package, ref=(
+        f"urn:one-link:vendored-cargo:{package.name}:{package.version}:sha256:"
+        + vendors[(package.name, package.version)]["proof"]["source_tree_sha256"]
+    )) if (package.name, package.version) in vendors else package for package in packages]
     workspace_members = _workspace_member_manifests(workspace_manifest)
     local_packages = {
         (package.name, package.version): package
@@ -347,6 +360,43 @@ def _cargo_inventory(
                     component["licenses"] = [{"license": {"id": license_value}}]
             if "description" in member:
                 component["description"] = member["description"]
+        vendor = vendors.get((package.name, package.version))
+        if vendor is not None:
+            proof = vendor["proof"]
+            upstream = proof["upstream"]
+            backport = proof["backport"]
+            # Keep the original package/version visible to advisory scanners,
+            # but identify the actual local bytes and their modified pedigree.
+            component["purl"] = _cargo_purl(
+                package.name, package.version, "registry+https://github.com/rust-lang/crates.io-index"
+            )
+            component["modified"] = True
+            component["licenses"] = [{"license": {"id": proof["package"]["license"]}}]
+            component["hashes"] = [{"alg": "SHA-256", "content": proof["source_tree_sha256"]}]
+            component["pedigree"] = {
+                "ancestors": [{
+                    "type": "library", "name": package.name, "version": package.version,
+                    "purl": component["purl"],
+                    "hashes": [{"alg": "SHA-256", "content": upstream["crate_sha256"]}],
+                    "licenses": [{"license": {"id": proof["package"]["license"]}}],
+                    "externalReferences": [{"type": "distribution", "url": upstream["crate_url"]}],
+                }],
+                "patches": [{"type": "backport", "diff": {
+                    "text": {"contentType": "text/plain", "content": vendor["patch_text"]},
+                    "url": backport["upstream_url"],
+                }}],
+                "notes": proof["maintenance"],
+            }
+            additions.update({
+                "one-link:cargo:source": "vendored",
+                "one-link:cargo:vendored-path": proof["package"]["path"],
+                "one-link:cargo:source-tree-sha256": proof["source_tree_sha256"],
+                "one-link:cargo:source-tree-hash-format": proof["tree_hash_format"],
+                "one-link:cargo:upstream-crate-sha256": upstream["crate_sha256"],
+                "one-link:cargo:upstream-fix-commit": backport["upstream_fix_commit"],
+                "one-link:cargo:patch-sha256": backport["patch_sha256"],
+                "one-link:cargo:backported-advisories": ",".join(backport["advisories"]),
+            })
         _properties(component, additions)
         components.append(component)
         dependencies.append(
@@ -364,6 +414,7 @@ def _cargo_inventory(
         "one-link:sbom:cargo-package-count": str(len(packages)),
         "one-link:sbom:cargo-workspace-member-count": str(len(workspace_members)),
         "one-link:sbom:cargo-scope": "complete Cargo.lock resolution, including build and test packages",
+        "one-link:sbom:cargo-vendored-backport-count": str(len(vendors)),
     }
     return components, dependencies, metadata
 

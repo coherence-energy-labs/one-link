@@ -136,6 +136,7 @@ jobs:
       - name: generate SBOM
         if: ${{ !cancelled() && steps.audit_tools.outcome == 'success' }}
         run: |
+          uv run --frozen --extra security python scripts/verify_vendor_patches.py --fetch-upstream --report vendor-provenance.json
           uv run --frozen --extra security python scripts/gen_sbom.py \
             --from requirements --python-lock uv.lock --exclude-python-extra native \
             --cargo-lock native/Cargo.lock --cargo-workspace native/Cargo.toml \
@@ -155,6 +156,7 @@ jobs:
             rendezvous-pip-audit.json
             rendezvous-pip-audit-osv.json
             bandit.json
+            vendor-provenance.json
             dist/sbom.cdx.json
           if-no-files-found: warn
 
@@ -171,6 +173,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
 
       - name: Install Rust toolchain
         run: |
@@ -192,13 +198,16 @@ jobs:
           cargo audit --file native/Cargo.lock --deny warnings
           cargo audit --file native/fuzz/Cargo.lock --deny warnings
 
-      # RustSec places the known medium glib advisory under unsound warnings.
-      # It remains unresolved alongside proc-macro-error's maintenance warning;
-      # this category gate does not certify an advisory-free Linux shell.
-      # See docs/DEPENDENCY_QUALIFICATION.md. No advisory IDs are suppressed.
+      # RustSec retains the macro-maintenance warning. It omits path packages,
+      # so the separately required live ancestor query below covers glib and
+      # fails closed on any advisory not addressed by the exact verified patch.
       - name: Gate shell RustSec vulnerability category with warnings retained
         if: ${{ !cancelled() && steps.rustsec_reports.outcome == 'success' }}
         run: cargo audit --file native/ol_shell/Cargo.lock
+
+      - name: Audit verified vendor registry ancestors against live advisories
+        if: ${{ !cancelled() }}
+        run: python scripts/audit_vendor_advisories.py --report vendor-upstream-advisories.json
 
       - name: Upload RustSec report
         if: always()
@@ -209,4 +218,5 @@ jobs:
             cargo-audit.json
             cargo-audit-fuzz.json
             cargo-audit-shell.json
+            vendor-upstream-advisories.json
           if-no-files-found: error

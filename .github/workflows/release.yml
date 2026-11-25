@@ -248,9 +248,13 @@ jobs:
 
       - name: gate shell RustSec vulnerability category with warnings retained
         if: ${{ !cancelled() && steps.cargo_audit.outcome == 'success' }}
-        # The medium glib advisory is an unsoundness warning in RustSec.
-        # See docs/DEPENDENCY_QUALIFICATION.md; it remains unresolved.
+        # Path packages are covered by the required live ancestor query below;
+        # the remaining proc-macro-error maintenance warning stays visible.
         run: cargo audit --file native/ol_shell/Cargo.lock
+
+      - name: audit verified vendor registry ancestors against live advisories
+        if: ${{ !cancelled() }}
+        run: python scripts/audit_vendor_advisories.py --report test-results/vendor-upstream-advisories.json
 
       - name: install checksummed Gitleaks release
         env:
@@ -717,6 +721,27 @@ jobs:
           rustup toolchain install 1.96.0 --profile minimal --no-self-update
           rustup default 1.96.0
 
+      - name: verify reviewed vendor source and upstream patch
+        run: python scripts/verify_vendor_patches.py --fetch-upstream --report test-results/vendor-provenance.json
+
+      - name: optimized GLib Variant iterator regression tests
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: '3'
+        run: |
+          mkdir -p test-results
+          cargo test --manifest-path native/ol_shell/Cargo.toml --locked --release \
+            -p ol_shell_glib_regression 2>&1 | tee test-results/glib-optimized.log
+
+      - name: retain vendor qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vendor-qualification-${{ matrix.native_artifact }}
+          path: test-results/
+          if-no-files-found: warn
+
       - name: install/verify OpenSSL on Windows ARM64 (cryptography build dep)
         # See auto_build.yml for the full rationale. Tagged releases do not
         # restore compiled vcpkg caches: OpenSSL is rebuilt from the pinned
@@ -1103,10 +1128,14 @@ jobs:
             wheels and standalone bundles assembled by this run. The SBOM is
             itself covered by SHA256SUMS, Sigstore, and provenance attestation.
             It includes build and test dependencies and does not assert runtime
-            reachability in every artifact. A known medium Linux shell glib
-            advisory and a separate maintenance warning remain documented in
-            `docs/DEPENDENCY_QUALIFICATION.md` and this run's RustSec evidence;
-            this is not an advisory-free or production qualification.
+            reachability in every artifact. The local Linux shell glib backport
+            preserves its original version and license, with exact source hashes,
+            an upstream patch pedigree and a live original-version advisory check.
+            The known upstream advisory remains visible and only that exact issue
+            is covered by the verified source patch. A separate macro-maintenance
+            warning remains; see `docs/DEPENDENCY_QUALIFICATION.md` and this run's
+            RustSec/vendor evidence. These checks do not by themselves establish
+            complete production qualification.
 
             `UPDATE_MANIFEST.json` is the signed, commit-bound authority used by
             the standalone transactional updater. It names and hashes each

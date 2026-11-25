@@ -106,10 +106,12 @@ def test_stale_port_files_dont_break_daemon():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_read_control_port_auto_cleans_dead_runtime_files(monkeypatch):
-    """If a daemon died hard, users should not inherit dead control/UI
-    pointers. The next launcher/CLI probe must clean them and force a fresh
-    daemon start path automatically."""
+def test_read_control_port_rejects_dead_hints_without_deleting_runtime_files(monkeypatch):
+    """A reader rejects stale hints; only the lock owner may retire them.
+
+    Startup replaces old publications after acquiring the singleton lock.
+    A failed client probe must not race a live owner or its successor.
+    """
     from one_link import daemon as daemon_mod
 
     tmp = Path(tempfile.mkdtemp(prefix="one_link_dead_runtime_"))
@@ -127,10 +129,10 @@ def test_read_control_port_auto_cleans_dead_runtime_files(monkeypatch):
         with pytest.raises(RuntimeError, match="stale control.port"):
             daemon_mod.read_control_port()
 
-        assert not (data / "control.port").exists()
-        assert not (data / "peer.port").exists()
-        assert not (data / "server.port").exists()
-        assert not (data / "daemon.lock").exists()
+        assert (data / "control.port").read_text() == "65530"
+        assert (data / "peer.port").read_text() == "65529"
+        assert (data / "server.port").read_text() == "65528"
+        assert (data / "daemon.lock").read_text() == "999999"
     finally:
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)

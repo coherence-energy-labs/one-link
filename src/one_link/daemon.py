@@ -2713,25 +2713,12 @@ def _runtime_port_paths() -> tuple[Path, ...]:
     )
 
 
-def _clear_stale_runtime_files() -> None:
-    """Remove dead daemon runtime hints without touching identity/state.
-
-    These files are just pointers to a currently running process. If the
-    process is gone, leaving them behind makes launchers and tests try a
-    port that will never answer. That is exactly the class of "spins forever"
-    failure a self-healing desktop app must not expose to users.
-    """
-    for p in (*_runtime_port_paths(), _daemon_lock_path()):
-        with contextlib.suppress(OSError):
-            p.unlink()
-
-
 def _candidate_control_ports_for_pid(pid: int) -> list[int]:
     """Return localhost listen ports owned by ``pid``.
 
     This is a recovery path for launchers: if a stale helper removes
-    ``control.port`` while the daemon is healthy, the app should repair the
-    hint file instead of spinning or starting a duplicate daemon.
+    ``control.port`` while the daemon is healthy, the app should discover the
+    authenticated endpoint instead of starting a duplicate daemon.
     """
     if pid <= 0:
         return []
@@ -2860,8 +2847,43 @@ def _candidate_local_listen_ports() -> list[int]:
     return sorted(ports)
 
 
+_CONTROL_RECOVERY_MAX_CANDIDATES = 32
+_CONTROL_RECOVERY_PROBE_WINDOW_S = 5.0
+
+
+def _control_recovery_pid_hint() -> int | None:
+    """Read a bounded discovery hint, never proof of instance ownership.
+
+    Windows denies reads of byte zero while another process holds the
+    singleton byte lock. Only that permission failure permits a fallback to
+    the existing lifecycle record; absent or malformed lock files do not
+    authorize a scan. The eventual control response must authenticate this
+    exact PID and data home regardless of which hint supplied the PID.
+    """
+    try:
+        raw_pid = _read_runtime_ascii_scalar(_daemon_lock_path())
+    except PermissionError:
+        try:
+            raw_lifecycle = json.loads(_read_runtime_ascii_scalar(
+                _lifecycle_path(), max_bytes=LIFECYCLE_RECORD_MAX_BYTES,
+            ))
+        except (OSError, ValueError, UnicodeError, RecursionError):
+            return None
+        lifecycle = _validated_lifecycle_identity(
+            raw_lifecycle if isinstance(raw_lifecycle, dict) else None,
+        )
+        return int(lifecycle["pid"]) if lifecycle is not None else None
+    except (OSError, UnicodeError):
+        return None
+    try:
+        pid = int(raw_pid)
+    except ValueError:
+        return None
+    return pid if 0 < pid <= 0xFFFFFFFF else None
+
+
 def _recover_control_port_from_live_pid() -> int | None:
-    pid = _read_lock_pid()
+    pid = _control_recovery_pid_hint()
     if pid is None or not _pid_is_alive(pid):
         return None
     candidates: list[int] = []
@@ -2869,17 +2891,26 @@ def _recover_control_port_from_live_pid() -> int | None:
     if not candidates:
         candidates.extend(_candidate_local_listen_ports())
     home = str(data_dir())
-    for port in candidates:
+    # Limit candidate count and when another probe may start. Socket timeouts
+    # apply to individual I/O operations, not an end-to-end wall-clock bound.
+    deadline = time.monotonic() + _CONTROL_RECOVERY_PROBE_WINDOW_S
+    for port in candidates[:_CONTROL_RECOVERY_MAX_CANDIDATES]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if type(port) is not int or not (0 < port <= 65535):
+            continue
         # query_control_status has a no-raise contract and returns an empty
         # mapping for an unreachable or unauthenticated candidate.
-        status = query_control_status(port, timeout=0.75)
+        status = query_control_status(port, timeout=min(0.75, remaining))
         if (
             status.get("ok") is True
-            and (pid is None or int(status.get("pid") or 0) == int(pid))
+            and type(status.get("pid")) is int
+            and status["pid"] == pid
             and str(status.get("home") or "") == home
         ):
-            with contextlib.suppress(OSError):
-                _publish_runtime_ascii_scalar(_control_port_path(), str(port))
+            # Discovery never publishes: a successor may acquire ownership
+            # and publish its port during this authenticated exchange.
             return int(port)
     return None
 
@@ -4051,6 +4082,49 @@ class Daemon:
         except Exception:
             f.close()
             raise
+
+    def _retire_runtime_publications(self) -> None:
+        """Retire this lifecycle's hints while its singleton lock is held.
+
+        An open owned handle and the matching lifecycle are both required.
+        In particular, a predecessor calling stop again after releasing its
+        lock cannot erase a successor's publications. Keep the lock inode:
+        unlinking it would let a successor lock a different file on POSIX.
+        """
+        handle = self._lock_file
+        expected = _validated_lifecycle_identity(self._runtime_lifecycle)
+        if (
+            handle is None
+            or handle.closed
+            or expected is None
+            or expected["pid"] != os.getpid()
+        ):
+            return
+        try:
+            opened = os.fstat(handle.fileno())
+            current = _daemon_lock_path().lstat()
+            attrs = int(getattr(current, "st_file_attributes", 0) or 0)
+            reparse = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or not stat.S_ISREG(current.st_mode)
+                or bool(attrs & reparse)
+                or opened.st_nlink != 1
+                or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+            ):
+                return
+            handle.seek(0)
+            if handle.read(65).decode("ascii").strip() != str(os.getpid()):
+                return
+        except (OSError, ValueError, UnicodeError):
+            return
+        active = _validated_lifecycle_identity(_read_lifecycle_record(_lifecycle_path()))
+        if active != expected:
+            return
+        _record_clean_shutdown(expected)
+        for path in (*_runtime_port_paths(), data_dir() / "ui.token"):
+            with contextlib.suppress(OSError):
+                path.unlink()
 
     def _release_instance_lock(self) -> None:
         if self._lock_file is None:
@@ -38789,9 +38863,8 @@ class Daemon:
                     "shutdown_state_store",
                     exc,
                 )
-        if self._runtime_lifecycle is not None:
-            _record_clean_shutdown(self._runtime_lifecycle)
-            self._runtime_lifecycle = None
+        self._retire_runtime_publications()
+        self._runtime_lifecycle = None
         # Retire the loop watchdog LAST, so a shutdown that itself blocks the
         # loop still gets named. Retiring it at all is not optional: a daemon
         # thread outlives stop(), and a process that starts and stops many
@@ -39175,26 +39248,18 @@ async def run() -> None:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await heartbeat_task
         await daemon.stop()
-        # A gracefully exiting daemon removes its own runtime publications:
-        # they describe THIS live process (ports, UI token), and leaving them
-        # behind is exactly the "launcher spins on a port that will never
-        # answer" class the reader-side GC only heals on the NEXT read.
-        # Eager removal here; the lazy path still covers crashes.
-        _clear_stale_runtime_files()
-        with contextlib.suppress(OSError):
-            (data_dir() / "ui.token").unlink()
 
 
 def read_control_port(clear_stale: bool = True) -> int:
     """Resolve the live daemon's control port.
 
-    ``clear_stale`` (default True) lets genuine CLI "is the daemon
-    running?" checks garbage-collect stale runtime files. When False, return
-    only the bounded port *hint*: callers in this mode immediately perform
-    authenticated IPC themselves. This avoids a redundant 500 ms status probe
-    falsely classifying a healthy daemon as stale while its event loop is busy
-    completing startup, and it never deletes a booting daemon's one-shot port
-    publication.
+    ``clear_stale`` retains its public name for compatibility: True validates
+    liveness with authenticated IPC, while False returns a bounded port hint
+    for callers that immediately authenticate themselves. Neither mode deletes
+    or replaces runtime files. A failed probe and an unreadable Windows lock
+    are not evidence of absent ownership; only the owning daemon retires its
+    publications, before releasing the singleton lock. Startup replaces stale
+    hints atomically.
     """
     p = _control_port_path()
     if not p.exists():
@@ -39205,16 +39270,11 @@ def read_control_port(clear_stale: bool = True) -> int:
     try:
         port = int(_read_runtime_ascii_scalar(p))
     except Exception as e:
-        if clear_stale:
-            _clear_stale_runtime_files()
         raise RuntimeError("daemon not running (bad control.port file)") from e
     if not clear_stale:
         return port
     if is_daemon_alive(port):
         return port
-    lock_pid = _read_lock_pid()
-    if clear_stale and (lock_pid is None or not _pid_is_alive(lock_pid)):
-        _clear_stale_runtime_files()
     raise RuntimeError(f"daemon not running (stale control.port {port})")
 
 

@@ -233,25 +233,25 @@ fn invalid_parameters_and_io_errors_preserve_their_error_categories() {
     );
 }
 
-/// A dense MCAP source generated on demand, without a file-sized input vector.
-/// Each valid zero-body message record is only nine bytes. The read trace also
-/// proves payload scanning begins while headers are still in the first window;
-/// collecting a complete candidate vector before scanning fails this assertion.
+/// A dense MCAP source generated on demand, without a file-sized input vector:
+/// 17-byte Message records whose 8-byte body is the record's sequence number,
+/// so every record's head differs (format-aware v2 selects among them; records
+/// that all looked alike would, correctly, get no structural cut at all).
 struct DenseMcap {
     pos: u64,
     len: usize,
-    header_windows: usize,
-    headers_before_payload: Option<usize>,
+    bytes_read: usize,
     largest_read: usize,
 }
+
+const DENSE_RECORD: usize = 17;
 
 impl DenseMcap {
     fn new(records: usize) -> Self {
         Self {
             pos: 0,
-            len: 8 + 13 + records * 9 + 8,
-            header_windows: 0,
-            headers_before_payload: None,
+            len: 8 + 13 + records * DENSE_RECORD + 8,
+            bytes_read: 0,
             largest_read: 0,
         }
     }
@@ -265,10 +265,12 @@ impl DenseMcap {
         if p < 21 {
             return [1, 4, 0, 0, 0, 0, 0, 0, 0, b'r', b'o', b's', b'2'][p - 8];
         }
-        if (p - 21).is_multiple_of(9) {
-            5
-        } else {
-            0
+        let (record, at) = ((p - 21) / DENSE_RECORD, (p - 21) % DENSE_RECORD);
+        match at {
+            0 => 5,
+            1 => 8,
+            2..=8 => 0,
+            _ => (record as u64).to_le_bytes()[at - 9],
         }
     }
 }
@@ -277,13 +279,8 @@ impl Read for DenseMcap {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let pos = usize::try_from(self.pos).unwrap();
         let count = buf.len().min(self.len.saturating_sub(pos));
-        self.largest_read = self.largest_read.max(buf.len());
-        if buf.len() == 64 << 10 {
-            self.header_windows += 1;
-        }
-        if (8192..64 << 10).contains(&buf.len()) && self.headers_before_payload.is_none() {
-            self.headers_before_payload = Some(self.header_windows);
-        }
+        self.largest_read = self.largest_read.max(count);
+        self.bytes_read += count;
         for (i, out) in buf[..count].iter_mut().enumerate() {
             *out = self.byte(pos + i);
         }
@@ -306,7 +303,12 @@ impl Seek for DenseMcap {
 }
 
 #[test]
-fn millions_of_dense_records_are_coalesced_online_without_candidate_vectors() {
+fn millions_of_dense_records_are_chunked_online_reading_the_source_once() {
+    // Two million records, 34 MB. The scanner holds a bounded header window
+    // and hashes short segments from it as their cuts are decided, so the
+    // source is read once. Collecting candidates or segments first and
+    // hashing afterwards would read the payload a second time (about 2x len)
+    // and fail the read-once assertion.
     let records = 2_000_000;
     let mut source = DenseMcap::new(records);
     let len = source.len;
@@ -318,15 +320,40 @@ fn millions_of_dense_records_are_coalesced_online_without_candidate_vectors() {
         0,
     )
     .unwrap();
-    // Leading magic is checked before trailing magic; the footer may evict
-    // the first read-ahead window. At most that one refill precedes payload.
-    assert!(matches!(source.headers_before_payload, Some(1 | 2)));
-    assert!(source.largest_read <= 64 << 10);
-    assert!(result.boundaries.len() < records / 100);
+    // Exactly once, plus a derived constant: the first 64 KiB header window
+    // (leading magic check), the 8-byte trailing magic (which replaces that
+    // window), and the first window again when the slide reloads the bytes
+    // the writer still needs from offset 0.
+    assert_eq!(
+        source.bytes_read,
+        len + 2 * (64 << 10) + 8,
+        "bytes read from a {len}-byte source"
+    );
+    assert!(source.largest_read <= 16 << 20, "{}", source.largest_read);
+    // About one chunk per avg_size bytes, each forced chunk on a record start.
+    assert!(
+        (len / (128 << 10)..len / (32 << 10)).contains(&result.boundaries.len()),
+        "{} chunks",
+        result.boundaries.len()
+    );
     assert_eq!(result.boundaries.first().unwrap().start, 0);
     assert_eq!(result.boundaries.last().unwrap().end, len);
     assert!(!result.format_aware[0]);
-    assert!(result.format_aware[1..].iter().all(|x| *x));
+    let forced = result.format_aware.iter().filter(|f| **f).count();
+    assert!(
+        forced * 10 >= result.boundaries.len() * 9,
+        "{forced} forced"
+    );
+    for (b, f) in result.boundaries.iter().zip(&result.format_aware) {
+        if *f {
+            assert_eq!(
+                (b.start - 21) % DENSE_RECORD,
+                0,
+                "forced cut at {}",
+                b.start
+            );
+        }
+    }
     for pair in result.boundaries.windows(2) {
         assert_eq!(pair[0].end, pair[1].start);
     }
@@ -337,4 +364,128 @@ fn millions_of_dense_records_are_coalesced_online_without_candidate_vectors() {
             .collect();
         assert_eq!(boundary.raw_address, *blake3::hash(&bytes).as_bytes());
     }
+}
+
+/// A dense MCAP of 17-byte sequence-numbered records, materialised.
+fn dense_mcap_bytes(records: usize) -> Vec<u8> {
+    let mut out = MCAP_MAGIC.to_vec();
+    out.extend_from_slice(&[1, 4, 0, 0, 0, 0, 0, 0, 0, b'r', b'o', b's', b'2']);
+    for k in 0..records as u64 {
+        out.push(5);
+        out.extend_from_slice(&8u64.to_le_bytes());
+        out.extend_from_slice(&k.to_le_bytes());
+    }
+    out.extend_from_slice(&MCAP_MAGIC);
+    out
+}
+
+fn mcap_record(opcode: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![opcode];
+    out.extend_from_slice(&(body.len() as u64).to_le_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
+#[test]
+fn every_payload_path_of_the_file_scanner_equals_the_in_memory_scanner() {
+    // The seekable scanner hashes short segments from its header window when
+    // a dense walk has slid the window over them, and reads them itself when
+    // the walk jumped (sparse records) or a segment outgrew the retention
+    // (one huge record inside a dense run). Each layout below exercises one of
+    // those paths, past the 16 MiB slide and 8 MiB batch sizes, through
+    // fragmented and interrupted reads; the in-memory scanner is the oracle.
+    let dense = dense_mcap_bytes(2_500_000); // 42.5 MB: several slides and batches
+    let mut sparse = MCAP_MAGIC.to_vec();
+    sparse.extend(mcap_record(1, b"ros2"));
+    for i in 0..400usize {
+        // Large records the walk jumps over, with short ones between them.
+        let big = 70_000 + (i * 7_919) % 200_000;
+        sparse.extend(mcap_record(5, &noise(big)));
+        sparse.extend(mcap_record(6, &noise(100 + i % 3_000)));
+    }
+    sparse.extend_from_slice(&MCAP_MAGIC);
+    let mut interrupted = dense_mcap_bytes(400_000);
+    let tail = interrupted.split_off(interrupted.len() - 8);
+    interrupted.extend(mcap_record(5, &noise(20 << 20))); // retention exceeded
+    let more = dense_mcap_bytes(400_000);
+    interrupted.extend_from_slice(&more[21..more.len() - 8]);
+    interrupted.extend(tail);
+    for (name, data) in [
+        ("dense", &dense),
+        ("sparse", &sparse),
+        ("interrupted", &interrupted),
+    ] {
+        let expected =
+            scan_format_aware(data, Some(ContainerFormat::Mcap), CdcParams::default()).unwrap();
+        assert!(
+            expected.format_forced_count() > 10,
+            "{name}: {} forced",
+            expected.format_forced_count()
+        );
+        for (limit, interrupt) in [(usize::MAX, false), (4093, true)] {
+            let mut source = Reader {
+                inner: Cursor::new(data.clone()),
+                limit,
+                interrupted: interrupt,
+                resize_on_read: None,
+            };
+            let actual = scan_format_aware_seekable(
+                &mut source,
+                data.len(),
+                Some(ContainerFormat::Mcap),
+                CdcParams::default(),
+                0,
+            )
+            .unwrap();
+            assert_eq!(actual.boundaries, expected.boundaries, "{name} {limit}");
+            assert_eq!(actual.format_aware, expected.format_aware, "{name} {limit}");
+        }
+    }
+}
+
+/// Truncates itself to `new_len` at the first read that starts past `at`.
+struct ShrinksMidway {
+    inner: Cursor<Vec<u8>>,
+    at: u64,
+    new_len: usize,
+}
+
+impl Read for ShrinksMidway {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.inner.position() > self.at && self.inner.get_ref().len() > self.new_len {
+            self.inner.get_mut().truncate(self.new_len);
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl Seek for ShrinksMidway {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+#[test]
+fn a_source_that_shrinks_during_a_dense_slide_is_an_error() {
+    // The header window slides forward in 16 MiB blocks. The leading header
+    // and trailing magic are read first; the truncation lands on the second
+    // slide, at about 16 MiB, and must surface as UnexpectedEof, never as a
+    // short chunk set.
+    let data = dense_mcap_bytes(2_000_000);
+    let mut source = ShrinksMidway {
+        inner: Cursor::new(data.clone()),
+        at: 1 << 20,
+        new_len: 20 << 20,
+    };
+    let result = scan_format_aware_seekable(
+        &mut source,
+        data.len(),
+        Some(ContainerFormat::Mcap),
+        CdcParams::default(),
+        0,
+    );
+    assert!(
+        matches!(result, Err(StreamScanError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof),
+        "{result:?}"
+    );
 }

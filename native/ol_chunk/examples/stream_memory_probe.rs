@@ -2,6 +2,11 @@
 //! so RSS does not include a materialized corpus. Run the same probe against
 //! baseline and candidate builds, compare `output_digest`, and measure process
 //! RSS externally. This is a header-coalescing workload, not a disk benchmark.
+//!
+//! Records are 17 bytes: a Message header and an 8-byte body holding the
+//! record's sequence number, so every record's head differs and format-aware
+//! chunking v2 selects cuts among them. (Records that all looked alike would,
+//! by design, get no structural cut and be chunked by plain CDC.)
 use std::fmt::Write as _;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::time::Instant;
@@ -24,13 +29,18 @@ impl DenseMcap {
         if pos < 21 {
             return [1, 4, 0, 0, 0, 0, 0, 0, 0, b'r', b'o', b's', b'2'][pos - 8];
         }
-        if (pos - 21).is_multiple_of(9) {
-            5
-        } else {
-            0
+        let (record, at) = ((pos - 21) / RECORD, (pos - 21) % RECORD);
+        match at {
+            0 => 5,
+            1 => 8,
+            2..=8 => 0,
+            _ => (record as u64).to_le_bytes()[at - 9],
         }
     }
 }
+
+/// Bytes per Message record: opcode, length, 8-byte sequence-number body.
+const RECORD: usize = 17;
 impl Read for DenseMcap {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let pos =
@@ -63,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if records > 10_000_000 {
         return Err("probe limit is 10 million records".into());
     }
-    let len = 8 + 13 + records * 9 + 8;
+    let len = 8 + 13 + records * RECORD + 8;
     let mut source = DenseMcap { pos: 0, len };
     let started = Instant::now();
     let result = scan_format_aware_seekable(

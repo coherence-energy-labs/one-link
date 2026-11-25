@@ -803,6 +803,12 @@ pub(crate) fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     m.add("CDC_MAX_SIZE", 256 * 1024usize)?;
     m.add("CDC_FILE_WINDOW_BYTES", ol_chunk::stream::STREAM_WINDOW)?;
     m.add("FORMAT_AWARE_IN_MEMORY_LIMIT", FORMAT_AWARE_IN_MEMORY_LIMIT)?;
+    // The format-aware boundary definition in force; stores record it next to
+    // a manifest (see ol_chunk::FORMAT_AWARE_CHUNKING_VERSION).
+    m.add(
+        "FORMAT_AWARE_CHUNKING_VERSION",
+        ol_chunk::FORMAT_AWARE_CHUNKING_VERSION,
+    )?;
     m.add("AEAD_FRAME_PLAINTEXT_LEN", AEAD_FRAME_PLAINTEXT_LEN)?;
     m.add("AEAD_TAG_LEN", AEAD_TAG_LEN)?;
 

@@ -716,3 +716,84 @@ fn seeded_hostile_headers_walk_identically_in_memory_from_a_file_and_in_the_refe
         "coverage: mp4 {mp4_multi}, mcap {mcap_multi}, wav {wav_found}"
     );
 }
+
+/// Reads at most `limit` bytes per call, so every window refill and slide is
+/// assembled from fragments.
+struct Fragmented<'a> {
+    inner: Cursor<&'a [u8]>,
+    limit: usize,
+}
+
+impl std::io::Read for Fragmented<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = buf.len().min(self.limit);
+        self.inner.read(&mut buf[..n])
+    }
+}
+
+impl std::io::Seek for Fragmented<'_> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+#[test]
+fn seeded_dense_logs_select_the_same_cuts_in_memory_and_from_a_file() {
+    // Format-aware v2 selects among dense candidates; the in-memory and file
+    // scanners must feed its one selector identical candidates and head bytes.
+    // Dense runs of small units with structural units (at least min_size)
+    // scattered through them, for every walkable format, under the tiny
+    // profile (thousands of cuts) and the default one.
+    let mut rng = Rng(0x00DE_45E0_0002);
+    let mut mcap = MCAP_MAGIC.to_vec();
+    mcap.extend_from_slice(&[1, 4, 0, 0, 0, 0, 0, 0, 0, b'r', b'o', b's', b'2']);
+    let mut mp4 = Vec::new();
+    let mut zip = Vec::new();
+    let mut h264 = vec![0, 0, 0, 1, 0x67];
+    for i in 0..60_000usize {
+        let body = if i % 997 == 0 {
+            9_000 + rng.index(60_000)
+        } else {
+            rng.index(120)
+        };
+        mcap.push(0x05);
+        mcap.extend_from_slice(&u64::try_from(body).unwrap().to_le_bytes());
+        mcap.extend(rng.bytes(body));
+        mp4.extend_from_slice(&u32::try_from(body + 8).unwrap().to_be_bytes());
+        mp4.extend_from_slice(if i % 2 == 0 { b"moof" } else { b"mdat" });
+        mp4.extend(rng.bytes(body));
+        zip.extend_from_slice(&ZIP_LFH_MAGIC);
+        zip.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        zip.extend(rng.bytes(16));
+        zip.extend(rng.bytes(body));
+        // An IDR or SPS NAL unit, then slice data free of start codes.
+        h264.extend_from_slice(&[0, 0, 1, if i % 3 == 0 { 0x67 } else { 0x65 }]);
+        h264.extend(rng.bytes(body).into_iter().map(|b| b | 1));
+    }
+    mcap.extend_from_slice(&MCAP_MAGIC);
+    let tiny = TINY;
+    for (data, format) in [
+        (&mcap, ContainerFormat::Mcap),
+        (&mp4, ContainerFormat::Mp4),
+        (&zip, ContainerFormat::Zip),
+        (&h264, ContainerFormat::H264AnnexB),
+    ] {
+        for params in [tiny, CdcParams::default()] {
+            let mem = scan_format_aware(data, Some(format), params).unwrap();
+            assert!(mem.format_forced_count() > 10, "{format:?} {params:?}");
+            let file = scan_format_aware_seekable(
+                &mut Fragmented {
+                    inner: Cursor::new(data),
+                    limit: 1_000,
+                },
+                data.len(),
+                Some(format),
+                params,
+                usize::MAX,
+            )
+            .unwrap();
+            assert_eq!(file.boundaries, mem.boundaries, "{format:?} {params:?}");
+            assert_eq!(file.format_aware, mem.format_aware, "{format:?} {params:?}");
+        }
+    }
+}

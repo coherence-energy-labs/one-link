@@ -9,6 +9,11 @@ CDC_AVG_SIZE: int
 CDC_MAX_SIZE: int
 CDC_FILE_WINDOW_BYTES: int
 FORMAT_AWARE_IN_MEMORY_LIMIT: int
+FORMAT_AWARE_CHUNKING_VERSION: int
+"""Version of the format-aware boundary definition (2 = content-defined candidate selection).
+
+Record it next to a manifest: boundaries are comparable only under the same value and sizes.
+"""
 AEAD_FRAME_PLAINTEXT_LEN: int
 AEAD_TAG_LEN: int
 

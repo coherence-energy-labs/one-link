@@ -1,0 +1,3522 @@
+{
+  "schema": "one-link-remediation-ledger/v2",
+  "schema_version": 2,
+  "document_status": "draft_pending_root_review_and_final_ci",
+  "generated_utc": "2026-11-25T04:37:49.364140+00:00",
+  "audit_date": "2026-11-24 America/New_York",
+  "audit_source_revision": "1279a450c74e0fdc745cf36e4a51d146d0b2f442",
+  "audit_findings_source": "/workspace/scratch/61eba8217325/one-link-audit/output/One_Link_Audit_Findings.json",
+  "repository": "https://github.com/coherence-energy-labs/one-link",
+  "draft_pull_request": "https://github.com/coherence-energy-labs/one-link/pull/88",
+  "review_basis_revision": "7df40a371bdcb01e5d3f5f8764e87a5542120763",
+  "final_candidate_revision": null,
+  "purpose": "Map all 27 existing findings to implemented changes, executed checks and explicit remaining acceptance work. This report consolidates existing evidence; it provides no blanket security, performance or release certification.",
+  "status_definitions": {
+    "implemented_and_verified": "The stated code/documentation defect has an implemented repair and relevant executed checks. This is bounded to cited evidence; it is not final CI, release, formal-security or all-platform certification.",
+    "implemented_pending_qualification": "Implementation and focused verification exist, but a material acceptance step such as hosted, platform, artifact, realistic-workload or controlled-run qualification remains pending.",
+    "partially_remediated": "A substantive portion is repaired, while a material implementation/architecture/advisory or production-integration gap remains. Do not mark closed.",
+    "prepared_not_applied": "A concrete change payload and validation exist, but the external control has not been applied or read back. Do not describe it as enforced."
+  },
+  "status_counts": {
+    "implemented_pending_qualification": 11,
+    "prepared_not_applied": 1,
+    "implemented_and_verified": 12,
+    "partially_remediated": 3
+  },
+  "evidence_policy": {
+    "do_not_sum_overlapping_runs": true,
+    "original_failures_preserved": true,
+    "skips_and_environment_blocks_are_not_passes": true,
+    "source_tests_are_not_released_artifact_qualification": true,
+    "observer_and_transcript_summaries_are_labeled": true,
+    "windows_full_xml_exported": false,
+    "artifact_sha256_scope": "Hashes capture the retained local files at draft generation; pending files/Windows retained logs have no invented digest."
+  },
+  "evidence_roots": {
+    "remediation": "/workspace/scratch/61eba8217325/one-link-remediation-evidence",
+    "delivery": "/workspace/scratch/61eba8217325/one-link-delivery-evidence",
+    "performance": "/workspace/scratch/61eba8217325/one-link-performance-validation",
+    "scratch": "/workspace/scratch/61eba8217325",
+    "repository": "/workspace/scratch/61eba8217325/one-link-remediation",
+    "windows": "C:\\Users\\Josh\\Projects\\OneDesktopConnection\\test-results\\one-link-remediation-20261124"
+  },
+  "evidence_catalog": [
+    {
+      "id": "E_BOOT",
+      "title": "Protected passphrase bootstrap regression tests",
+      "kind": "archived_local",
+      "root": "remediation",
+      "paths": [
+        "bootstrap.xml",
+        "bootstrap.log"
+      ],
+      "summary": "Fresh authority initialization and recovery transaction contracts: 30 passed.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": {
+        "tests": 30,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+        "passed": 30,
+        "seconds": 3.087
+      },
+      "limits": [],
+      "artifact_sha256": {
+        "bootstrap.xml": "c3b21ab63b89bec45855e721a8070bc790f106fae441e75e431db7316c7def1d",
+        "bootstrap.log": "2e9505a51f18ad44233ebcb33987c9dfbee654a30554d13b9480aaf4be1f5bcf"
+      }
+    },
+    {
+      "id": "E_TRANSFER",
+      "title": "Transfer/cache/resume integration selection",
+      "kind": "archived_local",
+      "root": "remediation",
+      "paths": [
+        "transfer-focused.xml",
+        "transfer-focused.log"
+      ],
+      "summary": "Transfer, cache and resume selection: 285 passed; 5 skipped. This overlaps receipt and service selections and must not be added to them.",
+      "result": "passed_with_skips",
+      "source_revision": null,
+      "counts": {
+        "tests": 290,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 5,
+        "passed": 285,
+        "seconds": 7.907
+      },
+      "limits": [],
+      "artifact_sha256": {
+        "transfer-focused.xml": "be950203689f78a0f359d0273c13109f3def17dde95e72d3c3e364bb2d49b5cf",
+        "transfer-focused.log": "1daef9bfff09266d26c97b5d80eb28d93337cf180370182be8183d7250958a9c"
+      }
+    },
+    {
+      "id": "E_RECEIPTS",
+      "title": "Protocol completion and receipt contracts",
+      "kind": "archived_local",
+      "root": "remediation",
+      "paths": [
+        "protocol.xml",
+        "protocol.log"
+      ],
+      "summary": "86 passed, including the updated session catalogue and completion behavior.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": {
+        "tests": 86,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+        "passed": 86,
+        "seconds": 2.73
+      },
+      "limits": [],
+      "artifact_sha256": {
+        "protocol.xml": "56b5e9ce8bccc58ceba9d2f00d84cd5aca062117ac12543a885b4f2796b1b18a",
+        "protocol.log": "d50aae690e6a4f622b6faa943ed5e3a2fe749a4e33ef16a775feccc4fceb03bb"
+      }
+    },
+    {
+      "id": "E_CDC",
+      "title": "Descriptor CDC regression selection",
+      "kind": "archived_local",
+      "root": "remediation",
+      "paths": [
+        "cdc.xml",
+        "cdc.log"
+      ],
+      "summary": "Descriptor CDC regression selection: 46 passed; 2 skipped. Tests cover descriptor and native behavior and stream compatibility.",
+      "result": "passed_with_skips",
+      "source_revision": null,
+      "counts": {
+        "tests": 48,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 2,
+        "passed": 46,
+        "seconds": 1.624
+      },
+      "limits": [],
+      "artifact_sha256": {
+        "cdc.xml": "95f1174dfd33398c4e205219ae518873674565054f83cc58827adbd1990c0d62",
+        "cdc.log": "16f0463c9b702d53705ea5c5d0a49c518813a779169f40838c8355ea80283455"
+      }
+    },
+    {
+      "id": "E_ROUTES",
+      "title": "Payload-route and CDC contracts",
+      "kind": "archived_local",
+      "root": "remediation",
+      "paths": [
+        "routes-cdc.xml",
+        "routes-cdc.log"
+      ],
+      "summary": "30 passed; explicit route selection/accounting and descriptor integration.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": {
+        "tests": 30,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+        "passed": 30,
+        "seconds": 1.073
+      },
+      "limits": [],
+      "artifact_sha256": {
+        "routes-cdc.xml": "5ec2cfbaa8830cf1e477779515e0b229603c440d9b0d278751054e7027cb916b",
+        "routes-cdc.log": "d00e97b5ca65a062d0cab5f17723ecc9d7c988ccada22922507f5aab4a85f98d"
+      }
+    },
+    {
+      "id": "E_BROWSER_FOCUSED",
+      "title": "Pairing lifecycle source/contract selection",
+      "kind": "archived_local",
+      "root": "remediation",
+      "paths": [
+        "browser-lifecycle-focused.xml",
+        "browser-lifecycle-focused.log"
+      ],
+      "summary": "188 passed after bounded-stage lifecycle and diagnostic changes.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": {
+        "tests": 188,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+        "passed": 188,
+        "seconds": 2.679
+      },
+      "limits": [],
+      "artifact_sha256": {
+        "browser-lifecycle-focused.xml": "6c46eb031699a4ff42d7bb4a108a533e54f8bdd32b46d0cd822f4b6206a91b1d",
+        "browser-lifecycle-focused.log": "a3569330294dec1ffffbfd6b94239133c35c9f483018efafcee5f7f4383fa007"
+      }
+    },
+    {
+      "id": "E_SERVICE_INTEGRATION",
+      "title": "Final descriptor/service compatibility selection",
+      "kind": "archived_local",
+      "root": "remediation",
+      "paths": [
+        "service-integration.xml",
+        "service-integration.log"
+      ],
+      "summary": "59 passed after read/seek-only stream compatibility correction.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": {
+        "tests": 59,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+        "passed": 59,
+        "seconds": 1.441
+      },
+      "limits": [],
+      "artifact_sha256": {
+        "service-integration.xml": "6715d430ebe4645ef9b437e0b1c7f7db10111a0ecf8d58ee1483d17618e31d00",
+        "service-integration.log": "9c1d690524eada9249522678a754eedb8d3a390dcbfac93d26f53a6af7358727"
+      }
+    },
+    {
+      "id": "E_RUNTIME",
+      "title": "Extracted preparation/commit service regression selection",
+      "kind": "archived_local",
+      "root": "scratch",
+      "paths": [
+        "one-link-runtime-services-tests.xml",
+        "one-link-runtime-services-tests.log"
+      ],
+      "summary": "Preparation and durable retry selection: 243 passed, including 37 direct service contract cases.",
+      "result": "passed",
+      "source_revision": "f61a2a38b3076818d57e2b1eb1026c53d298d59f",
+      "counts": {
+        "tests": 243,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+        "passed": 243,
+        "seconds": 5.833
+      },
+      "limits": [],
+      "artifact_sha256": {
+        "one-link-runtime-services-tests.xml": "a0423e3ed6c7896b3da476fb080c8aace52a6417bd4e045e818aa5de1d694287",
+        "one-link-runtime-services-tests.log": "16ae839b025cd898fca609d72a0bc5dcbc979e3fcc29ce2053b00c22a9790139"
+      }
+    },
+    {
+      "id": "E_RUNTIME_UI",
+      "title": "UI/queue compatibility after preparation extraction",
+      "kind": "archived_local",
+      "root": "scratch",
+      "paths": [
+        "one-link-runtime-ui-queue-tests.xml",
+        "one-link-runtime-ui-queue-tests.log"
+      ],
+      "summary": "86 passed; delivery idempotency, batching, intent and offer adapters.",
+      "result": "passed",
+      "source_revision": "f61a2a38b3076818d57e2b1eb1026c53d298d59f",
+      "counts": {
+        "tests": 86,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+        "passed": 86,
+        "seconds": 3.237
+      },
+      "limits": [],
+      "artifact_sha256": {
+        "one-link-runtime-ui-queue-tests.xml": "b3ff435d0475a0dbff0146645f37a190cfe03db7256851c6b2d3a3629798c473",
+        "one-link-runtime-ui-queue-tests.log": "156400240c8bb805194203534c8218ed34fd51cde03fd7e0b1975907e9a81542"
+      }
+    },
+    {
+      "id": "E_COURIER",
+      "title": "Courier service and server regression selection",
+      "kind": "archived_local",
+      "root": "scratch",
+      "paths": [
+        "one-link-courier-tests.xml",
+        "one-link-courier-tests.log"
+      ],
+      "summary": "Courier and server selection: 168 passed; 35 skipped (31 gated live cases and 4 Windows-only cases). Includes 42 new service and HTTP contract cases.",
+      "result": "passed_with_skips",
+      "source_revision": "479f08fc17b7677e875fa0474ada5e5ec9b6cbc8",
+      "counts": {
+        "tests": 203,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 35,
+        "passed": 168,
+        "seconds": 4.056
+      },
+      "limits": [],
+      "artifact_sha256": {
+        "one-link-courier-tests.xml": "e73bf221ca0e549ba06885f3ef5ab9ac1f3c751add61f9605b448d43456bd781",
+        "one-link-courier-tests.log": "fa8dcb0a4ad1942db842094fd2079a45c318c645651799c7076bea966dd4909f"
+      }
+    },
+    {
+      "id": "E_COURIER_LIVE_BLOCK",
+      "title": "Explicit Linux live smoke attempts",
+      "kind": "archived_local",
+      "root": "scratch",
+      "paths": [
+        "one-link-courier-live-tests.xml",
+        "one-link-courier-live-tests.log"
+      ],
+      "summary": "Three attempted live smoke cases fail before UI startup at ifaddr.get_adapters/getifaddrs EPERM; not counted as passes.",
+      "result": "failed",
+      "source_revision": null,
+      "counts": {
+        "tests": 3,
+        "failures": 3,
+        "errors": 0,
+        "skipped": 0,
+        "passed": 0,
+        "seconds": 136.682
+      },
+      "limits": [
+        "Environment-blocked execution is not product qualification."
+      ],
+      "artifact_sha256": {
+        "one-link-courier-live-tests.xml": "cb9ac2fe9de08772b83f4af0d2ac3dcc05b43e1fcda80a2a7b87d3c1b07b3523",
+        "one-link-courier-live-tests.log": "37ab56cafa325dbb2467bb482cd3b3ffea68b36f7d1da7385d71a9dfa4803e36"
+      }
+    },
+    {
+      "id": "E_NATIVE_BINDING",
+      "title": "Installed file-scanning wheel tests",
+      "kind": "archived_local",
+      "root": "scratch",
+      "paths": [
+        "one-link-native-python-tests.xml",
+        "one-link-native-python-tests.log"
+      ],
+      "summary": "107 passed across format-aware file exports, window crossing, native integrity and compatibility.",
+      "result": "passed",
+      "source_revision": "dedc28ddfec8ec3b1764e36c989660fa68c16bc7",
+      "counts": {
+        "tests": 107,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+        "passed": 107,
+        "seconds": 2.932
+      },
+      "limits": [
+        "The original focused run predates the dependency lock update. The same 107 cases also passed with the fresh integrated 0.22.1 binary in E_LINUX_FULL."
+      ],
+      "artifact_sha256": {
+        "one-link-native-python-tests.xml": "18db6450943d4451dcf63bba6980e2a2bd059546e163c5b6f1c6fc3b9ee90d62",
+        "one-link-native-python-tests.log": "c380a297b93c6275da95e6bf766651fa3cc2eb86b9598ae8b5ea94d7e0e6eca8"
+      }
+    },
+    {
+      "id": "E_NATIVE_CHUNK",
+      "title": "Rust scanner tests and strict Clippy",
+      "kind": "archived_local",
+      "root": "scratch",
+      "paths": [
+        "one-link-native-rust-tests.log",
+        "one-link-native-clippy.log",
+        "one-link-native-completion.json"
+      ],
+      "summary": "75 ol_chunk tests passed; Clippy all-targets release with -D warnings passed.",
+      "result": "passed",
+      "source_revision": "dedc28ddfec8ec3b1764e36c989660fa68c16bc7",
+      "counts": {
+        "passed": 75
+      },
+      "limits": [],
+      "artifact_sha256": {
+        "one-link-native-rust-tests.log": "546901e487aeb3f890d69ef5ae542c36a9e86fc1cfdd2f512abd4230ff933731",
+        "one-link-native-clippy.log": "01838e5ee7fc63cfc0f6c238e921c8a151abaae41a7bb0d29f08be0a1aa33bfa",
+        "one-link-native-completion.json": "fc7176423108ef0a1ea14842cbd309a958b7258039a6aa01ee980f186a81c501"
+      }
+    },
+    {
+      "id": "E_NATIVE_WORKSPACE",
+      "title": "Integrated native workspace release library tests",
+      "kind": "archived_local",
+      "root": "remediation",
+      "paths": [
+        "native-workspace-tests.log"
+      ],
+      "summary": "Across 44 crate result summaries: 1,427 passed; 0 failed; 1 ignored. The ignored onemem::tests::measure_residual_coder_on_kitti case requires a local KITTI corpus.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": {
+        "crate_result_summaries": 44,
+        "passed": 1427,
+        "failed": 0,
+        "ignored": 1
+      },
+      "limits": [
+        "This is a Linux release-library run, not a claim that every feature/target/platform or controlled timing test executed."
+      ],
+      "artifact_sha256": {
+        "native-workspace-tests.log": "a61987b754a9720326548e2904870faa1bc8d9f57e0b65f334f882d68b8a1a9c"
+      }
+    },
+    {
+      "id": "E_NATIVE_RUNTIME",
+      "title": "Fresh integrated Linux native identity and KEM self-test",
+      "kind": "archived_local",
+      "root": "remediation",
+      "paths": [
+        "native-runtime-linux.json",
+        "native-integrated-build.log"
+      ],
+      "summary": "Python source, native module and distribution versions all match 0.22.1. The executed KEM self-test passed. Binary SHA256: cc00549c0d0de6603df8e8827c360691e6348443f55996b465d3d750732ba1be.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": null,
+      "limits": [],
+      "artifact_sha256": {
+        "native-runtime-linux.json": "56354e759c0240e36e92faf136f6111522ee6375a6f75e10936fa8a3e26e967d",
+        "native-integrated-build.log": "328f538fc62bfcf6adff9b5c0171c09619ae111acdda0c7a65f878fb9731e806"
+      }
+    },
+    {
+      "id": "E_NATIVE_MEMORY",
+      "title": "Paired dense-record scanner memory probe",
+      "kind": "archived_local",
+      "root": "scratch",
+      "paths": [
+        "one-link-native-memory-results.json",
+        "one-link-native-memory-launcher-calibration.json",
+        "one-link-native-memory-posix-launcher-calibration.json"
+      ],
+      "summary": "Eighteen observations across nine pairs used 100,000, 1,000,000 and 4,000,000 virtual MCAP records; every output digest matched. At 4,000,000 records (36,000,029 bytes), median native Linux VmHWM decreased from 32,832 to 1,936 KiB, a 94.1% reduction.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": null,
+      "limits": [
+        "Synthetic dense headers; not realistic multi-GB disk/WAN workload. Output memory remains O(chunks). Initial launcher-contaminated maxrss calibrations retained and excluded from the native VmHWM comparison."
+      ],
+      "artifact_sha256": {
+        "one-link-native-memory-results.json": "48bdfab7300096341162e6e27d94814bc6025bc1e3c2155f135808735d152aac",
+        "one-link-native-memory-launcher-calibration.json": "b0b7027733fc828f80f70efb44de814c8dd6d05369673d96fa7b4e39618dd192",
+        "one-link-native-memory-posix-launcher-calibration.json": "7577ec2c7b1a7fcb889c211636148212c93e4056a0d79485928782f0c5174e17"
+      }
+    },
+    {
+      "id": "E_CDC_PREP",
+      "title": "Actual descriptor preparation comparison at 8 MiB",
+      "kind": "archived_local",
+      "root": "remediation",
+      "paths": [
+        "descriptor-preparation-cdc-v3.json",
+        "descriptor-preparation-cdc-v3.log",
+        "compare_preparation_v3.py"
+      ],
+      "summary": "Five alternating pairs preserved exact chunk boundaries and hashes. The median paired preparation speedup was 112.4275 times; pooled preparation medians were 1.439728 seconds before and 0.0129766 seconds after.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": null,
+      "limits": [
+        "One Linux host and one random 8 MiB file, warm in the operating system cache, without a persistent manifest cache. The observation includes scanner instrumentation. It does not measure full transfer, WAN performance, sustained throughput or tail latency."
+      ],
+      "artifact_sha256": {
+        "descriptor-preparation-cdc-v3.json": "425ec564d5523d831562253eaaa17932909ae9a8614a9b00294e065a8ccb6a15",
+        "descriptor-preparation-cdc-v3.log": "e92c931ebe86d2e783aab52a8d0c69e415e69b576793b5fb3f2857592eadcf61",
+        "compare_preparation_v3.py": "dbd658270db541bb56b314f9025f506d9bd79df3a634a59e3e1649e36af965b0"
+      }
+    },
+    {
+      "id": "E_FIXED_PREP",
+      "title": "Fixed 16 MiB preparation extraction follow-up",
+      "kind": "archived_local",
+      "root": "remediation",
+      "paths": [
+        "preparation-extraction-conclusion.json",
+        "preparation-extraction-fixed16mib.json",
+        "preparation-extraction-fixed16mib.log",
+        "compare_preparation_extraction.py",
+        "preparation-cold-attribution.json",
+        "trace_preparation_cold.py"
+      ],
+      "summary": "Five fresh-process pairs produced 130 verified samples. Steady medians were 8.324 and 8.416 ms; the paired process-median ratio was 0.99683. First-call medians of 8.819 and 17.533 ms are retained, alongside additional minor page faults and identical I/O and identity-probe work.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": null,
+      "limits": [
+        "Cold means first preparation after imports, not cold disk/full startup. Diagnostic instrumentation alters allocation history; no source-line cause or sustained regression established. No speculative code change made."
+      ],
+      "artifact_sha256": {
+        "preparation-extraction-conclusion.json": "9ca93f1968239cc2dfa475dc69f2dcb95f8171db85283d87d40be69fe87cb8df",
+        "preparation-extraction-fixed16mib.json": "bcbaf4829f8ff72d1695f95c18ddc4bb11d8ac1fba33dd39a11a6c87704b5689",
+        "preparation-extraction-fixed16mib.log": "3e80629fe9e812dbd3f294a0e21fa50ca0d5a6caf6594f66f992f34ac9ad7018",
+        "compare_preparation_extraction.py": "7547bce96672ee9c4919e6428f2c1b78e908af2935ef8d713b5b888ce5b2d9ab",
+        "preparation-cold-attribution.json": "064cebe849a95b06d6309732371c1a0c38da76e46c4351f44488b675e3807092",
+        "trace_preparation_cold.py": "b4115d910c9d03192b00a1a805d0fbb0f5d303f38cab3b62e475010ffcb71ec0"
+      }
+    },
+    {
+      "id": "E_STATIC",
+      "title": "Clean-snapshot source quality gates",
+      "kind": "archived_local",
+      "root": "remediation",
+      "paths": [
+        "ruff-b7a3ca2.log",
+        "mypy-b7a3ca2.log"
+      ],
+      "summary": "Ruff 0.16.1 passed the full src/one_link check. Mypy 2.3.0 with --platform win32 passed for 232 source files.",
+      "result": "passed",
+      "source_revision": "b7a3ca298510ba7f2819616b35153786eb692905",
+      "counts": {
+        "mypy_source_files": 232
+      },
+      "limits": [
+        "Later integration commits require final exact-candidate CI."
+      ],
+      "artifact_sha256": {
+        "ruff-b7a3ca2.log": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+        "mypy-b7a3ca2.log": "8b919c2c3d3ce2c477971aa7a043f9270b060f792dd9421c7771baa28da0ddb9"
+      }
+    },
+    {
+      "id": "E_DELIVERY",
+      "title": "Release/dependency/bootstrap evidence contracts",
+      "kind": "archived_local",
+      "root": "delivery",
+      "paths": [
+        "delivery-tests.xml",
+        "delivery-tests.log"
+      ],
+      "summary": "192 passed; includes negative rebuild comparisons, workflow dependency edges, analyzer artifact retention, policy proposals and incomplete live/timing outcome handling.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": {
+        "tests": 192,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+        "passed": 192,
+        "seconds": 9.164
+      },
+      "limits": [],
+      "artifact_sha256": {
+        "delivery-tests.xml": "8d65d741434243364c1dde4103fb44bce7fefcbc58e5a22f435c604dfc45c18e",
+        "delivery-tests.log": "04d1a1dc858f0c13ca61e3910fc977b185cbdff14974f2c95a7d82796ebd40bd"
+      }
+    },
+    {
+      "id": "E_BOOTSTRAP_CI",
+      "title": "Documented bootstrap CI contracts",
+      "kind": "archived_local",
+      "root": "delivery",
+      "paths": [
+        "bootstrap-ci-tests.log"
+      ],
+      "summary": "60 focused cases passed; public bootstrap path wired for both acceptance platforms.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": {
+        "passed": 60
+      },
+      "limits": [],
+      "artifact_sha256": {
+        "bootstrap-ci-tests.log": "ef5f5898c681d9405b6c11086c728cd3b8faeff3d5d02aa33d618473d8cbbf73"
+      }
+    },
+    {
+      "id": "E_BOOTSTRAP_SOURCE",
+      "title": "Fresh frozen source bootstrap and check-only",
+      "kind": "archived_local",
+      "root": "delivery",
+      "paths": [
+        "bootstrap.json",
+        "bootstrap-runtime.json",
+        "bootstrap-check.json",
+        "bootstrap-check-runtime.json",
+        "full-linux-3674060/bootstrap.json",
+        "full-linux-3674060/native-runtime.json"
+      ],
+      "summary": "Fresh native build/install+ABI verification passed; isolated validation environment used the same integrated native binary identity.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": null,
+      "limits": [
+        "The earlier Linux bootstrap evidence is retained. E_LINUX_BOOTSTRAP and E_WIN_BOOTSTRAP record later exact public command executions; neither substitutes for final supported-platform acceptance."
+      ],
+      "artifact_sha256": {
+        "bootstrap.json": "5a8cee27309d0070d96b74d0ccf2c7366086cd9b6fe01cfb5db37a6f07bb7222",
+        "bootstrap-runtime.json": "abda78d05e4c086ec9e1c5a239f90132edbd0c1214223d5fbfbe2090854c4e15",
+        "bootstrap-check.json": "6f15d8808d6b40b565741927f310c3a8e58b440356eca288a8e2d89387364f2c",
+        "bootstrap-check-runtime.json": "abda78d05e4c086ec9e1c5a239f90132edbd0c1214223d5fbfbe2090854c4e15",
+        "full-linux-3674060/bootstrap.json": "985ce8130e9f9b9fe2208a1e3fd62394af09baa76884e1a25577de31e2ddbc63",
+        "full-linux-3674060/native-runtime.json": "8cb63405ef9eea504755f4b4cdfa9cce4a9813ddb08beadbcfe02e27e4822cea"
+      }
+    },
+    {
+      "id": "E_HERMETIC_PAIRING",
+      "title": "Hermetic pairing collection preserved",
+      "kind": "archived_local",
+      "root": "delivery",
+      "paths": [
+        "hermetic-pairing.xml",
+        "hermetic-pairing.log"
+      ],
+      "summary": "21 passed; only the two live pairing definitions move to the live lane.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": {
+        "tests": 21,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+        "passed": 21,
+        "seconds": 0.241
+      },
+      "limits": [],
+      "artifact_sha256": {
+        "hermetic-pairing.xml": "86465c80c46f1001aae832de89ea8220f3487363592cee87480345e95cb43570",
+        "hermetic-pairing.log": "6e6bb4a1d768e64e1d5336e5987d32c5fdb4c91fb14555ceb3ce2ee3168b5cbd"
+      }
+    },
+    {
+      "id": "E_LIVE_MANIFEST",
+      "title": "Live-daemon collection and execution accounting",
+      "kind": "archived_local",
+      "root": "delivery",
+      "paths": [
+        "live-collection.json",
+        "live-collection.log"
+      ],
+      "summary": "The 139 declared live test functions resolve to 152 parameter cases, with no missing cases, unexpected cases or collection errors.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": null,
+      "limits": [
+        "Collection coverage is not execution. The final Windows/Linux shard results must satisfy the manifest with no missing/skipped cases."
+      ],
+      "artifact_sha256": {
+        "live-collection.json": "af9cbb837a55df0856d90e81f5168ec7c977f945032bc9bf50b0cc30a463e06e",
+        "live-collection.log": "f1a88fc29793da22a543df8e5c05837eafd4cfde5438ec230bd8fe33ff714b8a"
+      }
+    },
+    {
+      "id": "E_DEP_PY",
+      "title": "Python advisory checks",
+      "kind": "archived_local",
+      "root": "delivery",
+      "paths": [
+        "pip-audit.json",
+        "pip-audit-osv.json",
+        "universal-lock-osv.json"
+      ],
+      "summary": "The 143 environment-applicable package records produced no findings in PyPI and OSV scans. The universal lock check covered all 161 registry versions and found no OSV advisories.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": null,
+      "limits": [
+        "Database and artifact inventory scoped; no blanket vulnerability-free claim."
+      ],
+      "artifact_sha256": {
+        "pip-audit.json": "7ca7ce0314af19977f52a89d7af153875c9562539867e105558076e4589f60a6",
+        "pip-audit-osv.json": "7ca7ce0314af19977f52a89d7af153875c9562539867e105558076e4589f60a6",
+        "universal-lock-osv.json": "f61ff5fea83c7d0bf9bb0abee233827198ae8f5bf2e158956a12dd8c38655e30"
+      }
+    },
+    {
+      "id": "E_DEP_RUST",
+      "title": "Native workspace and fuzz advisory checks",
+      "kind": "archived_local",
+      "root": "delivery",
+      "paths": [
+        "cargo-audit.json",
+        "cargo-audit-fuzz.json",
+        "confidential-tests.log"
+      ],
+      "summary": "Workspace and fuzz scans each reported zero vulnerabilities and zero warnings against the retained database of 1,567 advisories. The P256 migration passed 35 tests, including an independent OpenSSL fixture.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": null,
+      "limits": [
+        "The separate native/ol_shell/Cargo.lock report is recorded in E_DEP_SHELL. These are source graph advisory results, not proof of every platform artifact dependency inventory."
+      ],
+      "artifact_sha256": {
+        "cargo-audit.json": "3b86bae6a7b3a1155061707696fa09f64d1c04a15ae1a131146b31ce45d28d41",
+        "cargo-audit-fuzz.json": "52b45bc56c71f4a0b02cf8b10e715b0d47e7f4d753bf08421ee534c0b4614874",
+        "confidential-tests.log": "5847dc29ab5ab35c08e83fafacd3358adb25058ecb485b07277b1a3c83f0f1f1"
+      }
+    },
+    {
+      "id": "E_DEP_SHELL",
+      "title": "Standalone shell advisory follow-up",
+      "kind": "archived_local",
+      "root": "delivery",
+      "paths": [
+        "native-shell-cargo-audit-before.json",
+        "native-shell-cargo-audit-after.json"
+      ],
+      "summary": "Compatible cookie and url patches removed the two entries in the RustSec vulnerabilities list. The remaining glib 0.18.5 issue is a known medium advisory, GHSA-wrw7-89jp-8q8g, fixed in version 0.20.0 or later. RustSec categorizes it as an unsoundness warning, RUSTSEC-2024-0429. The separate proc-macro-error 1.0.4 maintenance warning, RUSTSEC-2024-0370, also remains.",
+      "result": "known_advisory_and_maintenance_warning_remaining",
+      "source_revision": "d2de862013f157e5a61ef5b32a07120f547b439e",
+      "counts": {
+        "rustsec_vulnerabilities_list_entries": 0,
+        "rustsec_warnings": 2,
+        "github_known_affected_advisories": 1
+      },
+      "limits": [
+        "The current Linux GTK family remains below the patched glib boundary. Supported upstream backport feasibility is under review; no backport or remediation is claimed here. No global advisory ignore or clean Linux shell qualification is granted."
+      ],
+      "artifact_sha256": {
+        "native-shell-cargo-audit-before.json": "9e0b4fcde4f27165b61f894fdb5fa27f5539ab02dec13738edf5d95c72c5ebb5",
+        "native-shell-cargo-audit-after.json": "c90accd6f504619c53520425dea93be3c78e59cdb97abeb10760e19be9a487d0"
+      }
+    },
+    {
+      "id": "E_CONTAINER",
+      "title": "Locked rendezvous container inputs",
+      "kind": "archived_local",
+      "root": "delivery",
+      "paths": [
+        "rendezvous-pip-audit.json",
+        "container-input-metadata.json"
+      ],
+      "summary": "All 13 rendezvous packages had zero known advisories in the retained report. Container input digests were verified for uv 0.13.10 and Python 3.12.14.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": null,
+      "limits": [],
+      "artifact_sha256": {
+        "rendezvous-pip-audit.json": "0f1fe300695693a4c79b1040d0643416ef0d55605b9d25518466b8e540e166a8",
+        "container-input-metadata.json": "bc07c1baef1f4c4ebad2c3d7cee03cf8487204693391b6776bb75ab3b4ec5bf0"
+      }
+    },
+    {
+      "id": "E_POLICY",
+      "title": "Earlier strict repository-policy API payload, unapplied",
+      "kind": "archived_local",
+      "root": "delivery",
+      "paths": [
+        "default-branch-ruleset-proposal.json",
+        "repository-policy-before.json"
+      ],
+      "summary": "The earlier archived API payload preserves existing restrictions and requests one independent approval plus seven strict named checks bound to GitHub Actions producer 15368. The current ten-check desired policy in E_POLICY_DESIRED supersedes this proposal; neither has been applied.",
+      "result": "prepared_not_applied",
+      "source_revision": null,
+      "counts": null,
+      "limits": [
+        "This is retained historical proposal evidence. The current API payload must include both newly required native contexts before activation."
+      ],
+      "artifact_sha256": {
+        "default-branch-ruleset-proposal.json": "b44d016892250ecbe30315f96ba1559b072988be1ae8ade716b7726ee11c2ede",
+        "repository-policy-before.json": "11b0acf1c8a9998440dee0eaf5b728bea5826dd4c7062a8143a956db2ecd0c62"
+      }
+    },
+    {
+      "id": "E_RELEASE_LEDGER",
+      "title": "Dated release metadata and explicit verification gaps",
+      "kind": "archived_local",
+      "root": "repository",
+      "paths": [
+        "docs/RELEASE_EVIDENCE.json"
+      ],
+      "summary": "Historical v0.21.0 metadata records publication alongside a failed independent reproducibility workflow. The presence of published signature and provenance assets does not verify downloaded artifact bytes.",
+      "result": "qualified_metadata_only",
+      "source_revision": null,
+      "counts": null,
+      "limits": [
+        "Fresh final release artifact hashes/signatures/attestations, device qualification and whole-product reproducibility are not established."
+      ],
+      "artifact_sha256": {
+        "docs/RELEASE_EVIDENCE.json": "c94d70bb1cc977b7f8debe442c687fab9936787b37dd5f62dba50249c5be6523"
+      }
+    },
+    {
+      "id": "E_PERF_CONTRACT",
+      "title": "Executed performance-contract test summary",
+      "kind": "execution_transcript_summary",
+      "root": "repository",
+      "paths": [
+        "tests/test_bench_gate_compares_like_for_like.py",
+        "tests/test_benchmark_measurement_contract.py",
+        "tests/test_bench_file_engine_cli.py",
+        "tests/test_perf_lab_v0109.py"
+      ],
+      "summary": "The implementation agent reported 81 passing cases in 5.80 seconds in its execution transcript, with Ruff and mypy clean for the changed performance modules.",
+      "result": "passed",
+      "source_revision": "da01ffa535458f9419a7ccb9080c6f3f68319a88",
+      "counts": {
+        "passed": 81
+      },
+      "limits": [
+        "No standalone pytest log/XML was retained for this local run. Source test files are identified, not represented as result logs."
+      ],
+      "artifact_sha256": {
+        "tests/test_bench_gate_compares_like_for_like.py": "8232a5228771e6bafae6937d164785169ca72f75e87724248124052f5256907b",
+        "tests/test_benchmark_measurement_contract.py": "4e15c2f798fcd886f1d65fa61d6cd9ed6d7fe888ba60763ca8635d2ae5d0b3d3",
+        "tests/test_bench_file_engine_cli.py": "2cb675a75729f56b62b6887351e1360f2f5632dcb3ab55731289f059af6419d6",
+        "tests/test_perf_lab_v0109.py": "f3c7f686ef097e97f0216d836f2053d31b310e9ccefcc28285b6af5dd19d0b9f"
+      }
+    },
+    {
+      "id": "E_PERF_HARNESS",
+      "title": "Paired native benchmark harness smoke artifacts",
+      "kind": "archived_local",
+      "root": "performance",
+      "paths": [
+        "native-paired-smoke-v2/study.json",
+        "native-paired-smoke-v2/baseline-1.json",
+        "native-paired-smoke-v2/candidate-1.json"
+      ],
+      "summary": "The retained harness run contains 28 metrics and 203,244 observations per arm. Native helpers executed, but both arms used the same installed binary.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": null,
+      "limits": [
+        "Both arms used the same installed binary: harness validation only, no implementation speedup claim."
+      ],
+      "artifact_sha256": {
+        "native-paired-smoke-v2/study.json": "bd1026fb0a28b29343f58fda56aefccc98661ca9b7edd8653ff1aaa08282f4a4",
+        "native-paired-smoke-v2/baseline-1.json": "bcbf8c28c1d68126d21c282d0bbfb59421afa936c659957baea61cb5cb04a9a3",
+        "native-paired-smoke-v2/candidate-1.json": "c1162a05918fa3ac2d2c25f68614a917f8b20a1ad3044f5a6fec16552a6e8cd9"
+      }
+    },
+    {
+      "id": "E_OWNER",
+      "title": "Owner-browser source/service extraction checks",
+      "kind": "execution_transcript_summary",
+      "root": "repository",
+      "paths": [
+        "frontend/owner/manifest.json",
+        "tests/test_owner_ui_build.py",
+        "tests/js/test_owner_ui_services.cjs"
+      ],
+      "summary": "Owner authoring now has 106 modules and six isolated service factories; the largest module has 1,173 lines. The execution transcript records 11 passing build/source cases and eight passing Node service cases.",
+      "result": "passed",
+      "source_revision": "60907a556153caca3f6a9f8ad2644e4cc7cab5ab",
+      "counts": null,
+      "limits": [
+        "No standalone result log was retained. Feature modules retain shared page closures. Local Node and source checks do not establish browser or platform acceptance."
+      ],
+      "artifact_sha256": {
+        "frontend/owner/manifest.json": "758325dfe7b590561dd796a1374c70484c58f5f4855c502b6c3cc06774b46928",
+        "tests/test_owner_ui_build.py": "64057c4d84cd13dcc661736e46a24dd4472745cb0cd8a072b407872a83874f2a",
+        "tests/js/test_owner_ui_services.cjs": "bfa250e9465dba1b60e200fb5371dc70be192c52f9b2316e955aa1b533a3b44f"
+      }
+    },
+    {
+      "id": "E_PEER",
+      "title": "Integrated peer-browser extraction checks",
+      "kind": "execution_transcript_summary",
+      "root": "repository",
+      "paths": [
+        "frontend/peer/manifest.json",
+        "tests/test_peer_ui_build.py",
+        "tests/js/test_peer_ui_services.cjs"
+      ],
+      "summary": "The integrated peer extraction has 60 modules and four isolated factories; its largest module has 374 lines. The execution transcript records 593 passing source cases, three skipped cases and six passing Node cases. An AST comparison retained all 311 original named function bodies.",
+      "result": "passed",
+      "source_revision": "296c721b3205deb9d6d4a7864ed172ecc9790a6e",
+      "counts": null,
+      "limits": [
+        "Original implementation commit a922cc7 was integrated as 296c721. No standalone result log was retained. Final browser execution is separate, and shared feature closures remain."
+      ],
+      "artifact_sha256": {
+        "frontend/peer/manifest.json": "f98951a08c110ecaec95c012f4f0aed80bf920003e5d2928c9e76fe59593121d",
+        "tests/test_peer_ui_build.py": "5f2d3c6842d260c309987f6567b28e335094e891c2907db2f6f870c74f9f267f",
+        "tests/js/test_peer_ui_services.cjs": "cb4485451b3ed023f0b1a5683c9f6e24eee2c5eaf2449a7aa96e4560807e50dd"
+      }
+    },
+    {
+      "id": "E_WIN_FIREFOX_EXACT",
+      "title": "Windows exact required-identity Firefox case",
+      "kind": "observer_summary",
+      "root": "windows",
+      "paths": [
+        "firefox-cached.xml",
+        "firefox-cached.log"
+      ],
+      "summary": "The exact test_required_mode_live_pair_owner_request_and_immediate_revoke Firefox case passed on Windows: one case in 70.21 seconds.",
+      "result": "passed",
+      "source_revision": "0731ae5c9ba39460769dfd6c6ef63ce7a157a3a4",
+      "counts": {
+        "passed": 1,
+        "seconds": 70.21
+      },
+      "limits": [
+        "Aggregate counts and public test identity were supplied by the Windows execution observer. Full XML is retained on Windows, not exported. Final packaged-artifact qualification remains separate."
+      ],
+      "execution_job": "0139d6b0683040fd809c83aadc922466",
+      "artifact_sha256": {}
+    },
+    {
+      "id": "E_WIN_BROWSERS",
+      "title": "Windows integrated browser qualification attempts",
+      "kind": "observer_summary",
+      "root": "windows",
+      "paths": [
+        "browser-chromium-integrated.xml",
+        "browser-chromium-integrated.log",
+        "browser-firefox-integrated.xml",
+        "browser-firefox-integrated.log"
+      ],
+      "summary": "The Windows Firefox selection passed all three cases in 81.58 seconds. Chromium passed 62 cases and failed one HTTP read with a five-second timeout, in 761.99 seconds. Commit dbb2f52 adds authenticated HTTP readiness. The completed later Windows rerun at d2de862 is recorded separately in E_WIN_BROWSERS_D2DE862.",
+      "result": "mixed_pending_rerun",
+      "source_revision": "dcf9e5c74d7e1a552c7a3362b122eb02d2b237b8",
+      "counts": {
+        "firefox_passed": 3,
+        "firefox_seconds": 81.58,
+        "chromium_passed": 62,
+        "chromium_failed": 1,
+        "chromium_seconds": 761.99
+      },
+      "limits": [
+        "The original Chromium timeout remains retained. E_WIN_BROWSERS_D2DE862 records a later successful run after the readiness correction and both UI extractions; it does not rewrite this earlier failed attempt."
+      ],
+      "execution_job": "96a792e331de43448cdee1ad239d7b2b",
+      "artifact_sha256": {}
+    },
+    {
+      "id": "E_WIN_TRANSFER",
+      "title": "Windows fresh passphrase startup and verified transfers",
+      "kind": "observer_summary",
+      "root": "windows",
+      "paths": [
+        "live-passphrase-transfer.json",
+        "live-passphrase-transfer.log"
+      ],
+      "summary": "Three fresh passphrase startup and forced TCP transfer attempts completed with exact receiver hashes and application commit verification. Each payload was 16 MiB. Observed transfer times were 0.774, 0.906 and 1.524 seconds.",
+      "result": "passed",
+      "source_revision": "dcf9e5c74d7e1a552c7a3362b122eb02d2b237b8",
+      "counts": {
+        "attempts": 3,
+        "passed": 3
+      },
+      "limits": [
+        "Concurrent browser work: correctness evidence, not controlled throughput or tail-latency benchmark."
+      ],
+      "execution_job": "6d68933cf3444655bcedd8691f1a7516",
+      "artifact_sha256": {}
+    },
+    {
+      "id": "E_WIN_NATIVE",
+      "title": "Windows fresh native 0.22.1 build and installation",
+      "kind": "observer_summary",
+      "root": "windows",
+      "paths": [],
+      "summary": "A fresh matching native 0.22.1 build and installation was observed at source c1686ca. A later successful public bootstrap, with its own source revision and binary identity, is recorded separately in E_WIN_BOOTSTRAP.",
+      "result": "passed",
+      "source_revision": "c1686ca50989f70b4b71c173a2b19ea55304a2ed",
+      "counts": null,
+      "limits": [
+        "This earlier build observation has no separately recorded binary hash. The later public bootstrap identity is retained in E_WIN_BOOTSTRAP."
+      ],
+      "execution_job": "e38a80213eb54eafb2c5c54da48bcae9",
+      "artifact_sha256": {}
+    },
+    {
+      "id": "E_LINUX_TRANSFER_BLOCK",
+      "title": "Linux fresh passphrase live attempts blocked by environment",
+      "kind": "archived_local",
+      "root": "remediation",
+      "paths": [
+        "live-passphrase-transfer.json",
+        "live-passphrase-transfer.log"
+      ],
+      "summary": "All three Linux live attempts failed during network interface discovery with getifaddrs/ifaddr EPERM before transfer. These remain environment-blocked failures.",
+      "result": "environment_blocked",
+      "source_revision": "5344ee9387c2f6da87b4064f01c2d17c56cfeaa9",
+      "counts": {
+        "attempts": 3,
+        "failed": 3
+      },
+      "limits": [
+        "Distinct from identically named Windows artifacts under the Windows evidence root."
+      ],
+      "artifact_sha256": {
+        "live-passphrase-transfer.json": "0e8d82098be38b6b57001e8ee122bdbe69978f18f8b5cbc053d7d61dc38b2c10",
+        "live-passphrase-transfer.log": "2149832fda8315c936139b3fd8a683405a07318e9539158a9ef7b71d55aba0a7"
+      }
+    },
+    {
+      "id": "E_DIST_PRIOR",
+      "title": "Distribution/service run before manifest correction",
+      "kind": "archived_local",
+      "root": "remediation",
+      "paths": [
+        "distribution-services.xml",
+        "distribution-services.log"
+      ],
+      "summary": "The earlier distribution and service selection had 201 passes and eight failures caused by source inventory and package asset contract drift. These original failures remain retained.",
+      "result": "failed",
+      "source_revision": null,
+      "counts": {
+        "tests": 209,
+        "failures": 8,
+        "errors": 0,
+        "skipped": 0,
+        "passed": 201,
+        "seconds": 25.479
+      },
+      "limits": [],
+      "artifact_sha256": {
+        "distribution-services.xml": "2a866a7c7d872f863774829346497e95db42b4de4cb35b23e6c5e8988c42a496",
+        "distribution-services.log": "36153bfc3a9e29e96a8b72ecabc11df3cccfd02a155c0289145d8b703cb60ef3"
+      }
+    },
+    {
+      "id": "E_DIST_V2",
+      "title": "Distribution/services after first correction",
+      "kind": "archived_local",
+      "root": "remediation",
+      "paths": [
+        "distribution-services-v2.xml",
+        "distribution-services-v2.log"
+      ],
+      "summary": "The next distribution and service selection had 219 passes and one stale exact source-count failure. E_DIST_FINAL records the focused correction.",
+      "result": "failed",
+      "source_revision": null,
+      "counts": {
+        "tests": 220,
+        "failures": 1,
+        "errors": 0,
+        "skipped": 0,
+        "passed": 219,
+        "seconds": 31.382
+      },
+      "limits": [],
+      "artifact_sha256": {
+        "distribution-services-v2.xml": "c90fe2d651569c4834ca381da725da691e799b5e89196eda57513c77228c7510",
+        "distribution-services-v2.log": "a425d67dadfb5070089b9facd744a2ef0a133bc2c148f01e54c748bda7e27e70"
+      }
+    },
+    {
+      "id": "E_DIST_FINAL",
+      "title": "Corrected exact source and asset contracts",
+      "kind": "archived_local",
+      "root": "remediation",
+      "paths": [
+        "owner-package-final-v2.xml",
+        "owner-package-final-v2.log"
+      ],
+      "summary": "Twelve focused source and asset contract cases passed after the corrections. This does not replace complete final-candidate acceptance.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": {
+        "tests": 12,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+        "passed": 12,
+        "seconds": 1.062
+      },
+      "limits": [],
+      "artifact_sha256": {
+        "owner-package-final-v2.xml": "f4e63f8b59285490e5c018d24810771204a93cdf8fc0e09877bc34d7689be210",
+        "owner-package-final-v2.log": "1a16055668fd62390adc49ab6fd780dd48a77f7a42d9a56968a2f236f5a73389"
+      }
+    },
+    {
+      "id": "E_CONNECT",
+      "title": "Uncached connection metadata and LAN fixtures",
+      "kind": "archived_local",
+      "root": "remediation",
+      "paths": [
+        "connect-info-contracts.xml",
+        "connect-info-contracts.log"
+      ],
+      "summary": "Fourteen connection metadata cases passed after the no-store correction and deterministic LAN origin fixture changes.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": {
+        "tests": 14,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+        "passed": 14,
+        "seconds": 0.931
+      },
+      "limits": [],
+      "artifact_sha256": {
+        "connect-info-contracts.xml": "1695b7d389049e201807961ed45eed95bf793c414ad58096f86c621d2eaa49eb",
+        "connect-info-contracts.log": "3363cc2146e770a13dbd5c211eae1a05cb514dcf8d097ffc14b5e2c1f3b835bd"
+      }
+    },
+    {
+      "id": "E_INTEGRATION_PRIOR",
+      "title": "Earlier pairing contract failures retained",
+      "kind": "archived_local",
+      "root": "remediation",
+      "paths": [
+        "integration-focused.xml",
+        "integration-focused.log"
+      ],
+      "summary": "The earlier integration selection had 169 passes and two source-text pairing assertion failures. Corrected source contracts were later exercised in E_BROWSER_FOCUSED.",
+      "result": "failed",
+      "source_revision": null,
+      "counts": {
+        "tests": 171,
+        "failures": 2,
+        "errors": 0,
+        "skipped": 0,
+        "passed": 169,
+        "seconds": 3.796
+      },
+      "limits": [],
+      "artifact_sha256": {
+        "integration-focused.xml": "4255c61f5761338f4faa2ffd89d578e3cdaa6259344d2e387aa1e51678c5a872",
+        "integration-focused.log": "c530f70828168efa00988862dc66d943a5380c982f1d9b8d376556298582090d"
+      }
+    },
+    {
+      "id": "E_LINUX_FULL",
+      "title": "Accounted-for frozen Linux selection and continuation",
+      "kind": "archived_local",
+      "root": "delivery",
+      "paths": [
+        "full-linux-3674060/environment.json",
+        "full-linux-3674060/native-runtime.json",
+        "full-linux-3674060/selected-cases.json",
+        "full-linux-3674060/outcomes.ndjson",
+        "full-linux-3674060/progress.json",
+        "full-linux-3674060/junit.xml",
+        "full-linux-3674060/pytest.log",
+        "full-linux-3674060/continuation/continuation-selection.json",
+        "full-linux-3674060/continuation/selected-cases.json",
+        "full-linux-3674060/continuation/outcomes.ndjson",
+        "full-linux-3674060/continuation/progress.json",
+        "full-linux-3674060/continuation/junit.xml",
+        "full-linux-3674060/continuation.log"
+      ],
+      "summary": "All 9,687 selected cases are accounted for at frozen source 3674060: 9,621 passed; 42 skipped; 24 failed. The first run stopped at 20 failures; a separate continuation executed only previously unexecuted cases, with no repeated cases or failure retries. Seven failures are host getifaddrs restrictions, three concern QR fixtures or cache behavior, nine concern package or module manifests, one concerns historical benchmark wording, and four concern stale landing or workflow contracts. Later commits repair source and contract deltas; this original snapshot remains failed.",
+      "result": "failed",
+      "source_revision": "3674060956c22caa40a74eaf3f4f58c1c5e768a1",
+      "counts": {
+        "selected_cases": 9687,
+        "passed": 9621,
+        "skipped": 42,
+        "failed": 24,
+        "repeated_cases": 0,
+        "unaccounted_cases": 0
+      },
+      "limits": [
+        "Counts derive from unique selected test IDs and phase records. Five collection-level skips also appear in the first XML, so raw XML totals must not be blindly added. The 107 native binding cases passed inside this selection and are not additional tests. This is a completely accounted-for failed earlier snapshot, not final-candidate acceptance."
+      ],
+      "artifact_sha256": {
+        "full-linux-3674060/environment.json": "f1fb9a6fa322f742dd0c06c8f510f972c9862ae774504921724e6ae288e0e98d",
+        "full-linux-3674060/native-runtime.json": "8cb63405ef9eea504755f4b4cdfa9cce4a9813ddb08beadbcfe02e27e4822cea",
+        "full-linux-3674060/selected-cases.json": "894d10615d48d4f32931aaa45d219953bea334d4b1230af82f72d97fb1522d34",
+        "full-linux-3674060/outcomes.ndjson": "25bfc6a0195b629e35a72e8eb927e211ef1a86665c37e32c1c7f99056c0bac4d",
+        "full-linux-3674060/progress.json": "dee0297fad46c905b6cce3ac800373e7e36b8e88fc648658553f9dd8f5086b25",
+        "full-linux-3674060/junit.xml": "6d8f926291cc88f28d4b97d326cdb63b7b3e7f595589347cb98c801f06e0fcd6",
+        "full-linux-3674060/pytest.log": "19f81f7afe2e073abf9d8609227ed2a70045f51bf4adc537a2ba9fc4baf6dd8d",
+        "full-linux-3674060/continuation/continuation-selection.json": "368e188dcf3fd832664d29eef864148373644b1ddd6a0ec0bc5f72fb660bcda0",
+        "full-linux-3674060/continuation/selected-cases.json": "27f29bcc96544708c0b94777851706835c6f5caa234ae6d6becdca54c67fae03",
+        "full-linux-3674060/continuation/outcomes.ndjson": "4f80e640c32f330a6f6038c3dfa22c2902df42a5272dad82cd3994a5aeceeabc",
+        "full-linux-3674060/continuation/progress.json": "cf6a9d07666b94ff2e24e275ef511c626a470b64d0e005855437630c382ca0f8",
+        "full-linux-3674060/continuation/junit.xml": "80e84f7452495799d8ad2f05c2c383249422f33979be752c69fd04683a0e4613",
+        "full-linux-3674060/continuation.log": "a357187edb03d06a06b4fedca32935bae7c8a80c9ef3bff508f70953839bf4d0"
+      }
+    },
+    {
+      "id": "E_SHELL_TESTS",
+      "title": "Shell graph, release inventory and documentation contracts",
+      "kind": "archived_local",
+      "root": "delivery",
+      "paths": [
+        "shell-sbom-tests.xml",
+        "shell-sbom-tests.log",
+        "shell-sbom-ruff.log",
+        "shell-sbom-zizmor.log"
+      ],
+      "summary": "The delivery follow-up passed 145 focused cases. Ruff and zizmor passed; the two existing zizmor suppressions remain visible.",
+      "result": "passed",
+      "source_revision": "d2de862013f157e5a61ef5b32a07120f547b439e",
+      "counts": {
+        "passed": 145,
+        "seconds": 9.557
+      },
+      "limits": [],
+      "artifact_sha256": {
+        "shell-sbom-tests.xml": "264315bb890449c8eaaf5f4c8de446f49056ff95c2619cada5ca984f1a28f618",
+        "shell-sbom-tests.log": "2d5392c1a514e66fb7fcdde0800e6df41e7bdbc55f71c9b89c7c399d535cbff7",
+        "shell-sbom-ruff.log": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+        "shell-sbom-zizmor.log": "f6bbb7c3c503d632d4c43685d23e1515053c6dab5e9b98581777db15458d1ed2"
+      }
+    },
+    {
+      "id": "E_SBOM",
+      "title": "Complete source dependency graph inventory",
+      "kind": "archived_local",
+      "root": "delivery",
+      "paths": [
+        "all-graphs-sbom.cdx.json",
+        "all-graphs-sbom.log",
+        "dependency-manifest-inventory.json"
+      ],
+      "summary": "The validated source-union SBOM contains 956 components: 161 Python, 351 native workspace, 285 shell and 159 fuzz. It has 957 dependency entries including the root. The input inventory classifies 58 manifest, lock and container files across six graphs, with none unclassified.",
+      "result": "passed",
+      "source_revision": "d2de862013f157e5a61ef5b32a07120f547b439e",
+      "counts": {
+        "components": 956,
+        "dependency_entries": 957,
+        "classified_input_files": 58,
+        "graphs": 6,
+        "unclassified": 0
+      },
+      "limits": [
+        "The SBOM includes build and test dependencies and preserves separate Cargo graph identities. It is not an assertion that every listed component ships in every platform artifact. Rendezvous and npm inputs have separate audit coverage."
+      ],
+      "artifact_sha256": {
+        "all-graphs-sbom.cdx.json": "3364471b160f2867699768f05cb30c377fd4cef1c5965e25d99e452630bc7ed9",
+        "all-graphs-sbom.log": "27b00b5edcd7057eb5f970e7fcd1f16ee0ecec6de6f847c881acd922cc7946cf",
+        "dependency-manifest-inventory.json": "f69448383f46e1e7b43c6f6df2f5084598600c07ab330c48a93f893a0ef4f56c"
+      }
+    },
+    {
+      "id": "E_DEP_NPM",
+      "title": "Locked JavaScript test dependency audit",
+      "kind": "archived_local",
+      "root": "delivery",
+      "paths": [
+        "npm-audit.json"
+      ],
+      "summary": "The locked JavaScript test-tool graph reported zero vulnerabilities.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": {
+        "vulnerabilities": 0
+      },
+      "limits": [
+        "This is a test-tool dependency graph, not a runtime browser dependency or application security certification."
+      ],
+      "artifact_sha256": {
+        "npm-audit.json": "12931fe186a1d5341d0bd56a90726249c7208945f5b9168701ba8b1af5ce8dc3"
+      }
+    },
+    {
+      "id": "E_LINUX_BOOTSTRAP",
+      "title": "Linux exact public bootstrap at the review basis",
+      "kind": "archived_local",
+      "root": "remediation",
+      "paths": [
+        "source-bootstrap-d2de862.json",
+        "source-bootstrap-d2de862-runtime.json",
+        "source-bootstrap-d2de862.log"
+      ],
+      "summary": "The public source bootstrap passed at d2de862 in 56.102 seconds with 944 hashed build inputs. Versions matched 0.22.1 and the KEM self-test passed. Native binary SHA256: cc00549c0d0de6603df8e8827c360691e6348443f55996b465d3d750732ba1be.",
+      "result": "passed",
+      "source_revision": "d2de862013f157e5a61ef5b32a07120f547b439e",
+      "counts": {
+        "build_inputs": 944,
+        "seconds": 56.102
+      },
+      "limits": [],
+      "artifact_sha256": {
+        "source-bootstrap-d2de862.json": "eaa7c9140571c41fa3cf2ea4c5d7f3a8deb9795ad6e33dcc0081e2a1749850a3",
+        "source-bootstrap-d2de862-runtime.json": "56354e759c0240e36e92faf136f6111522ee6375a6f75e10936fa8a3e26e967d",
+        "source-bootstrap-d2de862.log": "5101bdd5fd5992c36204c6e7b85bc18a734831fb38f94a3a2f978fff5ef0e62f"
+      }
+    },
+    {
+      "id": "E_WIN_BOOTSTRAP",
+      "title": "Windows exact public bootstrap and native identity",
+      "kind": "observer_summary",
+      "root": "windows",
+      "paths": [
+        "source-bootstrap-public-command-v2.json",
+        "source-bootstrap-public-command-v2.log"
+      ],
+      "summary": "The public source bootstrap passed at dbb2f52 after installing isolated uv 0.13.10: 48.281 seconds, 944 hashed source inputs, matching 0.22.1 versions and a passed KEM self-test. The native binary is 6,274,560 bytes; SHA256: 030b5743bd9f8550382b40b7b6379ea2d7ad59ce9dbf4a80521e9b4d54702ac2.",
+      "result": "passed",
+      "source_revision": "dbb2f5221ffcc70d09a42b69aed03976b3b266e4",
+      "counts": {
+        "build_inputs": 944,
+        "seconds": 48.281,
+        "native_binary_size_bytes": 6274560
+      },
+      "limits": [
+        "The first public bootstrap attempt, job 10f259637cc14eb1bf595088f0864c8c, was blocked by installed uv 0.11.23 and remains retained. The successful observation belongs to dbb2f52, not every later source commit. Full Windows XML is not exported."
+      ],
+      "artifact_sha256": {},
+      "execution_job": "9fe115fe8f384c65a900e2d6e4a7d858"
+    },
+    {
+      "id": "E_HOSTED_INITIAL",
+      "title": "Initial hosted acceptance observations",
+      "kind": "archived_observer_summary",
+      "root": "remediation",
+      "paths": [
+        "hosted-initial-dbb2f52-summary.json"
+      ],
+      "summary": "At source dbb2f52, hosted Linux acceptance reported 9,683 passed, 47 skipped and five failed in 371.38 seconds, with 152 live cases deselected into separate shards. All 152 live cases passed with no skips across shards of 42, 47, 42 and 21 cases. Linux browser tests passed 63 Chromium and three Firefox cases. The five acceptance failures were later-corrected wording, landing-page and workflow-count contracts. GitHub merge revision 2927a0f has the exact same source tree as dbb2f52.",
+      "result": "mixed_pending_final_head",
+      "source_revision": "dbb2f5221ffcc70d09a42b69aed03976b3b266e4",
+      "counts": {
+        "passed": 9683,
+        "skipped": 47,
+        "failed": 5,
+        "deselected_live": 152,
+        "seconds": 371.38,
+        "live_passed": 152,
+        "live_failed": 0,
+        "live_skipped": 0,
+        "chromium_passed": 63,
+        "firefox_passed": 3
+      },
+      "limits": [
+        "The retained summary records exact source-tree equivalence between the tested merge and branch revisions. These are earlier-candidate outcomes; final-head execution is required. Original failed acceptance cases remain visible."
+      ],
+      "artifact_sha256": {
+        "hosted-initial-dbb2f52-summary.json": "bfc23401184cdd783c1295f508633c536802e46eed40073c5e7dd784fe602ea1"
+      },
+      "artifact_url": "https://github.com/coherence-energy-labs/one-link/actions/runs/45538106208/artifacts/14988128402"
+    },
+    {
+      "id": "E_HOSTED_BENCH",
+      "title": "Initial hosted paired benchmark gate",
+      "kind": "archived_observer_summary",
+      "root": "remediation",
+      "paths": [
+        "hosted-initial-dbb2f52-summary.json"
+      ],
+      "summary": "At dbb2f52, the hosted comparison correctly failed with an INCONCLUSIVE result after five pairs. Broad disk, WAL and QUIC confidence intervals crossed the five-percent acceptance boundary. Tolerances were not relaxed.",
+      "result": "inconclusive_gate_failed",
+      "source_revision": "dbb2f5221ffcc70d09a42b69aed03976b3b266e4",
+      "counts": {
+        "pairs": 5
+      },
+      "limits": [
+        "This is neither a demonstrated product regression nor evidence of accepted performance. Final-candidate timing requires sufficient comparable observations or the controlled runner."
+      ],
+      "artifact_sha256": {
+        "hosted-initial-dbb2f52-summary.json": "bfc23401184cdd783c1295f508633c536802e46eed40073c5e7dd784fe602ea1"
+      },
+      "artifact_url": "https://github.com/coherence-energy-labs/one-link/actions/runs/45538106206/artifacts/14987553541"
+    },
+    {
+      "id": "E_HOSTED_SECRET_SCAN",
+      "title": "Initial hosted full-history secret scan",
+      "kind": "archived_observer_summary",
+      "root": "remediation",
+      "paths": [
+        "hosted-initial-dbb2f52-summary.json"
+      ],
+      "summary": "The initial full-history Gitleaks check reported a type-annotation false positive on a dataclass field naming the Ed25519 private-key type, with no assigned secret value. Commit 27cc28b adds one exact historical fingerprint exception and redacted report retention. E_SECRET_REVALIDATION records a successful zero-finding full-history check at d2de862 using that exact exception.",
+      "result": "initial_false_positive_retained_revalidation_passed",
+      "source_revision": "dbb2f5221ffcc70d09a42b69aed03976b3b266e4",
+      "counts": {
+        "findings": 1
+      },
+      "limits": [
+        "The initial failed scan remains recorded. The successful revalidation is scoped to its source history; exact-final-source hosted security acceptance remains pending."
+      ],
+      "artifact_sha256": {
+        "hosted-initial-dbb2f52-summary.json": "bfc23401184cdd783c1295f508633c536802e46eed40073c5e7dd784fe602ea1"
+      }
+    },
+    {
+      "id": "E_GATE_INTEGRATION",
+      "title": "Integrated native gate and policy contract selection",
+      "kind": "archived_local",
+      "root": "remediation",
+      "paths": [
+        "gates-integration-876857f.log"
+      ],
+      "summary": "The integrated selection covering native source applicability, policy, benchmark contracts, release inventory, SBOM, landing text and historical controlled-lab documentation passed 213 cases in 10.83 seconds.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": {
+        "passed": 213,
+        "seconds": 10.83
+      },
+      "limits": [
+        "This focused result does not replace final hosted execution of the named required contexts.",
+        "The retained log records the executed result but has no embedded source revision. The coordinator associated it with these integrated gate changes; the filename alone is not an exact source identity."
+      ],
+      "artifact_sha256": {
+        "gates-integration-876857f.log": "1dea1f00c9df1747b481b2ffb936e4382d41790996496b0fa5f49450558825ef"
+      },
+      "covered_commits": [
+        "876857f",
+        "d6594c8",
+        "27cc28b"
+      ]
+    },
+    {
+      "id": "E_HOSTED_WINDOWS_INITIAL",
+      "title": "Initial hosted Windows live and browser acceptance",
+      "kind": "archived_observer_summary",
+      "root": "remediation",
+      "paths": [
+        "hosted-initial-dbb2f52-windows.json"
+      ],
+      "summary": "At the source tree of dbb2f52, all 152 Windows live cases passed across four shards with no skips or retries. Browser execution passed all 63 Chromium and three Firefox cases. The tested GitHub merge tree is identical to dbb2f52.",
+      "result": "passed",
+      "source_revision": "dbb2f5221ffcc70d09a42b69aed03976b3b266e4",
+      "counts": {
+        "live_passed": 152,
+        "live_failed": 0,
+        "live_skipped": 0,
+        "chromium_passed": 63,
+        "firefox_passed": 3
+      },
+      "limits": [
+        "This records the live and browser lanes only. The failed complete selection is E_HOSTED_WINDOWS_FULL_INITIAL. Final candidate outcomes are separate."
+      ],
+      "artifact_sha256": {
+        "hosted-initial-dbb2f52-windows.json": "9d3c2ff802ab8f127c4c8a511a4cccdb6059ea9264c2dd67d3db17abae186c12"
+      }
+    },
+    {
+      "id": "E_POLICY_DESIRED",
+      "title": "Current ten-context repository policy proposal",
+      "kind": "archived_local",
+      "root": "repository",
+      "paths": [
+        ".github/repository-policy.json"
+      ],
+      "summary": "Desired policy requires ten named producer-bound checks, including native correctness, performance and native shell qualification, plus one independent approving review. It remains unapplied at this report cutoff.",
+      "result": "prepared_not_applied",
+      "source_revision": "7df40a371bdcb01e5d3f5f8764e87a5542120763",
+      "counts": null,
+      "limits": [
+        "The older archived API payload contained seven checks. Regenerate from this current ten-check policy, observe all required contexts and producers, and retain effective-policy readback before claiming enforcement."
+      ],
+      "artifact_sha256": {
+        ".github/repository-policy.json": "64eaaf9682c9e12f8811aa54c56f8ecd63845a52e262c44dfb1fd777e98e644d"
+      }
+    },
+    {
+      "id": "E_DEP_ALERTS",
+      "title": "Default-branch advisory ranges compared with candidate locks",
+      "kind": "archived_local",
+      "root": "delivery",
+      "paths": [
+        "default-branch-open-alerts.json",
+        "dependabot-candidate-comparison.json"
+      ],
+      "summary": "All 88 observed default-branch alerts were compared with the exact candidate locks at 27cc28b. Eighty-seven are outside their affected version ranges; one remains affected: glib 0.18.5 in the shell lock, GHSA-wrw7-89jp-8q8g, medium severity, fixed in glib 0.20.0 or later. No alerts were dismissed.",
+      "result": "known_advisory_remaining",
+      "source_revision": "27cc28be750027a8663893b5dacd5616188bf435",
+      "counts": {
+        "observed_alerts": 88,
+        "outside_affected_ranges": 87,
+        "still_affected": 1
+      },
+      "limits": [
+        "This record predates the backport and preserves the originally affected registry comparison. The later verified source remedy and continuing ancestor advisories are E_GLIB_BACKPORT. No alert was dismissed and no absence-of-reachability claim is made."
+      ],
+      "artifact_sha256": {
+        "default-branch-open-alerts.json": "52ef6d8ec217172504989206cf5fa8a9d57bdad41dfda9f43affea9a8b993dd8",
+        "dependabot-candidate-comparison.json": "7d0ef844205b232eed07efca34f644a99cff1caa0d89c457213eb525a85fe87c"
+      }
+    },
+    {
+      "id": "E_SECRET_REVALIDATION",
+      "title": "Exact historical secret-scan exception revalidated",
+      "kind": "archived_local",
+      "root": "delivery",
+      "paths": [
+        "windows-gitleaks-reviewed-summary.json",
+        "windows-gitleaks-reviewed-receipt.json"
+      ],
+      "summary": "Full-history Gitleaks revalidation passed with zero findings using the one reviewed historical fingerprint exception supplied through an external ignore file. Source remained d2de862 before and after; no source or environment change was used to obtain the result. The original finding is retained.",
+      "result": "passed",
+      "source_revision": "d2de862013f157e5a61ef5b32a07120f547b439e",
+      "counts": {
+        "findings": 0,
+        "scan_exit_code": 0
+      },
+      "limits": [
+        "This validates the exact exception against the recorded source history. The final combined candidate and hosted security outcomes remain separate.",
+        "A later rationale comment introduced an additional historical detector match after this scanned source. Delivery is preparing its exact exception; final combined-candidate security acceptance remains pending."
+      ],
+      "artifact_sha256": {
+        "windows-gitleaks-reviewed-summary.json": "6d428e06383047980bb3395b9eb2e4c8cb9593f241ee1e1556733d28d05a686d",
+        "windows-gitleaks-reviewed-receipt.json": "8867aa108e33bfa95349d5ffc07debdc0162c32199d82ecfb472faeb9f2acc93"
+      },
+      "execution_job": "e70d2253bb5b425d8eab9928f3631210"
+    },
+    {
+      "id": "E_WIN_BROWSERS_D2DE862",
+      "title": "Windows browser acceptance after both UI extractions and HTTP readiness correction",
+      "kind": "observer_summary",
+      "root": "windows",
+      "paths": [
+        "browser-chromium-d2de862.xml",
+        "browser-chromium-d2de862.log",
+        "browser-firefox-d2de862.xml",
+        "browser-firefox-d2de862.log",
+        "browser-integrated-d2de862-summary.json"
+      ],
+      "summary": "Windows source remained d2de862 throughout the completed browser execution. Chromium passed all 63 cases with zero failures or skips; process elapsed time was 638.375 seconds. Firefox passed all three cases with zero failures or skips; process elapsed time was 70.0 seconds. This execution includes both extracted browser applications and the authenticated HTTP readiness correction.",
+      "result": "passed",
+      "source_revision": "d2de862013f157e5a61ef5b32a07120f547b439e",
+      "source_revision_after": "d2de862013f157e5a61ef5b32a07120f547b439e",
+      "execution_job": "d70c0267479d4629b35a49d7b26eb3d0",
+      "counts": {
+        "chromium_passed": 63,
+        "chromium_failed": 0,
+        "chromium_skipped": 0,
+        "chromium_process_elapsed_seconds": 638.375,
+        "firefox_passed": 3,
+        "firefox_failed": 0,
+        "firefox_skipped": 0,
+        "firefox_process_elapsed_seconds": 70.0
+      },
+      "limits": [
+        "Aggregate counts and public test identities are supplied by the execution observer. Full Windows XML remains on the Windows host. These are correctness process durations, not performance benchmarks.",
+        "This validates the UI extraction and readiness correction at d2de862; final combined-candidate hosted acceptance, intended released artifacts and broader device or network qualification remain separate."
+      ],
+      "artifact_sha256": {}
+    },
+    {
+      "id": "E_PYTHON_DIST_REVIEW",
+      "title": "Full-checkout Python wheel and source-distribution validation",
+      "kind": "archived_local",
+      "root": "remediation",
+      "paths": [
+        "python-dist-review-validation.json",
+        "python-dist-review-build.log",
+        "python-dist-review-validation.log",
+        "python-dist-review/one_link-0.22.1-py3-none-any.whl",
+        "python-dist-review/one_link-0.22.1.tar.gz"
+      ],
+      "summary": "At f5fb842, the actual full checkout produced the Python application wheel and source distribution. The independent validator passed clean direct and source-distribution-derived installations, exact payload and RECORD checks, and a wheel built from the source distribution. The inventory contains 232 Python files, 255 payload files, 215 stable runtime modules and 23 packaged assets.",
+      "result": "passed",
+      "source_revision": "f5fb84224dd9494d8871773cc7a3b61348cb0695",
+      "counts": {
+        "python_files": 232,
+        "payload_files": 255,
+        "stable_runtime_modules": 215,
+        "packaged_assets": 23
+      },
+      "artifact_identities": {
+        "version": "0.22.1",
+        "wheel": {
+          "name": "one_link-0.22.1-py3-none-any.whl",
+          "size_bytes": 3132542,
+          "sha256": "3c3a35484281c3a5a47745365483e9d60edecf66aebd015bd6d5ebc68fb7f9a9"
+        },
+        "sdist": {
+          "name": "one_link-0.22.1.tar.gz",
+          "size_bytes": 3009689,
+          "sha256": "95c477fb9c40e56d101ffb1ccc83bb19358e34871c347550f8c5622f2714dc54"
+        },
+        "sdist_derived_wheel": {
+          "name": "one_link-0.22.1-py3-none-any.whl",
+          "sha256": "9b504b4a6cad69669c37db6c6fe4be41ec1f282114cc4d3ed139b41b691a751d"
+        }
+      },
+      "limits": [
+        "This is Python application distribution and installation validation. It does not establish byte reproducibility, native wheel acceptance, standalone executable packaging, signing, provenance or whole-release qualification.",
+        "The validator summary records content identities and inventory counts. Source association with f5fb842 is supplied by the build execution observer; it does not turn an earlier test result into final-head acceptance."
+      ],
+      "artifact_sha256": {
+        "python-dist-review-validation.json": "d9c3e493490823f8419d3d12a7b4c4a813a862556c83e4204600fca447f3bb09",
+        "python-dist-review-build.log": "bb4359a980984540e1b13666756e302ab51cbc1e8bd0ac07b89b1c5da859bb05",
+        "python-dist-review-validation.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "python-dist-review/one_link-0.22.1-py3-none-any.whl": "3c3a35484281c3a5a47745365483e9d60edecf66aebd015bd6d5ebc68fb7f9a9",
+        "python-dist-review/one_link-0.22.1.tar.gz": "95c477fb9c40e56d101ffb1ccc83bb19358e34871c347550f8c5622f2714dc54"
+      }
+    },
+    {
+      "id": "E_NATIVE_GATE_FOLLOWUP",
+      "title": "Native scope and aggregate tests",
+      "kind": "archived_local",
+      "root": "scratch",
+      "paths": [
+        "one-link-native-gate-validation.xml"
+      ],
+      "summary": "Verified applicability, complete diff and aggregate decision contracts; associated root commit 876857f.",
+      "result": "failed",
+      "source_revision": null,
+      "counts": {
+        "tests": 185,
+        "passed": 184,
+        "failures": 1,
+        "errors": 0,
+        "skipped": 0
+      },
+      "limits": [
+        "Associated source changes are identified; this XML itself has no embedded Git source hash. Runs overlap other selections and must not be summed."
+      ],
+      "artifact_sha256": {
+        "one-link-native-gate-validation.xml": "f7a9a0949e71f6f2aae18ea834e1be923f262291310b61d9129adc987f2c8327"
+      }
+    },
+    {
+      "id": "E_NATIVE_SAMPLING",
+      "title": "Predeclared benchmark sampling contracts",
+      "kind": "archived_local",
+      "root": "scratch",
+      "paths": [
+        "one-link-native-sampling-validation.xml"
+      ],
+      "summary": "236 scoped cases validate the revised sampling orchestration. This does not establish a comparative performance pass; associated root commit 3acb6fc.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": {
+        "tests": 236,
+        "passed": 236,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "limits": [
+        "Associated source changes are identified; this XML itself has no embedded Git source hash. Runs overlap other selections and must not be summed."
+      ],
+      "artifact_sha256": {
+        "one-link-native-sampling-validation.xml": "57426c2919c7fb7ca15db2733a7fd45e45ecb066afde471ad5a7e20149c71c0a"
+      }
+    },
+    {
+      "id": "E_UI_PORTABILITY",
+      "title": "Owner and peer encoding/newline contracts",
+      "kind": "archived_local",
+      "root": "scratch",
+      "paths": [
+        "one-link-owner-ui-portability-validation.xml"
+      ],
+      "summary": "LF/CRLF source and stale-check tests preserve exact bytes and explicit UTF-8; associated root commit 5c39d28.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": {
+        "tests": 20,
+        "passed": 20,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "limits": [
+        "Associated source changes are identified; this XML itself has no embedded Git source hash. Runs overlap other selections and must not be summed."
+      ],
+      "artifact_sha256": {
+        "one-link-owner-ui-portability-validation.xml": "57c23ecaf63ff224339c7714dcc6e33c131e053d6698498281281213a2152f05"
+      }
+    },
+    {
+      "id": "E_SCOPE_PORTABILITY",
+      "title": "Portable Git-diff fixture contracts",
+      "kind": "archived_local",
+      "root": "scratch",
+      "paths": [
+        "one-link-scope-windows-validation.xml"
+      ],
+      "summary": "Linux contract execution covers Windows-valid real paths and explicit raw NUL/newline diff decoding; associated root commit 9a8475a.",
+      "result": "passed",
+      "source_revision": null,
+      "counts": {
+        "tests": 70,
+        "passed": 70,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "limits": [
+        "Associated source changes are identified; this XML itself has no embedded Git source hash. Runs overlap other selections and must not be summed."
+      ],
+      "artifact_sha256": {
+        "one-link-scope-windows-validation.xml": "da1b9d5d5db9eed6666ccddf465a68cff3171088f91a9247f802cd2808a54f9d"
+      }
+    },
+    {
+      "id": "E_WIN_PORTABILITY_ATTEMPT",
+      "title": "Windows portability attempt and native frozen vectors",
+      "kind": "archived_summary",
+      "root": "remediation",
+      "paths": [
+        "windows-portability-8bbb9c8-summary.json"
+      ],
+      "summary": "176 Python cases passed and two invalid Windows filename fixtures failed. All six Rust frozen-vector cases passed. Original failures retained.",
+      "result": "failed",
+      "source_revision": "8bbb9c80e3bdc4d4dc1a95800f7fc4ef63ce6592",
+      "limits": [
+        "Private Windows XML is retained on its original host. This local record contains only aggregate outcomes and public test identifiers."
+      ],
+      "artifact_sha256": {
+        "windows-portability-8bbb9c8-summary.json": "95f04f1b827ad4cf8e587bbec64e124c12f1acd7a0a39cb4768a0187239b381e"
+      }
+    },
+    {
+      "id": "E_WIN_SCOPE_PORTABILITY",
+      "title": "Windows scope contracts after portable fixture correction",
+      "kind": "archived_summary",
+      "root": "remediation",
+      "paths": [
+        "windows-scope-9a8475a-summary.json"
+      ],
+      "summary": "All 70 scope cases passed on actual Windows at 9a8475a in 84.10 seconds, without skips or implementation changes.",
+      "result": "passed",
+      "source_revision": "9a8475a98db4737245da4939fb136e3dab9e6362",
+      "limits": [
+        "Private Windows XML is retained on its original host. This local record contains only aggregate outcomes and public test identifiers."
+      ],
+      "artifact_sha256": {
+        "windows-scope-9a8475a-summary.json": "abd64965319121e2b2f56f47895d474a55f46088ced97cc6412ed0682748993b"
+      }
+    },
+    {
+      "id": "E_GLIB_BACKPORT",
+      "title": "Exact upstream GLib source backport and continuing advisory qualification",
+      "kind": "archived_local",
+      "root": "delivery",
+      "paths": [
+        "glib-backport-qualification.json",
+        "glib-backport-provenance-final.json",
+        "glib-backport-optimized-tests.log",
+        "glib-upstream-tests-lock-identity.json",
+        "glib-upstream-tests-cargo.lock",
+        "glib-backport-harness-opt3.log",
+        "glib-backport-reviewed-contracts.log",
+        "glib-backport-reviewed-contracts.xml",
+        "glib-backport-live-advisories-final.json",
+        "glib-backport-cargo-audit-final.json",
+        "glib-backport-all-graphs-sbom.cdx.json",
+        "glib-backport-all-graphs-sbom.log",
+        "glib-backport-bandit-reviewed.json",
+        "glib-backport-zizmor-complete.log",
+        "glib-working-source-gitleaks-reviewed.json",
+        "glib-working-source-scan-inputs-reviewed.json",
+        "glib-full-shell-sdk-probe.log"
+      ],
+      "summary": "All 121 original source files preserved; only the official two-line iterator fix applied. 181 focused contracts, 11 original optimized iterator tests and five ongoing optimized regression tests passed. Live original-version OSV retained both exact known advisory IDs; strict CycloneDX SBOM validated with 957 components and 958 dependency records.",
+      "result": "passed_with_hosted_shell_qualification_pending",
+      "source_revision": "d15a8042115e3a381d1787bc729587083fbaaf54",
+      "integrated_revision": "314e797451cb4cc9119082fd0c5f324fe7a015f3",
+      "limits": [
+        "The local host lacks GTK and WebKit development packages; no full ol_shell compilation or real window qualification is claimed by these local results.",
+        "Actual native-shell and release jobs install genuine development packages and repeat the checks; parent is separately making the shell gate required.",
+        "The original registry version remains in the upstream advisory affected range; the source backport is project-maintained, not an upstream-supported 0.18 release.",
+        "The unmaintained macro dependency and eventual upstream GTK stack migration remain open maintenance responsibilities.",
+        "Earlier failed checks and temporary qualification locks are retained; final passing evidence applies only to the specified corrected source."
+      ],
+      "artifact_sha256": {
+        "glib-backport-qualification.json": "8b955799c3c826e32f806dfd4a2f3720cdc3ffc3c28c3095dbda8197adabcb56",
+        "glib-backport-provenance-final.json": "48e308dda62634836458a2e5517c8d36fd558ec040501db460b6423c2fb591ad",
+        "glib-backport-optimized-tests.log": "bbc87700a46e59871ecb2c330d7deb1b845eea6d9b1d099a96b05b46732e9751",
+        "glib-upstream-tests-lock-identity.json": "5dd43faa09cb1896375e01c72bc690ac12a59d1fcae610f00c7c5d76047534d6",
+        "glib-upstream-tests-cargo.lock": "83bb9dc5271dfa350381ea9a1faa55c7db0b00d94138c34e930386a94d910bee",
+        "glib-backport-harness-opt3.log": "e4cb101ed6a1e32b2be72e4e8ab03b9e8237519f1dffd24aeb52a52750708469",
+        "glib-backport-reviewed-contracts.log": "8f4dc1e5b33eb140bd92677e816f7413ed6b21d026c2d93e09e3795bc9a06468",
+        "glib-backport-reviewed-contracts.xml": "4e03a85b18815f3a51030fee94555415b9f0fb1faccb3fb62641f46746958012",
+        "glib-backport-live-advisories-final.json": "74483a3a187686f248382824bb7df385c6e4d00f261029c3beefe903306727b6",
+        "glib-backport-cargo-audit-final.json": "9055d498b87c81f26666096a160989fa2a8a40279beb8da77f36b19367875d82",
+        "glib-backport-all-graphs-sbom.cdx.json": "082631056f36957a4763477f331d2291da09faa15a1cf166f6466a89135d49fa",
+        "glib-backport-all-graphs-sbom.log": "51db029836c46f40af40ea32b183322038bb032f49ac8bec6502a51c01331c33",
+        "glib-backport-bandit-reviewed.json": "b1f1db4b56c63b9257e445656b97480ee3331e951a6b8b5bf69c88bd68543cf9",
+        "glib-backport-zizmor-complete.log": "f6bbb7c3c503d632d4c43685d23e1515053c6dab5e9b98581777db15458d1ed2",
+        "glib-working-source-gitleaks-reviewed.json": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570",
+        "glib-working-source-scan-inputs-reviewed.json": "74866ecec99165a9597cf7f97bea0ee6ee7e2b675129112211bbebf2b4dd2116",
+        "glib-full-shell-sdk-probe.log": "3bfb005383e8f610421e607ad20de62faa40999b6980901d4e68f9dd5c29977b"
+      }
+    },
+    {
+      "id": "E_NATIVE_SAMPLING_SMOKE",
+      "title": "Real predeclared CI sampling orchestration smoke",
+      "kind": "archived_local",
+      "root": "performance",
+      "paths": [
+        "ci-sampling-smoke/native-ci-profile.json",
+        "ci-sampling-smoke/native-ci-profile.stderr.log",
+        "ci-sampling-smoke/failed-unbounded-server-call.json"
+      ],
+      "summary": "Real revised profile retained 28 metrics and 203,516 timing observations, including all ten target storage/QUIC metrics with 31 batches. Earlier unbounded-call attempt remains retained.",
+      "result": "passed_orchestration_only",
+      "source_revision": null,
+      "limits": [
+        "This is a single orchestration smoke, not the 20-pair candidate-versus-baseline acceptance study or a performance improvement result."
+      ],
+      "artifact_sha256": {
+        "ci-sampling-smoke/native-ci-profile.json": "1cffe561911e6ca48e2b22a4ac84251cc86e7dffec3b4c923d6622b69c799e70",
+        "ci-sampling-smoke/native-ci-profile.stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "ci-sampling-smoke/failed-unbounded-server-call.json": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "id": "E_NATIVE_GOLDEN_PORTABILITY",
+      "title": "Frozen golden fixture LF/CRLF repair without changed outputs",
+      "kind": "archived_local",
+      "root": "scratch",
+      "paths": [
+        "one-link-golden-fixture-validation/summary.json",
+        "one-link-golden-fixture-validation/before-crlf-regression.log",
+        "one-link-golden-fixture-validation/after-lf.log",
+        "one-link-golden-fixture-validation/after-crlf-checkout.log",
+        "one-link-golden-fixture-validation/clippy.log",
+        "one-link-golden-fixture-validation/checkout-encoding-proof.json"
+      ],
+      "summary": "The old parser fails the added CRLF regression. The repair passes all six tests with LF and physical CRLF checkout bytes, and strict Clippy passes. Golden fixture SHA256 remains acfdd4f4e11f7e3616477534a77320154fa46760d65b24a224c59c09ad63d0f1. Actual Windows execution is recorded separately.",
+      "result": "passed",
+      "source_revision": "e9129ae6cedcd71332e9390345448244983bda76",
+      "integrated_revision": "8bbb9c80e3bdc4d4dc1a95800f7fc4ef63ce6592",
+      "limits": [
+        "The local CRLF execution used Linux; later actual Windows six-case execution is E_WIN_PORTABILITY_ATTEMPT."
+      ],
+      "artifact_sha256": {
+        "one-link-golden-fixture-validation/summary.json": "7c14c7e3e355a590ec70a685d85877d65dff2ff15fa2aeb3f019daa0ae6d9e49",
+        "one-link-golden-fixture-validation/before-crlf-regression.log": "1e00af746b9294b1de94bc2a45ba5f36e81b01e5f83271dd027fd0a4be82518f",
+        "one-link-golden-fixture-validation/after-lf.log": "221dcb8ca570ff6c628b2608ca9072504e10153de17b984d9389dc6393565974",
+        "one-link-golden-fixture-validation/after-crlf-checkout.log": "280563b8be00ab1b3ae9608069fb0de7e185fe95d07ceae448ed46a357796fca",
+        "one-link-golden-fixture-validation/clippy.log": "431f1fb1d5f589ccbe9cbab0a0276008e5818f8a30125b7efd2d2d8fbcf5b7dc",
+        "one-link-golden-fixture-validation/checkout-encoding-proof.json": "0213f68de77c6dd179705559bd14e9dfe5458d2b36f3085450b89d5124993a43"
+      }
+    },
+    {
+      "id": "E_HOSTED_WINDOWS_FULL_INITIAL",
+      "title": "Initial hosted Windows complete acceptance selection",
+      "kind": "archived_observer_summary",
+      "root": "remediation",
+      "paths": [
+        "hosted-initial-dbb2f52-windows-full.json"
+      ],
+      "summary": "Initial complete Windows selection failed: 9,696 passed, seven failed, 32 skipped and 152 live cases deselected in 1,392.57 seconds. Five stale documentation/contracts and two UTF-8/newline fixture issues were corrected by later commits; the original result remains failed.",
+      "result": "failed",
+      "source_revision": "dbb2f5221ffcc70d09a42b69aed03976b3b266e4",
+      "counts": {
+        "passed": 9696,
+        "failed": 7,
+        "skipped": 32,
+        "deselected": 152,
+        "seconds": 1392.57
+      },
+      "limits": [
+        "Bounded public hosted log excerpt; no private Windows XML was exported. Later results have their own source identities."
+      ],
+      "artifact_sha256": {
+        "hosted-initial-dbb2f52-windows-full.json": "0c793d4633549b3d44d6cc7ffbc2978a8204fd48c88ace4044c43a9d7539c82d"
+      }
+    },
+    {
+      "id": "E_NATIVE_SHELL_GATE",
+      "title": "Always-present native shell gate contracts",
+      "kind": "archived_local",
+      "root": "remediation",
+      "paths": [
+        "native-shell-gate-contracts.xml"
+      ],
+      "summary": "218 scoped contracts passed. Complete real three-OS shell matrix is required whenever verified source scope is applicable; missing proof and failed, cancelled or improperly skipped work fail.",
+      "result": "passed",
+      "source_revision": "7df40a371bdcb01e5d3f5f8764e87a5542120763",
+      "limits": [
+        "Contracts do not establish real window qualification or remote policy activation."
+      ],
+      "artifact_sha256": {
+        "native-shell-gate-contracts.xml": "495fb976585cadaeae1009a776c24cce6ac27aed65460531109ed96f4f68d482"
+      }
+    },
+    {
+      "id": "E_POLICY_BEFORE_FINAL",
+      "title": "Fresh effective branch policy before final activation",
+      "kind": "archived_local",
+      "root": "delivery",
+      "paths": [
+        "default-branch-ruleset-before-final.json"
+      ],
+      "summary": "Authenticated readback of active default-branch ruleset 20516627: no bypass actors, protected deletion/non-fast-forward, zero required approvals and no named status checks. This is the original effective state, not the desired ten-check proposal.",
+      "result": "observed_not_enforced",
+      "source_revision": null,
+      "limits": [],
+      "artifact_sha256": {
+        "default-branch-ruleset-before-final.json": "3292ffd31369c13bc2c028873ba264c2a1b25ba2e5cfda0bae8a718d77ec58f8"
+      }
+    }
+  ],
+  "commit_catalog": [
+    {
+      "id": "2f57b98",
+      "revision": "2f57b9800a388afa59dab7a84ff0aed3e74637fc",
+      "subject": "fix: complete passphrase recovery envelope before bootstrap verification",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/2f57b9800a388afa59dab7a84ff0aed3e74637fc",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "74ae074",
+      "revision": "74ae0742ca433118f4c0d4c52bcc731e569ca898",
+      "subject": "perf: accelerate descriptor-bound Gear CDC without changing boundaries",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/74ae0742ca433118f4c0d4c52bcc731e569ca898",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "0731ae5",
+      "revision": "0731ae5c9ba39460769dfd6c6ef63ce7a157a3a4",
+      "subject": "fix: expose verified file payload routes and reject unsupported selection",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/0731ae5c9ba39460769dfd6c6ef63ce7a157a3a4",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "c2f6e0a",
+      "revision": "c2f6e0a57b5159a1fd045ca23965b7741177dc6a",
+      "subject": "fix: describe durable file and folder completion in protocol catalog",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/c2f6e0a57b5159a1fd045ca23965b7741177dc6a",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "8b42802",
+      "revision": "8b42802bf883cb0eed2f017d0cca274b81e83b9d",
+      "subject": "fix(native): enforce file scan contracts and coalesce records online",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/8b42802bf883cb0eed2f017d0cca274b81e83b9d",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "aa37b9d",
+      "revision": "aa37b9dd7f8f226c0129e438538022094f7a3dc5",
+      "subject": "docs: distinguish historical skip counts from current execution evidence",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/aa37b9dd7f8f226c0129e438538022094f7a3dc5",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "d6df3d3",
+      "revision": "d6df3d3c61588adc3c3fe3f39364015418e6497c",
+      "subject": "fix(deps): resolve advisory-free Python and native dependency graphs",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/d6df3d3c61588adc3c3fe3f39364015418e6497c",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "c1686ca",
+      "revision": "c1686ca50989f70b4b71c173a2b19ea55304a2ed",
+      "subject": "Make performance evidence verified, paired, and production-aware",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/c1686ca50989f70b4b71c173a2b19ea55304a2ed",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "084ed38",
+      "revision": "084ed38a1f95e8cf6219e2153b3eb2a7ee61528c",
+      "subject": "fix: report configured hybrid handshake and qualified payload routes",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/084ed38a1f95e8cf6219e2153b3eb2a7ee61528c",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "dcf9e5c",
+      "revision": "dcf9e5c74d7e1a552c7a3362b122eb02d2b237b8",
+      "subject": "fix(browser): bound pairing setup and retain stage diagnostics",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/dcf9e5c74d7e1a552c7a3362b122eb02d2b237b8",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "5344ee9",
+      "revision": "5344ee9387c2f6da87b4064f01c2d17c56cfeaa9",
+      "subject": "refactor: isolate file preparation and durable retry services",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/5344ee9387c2f6da87b4064f01c2d17c56cfeaa9",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "d90aa78",
+      "revision": "d90aa78614ad4b70259be67c7e6d1db1521b1fc2",
+      "subject": "fix(packaging): refresh locked container inputs and build contracts",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/d90aa78614ad4b70259be67c7e6d1db1521b1fc2",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "48990e4",
+      "revision": "48990e4469ed81520dd539d5fe2bf0741afbf33e",
+      "subject": "fix(ci): enforce release evidence and explicit live acceptance",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/48990e4469ed81520dd539d5fe2bf0741afbf33e",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "ee9e51e",
+      "revision": "ee9e51e01ad7d74df594ffa186d1f25ebdc81e77",
+      "subject": "fix: preserve stream wrapper compatibility and correct transport claims",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/ee9e51e01ad7d74df594ffa186d1f25ebdc81e77",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "93a5d0d",
+      "revision": "93a5d0d6e2c98d34760c01e6548232f0a9663fb1",
+      "subject": "test(ci): exercise documented source bootstrap on both acceptance platforms",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/93a5d0d6e2c98d34760c01e6548232f0a9663fb1",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "3674060",
+      "revision": "3674060956c22caa40a74eaf3f4f58c1c5e768a1",
+      "subject": "Modularize owner browser sources with deterministic offline assembly",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/3674060956c22caa40a74eaf3f4f58c1c5e768a1",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "0df0d95",
+      "revision": "0df0d957f86e159c7f9eee135183140e3557ae72",
+      "subject": "fix: make connection metadata uncached and LAN contract tests deterministic",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/0df0d957f86e159c7f9eee135183140e3557ae72",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "aac9f83",
+      "revision": "aac9f834855cf0f9fcd388d9579c4465178a61df",
+      "subject": "refactor: isolate offline courier runtime services",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/aac9f834855cf0f9fcd388d9579c4465178a61df",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "b7a3ca2",
+      "revision": "b7a3ca298510ba7f2819616b35153786eb692905",
+      "subject": "fix(packaging): declare extracted runtime services and source identities",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/b7a3ca298510ba7f2819616b35153786eb692905",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "8a9fe28",
+      "revision": "8a9fe2839959febb17457e1ef7ed90b8695e4eb2",
+      "subject": "test(packaging): pin source inventory after service extraction",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/8a9fe2839959febb17457e1ef7ed90b8695e4eb2",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "eab2337",
+      "revision": "eab2337e48067f84634553a3bc0a4946e5a46188",
+      "subject": "build: keep canonical browser sources outside runtime package assets",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/eab2337e48067f84634553a3bc0a4946e5a46188",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "dbb2f52",
+      "revision": "dbb2f5221ffcc70d09a42b69aed03976b3b266e4",
+      "subject": "test(e2e): require authenticated HTTP readiness before API assertions",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/dbb2f5221ffcc70d09a42b69aed03976b3b266e4",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "1164ed9",
+      "revision": "1164ed9ba3bc4716acdbb8ff3472c5c8e9144340",
+      "subject": "Clarify controlled-lab scope of historical coherence baseline",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/1164ed9ba3bc4716acdbb8ff3472c5c8e9144340",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "296c721",
+      "revision": "296c721b3205deb9d6d4a7864ed172ecc9790a6e",
+      "subject": "Modularize peer browser sources and verify both offline artifacts",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/296c721b3205deb9d6d4a7864ed172ecc9790a6e",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "d2de862",
+      "revision": "d2de862013f157e5a61ef5b32a07120f547b439e",
+      "subject": "fix(supply-chain): qualify shell graph and complete release inventory",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/d2de862013f157e5a61ef5b32a07120f547b439e",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "876857f",
+      "revision": "876857fbc389c2d486f8f99a4ad4ec33be13de9d",
+      "subject": "Emit required native gates with verified source applicability",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/876857fbc389c2d486f8f99a4ad4ec33be13de9d",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "d6594c8",
+      "revision": "d6594c8d59aec0ba44277e0c9ca074f89a8cb030",
+      "subject": "Require native correctness and performance evidence in branch policy",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/d6594c8d59aec0ba44277e0c9ca074f89a8cb030",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "27cc28b",
+      "revision": "27cc28be750027a8663893b5dacd5616188bf435",
+      "subject": "fix(ci): retain redacted secret findings and classify type annotation",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/27cc28be750027a8663893b5dacd5616188bf435",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "f5fb842",
+      "revision": "f5fb84224dd9494d8871773cc7a3b61348cb0695",
+      "subject": "Align transport and test documentation with enforced behavior",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/f5fb84224dd9494d8871773cc7a3b61348cb0695",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "3acb6fc",
+      "revision": "3acb6fc013d987f4613905d08757222a00caebe3",
+      "subject": "Predeclare longer balanced native benchmark sampling",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/3acb6fc013d987f4613905d08757222a00caebe3",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "5c39d28",
+      "revision": "5c39d28cb0e3b05661c192cb64e9429c921f07b6",
+      "subject": "Make browser build contracts portable across UTF-8 and CRLF checkouts",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/5c39d28cb0e3b05661c192cb64e9429c921f07b6",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "366d58e",
+      "revision": "366d58e76d606955c812dc6512472fae2059dbc1",
+      "subject": "docs(security): distinguish remaining advisory and preserve exact scan exceptions",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/366d58e76d606955c812dc6512472fae2059dbc1",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "8bbb9c8",
+      "revision": "8bbb9c80e3bdc4d4dc1a95800f7fc4ef63ce6592",
+      "subject": "fix(native): parse frozen vectors across checkout line endings",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/8bbb9c80e3bdc4d4dc1a95800f7fc4ef63ce6592",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "9a8475a",
+      "revision": "9a8475a98db4737245da4939fb136e3dab9e6362",
+      "subject": "Test newline Git paths without Windows-invalid fixture files",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/9a8475a98db4737245da4939fb136e3dab9e6362",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "314e797",
+      "revision": "314e797451cb4cc9119082fd0c5f324fe7a015f3",
+      "subject": "Backport verified GLib iterator fix with live ancestor auditing",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/314e797451cb4cc9119082fd0c5f324fe7a015f3",
+      "integrated_in_review_basis": true
+    },
+    {
+      "id": "7df40a3",
+      "revision": "7df40a371bdcb01e5d3f5f8764e87a5542120763",
+      "subject": "Require native shell qualification with verified source applicability",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/7df40a371bdcb01e5d3f5f8764e87a5542120763",
+      "integrated_in_review_basis": true
+    }
+  ],
+  "findings": [
+    {
+      "id": "RLS-01",
+      "priority": "High",
+      "title": "Current dependency checks fail against the committed locks",
+      "owner": "delivery",
+      "acceptance": "Update declarations, uv.lock, Cargo.lock and bootstrap tools together. Prioritize quinn-proto >=0.11.19, aiohttp >=3.14.4, and dnspython >=2.9.2. Review all normalized records, rerun current scanners, retain reports, and explicitly disposition entries whose triggering feature or input path is absent. Verify the actual dependency inventory of each intended release artifact.",
+      "status": "implemented_pending_qualification",
+      "changes": [
+        {
+          "summary": "Updated Python declarations and universal lock, all three Cargo lockfiles, the P256 API and fixture, and locked container inputs. Complete source graph inventories and independent audit reports are retained.",
+          "commits": [
+            "d6df3d3",
+            "d90aa78",
+            "48990e4",
+            "d2de862"
+          ],
+          "files": [
+            "pyproject.toml",
+            "uv.lock",
+            "native/Cargo.toml",
+            "native/Cargo.lock",
+            "native/fuzz/Cargo.lock",
+            "native/ol_confidential/src/platform_quote.rs",
+            "native/ol_shell/Cargo.lock",
+            "deploy/rendezvous/requirements.lock",
+            "scripts/gen_sbom.py",
+            "docs/DEPENDENCY_QUALIFICATION.md",
+            ".github/workflows/security.yml"
+          ]
+        },
+        {
+          "summary": "Backported the exact official GLib iterator repair to the complete original 0.18.5 source, retaining original version/license. Added complete source/upstream archive/diff verification, Windows byte preservation, optimized regression harness, honest modified-source SBOM pedigree and required live original-version advisory queries.",
+          "commits": [
+            "314e797"
+          ],
+          "files": [
+            "native/ol_shell/Cargo.toml",
+            "native/ol_shell/Cargo.lock",
+            "native/ol_shell/patches/glib-0.18.5.json",
+            "native/ol_shell/patches/glib-0.18.5-variant-str-iter.patch",
+            "native/ol_shell/regression/glib_variant_backport/src/lib.rs",
+            "scripts/verify_vendor_patches.py",
+            "scripts/audit_vendor_advisories.py",
+            "scripts/gen_sbom.py",
+            ".github/workflows/security.yml",
+            ".github/workflows/native_shell.yml",
+            ".github/workflows/release.yml"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Before the GLib backport, Python, rendezvous, npm, workspace and fuzz checks reported no vulnerabilities; the shell still carried one known medium GLib issue and a separate maintenance warning. The 27cc28b comparison mapped 87 of 88 default-branch alerts outside the candidate affected ranges. Those original observations remain retained; the later exact-source backport is separately qualified below.",
+          "tests": [
+            "tests/test_delivery_evidence.py",
+            "tests/test_container_appimage_supply_chain.py",
+            "native/ol_confidential/src/platform_quote.rs"
+          ],
+          "evidence_ids": [
+            "E_DEP_PY",
+            "E_DEP_RUST",
+            "E_DEP_SHELL",
+            "E_DEP_NPM",
+            "E_CONTAINER",
+            "E_SBOM",
+            "E_SHELL_TESTS",
+            "E_NATIVE_WORKSPACE",
+            "E_DEP_ALERTS"
+          ]
+        },
+        {
+          "summary": "181 focused contracts, 11 original optimized tests and five ongoing optimized regressions passed. Live OSV retained both known identifiers with verified-source disposition. New or incomplete advisory results fail closed. Strict CycloneDX validation passed for 957 components and 958 dependency records.",
+          "tests": [
+            "tests/test_vendor_patches.py",
+            "tests/test_vendor_advisories.py",
+            "tests/test_gen_sbom_v0210.py",
+            "native/ol_shell/regression/glib_variant_backport/src/lib.rs"
+          ],
+          "evidence_ids": [
+            "E_GLIB_BACKPORT"
+          ]
+        }
+      ],
+      "remaining": [
+        "Retain final hosted full shell build/window and security outcomes, and verify exact intended release artifacts.",
+        "This is a project-maintained backport, not an upstream-supported 0.18 release. The original registry version stays in the advisory affected range; continuing live ancestor checks are mandatory.",
+        "The proc-macro-error maintenance warning remains; plan migration to a compatible maintained upstream toolkit."
+      ]
+    },
+    {
+      "id": "RLS-02",
+      "priority": "High",
+      "title": "Release publication does not wait for reproducibility verification",
+      "owner": "delivery",
+      "acceptance": "Make the selected reproducibility check a required ancestor of signing/publication for the same source and artifact identities. Preserve member-level mismatch diagnostics and prove that a deliberately failed comparison prevents publication.",
+      "status": "implemented_pending_qualification",
+      "changes": [
+        {
+          "summary": "Signing/publication now depend on same-release native-wheel reproducibility verification; comparison checks complete bytes and retains member-level mismatch evidence.",
+          "commits": [
+            "48990e4"
+          ],
+          "files": [
+            ".github/workflows/release.yml",
+            ".github/workflows/reproducible_release.yml",
+            "scripts/verify_reproducible_wheels.py"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Local negative comparison, artifact-identity and workflow ancestry contracts passed.",
+          "tests": [
+            "tests/test_delivery_evidence.py::test_release_signing_and_publication_require_the_actual_artifact_rebuild",
+            "tests/test_delivery_evidence.py::test_rebuild_failure_cli_still_writes_machine_readable_evidence"
+          ],
+          "evidence_ids": [
+            "E_DELIVERY",
+            "E_RELEASE_LEDGER"
+          ]
+        }
+      ],
+      "remaining": [
+        "Execute and retain a fresh hosted two-builder comparison on the exact release candidate; prove the publication path respects its result.",
+        "Selected Linux native-wheel reproducibility does not prove whole-product/multi-platform byte reproducibility."
+      ]
+    },
+    {
+      "id": "RLS-03",
+      "priority": "Medium",
+      "title": "The observed ruleset does not require approving review or named status checks",
+      "owner": "delivery",
+      "acceptance": "Inspect the effective merged branch policy and require the intended correctness, security and release-authority checks, plus an independent review. Keep appropriate tag/release immutability controls. No repository setting was changed in this audit.",
+      "status": "prepared_not_applied",
+      "changes": [
+        {
+          "summary": "Prepared strict desired ruleset with ten named producer-bound checks, one independent approving review, stale review dismissal, resolved review threads, no bypass actors and preserved existing controls. Native correctness, performance and shell gates emit for every PR with verified applicability; external activation/readback remain pending.",
+          "commits": [
+            "48990e4",
+            "876857f",
+            "d6594c8",
+            "7df40a3"
+          ],
+          "files": [
+            ".github/repository-policy.json",
+            "scripts/repository_policy.py",
+            "docs/REPOSITORY_POLICY.md",
+            ".github/workflows/native_shell.yml"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Proposal, source applicability and required-context contracts passed in the integrated 213-case selection. No remote repository policy mutation has been applied.",
+          "tests": [
+            "tests/test_delivery_evidence.py::test_ruleset_proposal_preserves_existing_controls_and_requires_real_producer",
+            "tests/test_delivery_evidence.py::test_required_contexts_are_defined_by_unfiltered_pr_workflows"
+          ],
+          "evidence_ids": [
+            "E_POLICY",
+            "E_POLICY_DESIRED",
+            "E_DELIVERY",
+            "E_GATE_INTEGRATION"
+          ]
+        },
+        {
+          "summary": "218 focused scope, vendor/advisory, policy, workflow and owner-build cases passed. A fresh read of ruleset 20516627 still has zero required approving reviews and no named checks; the stricter desired policy has not yet been applied.",
+          "tests": [
+            "tests/test_native_ci_scope.py",
+            "tests/test_delivery_evidence.py"
+          ],
+          "evidence_ids": [
+            "E_NATIVE_SHELL_GATE",
+            "E_POLICY_BEFORE_FINAL"
+          ]
+        }
+      ],
+      "remaining": [
+        "Observe all ten required context names and real producers on the exact candidate; regenerate proposal from current effective policy, apply and retain authenticated readback."
+      ]
+    },
+    {
+      "id": "RLS-04",
+      "priority": "Medium",
+      "title": "A failed Python dependency gate prevents later analysis and report upload",
+      "owner": "delivery",
+      "acceptance": "Retain reports unconditionally and separate independent analyzers or aggregate their results explicitly. Preserve a strict final gate after collecting all relevant evidence.",
+      "status": "implemented_pending_qualification",
+      "changes": [
+        {
+          "summary": "Independent advisory/SAST/SBOM steps continue after a prior analyzer failure when tool setup succeeded; evidence upload is unconditional and enforcing commands still fail the job.",
+          "commits": [
+            "48990e4",
+            "27cc28b",
+            "366d58e",
+            "314e797"
+          ],
+          "files": [
+            ".github/workflows/security.yml",
+            ".gitleaksignore"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Workflow evidence-retention contracts passed. Full-history Gitleaks revalidation at d2de862 passed with zero findings using the one reviewed exact historical fingerprint exception, without changing source or environment. The original failed scan remains retained.",
+          "tests": [
+            "tests/test_delivery_evidence.py::test_independent_supply_chain_steps_and_evidence_survive_a_prior_failure"
+          ],
+          "evidence_ids": [
+            "E_DELIVERY",
+            "E_SHELL_TESTS",
+            "E_HOSTED_SECRET_SCAN",
+            "E_SECRET_REVALIDATION"
+          ]
+        }
+      ],
+      "remaining": [
+        "Retain final combined-candidate hosted security outcomes with original failed scans and later scoped verification.",
+        "Two exact historical type-only/comment fingerprints are documented; neither is a detector-wide or path-wide suppression. Local earlier scans do not establish all-candidate or all-artifact security."
+      ]
+    },
+    {
+      "id": "RLS-05",
+      "priority": "Medium",
+      "title": "A green native workflow includes an incomplete optional strict test pass",
+      "owner": "delivery",
+      "acceptance": "Separate required correctness from experimental/hardware checks. Run bounded timing analysis on a controlled machine, retain distributions and explicit incomplete outcomes, and avoid treating a noisy shared-runner wall-clock test as proof of constant-time execution.",
+      "status": "implemented_pending_qualification",
+      "changes": [
+        {
+          "summary": "Separated required native correctness from explicit controlled timing diagnostics on a dedicated runner; timeout/failure/incomplete outcomes and raw logs are retained.",
+          "commits": [
+            "48990e4"
+          ],
+          "files": [
+            ".github/workflows/native_build.yml",
+            ".github/workflows/native_timing.yml",
+            "scripts/run_native_timing.py"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "The native correctness library run recorded 1,427 passes and one explicit corpus-dependent ignore. Timing success, failure and timeout result-state contracts passed.",
+          "tests": [
+            "tests/test_delivery_evidence.py::test_controlled_timing_is_separate_from_required_correctness",
+            "tests/test_delivery_evidence.py::test_timing_attempts_retain_success_failure_and_timeout_logs"
+          ],
+          "evidence_ids": [
+            "E_DELIVERY",
+            "E_NATIVE_WORKSPACE"
+          ]
+        }
+      ],
+      "remaining": [
+        "Dedicated timing runner is not provisioned/executed in this evidence.",
+        "No claim of constant-time execution or complete strict timing qualification follows from ordinary tests."
+      ]
+    },
+    {
+      "id": "RLS-06",
+      "priority": "Medium",
+      "title": "The documented source quickstart omits the required secure-channel native backend",
+      "owner": "delivery",
+      "acceptance": "Provide one tested bootstrap command that builds or installs the matching native artifact, verifies the ABI self-test, and starts the supported configuration. Exercise that clean-install path in CI and document the limited Python-only mode if it remains supported.",
+      "status": "implemented_pending_qualification",
+      "changes": [
+        {
+          "summary": "One documented bootstrap command resolves frozen dependencies, builds/installs matching native code and verifies version/binary/KEM ABI before supported source use; CI invokes that public path.",
+          "commits": [
+            "48990e4",
+            "93a5d0d"
+          ],
+          "files": [
+            "scripts/bootstrap_source.py",
+            "scripts/verify_native_runtime.py",
+            "README.md",
+            "TESTING.md",
+            ".github/workflows/full_suite_and_e2e.yml"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Fresh public bootstrap commands passed on Linux at d2de862 and Windows at dbb2f52, with matching 0.22.1 versions, recorded native hashes and executed KEM self-tests. Sixty bootstrap and CI contract cases also passed. Independently validated full-checkout Python wheel and source-distribution builds at f5fb842 passed clean installations and exact payload checks; native backend qualification remains separately recorded.",
+          "tests": [
+            "tests/test_delivery_evidence.py::test_native_runtime_checks_versions_binary_and_executed_abi",
+            "tests/test_delivery_evidence.py::test_bootstrap_source_identity_detects_edits_to_already_dirty_inputs"
+          ],
+          "evidence_ids": [
+            "E_BOOTSTRAP_SOURCE",
+            "E_BOOTSTRAP_CI",
+            "E_LINUX_BOOTSTRAP",
+            "E_WIN_BOOTSTRAP",
+            "E_HOSTED_INITIAL",
+            "E_PYTHON_DIST_REVIEW"
+          ]
+        }
+      ],
+      "remaining": [
+        "Retain complete exact-final-source hosted clean-install and acceptance outcomes across supported platforms.",
+        "Packaged-device qualification is separate from a source bootstrap."
+      ]
+    },
+    {
+      "id": "RLS-07",
+      "priority": "Low",
+      "title": "The release-status narrative is stale",
+      "owner": "delivery",
+      "acceptance": "Generate a dated release/evidence ledger with exact commit, artifact identities, signature-verification outcomes, supported platform scope and remaining qualification work.",
+      "status": "implemented_and_verified",
+      "changes": [
+        {
+          "summary": "Replaced stale release posture with a dated evidence ledger, explicit observed-versus-verified distinctions and historical test-count labels.",
+          "commits": [
+            "48990e4",
+            "aa37b9d",
+            "d2de862"
+          ],
+          "files": [
+            "docs/RELEASE_EVIDENCE.json",
+            "docs/RELEASE_CHECKLIST.md",
+            "docs/LAUNCH_CHECKLIST.md",
+            "docs/SECURITY.md",
+            "docs/site/index.html",
+            "docs/TEST_SUITE_SKIP_AUDIT.md"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Documentation truth contracts passed. Historical v0.21.0 publication and its independent reproducibility failure remain visible.",
+          "tests": [
+            "tests/test_release_documentation_truth.py",
+            "tests/test_delivery_evidence.py"
+          ],
+          "evidence_ids": [
+            "E_RELEASE_LEDGER",
+            "E_DELIVERY"
+          ]
+        }
+      ],
+      "remaining": [
+        "Finalize this remediation ledger with exact candidate SHA and hosted outcomes.",
+        "Downloaded final release bytes/signatures/attestations and fresh-device verification remain incomplete."
+      ]
+    },
+    {
+      "id": "RLS-08",
+      "priority": "Medium",
+      "title": "The installed Windows native package identity differs from the checked-out source version",
+      "owner": "delivery",
+      "acceptance": "Build/install the matching native wheel into a dedicated reproducible environment, record its source/build identity, and run the full binding and live tests against that artifact. Add a startup or diagnostic version/build compatibility check with a documented compatibility policy.",
+      "status": "implemented_pending_qualification",
+      "changes": [
+        {
+          "summary": "Added source, native module and distribution compatibility checks, executed KEM ABI testing and binary hash records. Isolated matching 0.22.1 environments replace reliance on the older installed Windows package.",
+          "commits": [
+            "48990e4",
+            "93a5d0d"
+          ],
+          "files": [
+            "scripts/verify_native_runtime.py",
+            "scripts/bootstrap_source.py",
+            ".github/workflows/full_suite_and_e2e.yml"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Linux and Windows public bootstrap executions have matching versions and explicit binary hashes. The 107 installed file-binding cases also passed on the fresh integrated Linux binary. The subsequent Windows browser execution at d2de862 passed all 63 Chromium and three Firefox cases.",
+          "tests": [
+            "tests/test_delivery_evidence.py::test_native_runtime_checks_versions_binary_and_executed_abi",
+            "tests/test_native_format_aware_file.py"
+          ],
+          "evidence_ids": [
+            "E_NATIVE_RUNTIME",
+            "E_LINUX_BOOTSTRAP",
+            "E_WIN_BOOTSTRAP",
+            "E_LINUX_FULL",
+            "E_WIN_BROWSERS",
+            "E_WIN_BROWSERS_D2DE862"
+          ]
+        }
+      ],
+      "remaining": [
+        "Attach exact-final-source binding, browser and live acceptance results for each supported platform.",
+        "Package version and a single ABI self-test do not establish released-artifact compatibility on all devices."
+      ]
+    },
+    {
+      "id": "RUN-01",
+      "priority": "Medium",
+      "title": "Firefox required-identity browser-to-daemon pairing did not complete in the live test",
+      "owner": "runtime",
+      "acceptance": "Reproduce on a matching freshly built native wheel and the intended released artifact; capture bounded ICE/data-channel/pairing-stage diagnostics and distinguish browser, network, fixture and application causes. Require this exact scenario to pass before claiming the corresponding Firefox capability is qualified.",
+      "status": "implemented_pending_qualification",
+      "changes": [
+        {
+          "summary": "Bounded pairing lifecycle stages and diagnostics; retained exact required-identity flow; added authenticated HTTP fixture readiness after a separate Chromium read timeout.",
+          "commits": [
+            "0731ae5",
+            "dcf9e5c",
+            "dbb2f52"
+          ],
+          "files": [
+            "src/one_link/web/peer.html",
+            "tests/e2e/test_browser_identity_possession_live.py",
+            "tests/e2e/conftest.py",
+            "tests/test_peer_pairing_progress.py",
+            "tests/test_pair_by_qr_v0201.py"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "The exact local Windows Firefox case passed in 70.21 seconds and its integrated three-case selection passed in 81.58 seconds. Initial hosted Linux and Windows each passed 63 Chromium and three Firefox cases at the tree of dbb2f52. The older local Chromium timeout remains retained. The later Windows d2de862 run also passed all 63 Chromium and three Firefox cases, with zero skips, after both browser source extractions and the HTTP readiness correction.",
+          "tests": [
+            "tests/e2e/test_browser_identity_possession_live.py::test_required_mode_live_pair_owner_request_and_immediate_revoke",
+            "tests/test_peer_pairing_progress.py"
+          ],
+          "evidence_ids": [
+            "E_BROWSER_FOCUSED",
+            "E_WIN_FIREFOX_EXACT",
+            "E_WIN_BROWSERS",
+            "E_HOSTED_INITIAL",
+            "E_HOSTED_WINDOWS_INITIAL",
+            "E_WIN_BROWSERS_D2DE862"
+          ]
+        }
+      ],
+      "remaining": [
+        "The integrated Windows browser run at d2de862 is complete. Exact-final-source hosted acceptance remains pending.",
+        "Intended released artifacts, broader browser, operating-system and network conditions, and long-duration qualification remain separate."
+      ]
+    },
+    {
+      "id": "RUN-02",
+      "priority": "High",
+      "title": "Fresh passphrase-mode startup checks for a recovery envelope before creating it",
+      "owner": "runtime",
+      "acceptance": "Initialize the required recoverable passphrase envelope during the protected fresh-bootstrap phase, before the final convergence observation, while retaining strict existing-authority protections. Exercise fresh passphrase startup and restart through the actual daemon boot ordering, with default and legacy controls. Do not weaken the predicate or treat removal of the user\u2019s passphrase as the repair.",
+      "status": "implemented_and_verified",
+      "changes": [
+        {
+          "summary": "Creates the required recoverable passphrase envelope within protected fresh bootstrap before convergence verification; existing-authority checks remain strict.",
+          "commits": [
+            "2f57b98"
+          ],
+          "files": [
+            "src/one_link/master_seed.py",
+            "src/one_link/lockbox.py",
+            "tests/test_passphrase_bootstrap.py",
+            "tests/test_recovery_authority_transaction.py"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Thirty focused bootstrap and recovery cases passed. Three fresh Windows passphrase startup attempts each completed a verified 16 MiB forced TCP transfer.",
+          "tests": [
+            "tests/test_passphrase_bootstrap.py",
+            "tests/test_recovery_authority_transaction.py"
+          ],
+          "evidence_ids": [
+            "E_BOOT",
+            "E_WIN_TRANSFER",
+            "E_LINUX_TRANSFER_BLOCK"
+          ]
+        }
+      ],
+      "remaining": [
+        "Linux live discovery is environment-blocked by EPERM; it is not a pass or a passphrase regression.",
+        "Final packaged-install/platform/long-duration qualification remains separate from this verified initialization-order fix."
+      ]
+    },
+    {
+      "id": "PERF-01",
+      "priority": "High",
+      "title": "File-engine benchmark corpus is highly compressible and repetitive",
+      "owner": "measurement",
+      "acceptance": "Name this as a repetitive workload; add random, already-compressed, mixed-tree and controlled related-file corpora. Preserve actual wire bytes, logical bytes, skipped bytes, active transport and completion verification.",
+      "status": "implemented_and_verified",
+      "changes": [
+        {
+          "summary": "Added deterministic random, already-compressed, repetitive, controlled-related and mixed-tree corpora; preserved logical/skipped/framed payload accounting and declared scope.",
+          "commits": [
+            "c1686ca"
+          ],
+          "files": [
+            "src/one_link/benchmark_contract.py",
+            "scripts/bench_file_engine.py",
+            "docs/FILE_ENGINE_BENCHMARKS.md"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Corpus and completion contracts passed; historical repetitive-corpus tables explicitly remain unqualified historical observations.",
+          "tests": [
+            "tests/test_benchmark_measurement_contract.py::test_default_corpus_does_not_repeat_blocks_or_collapse_under_compression",
+            "tests/test_benchmark_measurement_contract.py::test_related_corpus_preserves_all_bytes_except_the_declared_edit"
+          ],
+          "evidence_ids": [
+            "E_PERF_CONTRACT",
+            "E_WIN_TRANSFER"
+          ]
+        }
+      ],
+      "remaining": [
+        "Run a controlled representative corpus matrix on target storage/network/hardware before publishing general transfer rates."
+      ]
+    },
+    {
+      "id": "PERF-02",
+      "priority": "High",
+      "title": "QUIC-versus-WebRTC scenario does not isolate the two transports",
+      "owner": "measurement",
+      "acceptance": "Use explicit isolated transport overrides, identical preparation, active-route receipts, completed-file validation, alternating order, and failure rows.",
+      "status": "implemented_and_verified",
+      "changes": [
+        {
+          "summary": "Explicit requested transport must match actual payload-route receipts; unsupported QUIC/WebRTC bulk paths return inconclusive instead of a fabricated speedup. TCP is correctly identified.",
+          "commits": [
+            "c1686ca",
+            "0731ae5",
+            "084ed38",
+            "ee9e51e"
+          ],
+          "files": [
+            "src/one_link/transfer_routes.py",
+            "src/one_link/daemon.py",
+            "src/one_link/benchmark_contract.py",
+            "scripts/bench_file_engine.py",
+            "src/one_link/server.py"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Forced route, payload accounting and completion contracts passed. Three live transfers explicitly used TCP and verified receiver content and application commit.",
+          "tests": [
+            "tests/test_transfer_routes.py",
+            "tests/test_benchmark_measurement_contract.py::test_transport_comparison_alternates_without_publishing_partial_speedup",
+            "tests/test_protocol_claims_policy.py"
+          ],
+          "evidence_ids": [
+            "E_ROUTES",
+            "E_PERF_CONTRACT",
+            "E_WIN_TRANSFER"
+          ]
+        }
+      ],
+      "remaining": [
+        "An actual isolated end-to-end QUIC-versus-WebRTC file comparison remains unavailable/unqualified.",
+        "Payload/framing counters are not link-layer packet captures or complete network overhead measurements."
+      ]
+    },
+    {
+      "id": "PERF-03",
+      "priority": "High",
+      "title": "Cold-transfer benchmark silently drops missing deliveries",
+      "owner": "measurement",
+      "acceptance": "Record every attempt and status, fail or mark inconclusive when an expected verified delivery is missing, and report completion rate separately from successful completion latency.",
+      "status": "implemented_and_verified",
+      "changes": [
+        {
+          "summary": "Every attempted delivery gets a result row; success requires fresh receiver bytes/hash and application completion; missing/failed attempts prevent a successful-only headline or zero-status CLI result.",
+          "commits": [
+            "c1686ca"
+          ],
+          "files": [
+            "scripts/bench_file_engine.py",
+            "src/one_link/benchmark_contract.py"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Original missing-delivery reproduction now retains both failures; observed blocked live attempts are retained as failed rows.",
+          "tests": [
+            "tests/test_benchmark_measurement_contract.py::test_audit_missing_delivery_fixture_keeps_both_failed_attempts",
+            "tests/test_benchmark_measurement_contract.py::test_cli_returns_nonzero_and_writes_empty_scenario_failure"
+          ],
+          "evidence_ids": [
+            "E_PERF_CONTRACT",
+            "E_LINUX_TRANSFER_BLOCK"
+          ]
+        }
+      ],
+      "remaining": [
+        "Completion rates and successful latency must remain separate in future product reports."
+      ]
+    },
+    {
+      "id": "PERF-04",
+      "priority": "High",
+      "title": "Primitive benchmarks bypass meaningful current daemon costs",
+      "owner": "measurement",
+      "acceptance": "Add representative daemon preparation and full-transfer profiles with explicit engine selection and stage timings.",
+      "status": "implemented_and_verified",
+      "changes": [
+        {
+          "summary": "Benchmarks exercise actual Daemon.prepare_file_for_transfer and report actual engine/stage scope; descriptor-safe native Gear CDC removes the Python byte loop without changing boundary semantics.",
+          "commits": [
+            "c1686ca",
+            "74ae074",
+            "ee9e51e",
+            "5344ee9"
+          ],
+          "files": [
+            "src/one_link/perf_lab.py",
+            "src/one_link/perf_lab_native.py",
+            "src/one_link/cdc.py",
+            "src/one_link/file_preparation.py"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Five paired 8 MiB production preparation observations showed a median paired improvement of 112.4 times with exact hashes and boundaries. The fixed 16 MiB follow-up retained 130 verified samples, including its higher first-call page-fault cost.",
+          "tests": [
+            "tests/test_cdc_descriptor_native.py",
+            "tests/test_benchmark_measurement_contract.py",
+            "tests/test_file_preparation_service.py"
+          ],
+          "evidence_ids": [
+            "E_CDC_PREP",
+            "E_FIXED_PREP",
+            "E_CDC",
+            "E_SERVICE_INTEGRATION"
+          ]
+        }
+      ],
+      "remaining": [
+        "These are preparation measurements, not full-transfer speedups.",
+        "Cold first-call allocation sensitivity remains recorded; no speculative warm-up or redundant-read fix was justified."
+      ]
+    },
+    {
+      "id": "PERF-05",
+      "priority": "Medium",
+      "title": "Overlap rule can pass a large median throughput loss",
+      "owner": "measurement",
+      "acceptance": "Alternate/randomize matched artifact runs, preserve raw timing distributions, use explicit inconclusive outcomes and an uncertainty/effect-size rule, and retain absolute user-facing SLOs.",
+      "status": "implemented_and_verified",
+      "changes": [
+        {
+          "summary": "Replaced permissive overlap acceptance with paired median/bootstrap uncertainty and pass/fail/inconclusive outcomes; matched runs alternate and retain raw samples.",
+          "commits": [
+            "c1686ca"
+          ],
+          "files": [
+            "scripts/bench_gate.py",
+            "scripts/bench_paired_native.py",
+            "bench_baselines/README.md"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Contract tests reject the former large-median-regression pass and incompatible comparisons. The initial hosted run correctly failed as inconclusive when intervals crossed its acceptance boundary.",
+          "tests": [
+            "tests/test_bench_gate_compares_like_for_like.py",
+            "tests/test_benchmark_measurement_contract.py"
+          ],
+          "evidence_ids": [
+            "E_PERF_CONTRACT",
+            "E_PERF_HARNESS",
+            "E_HOSTED_BENCH"
+          ]
+        }
+      ],
+      "remaining": [
+        "A sufficiently precise comparable final-candidate and baseline timing result remains required.",
+        "The same-binary harness smoke validates measurement plumbing and supplies no implementation speedup evidence."
+      ]
+    },
+    {
+      "id": "PERF-06",
+      "priority": "Medium",
+      "title": "Legacy Python CDC comparison may actually use native C",
+      "owner": "measurement",
+      "acceptance": "Explicitly force and identify engines, compare exact outputs for equivalent algorithms, and label different-kernel comparisons separately.",
+      "status": "implemented_and_verified",
+      "changes": [
+        {
+          "summary": "Forces the reference Python engine and identifies native engines; equivalent Gear implementations compare exact boundaries/hashes while distinct algorithms are labeled separately.",
+          "commits": [
+            "c1686ca",
+            "74ae074"
+          ],
+          "files": [
+            "src/one_link/perf_lab.py",
+            "src/one_link/perf_lab_native.py",
+            "src/one_link/cdc.py"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Explicit-engine and output-equivalence contracts passed; actual scanner call observation retained in production comparison.",
+          "tests": [
+            "tests/test_benchmark_measurement_contract.py::test_python_legacy_comparator_cannot_invoke_native",
+            "tests/test_benchmark_measurement_contract.py::test_equivalent_gear_pair_checks_hashes_and_boundaries",
+            "tests/test_cdc_descriptor_native.py"
+          ],
+          "evidence_ids": [
+            "E_PERF_CONTRACT",
+            "E_CDC_PREP"
+          ]
+        }
+      ],
+      "remaining": [
+        "Do not label format-aware Rust CDC and legacy Gear CDC as identical algorithms or infer transport speed from either primitive."
+      ]
+    },
+    {
+      "id": "PERF-07",
+      "priority": "Medium",
+      "title": "Provenance, repetitions and latency statistics need consistent contracts",
+      "owner": "measurement",
+      "acceptance": "Record source/build identity, raw timings, actual engine, hardware/storage/network state and verification; qualify incompatible comparisons; rename worst-batch average or measure real individual-operation percentiles.",
+      "status": "implemented_and_verified",
+      "changes": [
+        {
+          "summary": "Records source/native binary identity, raw timings, engine and workload/scope; incompatible results become inconclusive; batch averages are named accurately rather than advertised as per-operation percentile latency.",
+          "commits": [
+            "c1686ca"
+          ],
+          "files": [
+            "src/one_link/benchmark_contract.py",
+            "src/one_link/perf_lab_native.py",
+            "scripts/bench_recovery_rotation_v021.py",
+            "scripts/bench_audit_2026_05_21.py"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Raw samples, identities and verification are retained in representative harness and production-preparation runs.",
+          "tests": [
+            "tests/test_benchmark_measurement_contract.py::test_native_benchmark_preserves_raw_observations",
+            "tests/test_benchmark_measurement_contract.py::test_native_benchmark_rejects_changing_work"
+          ],
+          "evidence_ids": [
+            "E_PERF_CONTRACT",
+            "E_PERF_HARNESS",
+            "E_FIXED_PREP"
+          ]
+        }
+      ],
+      "remaining": [
+        "Small local samples do not establish tail latency, network variability, hardware coverage or user-facing SLOs."
+      ]
+    },
+    {
+      "id": "PERF-08",
+      "priority": "Medium",
+      "title": "Benchmark workflow path filters and acceptance descriptions are incomplete",
+      "owner": "measurement",
+      "acceptance": "Include all benchmark-dependent adapter/gate paths, align docs with actual policy, distinguish relative drift gates from absolute throughput targets.",
+      "status": "implemented_pending_qualification",
+      "changes": [
+        {
+          "summary": "Expanded benchmark-dependent triggers and separate head/baseline builds using a common harness. Required native contexts use verified source applicability. After the initial five-pair hosted study was inconclusive, predeclared exactly 20 balanced pairs, 31 timed storage/QUIC batches, three same-connection warmups and at least 16 MiB response payload per batch. Five-percent and twelve-percent tolerances and pass/fail/inconclusive semantics are unchanged; no outcome-dependent retry or stopping.",
+          "commits": [
+            "c1686ca",
+            "1164ed9",
+            "876857f",
+            "3acb6fc",
+            "9a8475a"
+          ],
+          "files": [
+            ".github/workflows/native_bench_gate.yml",
+            "scripts/bench_paired_native.py",
+            "bench_baselines/README.md",
+            "docs/FILE_ENGINE_BENCHMARKS.md",
+            "scripts/native_ci_scope.py",
+            "bench_baselines/studies/2026-11-25-hosted-dbb2f52.md"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Runner and gate contracts passed, and the execution transcript reports 23 coherence-field SLO and documentation cases passed. The initial hosted gate failed as INCONCLUSIVE after five pairs; no tolerance was relaxed.",
+          "tests": [
+            "tests/test_bench_gate_compares_like_for_like.py",
+            "tests/test_coherence_field_perf_slo.py",
+            "tests/test_native_ci_scope.py"
+          ],
+          "evidence_ids": [
+            "E_PERF_CONTRACT",
+            "E_PERF_HARNESS",
+            "E_HOSTED_BENCH",
+            "E_GATE_INTEGRATION"
+          ]
+        },
+        {
+          "summary": "236 sampling contracts passed. Real profile smoke retained 28 metrics and 203,516 observations. All 70 native scope contracts passed on actual Windows after legal-filename fixture corrections. The original 16 KiB QUIC result was slower in all five hosted pairs and is retained, not dismissed.",
+          "tests": [
+            "tests/test_native_ci_scope.py",
+            "tests/test_benchmark_sampling.py"
+          ],
+          "evidence_ids": [
+            "E_NATIVE_SAMPLING",
+            "E_NATIVE_SAMPLING_SMOKE",
+            "E_WIN_SCOPE_PORTABILITY",
+            "E_HOSTED_BENCH"
+          ]
+        }
+      ],
+      "remaining": [
+        "Retain a complete final-candidate 20-pair comparison and meet unchanged acceptance policy before declaring relative performance accepted.",
+        "A relative benchmark pass does not establish any absolute network throughput target."
+      ]
+    },
+    {
+      "id": "MNT-01",
+      "priority": "Medium",
+      "title": "Core runtime is concentrated into exceptionally large classes and stateful handlers",
+      "owner": "runtime",
+      "acceptance": "Extract cohesive transfer, peer lifecycle, call, folder, UI route, and persistence services behind typed interfaces. Preserve observable contracts and tests incrementally; avoid a wholesale rewrite.",
+      "status": "partially_remediated",
+      "changes": [
+        {
+          "summary": "Extracted descriptor identity/preparation/commit retry and courier ledger/catalog/monitor/use cases through typed ports and owned state; no daemon-global bridge or mixin rewrite. Fixed assembly rollback ownership and temporary-file cleanup.",
+          "commits": [
+            "5344ee9",
+            "aac9f83",
+            "b7a3ca2"
+          ],
+          "files": [
+            "src/one_link/file_source.py",
+            "src/one_link/file_preparation.py",
+            "src/one_link/transfer_commit_guard.py",
+            "src/one_link/courier_files.py",
+            "src/one_link/courier_ledger.py",
+            "src/one_link/courier_service.py",
+            "src/one_link/daemon.py",
+            "src/one_link/server.py",
+            "docs/architecture/transfer_services.md",
+            "docs/architecture/courier_services.md"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "The runtime, UI and courier selections passed 243, 86 and 168 cases respectively. These are separate overlapping runs. The preparation extraction removed 556 net daemon lines; courier extraction removed 654 net server lines while preserving send, receipt, authentication and public route contracts. Full-checkout Python distribution validation at f5fb842 includes the extracted services in the exact 232-file Python inventory.",
+          "tests": [
+            "tests/test_file_preparation_service.py",
+            "tests/test_transfer_commit_guard_service.py",
+            "tests/test_courier_services.py"
+          ],
+          "evidence_ids": [
+            "E_RUNTIME",
+            "E_RUNTIME_UI",
+            "E_COURIER",
+            "E_FIXED_PREP",
+            "E_PYTHON_DIST_REVIEW"
+          ]
+        }
+      ],
+      "remaining": [
+        "Daemon and UIServer remain very large; peer/outbound/call/folder/recovery orchestration still requires incremental service boundaries.",
+        "Courier execution remains synchronous/serialized; concurrent import workers require a separate synchronization design."
+      ]
+    },
+    {
+      "id": "MNT-02",
+      "priority": "Medium",
+      "title": "Many existing live-daemon tests are omitted from normal push/PR execution",
+      "owner": "runtime",
+      "acceptance": "Generate a dedicated live-test manifest from explicit markers, execute it in bounded shards on push/PR or a clearly defined scheduled required lane, and enforce expected collected/executed counts. Keep hermetic and browser sessions separate. Move only the two live pairing tests to a separate lane instead of deselecting all 23 definitions.",
+      "status": "implemented_pending_qualification",
+      "changes": [
+        {
+          "summary": "Explicit live markers/manifests drive four bounded shards per acceptance OS, enforce collection/execution counts and preserve incomplete/failed first attempts; only two live pairing tests leave hermetic execution.",
+          "commits": [
+            "48990e4",
+            "93a5d0d"
+          ],
+          "files": [
+            "tests/live_daemon_manifest.json",
+            "scripts/live_suite.py",
+            "tests/harness.py",
+            "tests/test_pairing.py",
+            ".github/workflows/full_suite_and_e2e.yml",
+            ".github/workflows/tests.yml"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Collection accounts for 139 functions and 152 parameter cases. Twenty-one hermetic pairing cases passed. The initial hosted Linux and Windows lanes each executed all 152 live cases with no failures or skips; exact-final-source acceptance remains pending.",
+          "tests": [
+            "tests/test_delivery_evidence.py::test_live_manifest_detects_stale_or_empty_selection_and_stable_shards",
+            "tests/test_delivery_evidence.py::test_live_acceptance_rejects_pytest_success_with_a_skipped_case",
+            "tests/test_pairing.py"
+          ],
+          "evidence_ids": [
+            "E_LIVE_MANIFEST",
+            "E_HERMETIC_PAIRING",
+            "E_DELIVERY",
+            "E_LINUX_FULL",
+            "E_HOSTED_INITIAL",
+            "E_HOSTED_WINDOWS_INITIAL"
+          ]
+        }
+      ],
+      "remaining": [
+        "Execute every required live shard at the final candidate and observe required hosted checks.",
+        "Linux ifaddr EPERM blocks relevant execution here; source collection is not substituted for live qualification."
+      ]
+    },
+    {
+      "id": "MNT-03",
+      "priority": "Low",
+      "title": "Browser application logic remains concentrated in huge inline scripts",
+      "owner": "runtime",
+      "acceptance": "Extract modules around message rendering, transfers, calls, settings, identity and transport state with explicit state boundaries; retain offline/no-build distribution if desired by bundling a reproducible static artifact. Add behavioral component contracts and stable critical-layout assertions on controlled browser/OS versions.",
+      "status": "partially_remediated",
+      "changes": [
+        {
+          "summary": "Owner authoring now has 106 modules and six service factories, and peer authoring has 60 modules and four service factories. Sources live outside shipped runtime assets; deterministic offline assembly retains the existing standalone HTML distribution and markup.",
+          "commits": [
+            "3674060",
+            "8a9fe28",
+            "eab2337",
+            "296c721",
+            "5c39d28"
+          ],
+          "files": [
+            "frontend/owner/manifest.json",
+            "frontend/peer/manifest.json",
+            "scripts/build_owner_ui.py",
+            "src/one_link/web/index.html",
+            "src/one_link/web/peer.html",
+            "tests/test_owner_ui_build.py",
+            "tests/test_peer_ui_build.py",
+            "tests/js/test_owner_ui_services.cjs",
+            "tests/js/test_peer_ui_services.cjs"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Execution transcripts record 11 owner source cases and eight owner Node cases passed, plus 593 peer source cases passed, three skipped and six peer Node cases passed. All 311 original named peer function bodies were retained. The peer change is integrated as 296c721. Windows browser acceptance at d2de862 passed all 63 Chromium and three Firefox cases. Full-checkout Python distribution validation at f5fb842 also confirmed exact packaged assets and clean installations.",
+          "tests": [
+            "tests/test_owner_ui_build.py",
+            "tests/test_peer_ui_build.py",
+            "tests/js/test_owner_ui_services.cjs",
+            "tests/js/test_peer_ui_services.cjs"
+          ],
+          "evidence_ids": [
+            "E_OWNER",
+            "E_PEER",
+            "E_DIST_FINAL",
+            "E_WIN_BROWSERS",
+            "E_WIN_BROWSERS_D2DE862",
+            "E_PYTHON_DIST_REVIEW"
+          ]
+        },
+        {
+          "summary": "Twenty local source/build cases passed with explicit UTF-8 and LF/CRLF handling. Windows portability selection passed the owner/peer source cases; its two failures were separate invalid-path scope fixtures.",
+          "tests": [
+            "tests/test_owner_ui_build.py",
+            "tests/test_peer_ui_build.py"
+          ],
+          "evidence_ids": [
+            "E_UI_PORTABILITY",
+            "E_WIN_PORTABILITY_ATTEMPT"
+          ]
+        }
+      ],
+      "remaining": [
+        "Both extracted UIs passed the Windows browser selection at d2de862. Final combined-candidate hosted and intended released-artifact qualification remain pending.",
+        "Legacy feature modules still share page closures. The new factories improve boundaries but do not complete state separation or broader physical-device qualification."
+      ]
+    },
+    {
+      "id": "MNT-04",
+      "priority": "Low",
+      "title": "Protocol catalogue omits current completion states and historical test audit is not current evidence",
+      "owner": "runtime",
+      "acceptance": "Version the protocol catalogue with terminal success/failure states and capability conditions, test it against handler registration/events, and generate skip/xfail summaries from exact-commit test result artifacts.",
+      "status": "implemented_and_verified",
+      "changes": [
+        {
+          "summary": "Protocol catalogue now names durable file/folder completion, failure and capability conditions; historical skip audit is labeled historical and exact-run manifests report current execution.",
+          "commits": [
+            "c2f6e0a",
+            "aa37b9d",
+            "48990e4"
+          ],
+          "files": [
+            "src/one_link/sessions.py",
+            "tests/test_capabilities_sessions.py",
+            "docs/TEST_SUITE_SKIP_AUDIT.md",
+            "scripts/live_suite.py"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "86 protocol/receipt cases passed and live collection accounting retained; historical counts no longer imply current runtime evidence.",
+          "tests": [
+            "tests/test_capabilities_sessions.py",
+            "tests/test_delivery_evidence.py"
+          ],
+          "evidence_ids": [
+            "E_RECEIPTS",
+            "E_LIVE_MANIFEST"
+          ]
+        }
+      ],
+      "remaining": [
+        "Append exact-final-source hosted skip/xfail/execution results; do not add overlapping suite counts."
+      ]
+    },
+    {
+      "id": "BRANCH-01",
+      "priority": "Medium",
+      "title": "ZIP/H264 whole-buffer path accepts a short read as a successful complete scan",
+      "owner": "native",
+      "acceptance": "Require bytes.len()==len before returning; decide and document whether growth is an error or a fixed-prefix snapshot. Add short-read/declared-length tests for every format, not only MCAP.",
+      "status": "implemented_and_verified",
+      "changes": [
+        {
+          "summary": "All declared-length paths reject shrinkage/growth; ZIP/H264 use exact reads and post-read length validation. Fragmented/interrupted readers and explicit IO error categories are covered.",
+          "commits": [
+            "8b42802"
+          ],
+          "files": [
+            "native/ol_chunk/src/stream.rs",
+            "native/ol_chunk/tests/stream_contracts.rs",
+            "native/one_link_native/src/chunk.rs",
+            "tests/test_native_format_aware_file.py"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Seventy-five Rust package cases and 107 installed-wheel cases passed. The same 107 binding cases also passed with the fresh integrated native binary.",
+          "tests": [
+            "native/ol_chunk/tests/stream_contracts.rs",
+            "tests/test_native_format_aware_file.py"
+          ],
+          "evidence_ids": [
+            "E_NATIVE_CHUNK",
+            "E_NATIVE_BINDING",
+            "E_LINUX_FULL"
+          ]
+        }
+      ],
+      "remaining": [
+        "Supported-platform/final-artifact matrix results remain to be attached; no claim covers arbitrary concurrent filesystem mutation beyond the documented contract."
+      ]
+    },
+    {
+      "id": "BRANCH-02",
+      "priority": "Medium",
+      "title": "Bounded payload buffering does not bound dense-record metadata memory",
+      "owner": "native",
+      "acceptance": "Apply min-size absorption while walking records, iterate accepted segments without retaining all raw offsets, consider a callback/iterator boundary API where necessary, and benchmark peak RSS on realistic dense and sparse multi-GB logs.",
+      "status": "implemented_pending_qualification",
+      "changes": [
+        {
+          "summary": "Online record visitors absorb dense boundaries during traversal and scan accepted segments immediately, removing production candidate/accepted-cut/segment materialization.",
+          "commits": [
+            "8b42802"
+          ],
+          "files": [
+            "native/ol_chunk/src/stream.rs",
+            "native/ol_chunk/examples/stream_memory_probe.rs",
+            "native/ol_chunk/tests/stream_contracts.rs",
+            "native/ol_chunk/FILE_SCANNING.md"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "A two-million-record reader contract and 18 paired memory observations verify online behavior. At four million records, median native VmHWM decreased by 94.1 percent while exact output digests matched.",
+          "tests": [
+            "native/ol_chunk/tests/stream_contracts.rs",
+            "native/ol_chunk/examples/stream_memory_probe.rs"
+          ],
+          "evidence_ids": [
+            "E_NATIVE_CHUNK",
+            "E_NATIVE_MEMORY"
+          ]
+        }
+      ],
+      "remaining": [
+        "Realistic dense/sparse multi-GB logs, disk/network effects and supported-platform RSS still require qualification.",
+        "Returned output remains O(chunks); public all-offset APIs intentionally retain O(records) compatibility behavior."
+      ]
+    },
+    {
+      "id": "BRANCH-03",
+      "priority": "Low",
+      "title": "New file APIs have no binding-level tests or in-repository runtime integration evidence",
+      "owner": "native",
+      "acceptance": "Exercise the installed Python wheel's new exports, error mappings, selected parameters, path handling, each format and the 256 MiB refusal/fallback contract. Add a bounded synthetic reader fixture to cross the real window without expensive disk tests, and randomize valid profiles/chunked reads for differential tests. Treat end-to-end product performance as unqualified until a real caller and benchmark are recorded.",
+      "status": "partially_remediated",
+      "changes": [
+        {
+          "summary": "Installed exports now have format/profile/path/error/window/limit tests. Separately accelerated the existing descriptor-bound production Gear CDC path without substituting the distinct pathname/format-aware Rust semantics.",
+          "commits": [
+            "8b42802",
+            "74ae074"
+          ],
+          "files": [
+            "native/one_link_native/src/chunk.rs",
+            "native/one_link_native/chunk.pyi",
+            "tests/test_native_format_aware_file.py",
+            "src/one_link/cdc.py"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "The 107 binding and export cases passed, including a real 32 MiB window crossing and 256 MiB refusal. Production Gear acceleration has exact-boundary evidence.",
+          "tests": [
+            "tests/test_native_format_aware_file.py",
+            "tests/test_cdc_file_windows.py",
+            "tests/test_chunk_native_v0210.py",
+            "tests/test_native_cdc_integrity_v0207.py",
+            "tests/test_cdc_descriptor_native.py"
+          ],
+          "evidence_ids": [
+            "E_NATIVE_BINDING",
+            "E_LINUX_FULL",
+            "E_CDC_PREP"
+          ]
+        }
+      ],
+      "remaining": [
+        "A production consumer/end-to-end benchmark for the distinct format-aware Rust file API remains absent/unqualified.",
+        "Binding tests and Gear acceleration do not prove that the product uses every new exported format-aware API."
+      ]
+    },
+    {
+      "id": "BRANCH-04",
+      "priority": "Low",
+      "title": "cdc_file documentation still describes a 512 KiB buffer despite a 32 MiB window",
+      "owner": "native",
+      "acceptance": "Describe payload window, candidate metadata and output-vector growth separately rather than quoting a 512 KiB bound.",
+      "status": "implemented_and_verified",
+      "changes": [
+        {
+          "summary": "Corrected Rust and Python documentation and exported constants: the default payload window is 32 MiB, or four times the maximum chunk size when larger. Kernel workspace and output or metadata growth are described separately.",
+          "commits": [
+            "8b42802"
+          ],
+          "files": [
+            "native/ol_chunk/FILE_SCANNING.md",
+            "native/ol_chunk/src/stream.rs",
+            "native/one_link_native/chunk.pyi",
+            "native/one_link_native/src/chunk.rs"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Runtime limit constants and window/refusal contracts are exercised by installed-wheel tests.",
+          "tests": [
+            "tests/test_native_format_aware_file.py",
+            "native/ol_chunk/tests/stream_contracts.rs"
+          ],
+          "evidence_ids": [
+            "E_NATIVE_BINDING",
+            "E_NATIVE_CHUNK",
+            "E_NATIVE_MEMORY"
+          ]
+        }
+      ],
+      "remaining": [
+        "No constant-total-memory claim; output size and explicit all-offset APIs remain proportional to their result counts."
+      ]
+    },
+    {
+      "id": "BRANCH-05",
+      "priority": "Medium",
+      "title": "Cross-platform determinism fixture does not yet pin exact boundary outputs",
+      "owner": "native",
+      "acceptance": "Pin a reviewed boundary/hash golden vector for representative profiles and execute it on x86_64/ARM64 and supported operating systems.",
+      "status": "implemented_pending_qualification",
+      "changes": [
+        {
+          "summary": "Pinned exact pre-change starts/ends/hashes and corpus hashes for random/zero/edited fixtures; serial/parallel/streamed kernels share reviewed golden outputs.",
+          "commits": [
+            "8b42802",
+            "8bbb9c8"
+          ],
+          "files": [
+            "native/ol_chunk/tests/fixtures/cdc_golden_v1.txt",
+            "native/ol_chunk/tests/cross_platform.rs",
+            ".github/workflows/native_build.yml"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Frozen vectors passed in local Linux package tests. Existing all-targets/all-features OS/architecture workflow includes the integration fixture.",
+          "tests": [
+            "native/ol_chunk/tests/cross_platform.rs"
+          ],
+          "evidence_ids": [
+            "E_NATIVE_CHUNK"
+          ]
+        },
+        {
+          "summary": "Initial hosted Linux x86_64/ARM64 and macOS native jobs passed. Windows exposed an LF-only parser. The repair passes against LF/CRLF while keeping all frozen golden outputs unchanged, and all six tests passed on actual Windows.",
+          "tests": [
+            "native/ol_chunk/tests/cross_platform.rs"
+          ],
+          "evidence_ids": [
+            "E_NATIVE_GOLDEN_PORTABILITY",
+            "E_WIN_PORTABILITY_ATTEMPT"
+          ]
+        }
+      ],
+      "remaining": [
+        "Retain fresh exact-candidate x86_64/ARM64 and supported-OS executions before declaring cross-platform determinism qualified."
+      ]
+    }
+  ],
+  "product_claim_qualification": [
+    {
+      "claim": "Supported fresh passphrase bootstrap reaches recoverable authority",
+      "assessment": "Verified in focused tests and three Windows fresh startup/transfer attempts",
+      "evidence_ids": [
+        "E_BOOT",
+        "E_WIN_TRANSFER"
+      ],
+      "limits": "Final packaged platforms and long soak remain separate. Local Linux discovery is blocked by the host; hosted Linux live execution passed all 152 cases."
+    },
+    {
+      "claim": "Reported file completion is backed by receiver content and application commit",
+      "assessment": "Scoped receipt contracts and three forced TCP live transfers verify this behavior.",
+      "evidence_ids": [
+        "E_RECEIPTS",
+        "E_ROUTES",
+        "E_WIN_TRANSFER"
+      ],
+      "limits": "Does not qualify every transport/device/crash scenario or link-layer wire-byte totals."
+    },
+    {
+      "claim": "Production descriptor Gear CDC is accelerated without changing boundaries",
+      "assessment": "Exact outputs and five paired 8 MiB preparation measurements support this scoped claim.",
+      "evidence_ids": [
+        "E_CDC_PREP",
+        "E_CDC",
+        "E_SERVICE_INTEGRATION"
+      ],
+      "limits": "112.4x is preparation on one host/workload, not an end-to-end network speedup."
+    },
+    {
+      "claim": "Format-aware scanner uses bounded payload/intermediate storage",
+      "assessment": "Online coalescing and declared memory contract verified",
+      "evidence_ids": [
+        "E_NATIVE_MEMORY",
+        "E_NATIVE_BINDING"
+      ],
+      "limits": "Output O(chunks), all-offset compatibility O(records); realistic multi-GB/platform and production format-aware use remain unqualified."
+    },
+    {
+      "claim": "Firefox required-identity pairing and immediate revoke work",
+      "assessment": "The exact case and later Windows d2de862 run passed, including all three Firefox cases and both extracted UIs.",
+      "evidence_ids": [
+        "E_WIN_FIREFOX_EXACT",
+        "E_WIN_BROWSERS",
+        "E_WIN_BROWSERS_D2DE862"
+      ],
+      "limits": "Final combined-candidate hosted acceptance, the intended released artifact and broader platform or network conditions remain pending."
+    },
+    {
+      "claim": "QUIC is faster than WebRTC for the current file path",
+      "assessment": "Not established; unsupported comparisons are now inconclusive",
+      "evidence_ids": [
+        "E_PERF_CONTRACT",
+        "E_ROUTES"
+      ],
+      "limits": "Require isolated real payload routes, verified completion, repeated matching artifacts and controlled environment."
+    },
+    {
+      "claim": "Native package matches source and executes its KEM ABI",
+      "assessment": "Public bootstrap commands verified matching 0.22.1 versions, hashes and executed KEM self-tests on Linux and Windows.",
+      "evidence_ids": [
+        "E_LINUX_BOOTSTRAP",
+        "E_WIN_BOOTSTRAP"
+      ],
+      "limits": "Observed source revisions differ; final supported-platform and released-artifact identities remain to be qualified."
+    },
+    {
+      "claim": "Dependency and release controls make a fully qualified secure release",
+      "assessment": "A verified official-source GLib backport and continuing original-version advisory checks are implemented; a fully qualified secure release is not established.",
+      "evidence_ids": [
+        "E_DEP_PY",
+        "E_DEP_RUST",
+        "E_DEP_SHELL",
+        "E_POLICY",
+        "E_RELEASE_LEDGER",
+        "E_HOSTED_SECRET_SCAN",
+        "E_SBOM",
+        "E_DEP_ALERTS",
+        "E_SECRET_REVALIDATION",
+        "E_GLIB_BACKPORT"
+      ],
+      "limits": "Project maintenance of the source backport, a separate unmaintained macro dependency, effective branch policy, final hosted acceptance, released-artifact verification, and controlled timing or formal qualification remain open."
+    },
+    {
+      "claim": "Runtime/browser maintainability is fully remediated",
+      "assessment": "Substantial boundaries implemented, residual monolith/shared closures remain",
+      "evidence_ids": [
+        "E_RUNTIME",
+        "E_COURIER",
+        "E_OWNER",
+        "E_PEER",
+        "E_WIN_BROWSERS_D2DE862",
+        "E_PYTHON_DIST_REVIEW"
+      ],
+      "limits": "No complete-decomposition or design-quality score is assigned from file/line counts."
+    }
+  ],
+  "remaining_global_qualification": [
+    "Complete final-source hosted correctness, security, browser, native and packaging gates. Preserve failing and inconclusive attempts with their actual source and artifact identities.",
+    "Preserve the original secret-scan finding and successful exact-exception revalidation, then retain final combined-candidate hosted security conclusions.",
+    "Apply and read back the reviewed repository ruleset. RLS-03 is prepared only; enforcement is not established.",
+    "Complete full hosted shell/window qualification and intended released-artifact checks for the verified official-source GLib backport. Maintain the exact patch and live original-version advisory gate; the separate proc-macro-error maintenance warning and eventual upstream toolkit migration remain responsibilities.",
+    "Obtain sufficiently precise comparable benchmark results and supported-platform executions of frozen boundary vectors. Windows UI execution at d2de862 and Python distribution validation at f5fb842 are complete; exact-final-source hosted acceptance remains pending.",
+    "Qualify representative LAN, WAN, storage and multi-gigabyte workloads on physical devices, including long-duration and recovery behavior. Current Windows transfer durations establish correctness observations only.",
+    "Run dedicated controlled timing and fresh formal or released-artifact signature and provenance verification where claimed. Functional tests do not certify side-channel resistance or universal safety.",
+    "Continue incremental Daemon and UIServer service decomposition and browser feature-state separation. Production use of the distinct Rust format-aware pathname API remains unqualified."
+  ],
+  "finalization_fields": {
+    "final_source_sha": null,
+    "hosted_ci_runs": [],
+    "windows_public_bootstrap_job": "9fe115fe8f384c65a900e2d6e4a7d858",
+    "windows_final_native_identity": null,
+    "windows_final_browser_summary": null,
+    "shell_final_scan_and_commit": {
+      "revision": "314e797451cb4cc9119082fd0c5f324fe7a015f3",
+      "evidence_id": "E_GLIB_BACKPORT",
+      "rustsec_vulnerability_entries": 0,
+      "remaining_maintenance_warnings": 1,
+      "original_registry_advisory_ids": [
+        "GHSA-wrw7-89jp-8q8g",
+        "RUSTSEC-2024-0429"
+      ],
+      "source_disposition": "exact verified official fix backported; original registry version unchanged",
+      "hosted_full_shell_qualification": null
+    },
+    "effective_repository_policy_readback": null,
+    "released_artifact_verification": null,
+    "production_signoff": "not_granted_by_this_draft",
+    "windows_observed_public_bootstrap": {
+      "source_revision": "dbb2f5221ffcc70d09a42b69aed03976b3b266e4",
+      "native_binary_sha256": "030b5743bd9f8550382b40b7b6379ea2d7ad59ce9dbf4a80521e9b4d54702ac2",
+      "size_bytes": 6274560,
+      "version": "0.22.1",
+      "pqkem_self_test": true
+    },
+    "hosted_observations": [
+      "E_HOSTED_INITIAL",
+      "E_HOSTED_BENCH",
+      "E_HOSTED_SECRET_SCAN",
+      "E_HOSTED_WINDOWS_INITIAL"
+    ],
+    "repository_policy_desired_contexts": 10,
+    "secret_scan_scoped_revalidation": {
+      "evidence_id": "E_SECRET_REVALIDATION",
+      "source_revision": "d2de862013f157e5a61ef5b32a07120f547b439e",
+      "findings": 0,
+      "final_head_hosted_acceptance": null
+    },
+    "windows_review_browser_summary": {
+      "source_revision": "d2de862013f157e5a61ef5b32a07120f547b439e",
+      "execution_job": "d70c0267479d4629b35a49d7b26eb3d0",
+      "evidence_id": "E_WIN_BROWSERS_D2DE862",
+      "chromium_passed": 63,
+      "firefox_passed": 3,
+      "failed": 0,
+      "skipped": 0,
+      "final_head_hosted_acceptance": null
+    },
+    "python_distribution_review": {
+      "source_revision": "f5fb84224dd9494d8871773cc7a3b61348cb0695",
+      "evidence_id": "E_PYTHON_DIST_REVIEW",
+      "verification_status": "python_distributions_ok",
+      "byte_reproducibility_claimed": false,
+      "whole_release_qualification_claimed": false
+    }
+  },
+  "evidence_cutoff_utc": "2026-11-25T04:37:49.364140+00:00",
+  "evidence_cutoff_note": "This report is a dated pre-final-hosted-acceptance source snapshot. Later final-head CI and effective policy readback belong in the pull request and durable final evidence package; this snapshot does not inherit them.",
+  "evidence_cutoff_local": "2026-11-24T23:37:49.364140-05:00",
+  "evidence_cutoff_timezone": "America/New_York"
+}

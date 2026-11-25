@@ -1,0 +1,454 @@
+# One Link remediation report
+
+**Audit date:** 24 November 2026  
+**Evidence update:** 24 November 2026, 11:37 PM America/New_York  
+**State:** Draft for review; final candidate and hosted acceptance remain open  
+**Repository:** [coherence-energy-labs/one-link](https://github.com/coherence-energy-labs/one-link)  
+**Draft pull request:** [#88](https://github.com/coherence-energy-labs/one-link/pull/88)  
+**Original audited source:** `1279a450c74e0fdc745cf36e4a51d146d0b2f442`  
+**Evidence cutoff source:** `7df40a371bdcb01e5d3f5f8764e87a5542120763`  
+**Evidence cutoff time:** `2026-11-25T04:37:49.364140+00:00`
+
+## Outcome and scope
+
+Substantial remediation is implemented across runtime correctness, native scanning, performance measurement, dependency inventory, delivery controls and software structure. The work repairs concrete failures, adds checks that exercise the repaired behavior, and narrows claims to the execution evidence available. **It does not close every audit finding or establish a fully qualified production release.**
+
+Later final-head CI results will be recorded in the pull request; this dated report does not automatically inherit them.
+
+This report maps all 27 findings from the original audit to actual changes, commits, tests and remaining acceptance work. Its companion [machine-readable ledger](remediation-2026-11-24.json) contains the complete file and test lists, full commit identities, evidence paths, local artifact hashes and qualifications. Evidence IDs in this report refer to that ledger. The report consolidates implementation and verification already performed; it is not a supplemental adversarial assessment.
+
+The source revisions of individual runs matter. The broad local Linux execution used frozen source `3674060`; initial hosted execution used the tree of `dbb2f52`; the later Linux public bootstrap and completed Windows UI rerun used `d2de862`; full-checkout Python distribution validation used `f5fb842`. Subsequent browser, delivery and workflow changes require their own final acceptance. A passing focused selection on one revision is not substituted for a complete passing result on another.
+
+### Status model
+
+“Verified” is limited to the specific repaired defect and cited checks. It does not mean every platform, transport, artifact, security property or product claim is certified. “Partially remediated” identifies a remaining implementation or architecture gap; “qualification pending” identifies substantial implementation whose required execution evidence is incomplete.
+
+| Status | Findings | Meaning |
+| --- | ---: | --- |
+| Partially remediated | 3 | A substantive portion is repaired, while a material implementation/architecture or production-integration gap remains. Do not mark closed. |
+| Implemented; qualification pending | 11 | Implementation and focused verification exist, but a material acceptance step such as hosted, platform, artifact, realistic-workload or controlled-run qualification remains pending. |
+| Prepared; not applied | 1 | A concrete change payload and validation exist, but the external control has not been applied or read back. Do not describe it as enforced. |
+| Implemented and verified | 12 | The stated code/documentation defect has an implemented repair and relevant executed checks. This is bounded to cited evidence; it is not final CI, release, formal-security or all-platform certification. |
+
+No overall maturity score is assigned from test counts, line reductions or the presence of advanced primitives. The judgment rests on operational behavior, exercised boundaries, credible measurements and accurately stated limitations.
+
+## What changed and why it matters
+
+### Recoverable startup and honest transfer completion
+
+Fresh passphrase startup now creates its required recovery envelope inside the protected bootstrap phase, before the final convergence check. Existing-authority protections remain strict. Thirty focused bootstrap and recovery cases passed. Three separate fresh Windows passphrase startups then completed 16 MiB transfers over explicitly selected TCP, with receiver content hashes and application commit verification. These directly exercise the initialization-order repair and successful transfer completion. [E_BOOT, E_WIN_TRANSFER]
+
+The transfer path now reports its actual payload route and durable receipt contract. A benchmark that requests a transport must verify that route in the result. Unsupported bulk QUIC or WebRTC comparisons return an explicit inconclusive outcome. The protocol catalogue also describes the durable completion and failure states used by the implementation. These changes prevent a successful connection, transport negotiation or submitted send from being presented as verified delivery. [E_RECEIPTS, E_ROUTES, E_PERF_CONTRACT]
+
+### Native correctness, bounded intermediate storage and compatible acceleration
+
+Declared-length native file scans reject both shrinkage and growth. ZIP and H264 scans use exact reads; fragmented readers, interrupted reads, premature EOF and I/O errors have focused coverage. Format-aware streaming coalesces record boundaries as it reads them and immediately scans accepted segments, avoiding accumulated vectors of every candidate record boundary. The public all-offset compatibility APIs still deliberately return results proportional to the number of records. [E_NATIVE_CHUNK, E_NATIVE_BINDING]
+
+A synthetic dense-record comparison retained 18 observations across nine pairs with exact matching output digests. At four million virtual MCAP records, native Linux peak resident high-water measurements decreased from a median 32,832 KiB to 1,936 KiB, a 94.1% reduction. This demonstrates removal of that intermediate metadata accumulation. It does not establish constant total memory: returned chunks require space proportional to output, and realistic multi-gigabyte files and other platforms remain unqualified. [E_NATIVE_MEMORY]
+
+The existing production Gear CDC path separately gained native C scanning through the already verified open descriptor. Its boundary semantics and descriptor/path mutation protections are preserved. This is distinct from the new Rust format-aware pathname API. The latter now has installed-binding tests, but an in-product consumer and corresponding end-to-end production evidence remain absent. Treating the two APIs as the same implementation would overstate BRANCH-03. [E_CDC, E_SERVICE_INTEGRATION, E_CDC_PREP]
+
+### Performance evidence with explicit scope and uncertainty
+
+Benchmarks now cover deterministic random, already-compressed, repetitive, related-file and mixed-tree corpora. They retain every delivery attempt, require independently verified receiver content and application completion for success, report the actual engine and route, and preserve raw observations and source/native identities. The native relative gate uses paired estimates with pass, fail and inconclusive outcomes. It no longer accepts a large median loss merely because uncertainty intervals overlap. [E_PERF_CONTRACT, E_PERF_HARNESS]
+
+Five alternating pairs measured actual preparation of an 8 MiB file through the daemon. Exact chunks and hashes matched. The median paired preparation improvement was 112.4 times, with pooled medians of about 1.440 seconds and 0.013 seconds. This is a single-host, operating-system-cache-warm preparation result; it is not a network transfer speedup, device-wide improvement, sustained throughput or latency guarantee. [E_CDC_PREP]
+
+A follow-up investigated a possible regression after extracting preparation services. Across five fresh-process pairs and 130 verified samples, steady medians were 8.324 ms and 8.416 ms, with a paired process-median ratio of 0.99683. First-call medians were 8.819 ms and 17.533 ms. The latter correlated with additional minor page faults despite identical read counts, bytes, identity probes and unchanged fixed-index logic. Instrumentation changed allocation history, so the evidence does not establish a responsible source line. Both the cold cost and steady observations remain recorded; no speculative warm-up was added. [E_FIXED_PREP]
+
+The initial hosted paired gate then **failed as inconclusive** after five pairs. Its ten timed processes took 28 seconds in total; the 16 KiB QUIC batch lasted roughly 5.5–6.1 ms. Disk, WAL and QUIC intervals crossed the five-percent boundary. The 16 KiB QUIC result was slower in all five pairs, with median ratio 0.94758 and 95% interval 0.90089–0.99181. This observation cannot be dismissed as noise, nor does that small study isolate its cause. The candidate also updates QUIC, UDP, Tokio and Rustls dependencies. The original failed acceptance remains retained. [E_HOSTED_BENCH]
+
+The follow-up profile is predeclared: exactly 20 balanced pairs, 31 measured storage and QUIC batches, three same-connection QUIC warmup batches, and at least 16 MiB of response payload per measured batch. It retains the existing five-percent general and twelve-percent named-crypto tolerances and the pass/fail/inconclusive rules. No result-dependent stopping or retries were added. A 236-case selection passed, and a real orchestration smoke retained 28 metrics and 203,516 timing observations. These validate measurement execution; the final comparative acceptance result remains separate. [E_NATIVE_SAMPLING, E_NATIVE_SAMPLING_SMOKE]
+
+### Services and source structure with remaining ownership limits
+
+Preparation and retry accounting now belong to `DescriptorFileSource`, `FilePreparationService` and `RemoteCommitGuard`, with typed cache, indexer, policy, ledger and durability dependencies. Offline courier behavior has separate filesystem, ledger and use-case services. These services can be tested without constructing the daemon or HTTP server, and they do not import the daemon's global namespace. The changes also repair courier temporary-file cleanup and exclusive-create rollback ownership. Existing send, receipt, public route and authentication behavior remains exercised through compatibility adapters. [E_RUNTIME, E_RUNTIME_UI, E_COURIER]
+
+The first extraction removed 556 net lines from `daemon.py`; the courier extraction removed 654 net lines from `server.py`. The daemon and server still contain exceptionally large classes and broad orchestration responsibilities. Their size and remaining state coupling keep MNT-01 open. The architecture documents identify further boundaries and the courier service's current serialized execution model. [Transfer service design](../architecture/transfer_services.md); [courier service design](../architecture/courier_services.md).
+
+Owner authoring now uses 106 source modules and six isolated service factories. Peer authoring uses 60 modules and four factories for encoding, state, public ICE configuration and bounded pairing progress. Deterministic offline assembly preserves standalone distribution artifacts; canonical sources reside outside the shipped asset directory. The largest owner and peer modules are 1,173 and 374 lines respectively. The peer comparison preserved all 311 original named function bodies. Feature modules still share legacy page closures, so source organization and the new isolated factories improve maintainability without completing state separation. [E_OWNER, E_PEER, E_DIST_FINAL]
+
+## Verification record
+
+The following are separate scoped executions. **They must not be added into one total**, because several select the same tests or run earlier source revisions. Skips, missing execution, environmental blocks and inconclusive measurements remain visible.
+
+| Execution and source scope | Observed outcome | Qualification |
+| --- | --- | --- |
+| Frozen local Linux selection, `3674060` | 9,621 passed; 42 skipped; 24 failed across all 9,687 selected cases | First run stopped at 20 failures; a continuation ran only previously unexecuted cases. No failed case was retried. This snapshot remains failed. E_LINUX_FULL. |
+| Initial hosted Linux acceptance, tree of `dbb2f52` | 9,683 passed; 47 skipped; 5 failed; 152 live cases deselected; 371.38 s | Failures concern later-corrected controlled-lab wording, landing text and workflow-count contracts. Final-head acceptance is pending. E_HOSTED_INITIAL. |
+| Initial hosted Windows acceptance, same tree | 9,696 passed; 32 skipped; 7 failed; 152 live cases deselected; 1,392.57 s | Five stale documentation/contracts and two UTF-8/newline test portability issues. Original failures are retained; later corrections do not rewrite this outcome. E_HOSTED_WINDOWS_FULL_INITIAL. |
+| Initial hosted Linux live lane, same tree | All 152 cases passed; no skips or failures; shards of 42, 47, 42 and 21 | Actual execution of the 139 declared live functions after parametrization. E_HOSTED_INITIAL. |
+| Initial hosted Windows live and browser lanes, same tree | All 152 live cases passed without skips or retries; Chromium 63 passed; Firefox 3 passed | Exact shard and browser artifact links are retained in E_HOSTED_WINDOWS_INITIAL. Windows full acceptance and final candidate outcomes remain separate. |
+| Initial hosted Linux browsers, same tree | Chromium 63 passed; Firefox 3 passed | Source-level hosted browser execution; final extracted-UI candidate remains separate. E_HOSTED_INITIAL. |
+| Integrated native Linux release library tests | 1,427 passed; 0 failed; 1 ignored across 44 crate summaries | Ignored KITTI measurement requires its external corpus. This does not represent every feature, target or timing diagnostic. E_NATIVE_WORKSPACE. |
+| Native chunk and installed binding selections | 75 Rust cases; 107 installed-wheel cases passed | The same 107 binding cases also passed inside the frozen Linux selection; they are not additional to that selection. Strict Clippy passed. E_NATIVE_CHUNK, E_NATIVE_BINDING. |
+| Runtime, UI and courier selections | 243 runtime passes; 86 UI/queue passes; 168 courier passes with 35 skips | Includes focused service contracts. Courier skips include gated live and Windows-only cases. E_RUNTIME, E_RUNTIME_UI, E_COURIER. |
+| Bootstrap, transfer and protocol selections | 30 bootstrap passes; 285 transfer passes with 5 skips; 86 receipt/protocol passes | Separate selections with overlap; no combined total. E_BOOT, E_TRANSFER, E_RECEIPTS. |
+| Delivery and follow-up contracts | 192 delivery cases; 60 public-bootstrap CI cases; 145 shell/SBOM follow-up cases passed | Includes negative and incomplete-result contracts, not a performed release publication. E_DELIVERY, E_BOOTSTRAP_CI, E_SHELL_TESTS. |
+| Performance contracts and harness | 81 cases passed; 28 native metrics with 203,244 observations per arm | The native harness smoke used the same binary in both arms and establishes no speedup. E_PERF_CONTRACT, E_PERF_HARNESS. |
+| Windows exact Firefox identity case | One case passed in 70.21 s | Source `0731ae5`; explicit required identity, owner request and immediate revoke. E_WIN_FIREFOX_EXACT. |
+| Windows integrated browser attempt, `dcf9e5c` | Firefox 3 passed in 81.58 s; Chromium 62 passed and 1 timed out in 761.99 s | The original Chromium five-second HTTP timeout remains retained; a readiness correction and later rerun are separate. E_WIN_BROWSERS. |
+| Windows browser run after both UI extractions, `d2de862` | Chromium 63 passed; Firefox 3 passed; zero failures or skips | Process elapsed times were 638.375 s and 70.0 s respectively. The source remained unchanged, and the HTTP readiness correction was included. E_WIN_BROWSERS_D2DE862. |
+| Windows fresh passphrase transfers, `dcf9e5c` | All three fresh startups and 16 MiB forced TCP transfers verified | Receiver hash and commit checked. The 0.774, 0.906 and 1.524 s durations were concurrent with browser work and are correctness observations. E_WIN_TRANSFER. |
+| Exact public bootstrap | Linux at `d2de862`: 56.102 s; Windows at `dbb2f52`: 48.281 s | Each records 944 hashed inputs, matching 0.22.1 versions and a passed KEM self-test. E_LINUX_BOOTSTRAP, E_WIN_BOOTSTRAP. |
+| Full-checkout Python wheel and source distribution, `f5fb842` | Independent clean-install, exact payload, RECORD and source-distribution-derived wheel validation passed | 232 Python files; 255 payload files; 215 stable modules; 23 assets. This does not establish byte reproducibility or whole standalone-release qualification. E_PYTHON_DIST_REVIEW. |
+| Clean-snapshot static analysis, `b7a3ca2` | Ruff passed; mypy with Windows platform passed all 232 source files | Later source changes require exact-candidate gates. E_STATIC. |
+| Windows portability, `8bbb9c8` then `9a8475a` | First selection: 176 Python passes and two illegal-path fixture failures; all six Rust golden-vector cases passed. Corrected scope selection: all 70 passed in 84.10 s. | Real Windows filenames use legal names; separate injected NUL-delimited diff cases retain embedded-newline decoding coverage. No implementation or golden output was weakened. E_WIN_PORTABILITY_ATTEMPT, E_WIN_SCOPE_PORTABILITY. |
+| Verified GLib source backport, integrated as `314e797` | 181 focused contracts; 11 original upstream iterator tests; five ongoing regression tests passed at optimization level 3. Live ancestor-advisory check and strict SBOM validation passed. | Tests used actual GLib/GObject/GIO 2.84.4 runtimes. The local host lacks GTK/WebKit development SDKs; full shell/window qualification remains hosted. E_GLIB_BACKPORT. |
+
+The frozen Linux failures classify as seven host `getifaddrs` restrictions, three QR fixture or cache behavior deltas, nine packaging or module inventory deltas, one historical benchmark wording contract and four stale landing or workflow contracts. Subsequent fixes are represented by their commits and focused checks; the failed original result has not been rewritten. Counting unique selected IDs is necessary: five collection-level skips also appear in the first XML but are not additional selected cases. [E_LINUX_FULL]
+
+Distribution corrections likewise preserve their earlier 201-pass/eight-failure and 219-pass/one-failure attempts. The final exact source and asset selection passed 12 cases. Canonical browser authoring files now remain outside shipped runtime assets, while extracted Python services are included in source fingerprints and distribution manifests. [E_DIST_PRIOR, E_DIST_V2, E_DIST_FINAL]
+
+The later full-checkout build at `f5fb842` produced an actual application wheel and source distribution. Independent validation passed direct clean installation, source-distribution-derived wheel installation, exact payload checks and RECORD integrity. It verified 232 Python files, 255 payload files, 215 stable runtime modules and 23 assets. Artifact hashes are retained in the ledger. This establishes the Python distribution contract; byte reproducibility, native artifacts, standalone application packaging and release signing remain separate. [E_PYTHON_DIST_REVIEW]
+
+The initial hosted merge revision `2927a0f57d1eee6e0f1ddfd4acbdbeb8219f17d2` and branch revision `dbb2f5221ffcc70d09a42b69aed03976b3b266e4` have the same verified Git tree, `39163ef7c1b99cbf502f5f63141a3625087eab18`. This connects that hosted result to the stated source tree without implying acceptance of later changes. [Hosted run](https://github.com/coherence-energy-labs/one-link/actions/runs/45538106208); [retained acceptance artifact](https://github.com/coherence-energy-labs/one-link/actions/runs/45538106208/artifacts/14988128402).
+
+### Native artifact identities
+
+| Observation | Version and executed check | Native binary SHA256 |
+| --- | --- | --- |
+| Linux public bootstrap at `d2de862` | Source, module and distribution 0.22.1; KEM self-test passed | `cc00549c0d0de6603df8e8827c360691e6348443f55996b465d3d750732ba1be` |
+| Windows public bootstrap at `dbb2f52` | Source, module and distribution 0.22.1; KEM self-test passed; 6,274,560 bytes | `030b5743bd9f8550382b40b7b6379ea2d7ad59ce9dbf4a80521e9b4d54702ac2` |
+
+The first Windows bootstrap attempt was blocked by the installed uv 0.11.23. That attempt remains retained; the later successful command used isolated uv 0.13.10. Platform binaries are expected to differ. Identity records qualify their specific executions and do not substitute for testing every intended released artifact. [E_WIN_BOOTSTRAP, E_LINUX_BOOTSTRAP]
+
+## Finding-by-finding disposition
+
+Each entry states its repair, representative source and tests, and the work still needed. The JSON ledger retains the full lists, original acceptance language and evidence hashes.
+
+### Release and supply chain
+
+#### RLS-01 — Current dependency checks fail against the committed locks
+
+**Implemented; qualification pending · Original priority: High.** Updated Python declarations and universal lock, all three Cargo lockfiles, the P256 API and fixture, and locked container inputs. Complete source graph inventories and independent audit reports are retained. The remaining GLib iterator issue now has the official two-line source fix backported to the exact original 0.18.5 package, with unchanged version and license, complete provenance verification and continuing upstream advisory checks. Commits include d6df3d3, d90aa78, 48990e4, d2de862 and 314e797; full identities are in the ledger.
+
+Source: [pyproject.toml](../../pyproject.toml), [uv.lock](../../uv.lock), [native/Cargo.toml](../../native/Cargo.toml). Representative tests: [tests/test_delivery_evidence.py](../../tests/test_delivery_evidence.py), [tests/test_container_appimage_supply_chain.py](../../tests/test_container_appimage_supply_chain.py).
+
+Python, rendezvous, npm, workspace and fuzz scans have no reported vulnerabilities in the retained checks. Before the backport, 87 of 88 observed default-branch alerts were outside the candidate's affected ranges; the remaining GLib issue was still affected. The backport now verifies all 121 original files and the exact two-line upstream diff, and the live OSV gate retains the two exact identifiers for that issue while rejecting any new affected advisory or incomplete query. Optimized regression, failure-path and source-provenance checks passed. The source-union SBOM contains 957 components and 958 dependency records. Evidence: E_DEP_PY, E_DEP_RUST, E_DEP_SHELL, E_DEP_NPM, E_CONTAINER, E_SBOM, E_DEP_ALERTS, E_GLIB_BACKPORT.
+
+**Remaining qualification:** Retain full hosted Linux shell compilation/window and final-candidate security outcomes. This is a project-maintained source backport, not an upstream-supported 0.18 release or a version outside the registry advisory range. The separate proc-macro-error maintenance warning remains. Verify the dependency inventory of each intended final artifact, maintain the source patch and migrate to a compatible maintained upstream toolkit when available.
+
+#### RLS-02 — Release publication does not wait for reproducibility verification
+
+**Implemented; qualification pending · Original priority: High.** Signing/publication now depend on same-release native-wheel reproducibility verification; comparison checks complete bytes and retains member-level mismatch evidence. Commits: [48990e4](https://github.com/coherence-energy-labs/one-link/commit/48990e4469ed81520dd539d5fe2bf0741afbf33e).
+
+Source: [.github/workflows/release.yml](../../.github/workflows/release.yml), [.github/workflows/reproducible_release.yml](../../.github/workflows/reproducible_release.yml), [scripts/verify_reproducible_wheels.py](../../scripts/verify_reproducible_wheels.py). Representative tests: [tests/test_delivery_evidence.py::test_release_signing_and_publication_require_the_actual_artifact_rebuild](../../tests/test_delivery_evidence.py), [tests/test_delivery_evidence.py::test_rebuild_failure_cli_still_writes_machine_readable_evidence](../../tests/test_delivery_evidence.py).
+
+Local negative comparison, artifact-identity and workflow ancestry contracts passed. Evidence: E_DELIVERY, E_RELEASE_LEDGER.
+
+**Remaining qualification:** Execute and retain a fresh hosted two-builder comparison on the exact release candidate; prove the publication path respects its result. Selected Linux native-wheel reproducibility does not prove whole-product/multi-platform byte reproducibility.
+
+#### RLS-03 — The observed ruleset does not require approving review or named status checks
+
+**Prepared; not applied · Original priority: Medium.** Prepared a strict desired ruleset with ten named producer-bound checks, one approving review, no bypass actors and preserved existing controls. Native correctness, performance and shell contexts are included; the external policy remains unapplied. Commits: [48990e4](https://github.com/coherence-energy-labs/one-link/commit/48990e4469ed81520dd539d5fe2bf0741afbf33e), [876857f](https://github.com/coherence-energy-labs/one-link/commit/876857fbc389c2d486f8f99a4ad4ec33be13de9d), [d6594c8](https://github.com/coherence-energy-labs/one-link/commit/d6594c8d59aec0ba44277e0c9ca074f89a8cb030).
+
+Source: [.github/repository-policy.json](../../.github/repository-policy.json), [scripts/repository_policy.py](../../scripts/repository_policy.py), [docs/REPOSITORY_POLICY.md](../../docs/REPOSITORY_POLICY.md). Representative tests: [tests/test_delivery_evidence.py::test_ruleset_proposal_preserves_existing_controls_and_requires_real_producer](../../tests/test_delivery_evidence.py), [tests/test_delivery_evidence.py::test_required_contexts_are_defined_by_unfiltered_pr_workflows](../../tests/test_delivery_evidence.py).
+
+Proposal, source applicability and required-context contracts passed in the integrated 213-case selection. The shell follow-up passed 218 cases and requires its complete three-OS matrix whenever applicable. A fresh authenticated read confirms the original external policy still requires zero approvals and no named checks. No remote policy mutation has been applied at this snapshot. Evidence: E_POLICY, E_POLICY_DESIRED, E_DELIVERY, E_GATE_INTEGRATION, E_NATIVE_SHELL_GATE, E_POLICY_BEFORE_FINAL.
+
+**Remaining qualification:** Observe the ten required check names on the exact candidate, regenerate the API payload from the current desired policy, apply it and retain authenticated effective-policy readback.
+
+#### RLS-04 — A failed Python dependency gate prevents later analysis and report upload
+
+**Implemented; qualification pending · Original priority: Medium.** Independent advisory/SAST/SBOM steps continue after a prior analyzer failure when tool setup succeeded; evidence upload is unconditional and enforcing commands still fail the job. Commits: [48990e4](https://github.com/coherence-energy-labs/one-link/commit/48990e4469ed81520dd539d5fe2bf0741afbf33e), [27cc28b](https://github.com/coherence-energy-labs/one-link/commit/27cc28be750027a8663893b5dacd5616188bf435).
+
+Source: [.github/workflows/security.yml](../../.github/workflows/security.yml), [.gitleaksignore](../../.gitleaksignore). Representative tests: [tests/test_delivery_evidence.py::test_independent_supply_chain_steps_and_evidence_survive_a_prior_failure](../../tests/test_delivery_evidence.py).
+
+Workflow evidence-retention contracts passed. Full-history Gitleaks revalidation at d2de862 passed with zero findings using the one reviewed exact historical fingerprint exception, without changing source or environment. The original failed scan remains retained. Evidence: E_DELIVERY, E_SHELL_TESTS, E_HOSTED_SECRET_SCAN, E_SECRET_REVALIDATION.
+
+**Remaining qualification:** Retain final combined-candidate hosted security conclusions. Commit 366d58e adds the second exact historical fingerprint for a rationale comment that repeated the same type annotation, and removes that literal from the current comment. Preserve both original detector matches and earlier scoped revalidation. No path-wide or detector-wide exception was added. Local workflow contracts and a clean earlier secret scan do not establish that every analyzer or dependency is clean.
+
+#### RLS-05 — A green native workflow includes an incomplete optional strict test pass
+
+**Implemented; qualification pending · Original priority: Medium.** Separated required native correctness from explicit controlled timing diagnostics on a dedicated runner; timeout/failure/incomplete outcomes and raw logs are retained. Commits: [48990e4](https://github.com/coherence-energy-labs/one-link/commit/48990e4469ed81520dd539d5fe2bf0741afbf33e).
+
+Source: [.github/workflows/native_build.yml](../../.github/workflows/native_build.yml), [.github/workflows/native_timing.yml](../../.github/workflows/native_timing.yml), [scripts/run_native_timing.py](../../scripts/run_native_timing.py). Representative tests: [tests/test_delivery_evidence.py::test_controlled_timing_is_separate_from_required_correctness](../../tests/test_delivery_evidence.py), [tests/test_delivery_evidence.py::test_timing_attempts_retain_success_failure_and_timeout_logs](../../tests/test_delivery_evidence.py).
+
+The native correctness library run recorded 1,427 passes and one explicit corpus-dependent ignore. Timing success, failure and timeout result-state contracts passed. Evidence: E_DELIVERY, E_NATIVE_WORKSPACE.
+
+**Remaining qualification:** Dedicated timing runner is not provisioned/executed in this evidence. No claim of constant-time execution or complete strict timing qualification follows from ordinary tests.
+
+#### RLS-06 — The documented source quickstart omits the required secure-channel native backend
+
+**Implemented; qualification pending · Original priority: Medium.** One documented bootstrap command resolves frozen dependencies, builds/installs matching native code and verifies version/binary/KEM ABI before supported source use; CI invokes that public path. Commits: [48990e4](https://github.com/coherence-energy-labs/one-link/commit/48990e4469ed81520dd539d5fe2bf0741afbf33e), [93a5d0d](https://github.com/coherence-energy-labs/one-link/commit/93a5d0d6e2c98d34760c01e6548232f0a9663fb1).
+
+Source: [scripts/bootstrap_source.py](../../scripts/bootstrap_source.py), [scripts/verify_native_runtime.py](../../scripts/verify_native_runtime.py), [README.md](../../README.md). Representative tests: [tests/test_delivery_evidence.py::test_native_runtime_checks_versions_binary_and_executed_abi](../../tests/test_delivery_evidence.py), [tests/test_delivery_evidence.py::test_bootstrap_source_identity_detects_edits_to_already_dirty_inputs](../../tests/test_delivery_evidence.py).
+
+Fresh public bootstrap commands passed on Linux at d2de862 and Windows at dbb2f52, with matching 0.22.1 versions, recorded native hashes and executed KEM self-tests. Sixty bootstrap and CI contract cases also passed. Independently validated full-checkout Python wheel and source-distribution builds at f5fb842 passed clean installations and exact payload checks; native backend qualification remains separately recorded. Evidence: E_BOOTSTRAP_SOURCE, E_BOOTSTRAP_CI, E_LINUX_BOOTSTRAP, E_WIN_BOOTSTRAP, E_HOSTED_INITIAL, E_PYTHON_DIST_REVIEW.
+
+**Remaining qualification:** Retain complete exact-final-source hosted clean-install and acceptance outcomes across supported platforms. Packaged-device qualification is separate from a source bootstrap.
+
+#### RLS-07 — The release-status narrative is stale
+
+**Implemented and verified · Original priority: Low.** Replaced stale release posture with a dated evidence ledger, explicit observed-versus-verified distinctions and historical test-count labels. Commits: [48990e4](https://github.com/coherence-energy-labs/one-link/commit/48990e4469ed81520dd539d5fe2bf0741afbf33e), [aa37b9d](https://github.com/coherence-energy-labs/one-link/commit/aa37b9dd7f8f226c0129e438538022094f7a3dc5), [d2de862](https://github.com/coherence-energy-labs/one-link/commit/d2de862013f157e5a61ef5b32a07120f547b439e).
+
+Source: [docs/RELEASE_EVIDENCE.json](../../docs/RELEASE_EVIDENCE.json), [docs/RELEASE_CHECKLIST.md](../../docs/RELEASE_CHECKLIST.md), [docs/LAUNCH_CHECKLIST.md](../../docs/LAUNCH_CHECKLIST.md). Representative tests: [tests/test_release_documentation_truth.py](../../tests/test_release_documentation_truth.py), [tests/test_delivery_evidence.py](../../tests/test_delivery_evidence.py).
+
+Documentation truth contracts passed. Historical v0.21.0 publication and its independent reproducibility failure remain visible. Evidence: E_RELEASE_LEDGER, E_DELIVERY.
+
+**Remaining qualification:** Finalize this remediation ledger with exact candidate SHA and hosted outcomes. Downloaded final release bytes/signatures/attestations and fresh-device verification remain incomplete.
+
+#### RLS-08 — The installed Windows native package identity differs from the checked-out source version
+
+**Implemented; qualification pending · Original priority: Medium.** Added source, native module and distribution compatibility checks, executed KEM ABI testing and binary hash records. Isolated matching 0.22.1 environments replace reliance on the older installed Windows package. Commits: [48990e4](https://github.com/coherence-energy-labs/one-link/commit/48990e4469ed81520dd539d5fe2bf0741afbf33e), [93a5d0d](https://github.com/coherence-energy-labs/one-link/commit/93a5d0d6e2c98d34760c01e6548232f0a9663fb1).
+
+Source: [scripts/verify_native_runtime.py](../../scripts/verify_native_runtime.py), [scripts/bootstrap_source.py](../../scripts/bootstrap_source.py), [.github/workflows/full_suite_and_e2e.yml](../../.github/workflows/full_suite_and_e2e.yml). Representative tests: [tests/test_delivery_evidence.py::test_native_runtime_checks_versions_binary_and_executed_abi](../../tests/test_delivery_evidence.py), [tests/test_native_format_aware_file.py](../../tests/test_native_format_aware_file.py).
+
+Linux and Windows public bootstrap executions have matching versions and explicit binary hashes. The 107 installed file-binding cases also passed on the fresh integrated Linux binary. The subsequent Windows browser execution at d2de862 passed all 63 Chromium and three Firefox cases. Evidence: E_NATIVE_RUNTIME, E_LINUX_BOOTSTRAP, E_WIN_BOOTSTRAP, E_LINUX_FULL, E_WIN_BROWSERS, E_WIN_BROWSERS_D2DE862.
+
+**Remaining qualification:** Attach exact-final-source binding, browser and live acceptance results for each supported platform. Package version and a single ABI self-test do not establish released-artifact compatibility on all devices.
+
+### Observed runtime failures
+
+#### RUN-01 — Firefox required-identity browser-to-daemon pairing did not complete in the live test
+
+**Implemented; qualification pending · Original priority: Medium.** Bounded pairing lifecycle stages and diagnostics; retained exact required-identity flow; added authenticated HTTP fixture readiness after a separate Chromium read timeout. Commits: [0731ae5](https://github.com/coherence-energy-labs/one-link/commit/0731ae5c9ba39460769dfd6c6ef63ce7a157a3a4), [dcf9e5c](https://github.com/coherence-energy-labs/one-link/commit/dcf9e5c74d7e1a552c7a3362b122eb02d2b237b8), [dbb2f52](https://github.com/coherence-energy-labs/one-link/commit/dbb2f5221ffcc70d09a42b69aed03976b3b266e4).
+
+Source: [src/one_link/web/peer.html](../../src/one_link/web/peer.html), [tests/e2e/test_browser_identity_possession_live.py](../../tests/e2e/test_browser_identity_possession_live.py), [tests/e2e/conftest.py](../../tests/e2e/conftest.py). Representative tests: [tests/e2e/test_browser_identity_possession_live.py::test_required_mode_live_pair_owner_request_and_immediate_revoke](../../tests/e2e/test_browser_identity_possession_live.py), [tests/test_peer_pairing_progress.py](../../tests/test_peer_pairing_progress.py).
+
+The exact local Windows Firefox case passed in 70.21 seconds and its integrated three-case selection passed in 81.58 seconds. Initial hosted Linux and Windows each passed 63 Chromium and three Firefox cases at the tree of dbb2f52. The older local Chromium timeout remains retained. The later Windows d2de862 run also passed all 63 Chromium and three Firefox cases, with zero skips, after both browser source extractions and the HTTP readiness correction. Evidence: E_BROWSER_FOCUSED, E_WIN_FIREFOX_EXACT, E_WIN_BROWSERS, E_HOSTED_INITIAL, E_HOSTED_WINDOWS_INITIAL, E_WIN_BROWSERS_D2DE862.
+
+**Remaining qualification:** The integrated Windows browser run at d2de862 is complete. Exact-final-source hosted acceptance remains pending. Intended released artifacts, broader browser, operating-system and network conditions, and long-duration qualification remain separate.
+
+#### RUN-02 — Fresh passphrase-mode startup checks for a recovery envelope before creating it
+
+**Implemented and verified · Original priority: High.** Creates the required recoverable passphrase envelope within protected fresh bootstrap before convergence verification; existing-authority checks remain strict. Commits: [2f57b98](https://github.com/coherence-energy-labs/one-link/commit/2f57b9800a388afa59dab7a84ff0aed3e74637fc).
+
+Source: [src/one_link/master_seed.py](../../src/one_link/master_seed.py), [src/one_link/lockbox.py](../../src/one_link/lockbox.py), [tests/test_passphrase_bootstrap.py](../../tests/test_passphrase_bootstrap.py). Representative tests: [tests/test_passphrase_bootstrap.py](../../tests/test_passphrase_bootstrap.py), [tests/test_recovery_authority_transaction.py](../../tests/test_recovery_authority_transaction.py).
+
+Thirty focused bootstrap and recovery cases passed. Three fresh Windows passphrase startup attempts each completed a verified 16 MiB forced TCP transfer. Evidence: E_BOOT, E_WIN_TRANSFER, E_LINUX_TRANSFER_BLOCK.
+
+**Remaining qualification:** Linux live discovery is environment-blocked by EPERM; it is not a pass or a passphrase regression. Final packaged-install/platform/long-duration qualification remains separate from this verified initialization-order fix.
+
+### Performance validity
+
+#### PERF-01 — File-engine benchmark corpus is highly compressible and repetitive
+
+**Implemented and verified · Original priority: High.** Added deterministic random, already-compressed, repetitive, controlled-related and mixed-tree corpora; preserved logical/skipped/framed payload accounting and declared scope. Commits: [c1686ca](https://github.com/coherence-energy-labs/one-link/commit/c1686ca50989f70b4b71c173a2b19ea55304a2ed).
+
+Source: [src/one_link/benchmark_contract.py](../../src/one_link/benchmark_contract.py), [scripts/bench_file_engine.py](../../scripts/bench_file_engine.py), [docs/FILE_ENGINE_BENCHMARKS.md](../../docs/FILE_ENGINE_BENCHMARKS.md). Representative tests: [tests/test_benchmark_measurement_contract.py::test_default_corpus_does_not_repeat_blocks_or_collapse_under_compression](../../tests/test_benchmark_measurement_contract.py), [tests/test_benchmark_measurement_contract.py::test_related_corpus_preserves_all_bytes_except_the_declared_edit](../../tests/test_benchmark_measurement_contract.py).
+
+Corpus and completion contracts passed; historical repetitive-corpus tables explicitly remain unqualified historical observations. Evidence: E_PERF_CONTRACT, E_WIN_TRANSFER.
+
+**Remaining qualification:** Run a controlled representative corpus matrix on target storage/network/hardware before publishing general transfer rates.
+
+#### PERF-02 — QUIC-versus-WebRTC scenario does not isolate the two transports
+
+**Implemented and verified · Original priority: High.** Explicit requested transport must match actual payload-route receipts; unsupported QUIC/WebRTC bulk paths return inconclusive instead of a fabricated speedup. TCP is correctly identified. Commits: [c1686ca](https://github.com/coherence-energy-labs/one-link/commit/c1686ca50989f70b4b71c173a2b19ea55304a2ed), [0731ae5](https://github.com/coherence-energy-labs/one-link/commit/0731ae5c9ba39460769dfd6c6ef63ce7a157a3a4), [084ed38](https://github.com/coherence-energy-labs/one-link/commit/084ed38a1f95e8cf6219e2153b3eb2a7ee61528c), [ee9e51e](https://github.com/coherence-energy-labs/one-link/commit/ee9e51e01ad7d74df594ffa186d1f25ebdc81e77).
+
+Source: [src/one_link/transfer_routes.py](../../src/one_link/transfer_routes.py), [src/one_link/daemon.py](../../src/one_link/daemon.py), [src/one_link/benchmark_contract.py](../../src/one_link/benchmark_contract.py). Representative tests: [tests/test_transfer_routes.py](../../tests/test_transfer_routes.py), [tests/test_benchmark_measurement_contract.py::test_transport_comparison_alternates_without_publishing_partial_speedup](../../tests/test_benchmark_measurement_contract.py).
+
+Forced route, payload accounting and completion contracts passed. Three live transfers explicitly used TCP and verified receiver content and application commit. Evidence: E_ROUTES, E_PERF_CONTRACT, E_WIN_TRANSFER.
+
+**Remaining qualification:** An actual isolated end-to-end QUIC-versus-WebRTC file comparison remains unavailable/unqualified. Payload/framing counters are not link-layer packet captures or complete network overhead measurements.
+
+#### PERF-03 — Cold-transfer benchmark silently drops missing deliveries
+
+**Implemented and verified · Original priority: High.** Every attempted delivery gets a result row; success requires fresh receiver bytes/hash and application completion; missing/failed attempts prevent a successful-only headline or zero-status CLI result. Commits: [c1686ca](https://github.com/coherence-energy-labs/one-link/commit/c1686ca50989f70b4b71c173a2b19ea55304a2ed).
+
+Source: [scripts/bench_file_engine.py](../../scripts/bench_file_engine.py), [src/one_link/benchmark_contract.py](../../src/one_link/benchmark_contract.py). Representative tests: [tests/test_benchmark_measurement_contract.py::test_audit_missing_delivery_fixture_keeps_both_failed_attempts](../../tests/test_benchmark_measurement_contract.py), [tests/test_benchmark_measurement_contract.py::test_cli_returns_nonzero_and_writes_empty_scenario_failure](../../tests/test_benchmark_measurement_contract.py).
+
+Original missing-delivery reproduction now retains both failures; observed blocked live attempts are retained as failed rows. Evidence: E_PERF_CONTRACT, E_LINUX_TRANSFER_BLOCK.
+
+**Remaining qualification:** Completion rates and successful latency must remain separate in future product reports.
+
+#### PERF-04 — Primitive benchmarks bypass meaningful current daemon costs
+
+**Implemented and verified · Original priority: High.** Benchmarks exercise actual Daemon.prepare_file_for_transfer and report actual engine/stage scope; descriptor-safe native Gear CDC removes the Python byte loop without changing boundary semantics. Commits: [c1686ca](https://github.com/coherence-energy-labs/one-link/commit/c1686ca50989f70b4b71c173a2b19ea55304a2ed), [74ae074](https://github.com/coherence-energy-labs/one-link/commit/74ae0742ca433118f4c0d4c52bcc731e569ca898), [ee9e51e](https://github.com/coherence-energy-labs/one-link/commit/ee9e51e01ad7d74df594ffa186d1f25ebdc81e77), [5344ee9](https://github.com/coherence-energy-labs/one-link/commit/5344ee9387c2f6da87b4064f01c2d17c56cfeaa9).
+
+Source: [src/one_link/perf_lab.py](../../src/one_link/perf_lab.py), [src/one_link/perf_lab_native.py](../../src/one_link/perf_lab_native.py), [src/one_link/cdc.py](../../src/one_link/cdc.py). Representative tests: [tests/test_cdc_descriptor_native.py](../../tests/test_cdc_descriptor_native.py), [tests/test_benchmark_measurement_contract.py](../../tests/test_benchmark_measurement_contract.py).
+
+Five paired 8 MiB production preparation observations showed a median paired improvement of 112.4 times with exact hashes and boundaries. The fixed 16 MiB follow-up retained 130 verified samples, including its higher first-call page-fault cost. Evidence: E_CDC_PREP, E_FIXED_PREP, E_CDC, E_SERVICE_INTEGRATION.
+
+**Remaining qualification:** These are preparation measurements, not full-transfer speedups. Cold first-call allocation sensitivity remains recorded; no speculative warm-up or redundant-read fix was justified.
+
+#### PERF-05 — Overlap rule can pass a large median throughput loss
+
+**Implemented and verified · Original priority: Medium.** Replaced permissive overlap acceptance with paired median/bootstrap uncertainty and pass/fail/inconclusive outcomes; matched runs alternate and retain raw samples. Commits: [c1686ca](https://github.com/coherence-energy-labs/one-link/commit/c1686ca50989f70b4b71c173a2b19ea55304a2ed).
+
+Source: [scripts/bench_gate.py](../../scripts/bench_gate.py), [scripts/bench_paired_native.py](../../scripts/bench_paired_native.py), [bench_baselines/README.md](../../bench_baselines/README.md). Representative tests: [tests/test_bench_gate_compares_like_for_like.py](../../tests/test_bench_gate_compares_like_for_like.py), [tests/test_benchmark_measurement_contract.py](../../tests/test_benchmark_measurement_contract.py).
+
+Contract tests reject the former large-median-regression pass and incompatible comparisons. The initial hosted run correctly failed as inconclusive when intervals crossed its acceptance boundary. Evidence: E_PERF_CONTRACT, E_PERF_HARNESS, E_HOSTED_BENCH.
+
+**Remaining qualification:** A sufficiently precise comparable final-candidate and baseline timing result remains required. The same-binary harness smoke validates measurement plumbing and supplies no implementation speedup evidence.
+
+#### PERF-06 — Legacy Python CDC comparison may actually use native C
+
+**Implemented and verified · Original priority: Medium.** Forces the reference Python engine and identifies native engines; equivalent Gear implementations compare exact boundaries/hashes while distinct algorithms are labeled separately. Commits: [c1686ca](https://github.com/coherence-energy-labs/one-link/commit/c1686ca50989f70b4b71c173a2b19ea55304a2ed), [74ae074](https://github.com/coherence-energy-labs/one-link/commit/74ae0742ca433118f4c0d4c52bcc731e569ca898).
+
+Source: [src/one_link/perf_lab.py](../../src/one_link/perf_lab.py), [src/one_link/perf_lab_native.py](../../src/one_link/perf_lab_native.py), [src/one_link/cdc.py](../../src/one_link/cdc.py). Representative tests: [tests/test_benchmark_measurement_contract.py::test_python_legacy_comparator_cannot_invoke_native](../../tests/test_benchmark_measurement_contract.py), [tests/test_benchmark_measurement_contract.py::test_equivalent_gear_pair_checks_hashes_and_boundaries](../../tests/test_benchmark_measurement_contract.py).
+
+Explicit-engine and output-equivalence contracts passed; actual scanner call observation retained in production comparison. Evidence: E_PERF_CONTRACT, E_CDC_PREP.
+
+**Remaining qualification:** Do not label format-aware Rust CDC and legacy Gear CDC as identical algorithms or infer transport speed from either primitive.
+
+#### PERF-07 — Provenance, repetitions and latency statistics need consistent contracts
+
+**Implemented and verified · Original priority: Medium.** Records source/native binary identity, raw timings, engine and workload/scope; incompatible results become inconclusive; batch averages are named accurately rather than advertised as per-operation percentile latency. Commits: [c1686ca](https://github.com/coherence-energy-labs/one-link/commit/c1686ca50989f70b4b71c173a2b19ea55304a2ed).
+
+Source: [src/one_link/benchmark_contract.py](../../src/one_link/benchmark_contract.py), [src/one_link/perf_lab_native.py](../../src/one_link/perf_lab_native.py), [scripts/bench_recovery_rotation_v021.py](../../scripts/bench_recovery_rotation_v021.py). Representative tests: [tests/test_benchmark_measurement_contract.py::test_native_benchmark_preserves_raw_observations](../../tests/test_benchmark_measurement_contract.py), [tests/test_benchmark_measurement_contract.py::test_native_benchmark_rejects_changing_work](../../tests/test_benchmark_measurement_contract.py).
+
+Raw samples, identities and verification are retained in representative harness and production-preparation runs. Evidence: E_PERF_CONTRACT, E_PERF_HARNESS, E_FIXED_PREP.
+
+**Remaining qualification:** Small local samples do not establish tail latency, network variability, hardware coverage or user-facing SLOs.
+
+#### PERF-08 — Benchmark workflow path filters and acceptance descriptions are incomplete
+
+**Implemented; qualification pending · Original priority: Medium.** Expanded benchmark-dependent triggers and separate head and baseline builds using a common harness. Five alternating pairs and the documented five-percent and twelve-percent policies distinguish relative drift from absolute goals. Historical coherence timing remains limited to its dedicated runner. Stable required native contexts now emit with verified source applicability, so unrelated changes can be reported explicitly without leaving a required check missing. Commits: [c1686ca](https://github.com/coherence-energy-labs/one-link/commit/c1686ca50989f70b4b71c173a2b19ea55304a2ed), [1164ed9](https://github.com/coherence-energy-labs/one-link/commit/1164ed9ba3bc4716acdbb8ff3472c5c8e9144340), [876857f](https://github.com/coherence-energy-labs/one-link/commit/876857fbc389c2d486f8f99a4ad4ec33be13de9d).
+
+Source: [.github/workflows/native_bench_gate.yml](../../.github/workflows/native_bench_gate.yml), [scripts/bench_paired_native.py](../../scripts/bench_paired_native.py), [bench_baselines/README.md](../../bench_baselines/README.md). Representative tests: [tests/test_bench_gate_compares_like_for_like.py](../../tests/test_bench_gate_compares_like_for_like.py), [tests/test_coherence_field_perf_slo.py](../../tests/test_coherence_field_perf_slo.py).
+
+Runner and gate contracts passed, and the execution transcript reports 23 coherence-field SLO and documentation cases passed. The initial hosted gate failed as INCONCLUSIVE after five pairs; no tolerance was relaxed. The follow-up profile is implemented in 3acb6fc, with 236 passed sampling contracts and a real 28-metric orchestration smoke. Windows scope portability passes all 70 cases after 9a8475a. Evidence: E_PERF_CONTRACT, E_PERF_HARNESS, E_HOSTED_BENCH, E_GATE_INTEGRATION, E_NATIVE_SAMPLING, E_NATIVE_SAMPLING_SMOKE, E_WIN_SCOPE_PORTABILITY.
+
+**Remaining qualification:** Retain the implemented 20-pair final-candidate comparison and meet the unchanged acceptance policy. A relative benchmark pass does not establish an absolute throughput target. The profile uses 31 storage and QUIC batches, three warmup batches and at least 16 MiB response payload per measured QUIC batch; its orchestration smoke does not supply a comparative acceptance result.
+
+### Maintainability and test coverage
+
+#### MNT-01 — Core runtime is concentrated into exceptionally large classes and stateful handlers
+
+**Partially remediated · Original priority: Medium.** Extracted descriptor identity/preparation/commit retry and courier ledger/catalog/monitor/use cases through typed ports and owned state; no daemon-global bridge or mixin rewrite. Fixed assembly rollback ownership and temporary-file cleanup. Commits: [5344ee9](https://github.com/coherence-energy-labs/one-link/commit/5344ee9387c2f6da87b4064f01c2d17c56cfeaa9), [aac9f83](https://github.com/coherence-energy-labs/one-link/commit/aac9f834855cf0f9fcd388d9579c4465178a61df), [b7a3ca2](https://github.com/coherence-energy-labs/one-link/commit/b7a3ca298510ba7f2819616b35153786eb692905).
+
+Source: [src/one_link/file_source.py](../../src/one_link/file_source.py), [src/one_link/file_preparation.py](../../src/one_link/file_preparation.py), [src/one_link/transfer_commit_guard.py](../../src/one_link/transfer_commit_guard.py). Representative tests: [tests/test_file_preparation_service.py](../../tests/test_file_preparation_service.py), [tests/test_transfer_commit_guard_service.py](../../tests/test_transfer_commit_guard_service.py).
+
+The runtime, UI and courier selections passed 243, 86 and 168 cases respectively. These are separate overlapping runs. The preparation extraction removed 556 net daemon lines; courier extraction removed 654 net server lines while preserving send, receipt, authentication and public route contracts. Full-checkout Python distribution validation at f5fb842 includes the extracted services in the exact 232-file Python inventory. Evidence: E_RUNTIME, E_RUNTIME_UI, E_COURIER, E_FIXED_PREP, E_PYTHON_DIST_REVIEW.
+
+**Remaining qualification:** Daemon and UIServer remain very large; peer/outbound/call/folder/recovery orchestration still requires incremental service boundaries. Courier execution remains synchronous/serialized; concurrent import workers require a separate synchronization design.
+
+#### MNT-02 — Many existing live-daemon tests are omitted from normal push/PR execution
+
+**Implemented; qualification pending · Original priority: Medium.** Explicit live markers/manifests drive four bounded shards per acceptance OS, enforce collection/execution counts and preserve incomplete/failed first attempts; only two live pairing tests leave hermetic execution. Commits: [48990e4](https://github.com/coherence-energy-labs/one-link/commit/48990e4469ed81520dd539d5fe2bf0741afbf33e), [93a5d0d](https://github.com/coherence-energy-labs/one-link/commit/93a5d0d6e2c98d34760c01e6548232f0a9663fb1).
+
+Source: [tests/live_daemon_manifest.json](../../tests/live_daemon_manifest.json), [scripts/live_suite.py](../../scripts/live_suite.py), [tests/harness.py](../../tests/harness.py). Representative tests: [tests/test_delivery_evidence.py::test_live_manifest_detects_stale_or_empty_selection_and_stable_shards](../../tests/test_delivery_evidence.py), [tests/test_delivery_evidence.py::test_live_acceptance_rejects_pytest_success_with_a_skipped_case](../../tests/test_delivery_evidence.py).
+
+Collection accounts for 139 functions and 152 parameter cases. Twenty-one hermetic pairing cases passed. The initial hosted Linux and Windows lanes each executed all 152 live cases with no failures or skips; exact-final-source acceptance remains pending. Evidence: E_LIVE_MANIFEST, E_HERMETIC_PAIRING, E_DELIVERY, E_LINUX_FULL, E_HOSTED_INITIAL, E_HOSTED_WINDOWS_INITIAL.
+
+**Remaining qualification:** Execute every required live shard at the final candidate and observe required hosted checks. Linux ifaddr EPERM blocks relevant execution here; source collection is not substituted for live qualification.
+
+#### MNT-03 — Browser application logic remains concentrated in huge inline scripts
+
+**Partially remediated · Original priority: Low.** Owner authoring now has 106 modules and six service factories, and peer authoring has 60 modules and four service factories. Sources live outside shipped runtime assets; deterministic offline assembly retains the existing standalone HTML distribution and markup. Commits: [3674060](https://github.com/coherence-energy-labs/one-link/commit/3674060956c22caa40a74eaf3f4f58c1c5e768a1), [8a9fe28](https://github.com/coherence-energy-labs/one-link/commit/8a9fe2839959febb17457e1ef7ed90b8695e4eb2), [eab2337](https://github.com/coherence-energy-labs/one-link/commit/eab2337e48067f84634553a3bc0a4946e5a46188), [296c721](https://github.com/coherence-energy-labs/one-link/commit/296c721b3205deb9d6d4a7864ed172ecc9790a6e).
+
+Source: [frontend/owner/manifest.json](../../frontend/owner/manifest.json), [frontend/peer/manifest.json](../../frontend/peer/manifest.json), [scripts/build_owner_ui.py](../../scripts/build_owner_ui.py). Representative tests: [tests/test_owner_ui_build.py](../../tests/test_owner_ui_build.py), [tests/test_peer_ui_build.py](../../tests/test_peer_ui_build.py).
+
+Execution transcripts record 11 owner source cases and eight owner Node cases passed, plus 593 peer source cases passed, three skipped and six peer Node cases passed. All 311 original named peer function bodies were retained. The peer change is integrated as 296c721. Windows browser acceptance at d2de862 passed all 63 Chromium and three Firefox cases. Full-checkout Python distribution validation at f5fb842 also confirmed exact packaged assets and clean installations. Evidence: E_OWNER, E_PEER, E_DIST_FINAL, E_WIN_BROWSERS, E_WIN_BROWSERS_D2DE862, E_PYTHON_DIST_REVIEW.
+
+**Remaining qualification:** Both extracted UIs passed the Windows browser selection at d2de862. Final combined-candidate hosted and intended released-artifact qualification remain pending. Legacy feature modules still share page closures. The new factories improve boundaries but do not complete state separation or broader physical-device qualification.
+
+#### MNT-04 — Protocol catalogue omits current completion states and historical test audit is not current evidence
+
+**Implemented and verified · Original priority: Low.** Protocol catalogue now names durable file/folder completion, failure and capability conditions; historical skip audit is labeled historical and exact-run manifests report current execution. Commits: [c2f6e0a](https://github.com/coherence-energy-labs/one-link/commit/c2f6e0a57b5159a1fd045ca23965b7741177dc6a), [aa37b9d](https://github.com/coherence-energy-labs/one-link/commit/aa37b9dd7f8f226c0129e438538022094f7a3dc5), [48990e4](https://github.com/coherence-energy-labs/one-link/commit/48990e4469ed81520dd539d5fe2bf0741afbf33e).
+
+Source: [src/one_link/sessions.py](../../src/one_link/sessions.py), [tests/test_capabilities_sessions.py](../../tests/test_capabilities_sessions.py), [docs/TEST_SUITE_SKIP_AUDIT.md](../../docs/TEST_SUITE_SKIP_AUDIT.md). Representative tests: [tests/test_capabilities_sessions.py](../../tests/test_capabilities_sessions.py), [tests/test_delivery_evidence.py](../../tests/test_delivery_evidence.py).
+
+86 protocol/receipt cases passed and live collection accounting retained; historical counts no longer imply current runtime evidence. Evidence: E_RECEIPTS, E_LIVE_MANIFEST.
+
+**Remaining qualification:** Append exact-final-source hosted skip/xfail/execution results; do not add overlapping suite counts.
+
+### Native file-scanning branch
+
+#### BRANCH-01 — ZIP/H264 whole-buffer path accepts a short read as a successful complete scan
+
+**Implemented and verified · Original priority: Medium.** All declared-length paths reject shrinkage/growth; ZIP/H264 use exact reads and post-read length validation. Fragmented/interrupted readers and explicit IO error categories are covered. Commits: [8b42802](https://github.com/coherence-energy-labs/one-link/commit/8b42802bf883cb0eed2f017d0cca274b81e83b9d).
+
+Source: [native/ol_chunk/src/stream.rs](../../native/ol_chunk/src/stream.rs), [native/ol_chunk/tests/stream_contracts.rs](../../native/ol_chunk/tests/stream_contracts.rs), [native/one_link_native/src/chunk.rs](../../native/one_link_native/src/chunk.rs). Representative tests: [native/ol_chunk/tests/stream_contracts.rs](../../native/ol_chunk/tests/stream_contracts.rs), [tests/test_native_format_aware_file.py](../../tests/test_native_format_aware_file.py).
+
+Seventy-five Rust package cases and 107 installed-wheel cases passed. The same 107 binding cases also passed with the fresh integrated native binary. Evidence: E_NATIVE_CHUNK, E_NATIVE_BINDING, E_LINUX_FULL.
+
+**Remaining qualification:** Supported-platform/final-artifact matrix results remain to be attached; no claim covers arbitrary concurrent filesystem mutation beyond the documented contract.
+
+#### BRANCH-02 — Bounded payload buffering does not bound dense-record metadata memory
+
+**Implemented; qualification pending · Original priority: Medium.** Online record visitors absorb dense boundaries during traversal and scan accepted segments immediately, removing production candidate/accepted-cut/segment materialization. Commits: [8b42802](https://github.com/coherence-energy-labs/one-link/commit/8b42802bf883cb0eed2f017d0cca274b81e83b9d).
+
+Source: [native/ol_chunk/src/stream.rs](../../native/ol_chunk/src/stream.rs), [native/ol_chunk/examples/stream_memory_probe.rs](../../native/ol_chunk/examples/stream_memory_probe.rs), [native/ol_chunk/tests/stream_contracts.rs](../../native/ol_chunk/tests/stream_contracts.rs). Representative tests: [native/ol_chunk/tests/stream_contracts.rs](../../native/ol_chunk/tests/stream_contracts.rs), [native/ol_chunk/examples/stream_memory_probe.rs](../../native/ol_chunk/examples/stream_memory_probe.rs).
+
+A two-million-record reader contract and 18 paired memory observations verify online behavior. At four million records, median native VmHWM decreased by 94.1 percent while exact output digests matched. Evidence: E_NATIVE_CHUNK, E_NATIVE_MEMORY.
+
+**Remaining qualification:** Realistic dense/sparse multi-GB logs, disk/network effects and supported-platform RSS still require qualification. Returned output remains O(chunks); public all-offset APIs intentionally retain O(records) compatibility behavior.
+
+#### BRANCH-03 — New file APIs have no binding-level tests or in-repository runtime integration evidence
+
+**Partially remediated · Original priority: Low.** Installed exports now have format/profile/path/error/window/limit tests. Separately accelerated the existing descriptor-bound production Gear CDC path without substituting the distinct pathname/format-aware Rust semantics. Commits: [8b42802](https://github.com/coherence-energy-labs/one-link/commit/8b42802bf883cb0eed2f017d0cca274b81e83b9d), [74ae074](https://github.com/coherence-energy-labs/one-link/commit/74ae0742ca433118f4c0d4c52bcc731e569ca898).
+
+Source: [native/one_link_native/src/chunk.rs](../../native/one_link_native/src/chunk.rs), [native/one_link_native/chunk.pyi](../../native/one_link_native/chunk.pyi), [tests/test_native_format_aware_file.py](../../tests/test_native_format_aware_file.py). Representative tests: [tests/test_native_format_aware_file.py](../../tests/test_native_format_aware_file.py), [tests/test_cdc_file_windows.py](../../tests/test_cdc_file_windows.py).
+
+The 107 binding and export cases passed, including a real 32 MiB window crossing and 256 MiB refusal. Production Gear acceleration has exact-boundary evidence. Evidence: E_NATIVE_BINDING, E_LINUX_FULL, E_CDC_PREP.
+
+**Remaining qualification:** A production consumer/end-to-end benchmark for the distinct format-aware Rust file API remains absent/unqualified. Binding tests and Gear acceleration do not prove that the product uses every new exported format-aware API.
+
+#### BRANCH-04 — cdc_file documentation still describes a 512 KiB buffer despite a 32 MiB window
+
+**Implemented and verified · Original priority: Low.** Corrected Rust and Python documentation and exported constants: the default payload window is 32 MiB, or four times the maximum chunk size when larger. Kernel workspace and output or metadata growth are described separately. Commits: [8b42802](https://github.com/coherence-energy-labs/one-link/commit/8b42802bf883cb0eed2f017d0cca274b81e83b9d).
+
+Source: [native/ol_chunk/FILE_SCANNING.md](../../native/ol_chunk/FILE_SCANNING.md), [native/ol_chunk/src/stream.rs](../../native/ol_chunk/src/stream.rs), [native/one_link_native/chunk.pyi](../../native/one_link_native/chunk.pyi). Representative tests: [tests/test_native_format_aware_file.py](../../tests/test_native_format_aware_file.py), [native/ol_chunk/tests/stream_contracts.rs](../../native/ol_chunk/tests/stream_contracts.rs).
+
+Runtime limit constants and window/refusal contracts are exercised by installed-wheel tests. Evidence: E_NATIVE_BINDING, E_NATIVE_CHUNK, E_NATIVE_MEMORY.
+
+**Remaining qualification:** No constant-total-memory claim; output size and explicit all-offset APIs remain proportional to their result counts.
+
+#### BRANCH-05 — Cross-platform determinism fixture does not yet pin exact boundary outputs
+
+**Implemented; qualification pending · Original priority: Medium.** Pinned exact pre-change starts/ends/hashes and corpus hashes for random/zero/edited fixtures; serial/parallel/streamed kernels share reviewed golden outputs. Commits: [8b42802](https://github.com/coherence-energy-labs/one-link/commit/8b42802bf883cb0eed2f017d0cca274b81e83b9d).
+
+Source: [native/ol_chunk/tests/fixtures/cdc_golden_v1.txt](../../native/ol_chunk/tests/fixtures/cdc_golden_v1.txt), [native/ol_chunk/tests/cross_platform.rs](../../native/ol_chunk/tests/cross_platform.rs), [.github/workflows/native_build.yml](../../.github/workflows/native_build.yml). Representative tests: [native/ol_chunk/tests/cross_platform.rs](../../native/ol_chunk/tests/cross_platform.rs).
+
+Frozen vectors passed in local Linux package tests. Initial hosted all-targets/all-features Linux x86_64, Linux ARM64 and macOS jobs passed. Windows exposed a fixture parser that assumed LF. Commit 8bbb9c8 parses sections with portable line handling; the golden corpus and exact expected outputs are unchanged. The new LF/CRLF equivalence test fails against the old parser and passes against the repair. All six golden-vector tests then passed on actual Windows. Evidence: E_NATIVE_CHUNK, E_NATIVE_GOLDEN_PORTABILITY, E_WIN_PORTABILITY_ATTEMPT.
+
+**Remaining qualification:** Retain fresh exact-candidate x86_64/ARM64 and supported-OS executions before declaring cross-platform determinism qualified.
+
+## Dependency coverage and remaining supply-chain issues
+
+The retained Python, rendezvous, npm, native workspace and fuzz checks report no known vulnerabilities in their reviewed graphs. The earlier shell RustSec report had an empty `vulnerabilities` list but still reported GLib unsoundness as RUSTSEC-2024-0429; GitHub identifies the same issue as GHSA-wrw7-89jp-8q8g. Its warning category did not make the defect harmless. A read-only comparison mapped all 88 observed default-branch alerts at `27cc28b`: 87 were outside the candidate's affected ranges and GLib remained affected. No alerts were dismissed. Those original reports remain retained. [E_DEP_PY, E_DEP_RUST, E_DEP_SHELL, E_DEP_NPM, E_CONTAINER, E_DEP_ALERTS]
+
+The integrated backport preserves all 121 files of the official GLib 0.18.5 crate and changes only the two lines in the [upstream iterator fix](https://github.com/gtk-rs/gtk-rs-core/commit/b5a4071e439bef2b5eea76c3aa25e5ae84839e34). It preserves the original version and MIT license. CI verifies the original archive checksum, the complete local tree and the exact reviewed diff; a real `core.autocrlf=true` checkout test verifies Windows byte preservation. Eleven original iterator tests and five continuing regression tests passed with optimization level 3. [E_GLIB_BACKPORT; dependency qualification](../DEPENDENCY_QUALIFICATION.md)
+
+Because Cargo audit omits local path packages, a separate required live OSV query covers the original registry identity. Its retained replies still contain both known advisory IDs; only that exact issue receives the verified-source-backport disposition. New identifiers, failed requests, invalid responses or incomplete pagination fail the gate. This avoids hiding future advisories behind vendoring. The separate `proc-macro-error 1.0.4` maintenance warning, RUSTSEC-2024-0370, remains visible. The backport is a project maintenance responsibility; full hosted shell/window and intended released-artifact qualification remain separate from the local optimized tests. [E_GLIB_BACKPORT]
+
+The final source-union SBOM contains 957 components and 958 dependency entries including its root. The earlier inventory had 956 components: the additional component is the first-party GLib regression harness. The GLib entry explicitly identifies modified source, the original registry ancestor, license, complete tree hash and upstream patch pedigree. Separate graph references preserve resolved Cargo edges even when the same package appears in more than one lock. The six-graph inventory includes build and test dependencies; a per-artifact inventory is still required before claiming exactly what ships on each platform. [E_SBOM, E_GLIB_BACKPORT]
+
+The initial hosted full-history Gitleaks check reported one item. Independent inspection found a type-only dataclass field annotation with no assigned secret value. Commit `27cc28b` added its exact historical fingerprint and redacted report retention. A later explanatory comment repeated the annotation and triggered another historical match; commit `366d58e` removes the literal and adds that second exact fingerprint. Neither exception suppresses a detector or a path. The original findings and earlier zero-finding full-history revalidation at `d2de862` remain retained. A scan of all 139 staged backport files also returned zero findings; final combined-candidate full-history hosted acceptance remains separate. [E_HOSTED_SECRET_SCAN, E_SECRET_REVALIDATION, E_GLIB_BACKPORT]
+
+Release signing and publication now depend on the selected native-wheel reproducibility comparison, and negative comparison tests confirm failure semantics and retained diagnostics. A fresh executed release DAG, independently built final artifacts, downloaded-byte signature and provenance verification, and supported-device qualification are still required. Historical v0.21.0 publication and its failed independent reproducibility workflow remain explicit in the release ledger. [E_DELIVERY, E_RELEASE_LEDGER]
+
+## Product claims and their present support
+
+| Claim | Present support | Limit |
+| --- | --- | --- |
+| Supported fresh passphrase bootstrap reaches recoverable authority | Verified in focused tests and three Windows fresh startup/transfer attempts (E_BOOT, E_WIN_TRANSFER) | Final packaged platforms and long soak remain separate. The local Linux host blocks discovery; the hosted Linux live suite passed all 152 cases. |
+| Reported file completion is backed by receiver content and application commit | Scoped receipt contracts and three forced TCP live transfers verify this behavior. (E_RECEIPTS, E_ROUTES, E_WIN_TRANSFER) | Does not qualify every transport/device/crash scenario or link-layer wire-byte totals. |
+| Production descriptor Gear CDC is accelerated without changing boundaries | Exact outputs and five paired 8 MiB preparation measurements support this scoped claim. (E_CDC_PREP, E_CDC, E_SERVICE_INTEGRATION) | 112.4x is preparation on one host/workload, not an end-to-end network speedup. |
+| Format-aware scanner uses bounded payload/intermediate storage | Online coalescing and declared memory contract verified (E_NATIVE_MEMORY, E_NATIVE_BINDING) | Output O(chunks), all-offset compatibility O(records); realistic multi-GB/platform and production format-aware use remain unqualified. |
+| Firefox required-identity pairing and immediate revoke work | The exact case and later Windows d2de862 run passed, including all three Firefox cases and both extracted UIs. (E_WIN_FIREFOX_EXACT, E_WIN_BROWSERS, E_WIN_BROWSERS_D2DE862) | Final combined-candidate hosted acceptance, the intended released artifact and broader platform or network conditions remain pending. |
+| QUIC is faster than WebRTC for the current file path | Not established; unsupported comparisons are now inconclusive (E_PERF_CONTRACT, E_ROUTES) | Require isolated real payload routes, verified completion, repeated matching artifacts and controlled environment. |
+| Native package matches source and executes its KEM ABI | Public bootstrap commands verified matching 0.22.1 versions, hashes and executed KEM self-tests on Linux and Windows. (E_LINUX_BOOTSTRAP, E_WIN_BOOTSTRAP) | Observed source revisions differ; final supported-platform and released-artifact identities remain to be qualified. |
+| Dependency and release controls make a fully qualified secure release | Not established; the known GLib source defect has a verified upstream backport and continuing advisory coverage (E_DEP_PY, E_DEP_RUST, E_GLIB_BACKPORT, E_POLICY, E_RELEASE_LEDGER, E_DEP_ALERTS, E_SECRET_REVALIDATION) | Project maintenance of the backport, an unmaintained macro dependency, unapplied branch policy, final hosted CI, release artifact verification and controlled timing or formal qualification remain open. |
+| Runtime/browser maintainability is fully remediated | Substantial boundaries implemented, residual monolith/shared closures remain (E_RUNTIME, E_COURIER, E_OWNER, E_PEER, E_WIN_BROWSERS_D2DE862, E_PYTHON_DIST_REVIEW) | No complete-decomposition or design-quality score is assigned from file/line counts. |
+
+## Remaining acceptance and finalization
+
+The immediate remaining decisions are based on evidence, not on a target percentage of findings to mark closed:
+
+1. Run the final combined source through required hosted correctness, browser, live, native, packaging and security jobs. Record each source or verified equivalent tree, exact artifact identity, result and unresolved skip. Retain the original failed and inconclusive attempts.
+2. Retain final combined-candidate hosted security conclusions alongside the original secret-scan findings and scoped revalidation. Complete native shell/window qualification of the verified GLib backport, continue live original-version advisory checks, and verify dependencies in intended release artifacts. The separate unmaintained macro dependency remains a maintenance obligation.
+3. Obtain sufficiently precise comparable benchmark acceptance. The initial inconclusive gate cannot be relabeled a pass, and local preparation gains cannot become general network claims.
+4. Observe actual required check names, regenerate and apply the reviewed ten-check and one-review repository policy, and retain effective-policy readback. The policy is currently prepared only.
+5. Attach supported-platform executions of the frozen native boundary vectors, exact-final-source hosted browser outcomes and a freshly verified release artifact set. The completed Windows d2de862 browser run and f5fb842 Python distribution validation retain their specific scope. Validate selected reproducibility, signatures and provenance on the downloaded bytes.
+6. Provision and execute controlled timing work where claimed, and conduct representative physical-device, multi-gigabyte, storage, LAN/WAN and long-duration reliability qualification. No new formal proof or side-channel certification is supplied by these functional checks.
+7. Continue cohesive service and state ownership work in the remaining large daemon, server and browser feature closures. Qualify a real product consumer before describing the distinct Rust format-aware file API as fully integrated.
+
+The final source SHA, final-head hosted run identities, effective repository-policy readback, final browser summary and released-artifact verification are intentionally open fields in the JSON ledger. This draft neither merges the pull request nor publishes a release or grants production signoff.
+
+## Evidence locations and interpretation
+
+The companion JSON is the authoritative index of evidence IDs and complete paths. It distinguishes archived local reports, execution-transcript summaries, and observations made on Windows. Local evidence files are session artifacts and are not implicitly published with the repository documentation. SHA256 entries in the ledger identify the retained files actually present at drafting time; absent Windows files do not receive invented hashes.
+
+| Evidence root | Location | Contents |
+| --- | --- | --- |
+| Remediation | `/workspace/scratch/61eba8217325/one-link-remediation-evidence/` | Integrated test XML and logs, native identity, paired preparation measurements, public bootstrap and initial hosted summary |
+| Delivery | `/workspace/scratch/61eba8217325/one-link-delivery-evidence/` | Advisory reports, frozen Linux selection and continuation, SBOM, policy proposal and delivery contract checks |
+| Performance | `/workspace/scratch/61eba8217325/one-link-performance-validation/` | Retained native paired harness smoke artifacts |
+| Focused native and service work | `/workspace/scratch/61eba8217325/` | Named native memory, binding, runtime-service and courier reports indexed in the JSON |
+| Windows | `C:\Users\Josh\Projects\OneDesktopConnection\test-results\one-link-remediation-20261124` | Original Windows bootstrap, browser and verified transfer evidence; aggregate counts and public test IDs are summarized here |
+
+The performance 81-case, owner source/Node and peer source/Node results were recorded in execution transcripts; no standalone pytest XML was retained for those local runs. They are labeled accordingly and must not be presented as archived raw result logs. The Windows XML remains on the Windows host; this report uses approved aggregate counts and public test identities. All reported measurements carry their workload, platform and source limits. There is no blanket security, performance, formal-verification or all-platform certification.

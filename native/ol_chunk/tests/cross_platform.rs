@@ -39,19 +39,26 @@ fn pseudo_random_buf(seed: u64, len: usize) -> Vec<u8> {
 /// regenerates this file. The input hash also freezes the corpus generator.
 const GOLDEN: &str = include_str!("fixtures/cdc_golden_v1.txt");
 
-fn assert_golden(name: &str, buf: &[u8]) {
-    let marker = format!("[{name}]\n");
-    let mut lines = GOLDEN
-        .split_once(marker.as_str())
-        .unwrap()
-        .1
-        .lines()
-        .take_while(|line| !line.starts_with('['));
+#[derive(Debug, Eq, PartialEq)]
+struct GoldenFixture {
+    input_len: usize,
+    input_hash: [u8; 32],
+    boundaries: Vec<Boundary>,
+}
+
+fn parse_golden_fixture(fixture: &str, name: &str) -> GoldenFixture {
+    let marker = format!("[{name}]");
+    // `lines` recognizes both LF and CRLF without changing the fixture values.
+    let mut lines = fixture.lines();
+    assert!(
+        lines.any(|line| line == marker),
+        "missing golden fixture section {name}"
+    );
+    let mut lines = lines.take_while(|line| !line.starts_with('['));
     let identity: Vec<&str> = lines.next().unwrap().split_whitespace().collect();
+    assert_eq!(identity.len(), 3);
     assert_eq!(identity[0], "input");
-    assert_eq!(identity[1].parse::<usize>().unwrap(), buf.len());
-    assert_eq!(identity[2], blake3::hash(buf).to_hex().as_str());
-    let expected: Vec<Boundary> = lines
+    let boundaries = lines
         .map(|line| {
             let fields: Vec<&str> = line.split_whitespace().collect();
             assert_eq!(fields.len(), 3);
@@ -62,6 +69,17 @@ fn assert_golden(name: &str, buf: &[u8]) {
             }
         })
         .collect();
+    GoldenFixture {
+        input_len: identity[1].parse().unwrap(),
+        input_hash: hex::decode(identity[2]).unwrap().try_into().unwrap(),
+        boundaries,
+    }
+}
+
+fn assert_golden(name: &str, buf: &[u8]) {
+    let expected = parse_golden_fixture(GOLDEN, name);
+    assert_eq!(expected.input_len, buf.len());
+    assert_eq!(expected.input_hash, *blake3::hash(buf).as_bytes());
     for (engine, boundaries) in [
         ("serial", scan_to_vec(buf)),
         ("parallel", scan_to_vec_parallel(buf)),
@@ -70,7 +88,10 @@ fn assert_golden(name: &str, buf: &[u8]) {
             scan_stream(Cursor::new(buf), buf.len(), CdcParams::default()).unwrap(),
         ),
     ] {
-        assert_eq!(boundaries, expected, "fixture {name}, engine {engine}");
+        assert_eq!(
+            boundaries, expected.boundaries,
+            "fixture {name}, engine {engine}"
+        );
         assert_eq!(boundaries.first().unwrap().start, 0);
         assert_eq!(boundaries.last().unwrap().end, buf.len());
         for b in &boundaries {
@@ -82,6 +103,22 @@ fn assert_golden(name: &str, buf: &[u8]) {
         for pair in boundaries.windows(2) {
             assert_eq!(pair[0].end, pair[1].start);
         }
+    }
+}
+
+#[test]
+fn frozen_fixture_parses_identically_with_lf_or_crlf() {
+    // Git may check this text fixture out with CRLF on Windows. Exercise both
+    // encodings on every host, comparing the full corpus identity and every
+    // frozen start, end and hash rather than only checking section discovery.
+    let lf = GOLDEN.replace("\r\n", "\n");
+    let crlf = lf.replace('\n', "\r\n");
+    for name in ["RANDOM", "ZEROS", "EDITED"] {
+        assert_eq!(
+            parse_golden_fixture(&crlf, name),
+            parse_golden_fixture(&lf, name),
+            "newline encoding changed fixture {name}"
+        );
     }
 }
 

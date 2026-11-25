@@ -158,11 +158,12 @@ def live_daemon(tmp_path: Path) -> Iterator[LiveDaemon]:
     # before any owner request is accepted; this is identity possession, not a
     # claim of browser hardware/platform attestation.
     env["ONE_LINK_REQUIRE_BROWSER_IDENTITY_POSSESSION"] = "required"
-    # The daemon auto-discovers a free port starting at 7117 and
-    # falls through to 7118..7132 if taken, then OS-assigned. Since
-    # ONE_LINK_HOME is fresh + isolated, we read the chosen port
-    # back from data/server.port once it's up - no env override
-    # needed.
+    # An OS-assigned UI port, read back from data/server.port once the daemon
+    # is up. Left to itself the daemon auto-discovers from the product's
+    # well-known 7117, so a test daemon could occupy a port a real daemon on
+    # this machine expects (observed 2026-11-25). Set explicitly here as well
+    # as in tests/conftest.py, so this fixture is safe however it is invoked.
+    env["ONE_LINK_UI_PORT"] = "0"
 
     log_fh = open(log_path, "ab", buffering=0)
     proc = subprocess.Popen(
@@ -268,6 +269,34 @@ def ui_page(live_daemon, page):
         except Exception:
             pass
     return page
+
+
+# Browser sessions (by id) already past their startup-cache write.
+_STARTUP_CACHE_SETTLED: set[int] = set()
+
+
+@pytest.fixture(autouse=True)
+def firefox_past_startup_cache_write(request):
+    """Run every browser test after Firefox's one-time startup-cache write (RUN-01).
+
+    While a freshly launched Firefox writes its startup cache, its parent
+    process can stop answering content for as long as the write takes (seconds
+    to minutes on a loaded host), which holds createOffer() and Playwright's
+    own commands. A WebRTC test that starts inside that window fails in a way
+    that looks like a product defect. This waits the write out once per
+    browser session, for whichever browser test runs first. It is a no-op for
+    tests that use no browser and for other browsers; a browser that never
+    settles fails the test with BrowserNotReady, never a pass or a skip.
+    """
+    if "browser" not in request.fixturenames:
+        return
+    browser = request.getfixturevalue("browser")
+    if id(browser) in _STARTUP_CACHE_SETTLED:
+        return
+    from tests.e2e.browser_readiness import wait_for_startup_cache_write
+
+    wait_for_startup_cache_write(browser)
+    _STARTUP_CACHE_SETTLED.add(id(browser))
 
 
 @pytest.fixture(scope="session")

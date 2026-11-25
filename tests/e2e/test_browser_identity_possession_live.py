@@ -21,6 +21,8 @@ from playwright.sync_api import (
     TimeoutError as PlaywrightTimeoutError,
 )
 
+from tests.e2e.browser_readiness import wait_for_browser_ready
+
 
 _IDENTITY_PASSPHRASE = "channel-bound browser authority 2026"
 
@@ -126,6 +128,12 @@ def test_required_mode_live_pair_owner_request_and_immediate_revoke(
 
         peer = context.new_page()
         _open_ready_peer(peer, origin)
+        # RUN-01: the pairing token TTL and the flow's 90 s deadline start
+        # below. Before that, the browser must prove it is past its one-time
+        # startup-cache write and that its parent process answers; otherwise
+        # a browser/host stall would be reported as a pairing failure. The
+        # pairing assertions and budgets that follow are unchanged.
+        wait_for_browser_ready(peer, browser)
         identity = peer.evaluate(
             """() => ({
                 pub: window.__oneLinkPeer.state.rec.public_key_b64u,

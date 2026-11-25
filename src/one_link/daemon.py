@@ -289,6 +289,7 @@ from one_link.transfer_safety import (
     known_bytes_from_chunks,
     same_storage_volume,
 )
+from one_link import held_offers
 from one_link.wire import decode_msg, encode_msg, make_msg
 
 log = logging.getLogger("one_link.daemon")
@@ -7607,15 +7608,19 @@ class Daemon:
                     # A peer that holds the channel open with no further
                     # bytes after handshake exits the loop here instead
                     # of pinning fds forever.
+                    read_deadline_s = held_offers.read_deadline_s(
+                        self._pending_file_offers, channel,
+                        idle_s=PEER_IDLE_S, accept_wait_s=FILE_OFFER_ACCEPT_WAIT_S,
+                    )
                     plaintext = await asyncio.wait_for(
-                        channel.recv(), timeout=PEER_IDLE_S
+                        channel.recv(), timeout=read_deadline_s
                     )
                 except asyncio.IncompleteReadError:
                     break
                 except asyncio.TimeoutError:
                     log.info(
                         "peer %s idle for %.0fs, closing channel",
-                        channel.peer_short_id, PEER_IDLE_S,
+                        channel.peer_short_id, read_deadline_s,
                     )
                     break
                 if plaintext.startswith(BINARY_FRAME_MAGIC):
@@ -8658,6 +8663,35 @@ class Daemon:
                     ),
                 )
                 return
+            # Owner consent carried over from an accepted offer whose sender left.
+            inherited_acceptance = False
+            if existing_owner is not None and not _incoming_delivery_contract_matches(
+                existing_owner,
+                peer_fp=peer_fp,
+                delivery_id=delivery_id,
+                delivery_name=delivery_name,
+                delivery_rel_path=delivery_rel_path,
+                delivery_kind=delivery_kind,
+            ):
+                settled = await held_offers.settle_offer_against_held_offer(
+                    self,
+                    channel,
+                    msg,
+                    holder=existing_owner,
+                    peer_fp=peer_fp,
+                    peer_sid=peer_sid,
+                    name=name,
+                    blob=blob,
+                    delivery_id=delivery_id,
+                    delivery_name=delivery_name,
+                    delivery_rel_path=delivery_rel_path,
+                    delivery_kind=delivery_kind,
+                )
+                if settled == "waiting":
+                    return
+                if settled == "superseded":
+                    inherited_acceptance = True
+                    existing_owner = None
             if existing_owner is not None and not _incoming_delivery_contract_matches(
                 existing_owner,
                 peer_fp=peer_fp,
@@ -8687,6 +8721,11 @@ class Daemon:
                 # that bound would be orphaned and would refuse this blob until
                 # restart. `held_ms` and `holder_has_transfer_row` are here to
                 # confirm or eliminate exactly that.
+                #
+                # 2026-11-25: they did their job. 13 live refusals all read
+                # holder_transfer_status=offered: an offer HELD for the owner,
+                # not an orphan. That case is settled above (held_offers) and no
+                # longer reaches this branch; the orphan theory stays open.
                 _held_ms = -1
                 _started = getattr(existing_owner, "started_ms", None)
                 if isinstance(_started, int) and _started > 0:
@@ -8958,6 +8997,7 @@ class Daemon:
             )
             acceptance_granted = bool(
                 current_offer_authorized
+                or inherited_acceptance
                 or prior_acceptance_granted
                 or (existing_inflight and existing_inflight.acceptance_granted)
                 or (cross_restart_resume and sc_match and sc_match.acceptance_granted)
@@ -9129,6 +9169,18 @@ class Daemon:
                     else:
                         with contextlib.suppress(OSError):
                             candidate.out_path.unlink()
+                if held_offers.quota_is_waiting_on_the_owner(
+                    self._pending_file_offers, admission.reason, peer_fp,
+                ):
+                    await held_offers.tell_sender_offer_waits(
+                        channel, msg, short_id=self.me.short_id, blob=blob,
+                    )
+                    log.info(
+                        "file offer WAITS for earlier offers to be answered: %s "
+                        "(%d bytes) from %s (%s)",
+                        name, size, peer_sid, admission.reason,
+                    )
+                    return
                 await self._reject_file_offer(
                     channel,
                     msg,

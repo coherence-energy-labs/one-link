@@ -1,7 +1,7 @@
 {
   "classes": {
     "Daemon": {
-      "class_lines": 33877,
+      "class_lines": 33928,
       "domains": {
         "call": {
           "lines": 660,
@@ -32,7 +32,7 @@
           "methods": 206
         },
         "peer": {
-          "lines": 4411,
+          "lines": 4462,
           "methods": 35
         },
         "recovery": {
@@ -48,7 +48,7 @@
           "methods": 124
         }
       },
-      "method_lines": 33200,
+      "method_lines": 33251,
       "methods": 499,
       "self_attributes_assigned": 190
     },
@@ -180,6 +180,20 @@
       "totals": {
         "Daemon": {
           "method_lines": 33200,
+          "methods": 499
+        },
+        "UIServer": {
+          "method_lines": 25034,
+          "methods": 445
+        }
+      }
+    },
+    {
+      "growth_reason": "Daemon +51 lines, no method added: call sites only. The offer handler asks held_offers at three points (a different delivery of content a held offer claims: +33; the inherited consent reaching the acceptance decision: +1; a quota full of unanswered offers: +11) and the channel read loop asks for its deadline (+4), plus 2 comment lines in the refusal it narrows. All logic and its explanation are in held_offers.py behind HeldOfferPort.",
+      "label": "held offers: the decisions live in one_link.held_offers; the offer handler and the channel read loop call them",
+      "totals": {
+        "Daemon": {
+          "method_lines": 33251,
           "methods": 499
         },
         "UIServer": {

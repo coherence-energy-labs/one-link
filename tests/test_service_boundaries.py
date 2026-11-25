@@ -29,7 +29,9 @@ EXTRACTED_MODULES = (
     "one_link.folder_manifest_policy",
     "one_link.folder_sync_receipts",
     "one_link.folder_sync_scheduler",
+    "one_link.held_offers",
     "one_link.off_loop_import",
+    "one_link.owner_auth_note",
 )
 
 

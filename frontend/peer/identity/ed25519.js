@@ -5,6 +5,9 @@
       /^the operation is not supported\.?$/i.test(String(error.message || ""));
   }
 
+  // The one pinned WASM instantiation per page; owned by its only loader.
+  let _ed25519WasmPromise = null;
+
   async function _loadEd25519Wasm() {
     if (_ed25519WasmPromise) return _ed25519WasmPromise;
     _ed25519WasmPromise = (async () => {

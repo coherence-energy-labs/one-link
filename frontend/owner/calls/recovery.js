@@ -13,20 +13,20 @@
     const now = Date.now();
     const last = Number(callUI.backendActionCooldowns[action] || 0);
     if (now - last < minGapMs) return false;
-    callUI.backendActionCooldowns[action] = now;
+    callState.stampBackendCooldown(action, now);
     return true;
   }
 
   function rememberBackendRecommendation(recommendation) {
     const key = backendRecommendationKey(recommendation);
-    callUI.lastBackendRecommendation = {
+    callState.set("lastBackendRecommendation", {
       at_ms: Date.now(),
       ...(recommendation || {}),
-    };
-    callUI.lastBackendRecommendationMs = callUI.lastBackendRecommendation.at_ms;
+    });
+    callState.set("lastBackendRecommendationMs", callUI.lastBackendRecommendation.at_ms);
     const changed = key && key !== callUI.lastBackendRecommendationKey;
     if (changed) {
-      callUI.lastBackendRecommendationKey = key;
+      callState.set("lastBackendRecommendationKey", key);
       reportCallEvent("backend_recommendation_received", {
         reason: String(recommendation.action || "observe"),
         state: String(recommendation.route_preference || "auto"),
@@ -45,7 +45,7 @@
       if (action === "observe" || action === "hold" || action === "watch") return;
 
       if (routePreference === "relay") {
-        media.preferRelayNext = true;
+        mediaState.set("preferRelayNext", true);
         updateOneChip("#call-one-engine", "Relay ready");
       }
 
@@ -140,14 +140,14 @@
       intent.priority || 0,
       intent.route_preference || "auto",
     ].join("|");
-    callUI.lastRecoveryIntent = {
+    callState.set("lastRecoveryIntent", {
       at_ms: Date.now(),
       ...intent,
-    };
-    callUI.lastRecoveryIntentMs = callUI.lastRecoveryIntent.at_ms;
+    });
+    callState.set("lastRecoveryIntentMs", callUI.lastRecoveryIntent.at_ms);
     const changed = key && key !== callUI.lastRecoveryIntentKey;
     if (changed) {
-      callUI.lastRecoveryIntentKey = key;
+      callState.set("lastRecoveryIntentKey", key);
       reportCallEvent("recovery_intent_seen", {
         reason: String(intent.action || "observe"),
         state: String(intent.route_preference || "auto"),
@@ -185,7 +185,7 @@
         audio_priority: intent.audio_first === true,
       };
       if (routePreference === "relay" || action === "force_relay") {
-        media.preferRelayNext = true;
+        mediaState.set("preferRelayNext", true);
         updateOneChip("#call-one-engine", "Relay repair");
       }
       if (action === "force_relay") {
@@ -220,13 +220,13 @@
       session.sequence || "",
       session.recommendation_action || "",
     ].join("|");
-    callUI.lastSessionAuthority = {
+    callState.set("lastSessionAuthority", {
       at_ms: Date.now(),
       ...session,
-    };
-    callUI.lastSessionAuthorityMs = callUI.lastSessionAuthority.at_ms;
+    });
+    callState.set("lastSessionAuthorityMs", callUI.lastSessionAuthority.at_ms);
     if (key !== callUI.lastSessionAuthorityKey) {
-      callUI.lastSessionAuthorityKey = key;
+      callState.set("lastSessionAuthorityKey", key);
       // doctrine-ok: §3.2.a internal state-machine value; user copy below stays calm.
       reportCallEvent("session_authority_seen", {
         reason: state,

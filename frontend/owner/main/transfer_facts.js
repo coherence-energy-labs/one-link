@@ -1,23 +1,12 @@
+  // T3-Z: the O(1) (direction|blob) -> transfer index is owned by
+  // transferStore, next to the by-id map it is derived from.
   function _rebuildTransferByDirBlob() {
-    const idx = new Map();
-    for (const t of state.transfersById.values()) {
-      const blob = (t.blob_hash || "").toLowerCase();
-      if (!blob || !t.direction) continue;
-      idx.set(`${t.direction}|${blob}`, t);
-    }
-    state.transferByDirBlob = idx;
+    transferStore.rebuildDirBlobIndex();
   }
   function _trackTransferIndex(t) {
     // Incremental update path for the WS-event handler. Avoids a
     // full rebuild on every transfer event.
-    if (!state.transferByDirBlob) {
-      _rebuildTransferByDirBlob();
-      return;
-    }
-    const blob = (t?.blob_hash || "").toLowerCase();
-    if (blob && t.direction) {
-      state.transferByDirBlob.set(`${t.direction}|${blob}`, t);
-    }
+    transferStore.trackDirBlob(t);
   }
   function transferForMessage(msg) {
     const blob = (msg.blob || "").toLowerCase();
@@ -87,56 +76,19 @@
 
   // v0.8.8: per-transfer EWMA rate tracker. Each `transfer` WS event
   // is a snapshot - by diffing progress_bytes across events we get
-  // bytes/sec without any extra wire data. EWMA (alpha=0.4) smooths
-  // out the chunk-by-chunk burstiness without going stale on slow
-  // links. Reset on terminal status so the next transfer for the
-  // same id (e.g. retry after pause) starts clean.
-  const _RATE_ALPHA = 0.4;
+  // bytes/sec without any extra wire data. transferStore owns the
+  // tracker and its EWMA (alpha=0.4), which smooths out chunk-by-chunk
+  // burstiness without going stale on slow links. Reset on terminal
+  // status so the next transfer for the same id (e.g. retry after
+  // pause) starts clean.
   function updateTransferRate(t) {
     if (!t || !t.id) return;
     const terminal = t.status === "complete" || t.status === "failed";
     if (terminal) {
-      state.transferRates.delete(t.id);
+      transferStore.forgetRate(t.id);
       return;
     }
-    if (t.status !== "active" && t.status !== "offered") {
-      // queued / paused - keep last bps but stamp timestamp so a
-      // resume's first delta is reasonable.
-      const cur = state.transferRates.get(t.id) || {};
-      cur.lastBytes = t.progress_bytes || 0;
-      cur.lastTs = Date.now();
-      state.transferRates.set(t.id, cur);
-      return;
-    }
-    const now = Date.now();
-    const prev = state.transferRates.get(t.id);
-    if (!prev) {
-      state.transferRates.set(t.id, {
-        lastBytes: t.progress_bytes || 0,
-        lastTs: now,
-        bps: 0,
-      });
-      return;
-    }
-    const dt = (now - prev.lastTs) / 1000;
-    if (dt < 0.1) return;  // ignore <100ms gaps - too noisy.
-    const db = (t.progress_bytes || 0) - prev.lastBytes;
-    if (db < 0) {
-      // progress went backwards (resume / retry) - restart.
-      state.transferRates.set(t.id, {
-        lastBytes: t.progress_bytes || 0,
-        lastTs: now,
-        bps: 0,
-      });
-      return;
-    }
-    const inst = db / dt;
-    const ewma = (1 - _RATE_ALPHA) * (prev.bps || 0) + _RATE_ALPHA * inst;
-    state.transferRates.set(t.id, {
-      lastBytes: t.progress_bytes || 0,
-      lastTs: now,
-      bps: ewma,
-    });
+    transferStore.sampleRate(t);
   }
   function rateForTransfer(t) {
     if (!t) return 0;

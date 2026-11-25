@@ -28,9 +28,51 @@
           "factory": "createOwnerState"
         },
         {
+          "path": "services/state_publisher.js",
+          "kind": "service",
+          "responsibility": "Read-only publication of owned feature state; a raw write names its owner and throws",
+          "factory": "createStatePublisher"
+        },
+        {
+          "path": "services/message_store.js",
+          "kind": "service",
+          "responsibility": "Message rendering state owner: direct and group history, live edits, reactions and send-state",
+          "factory": "createMessageStore"
+        },
+        {
+          "path": "services/transfer_store.js",
+          "kind": "service",
+          "responsibility": "Transfer state owner: ledger mirror, by-id map, (direction|blob) index and EWMA rates",
+          "factory": "createTransferStore"
+        },
+        {
+          "path": "services/settings_store.js",
+          "kind": "service",
+          "responsibility": "Settings state owner: runtime cache, editor hydration/dirty flags, rendezvous URLs and chat preferences",
+          "factory": "createSettingsStore"
+        },
+        {
+          "path": "services/identity_store.js",
+          "kind": "service",
+          "responsibility": "Identity state owner: this device's /api/me snapshot and personal device mesh",
+          "factory": "createIdentityStore"
+        },
+        {
+          "path": "services/polling_cluster.js",
+          "kind": "service",
+          "responsibility": "Polling transport owner: background refresh timers with pause, resume and dispose",
+          "factory": "createPollingCluster"
+        },
+        {
+          "path": "services/call_log_bridge.js",
+          "kind": "service",
+          "responsibility": "The call driver's only route into message rendering state: peer lookup and CALL_LOG rows",
+          "factory": "createCallLogBridge"
+        },
+        {
           "path": "main/state.js",
           "kind": "feature",
-          "responsibility": "Owner state and message media constants"
+          "responsibility": "Owner state, feature state owner composition and message media constants"
         },
         {
           "path": "main/peer_status.js",
@@ -412,6 +454,11 @@
           "path": "main/lifecycle.js",
           "kind": "feature",
           "responsibility": "Global shortcuts, startup and deep-link handling"
+        },
+        {
+          "path": "main/call_bridges.js",
+          "kind": "feature",
+          "responsibility": "Publishes the explicit call-log and host-service bridges for the call driver closure"
         }
       ]
     },
@@ -424,9 +471,20 @@
           "responsibility": "Call closure guard and DOM selector"
         },
         {
+          "path": "calls/host.js",
+          "kind": "feature",
+          "responsibility": "Owner-page services through the explicit host bridge; local HTML escaping"
+        },
+        {
+          "path": "services/owned_record.js",
+          "kind": "service",
+          "responsibility": "Closed-schema state record with a read-only view; refuses undeclared fields and direct writes",
+          "factory": "createOwnedRecord"
+        },
+        {
           "path": "services/call_state.js",
           "kind": "service",
-          "responsibility": "Fresh call lifecycle, signaling and telemetry state",
+          "responsibility": "Call state owner: call identity, negotiation, telemetry, repair and timers behind a read-only view",
           "factory": "createCallState"
         },
         {
@@ -442,7 +500,7 @@
         {
           "path": "services/media_state.js",
           "kind": "service",
-          "responsibility": "Fresh media and route state; capture resources owned by call lifecycle",
+          "responsibility": "Media state owner: streams, peer connection, route policy and in-call controls behind a read-only view",
           "factory": "createCallMediaState"
         },
         {

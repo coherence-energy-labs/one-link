@@ -4,8 +4,10 @@
     if (!callUI.activeCallId) return;
     const callId = callUI.activeCallId;
     hideOutgoingOverlay();
-    callUI.activeCallId = null;
-    callUI.activeCallLocalRole = "";
+    callState.update({
+      activeCallId: null,
+      activeCallLocalRole: "",
+    });
     await callApiPost({ action: "hangup", call_id: callId });
   });
   const declineBtn = $$("#btn-call-decline");
@@ -13,7 +15,7 @@
     if (!callUI.inboundCallId) return;
     const callId = callUI.inboundCallId;
     hideIncomingRing();
-    callUI.inboundCallId = null;
+    callState.set("inboundCallId", null);
     await callApiPost({ action: "decline", call_id: callId });
   });
   const acceptBtn = $$("#btn-call-accept");
@@ -26,9 +28,9 @@
     });
     hideIncomingRing();
     if (result.ok) {
-      callUI.activeCallId = callUI.inboundCallId;
-      callUI.activeCallPeer = callUI.inboundCallPeer;
-      callUI.activeCallPeerFp = callUI.inboundCallPeerFp;
+      callState.set("activeCallId", callUI.inboundCallId);
+      callState.set("activeCallPeer", callUI.inboundCallPeer);
+      callState.set("activeCallPeerFp", callUI.inboundCallPeerFp);
       showActiveSurface(callUI.activeCallPeer, "");
       // Tier α: bring up local media on accept.
       setupRtcPeerConnection();
@@ -45,12 +47,14 @@
       // emit our answer.
       if (callUI.pendingRemoteOffer) {
         const offerSdp = callUI.pendingRemoteOffer;
-        callUI.pendingRemoteOffer = null;
+        callState.set("pendingRemoteOffer", null);
         await applyRemoteSdpOffer(offerSdp);
       }
     }
-    callUI.inboundCallId = null;
-    callUI.inboundCallPeerFp = null;
+    callState.update({
+      inboundCallId: null,
+      inboundCallPeerFp: null,
+    });
   });
   const hangupBtn = $$("#btn-call-hangup");
   if (hangupBtn) hangupBtn.addEventListener("click", async () => {
@@ -65,8 +69,10 @@
     const callId = callUI.activeCallId;
     hideActiveSurface();
     stopAllMedia();
-    callUI.activeCallId = null;
-    callUI.activeCallLocalRole = "";
+    callState.update({
+      activeCallId: null,
+      activeCallLocalRole: "",
+    });
     await callApiPost({ action: "hangup", call_id: callId });
   });
   const recordBtn = $$("#btn-call-record");
@@ -82,14 +88,14 @@
   const muteBtn = $$("#btn-call-mute");
   if (muteBtn) muteBtn.addEventListener("click", () => {
     if (!media.localStream) return;
-    media.muted = !media.muted;
+    mediaState.set("muted", !media.muted);
     media.localStream.getAudioTracks().forEach((t) => { t.enabled = !media.muted; });
     syncMuteCameraButtons();
   });
   const cameraBtn = $$("#btn-call-camera");
   if (cameraBtn) cameraBtn.addEventListener("click", () => {
     if (!media.localStream) return;
-    media.cameraOff = !media.cameraOff;
+    mediaState.set("cameraOff", !media.cameraOff);
     media.localStream.getVideoTracks().forEach((t) => { t.enabled = !media.cameraOff; });
     syncMuteCameraButtons();
   });
@@ -126,7 +132,7 @@
       });
       hideActiveSurface();
       stopAllMedia();
-      callUI.activeCallId = null;
+      callState.set("activeCallId", null);
     }
     hideSasPane();
   });

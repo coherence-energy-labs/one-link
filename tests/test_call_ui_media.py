@@ -142,7 +142,7 @@ def test_firefox_mdns_call_candidates_gain_scoped_local_numeric_routes(
     assert "function _callCandidateLinesForSignal" in index_html
     setup_at = index_html.index("function setupRtcPeerConnection")
     setup = index_html[setup_at : setup_at + 10_000]
-    assert "media.localCandidateAddresses = _callLocalAddressesFromIceConfig(cfg)" in setup
+    assert 'mediaState.set("localCandidateAddresses", _callLocalAddressesFromIceConfig(cfg))' in setup
     assert "_callCandidateLinesForSignal(" in setup
     assert "_queueCallIcePayloads(candidateLines.map((candidate)" in setup
     assert "_queueCallIcePayloads([{" in setup
@@ -150,7 +150,7 @@ def test_firefox_mdns_call_candidates_gain_scoped_local_numeric_routes(
     assert 'reportCallEvent("ice_local_numeric_candidate"' in setup
     refresh_at = index_html.index("async function refreshIceConfigForCall")
     refresh = index_html[refresh_at : refresh_at + 3200]
-    assert "media.localCandidateAddresses = _callLocalAddressesFromIceConfig(cfg)" in refresh
+    assert 'mediaState.set("localCandidateAddresses", _callLocalAddressesFromIceConfig(cfg))' in refresh
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
@@ -281,7 +281,7 @@ def test_media_watchdog_restarts_stuck_negotiation(index_html: str) -> None:
     idx = index_html.find("async function ensureMediaNegotiation")
     snippet = index_html[idx : idx + 1400]
     assert "ensureLocalTracksOnPeerConnection()" in snippet
-    assert "callUI.localMediaReady = true" in snippet
+    assert 'callState.set("localMediaReady", true)' in snippet
     assert "media.pc.localDescription" in snippet
     assert "media.pc.signalingState" in snippet
     assert "sendLocalSdpOffer" in snippet
@@ -527,8 +527,8 @@ def test_call_captions_require_on_device_recognition_and_roll_back_state(
     assert "SpeechRecognition.available" in snippet
     assert "processLocally: true" in snippet
     assert 'quality: "conversation"' in snippet
-    assert "media.captionRecognizer = null;" in snippet
-    assert "media.captionsStarting = false;" in snippet
+    assert 'mediaState.set("captionRecognizer", null);' in snippet
+    assert 'mediaState.set("captionsStarting", false);' in snippet
     assert "_setCaptionsEnabled(false);" in snippet
     assert "No call audio was sent to a cloud recognizer" in snippet
     assert "One Link never falls back to a vendor cloud recognizer" in index_html
@@ -685,7 +685,7 @@ def test_backend_recommendation_executor_controls_media_repairs(index_html: str)
         assert action in snippet
     assert "reviveRemotePlayback" in snippet
     assert "tuneOutboundMediaForTau" in snippet
-    assert "media.preferRelayNext = true" in snippet
+    assert 'mediaState.set("preferRelayNext", true)' in snippet
     assert "media.pc.restartIce" in snippet
     assert "sendLocalSdpOffer" in snippet
     assert 'repairMediaPath("backend_renegotiate")' in snippet
@@ -771,7 +771,7 @@ def test_backend_recovery_intent_drives_repair_actions(index_html: str) -> None:
     assert "recovery_intent_seen" in index_html
     assert "recovery_intent_applied" in index_html
     assert "recovery_intent_failed" in index_html
-    assert "media.preferRelayNext = true" in snippet
+    assert 'mediaState.set("preferRelayNext", true)' in snippet
     assert "applyBackendPathRecommendation" in snippet
     assert "backendActionAllowed(`intent_${action}`" in snippet
     metrics_idx = index_html.find("async function reportCallMetricsOnce")

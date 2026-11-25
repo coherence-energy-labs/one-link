@@ -1,5 +1,9 @@
   // ── chat send + receive ────────────────────────────────────────────
 
+  // Inbound rate window per peer fingerprint (MSG_RATE_MAX_PER_PEER new
+  // messages per MSG_RATE_WINDOW_MS). Owned by the receive path below.
+  const _messageRateByPeer = new Map();
+
   async function sendChatMessage(body) {
     const p = state.pairing;
     const binding = _activeChatBinding(p, true);

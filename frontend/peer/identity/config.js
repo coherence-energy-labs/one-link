@@ -37,7 +37,6 @@
   const ED25519_WASM_ABI_VERSION = 1;
   const ED25519_WASM_MAX_BYTES = 256 * 1024;
   const ED25519_WASM_MAX_MESSAGE_BYTES = 1024 * 1024;
-  let _ed25519WasmPromise = null;
 
   class IdentityStorageError extends Error {
     constructor(message, cause) {

@@ -35,7 +35,7 @@ def test_self_mesh_ui_fetches_and_listens_for_daemon_events():
     assert 'selfMeshPerformance() { return this.get("/api/self-mesh/performance"); }' in src
     assert 'selfMeshAllowedRoots(body) { return this.post("/api/self-mesh/allowed-roots", body); }' in src
     assert 'm.type === "self_mesh_changed"' in src
-    assert "state.selfMesh = await api.selfMesh()" in src
+    assert "identityStore.replaceSelfMesh(await api.selfMesh())" in src
     assert "mesh.timeline" in src
     assert "performance_observations" in src
     assert "performance_budgets" in src

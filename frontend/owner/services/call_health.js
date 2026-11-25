@@ -1,6 +1,7 @@
 // Isolated service: dependencies are explicit parameters; no owner closure access.
 function createCallHealth({
   callUI,
+  callState,
   media,
   setReconnectState,
   updateCallQuality,
@@ -38,21 +39,21 @@ function createCallHealth({
 
   function applyCallQualityHysteresis(rawLevel, label) {
     if (rawLevel === "connecting") {
-      callUI.qualityGoodTicks = 0;
+      callState.set("qualityGoodTicks", 0);
       setReconnectState(false);
       updateCallQuality("connecting", label || "Connecting media");
       return;
     }
     // doctrine-ok: §3.2.a internal state name; user copy says repair/recover.
     if (rawLevel === "reconnecting" || rawLevel === "bad") {
-      callUI.qualityBadTicks += 1;
-      callUI.qualityGoodTicks = 0;
+      callState.increment("qualityBadTicks");
+      callState.set("qualityGoodTicks", 0);
     } else if (rawLevel === "good") {
-      callUI.qualityGoodTicks += 1;
-      callUI.qualityBadTicks = Math.max(0, callUI.qualityBadTicks - 1);
+      callState.increment("qualityGoodTicks");
+      callState.set("qualityBadTicks", Math.max(0, callUI.qualityBadTicks - 1));
     } else {
-      callUI.qualityGoodTicks = 0;
-      callUI.qualityBadTicks = Math.max(0, callUI.qualityBadTicks - 1);
+      callState.set("qualityGoodTicks", 0);
+      callState.set("qualityBadTicks", Math.max(0, callUI.qualityBadTicks - 1));
     }
     const showProblem = callUI.qualityBadTicks >= 3;
     const clearProblem = callUI.qualityGoodTicks >= 2;
@@ -215,7 +216,7 @@ function createCallHealth({
     const jitter = Number(metrics.jitter_ms || 0);
     const bandwidthKbps = Number(metrics.bandwidth_estimate_kbps || 0);
     if (bandwidthKbps > 0) {
-      callUI.tauBandwidthEwmaKbps = ewmaNullable(callUI.tauBandwidthEwmaKbps, bandwidthKbps, 0.22);
+      callState.set("tauBandwidthEwmaKbps", ewmaNullable(callUI.tauBandwidthEwmaKbps, bandwidthKbps, 0.22));
     }
     const smoothedBandwidthKbps = Number(callUI.tauBandwidthEwmaKbps || bandwidthKbps || 0);
     const expectedKbps = profile ? Math.max(1, Number(profile.maxBitrate || 0) / 1000) : 850;
@@ -252,16 +253,16 @@ function createCallHealth({
       (0.08 * icePenalty) +
       routePenalty
     );
-    callUI.tauRiskEwma = ewmaNullable(
+    callState.set("tauRiskEwma", ewmaNullable(
       callUI.tauRiskEwma,
       rawRisk,
       rawRisk > Number(callUI.tauRiskEwma || 0) ? 0.38 : 0.16,
-    );
+    ));
     const risk = clampUnit(callUI.tauRiskEwma);
     const coherence = clampUnit(1 - risk);
-    callUI.tauCoherenceEwma = ewmaNullable(callUI.tauCoherenceEwma, coherence, 0.2);
+    callState.set("tauCoherenceEwma", ewmaNullable(callUI.tauCoherenceEwma, coherence, 0.2));
     const surprise = -Math.log(Math.max(0.01, Number(callUI.tauCoherenceEwma || coherence || 0.01)));
-    callUI.tauSurpriseEwma = ewmaNullable(callUI.tauSurpriseEwma, surprise, 0.2);
+    callState.set("tauSurpriseEwma", ewmaNullable(callUI.tauSurpriseEwma, surprise, 0.2));
     return {
       rawRisk,
       risk,
@@ -290,20 +291,20 @@ function createCallHealth({
     const cautious = score.risk >= 0.30 || score.jitterPressure >= 0.46;
     const excellent = score.risk <= 0.14 && score.coherence >= 0.82 && !score.remoteWaiting && score.icePenalty === 0;
     if (critical) {
-      callUI.tauPressureTicks += 2;
-      callUI.tauStableTicks = 0;
+      callState.increment("tauPressureTicks", 2);
+      callState.set("tauStableTicks", 0);
     } else if (pressured) {
-      callUI.tauPressureTicks += 1;
-      callUI.tauStableTicks = 0;
+      callState.increment("tauPressureTicks");
+      callState.set("tauStableTicks", 0);
     } else if (excellent) {
-      callUI.tauStableTicks += 1;
-      callUI.tauPressureTicks = Math.max(0, callUI.tauPressureTicks - 1);
+      callState.increment("tauStableTicks");
+      callState.set("tauPressureTicks", Math.max(0, callUI.tauPressureTicks - 1));
     } else if (cautious) {
-      callUI.tauPressureTicks = Math.max(1, callUI.tauPressureTicks);
-      callUI.tauStableTicks = 0;
+      callState.set("tauPressureTicks", Math.max(1, callUI.tauPressureTicks));
+      callState.set("tauStableTicks", 0);
     } else {
-      callUI.tauPressureTicks = Math.max(0, callUI.tauPressureTicks - 1);
-      callUI.tauStableTicks = Math.max(0, callUI.tauStableTicks - 1);
+      callState.set("tauPressureTicks", Math.max(0, callUI.tauPressureTicks - 1));
+      callState.set("tauStableTicks", Math.max(0, callUI.tauStableTicks - 1));
     }
     if (critical && callUI.tauPressureTicks >= 2) targetLevel = 3;
     else if (pressured && callUI.tauPressureTicks >= 2) targetLevel = Math.max(currentLevel, Math.min(2, currentLevel + 1));
@@ -324,15 +325,14 @@ function createCallHealth({
   async function tuneOutboundMediaForTau(metrics) {
     if (!media.pc || !media.pc.getSenders) return;
     const decision = chooseTauVideoLevel(metrics);
-    callUI.tauLastDecision = decision;
+    callState.set("tauLastDecision", decision);
     // doctrine-ok: §3.2.a internal state name; no user-facing reconnect prompt.
     const cooldownMs = decision.targetLevel > decision.currentLevel ? 2800 : 9000;
     const now = Date.now();
     if (now - Number(callUI.lastTauAdaptMs || 0) < cooldownMs) return;
     const targetLevel = decision.targetLevel;
     if (targetLevel === callUI.adaptationLevel) return;
-    callUI.adaptationLevel = targetLevel;
-    callUI.lastTauAdaptMs = now;
+    callState.update({ adaptationLevel: targetLevel, lastTauAdaptMs: now });
     const caps = targetMediaProfile(targetLevel);
     await applyCaptureProfileForTau(targetLevel, decision.reason);
     for (const sender of media.pc.getSenders()) {

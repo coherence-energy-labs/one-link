@@ -986,16 +986,133 @@ function createPeerEncoding({
 
   return { bytesToHex, bytesToB64Url, b64UrlToBytes };
 }
+// peer-ui module: services/state_publisher.js
+// Isolated service: dependencies are explicit parameters; no owner closure access.
+//
+// A feature state owner keeps its fields private and changes them only
+// through its own functions. The page still reads that state through the
+// shared namespace (`state.transfers`, `state.messages`, ...), so this
+// publisher installs a read-only accessor per field. Assigning one throws a
+// TypeError that names the owner: a missed migration fails loudly instead of
+// silently forking the owner's copy. A field is published once, by one owner.
+function createStatePublisher(target, label = "state") {
+  if (!target || typeof target !== "object") throw new TypeError(`${label} must be an object`);
+  const ownerOf = new Map();
+  function publish(owner, readers) {
+    if (typeof owner !== "string" || !owner) throw new TypeError("a published field needs a named owner");
+    for (const [field, read] of Object.entries(readers)) {
+      if (typeof read !== "function") throw new TypeError(`${label}.${field} needs a reader function`);
+      if (ownerOf.has(field) || Object.prototype.hasOwnProperty.call(target, field)) {
+        throw new TypeError(`${label}.${field} already has an owner (${ownerOf.get(field) || "a plain field"})`);
+      }
+      ownerOf.set(field, owner);
+      Object.defineProperty(target, field, {
+        enumerable: true,
+        configurable: false,
+        get: read,
+        set() {
+          throw new TypeError(`${label}.${field} is owned by ${owner}; change it through ${owner}`);
+        },
+      });
+    }
+  }
+  return Object.freeze({
+    publish,
+    ownerOf: (field) => ownerOf.get(field) || null,
+    fields: () => [...ownerOf.keys()],
+  });
+}
+// peer-ui module: services/identity.js
+// Isolated service: collaborators cross the factory parameter boundary.
+//
+// Owner of the peer page's identity session. The unwrapped identity record
+// lives only in memory after unlock; the passphrase is never kept. Fields
+// (read through `state.<name>`):
+//   rec                         unlocked identity record, or null
+//   envelope                    the wrapped envelope committed on disk
+//   pending_rec / pending_authority
+//                               a fresh or legacy identity awaiting its
+//                               first encrypted commit, and the storage
+//                               authority it must replace
+//   boot_error_msg              why boot stopped (absent until it does)
+//   post_identity_flow_started  the post-unlock flow runs once per page
+function createPeerIdentity() {
+  let rec = null;
+  let envelope = null;
+  let pendingRec = null;
+  let pendingAuthority = null;
+  let bootError;
+  let postIdentityFlowStarted = false;
+
+  // Protection required: the record is held aside, not usable, until its
+  // encrypted commit replaces `authority` (null for a fresh identity).
+  function stagePending(record, authority) {
+    rec = null;
+    envelope = null;
+    pendingRec = record;
+    pendingAuthority = authority;
+  }
+
+  // The authenticated private identity is available.
+  function unlock(record, committedEnvelope) {
+    rec = record;
+    envelope = committedEnvelope;
+    pendingRec = null;
+    pendingAuthority = null;
+  }
+
+  // A wrapped envelope was found on disk, or a rotation committed.
+  function setEnvelope(next) {
+    envelope = next;
+  }
+
+  function failBoot(message) {
+    bootError = message;
+  }
+
+  // Returns true exactly once, and only with an unlocked identity.
+  function beginPostIdentityFlow() {
+    if (!rec || postIdentityFlowStarted) return false;
+    postIdentityFlowStarted = true;
+    return true;
+  }
+
+  // Lifecycle: forget the in-memory identity (sign-out, reset). The disk
+  // authority is the identity feature's concern, not this owner's.
+  function reset() {
+    rec = null;
+    envelope = null;
+    pendingRec = null;
+    pendingAuthority = null;
+    bootError = undefined;
+    postIdentityFlowStarted = false;
+  }
+
+  return Object.freeze({
+    rec: () => rec,
+    envelope: () => envelope,
+    pendingRec: () => pendingRec,
+    pendingAuthority: () => pendingAuthority,
+    bootError: () => bootError,
+    postIdentityFlowStarted: () => postIdentityFlowStarted,
+    stagePending,
+    unlock,
+    setEnvelope,
+    failBoot,
+    beginPostIdentityFlow,
+    reset,
+  });
+}
 // peer-ui module: services/state.js
 // Isolated service: collaborators cross the factory parameter boundary.
+//
+// The peer page's shared read namespace. Identity session fields belong to
+// createPeerIdentity() and daemon transport fields to createDaemonLink();
+// both are published here read-only. The remaining shared fields
+// (pairing session, daemon chat selection, diagnostics) are added by the
+// features that use them.
 function createPeerState() {
-  const state = {
-    rec: null,
-    envelope: null,
-    pending_rec: null,
-    pending_authority: null,
-    post_identity_flow_started: false,
-  };
+  const state = {};
 
   return state;
 }
@@ -1115,6 +1232,239 @@ function createPeerProgress({
 
   return { _pairingProgress };
 }
+// peer-ui module: services/daemon_link.js
+// Isolated service: collaborators cross the factory parameter boundary.
+//
+// Owner of the peer page's transport state toward the daemon: the one
+// authenticated DataChannel, the daemon fingerprint it was opened for, the
+// in-flight requests keyed by rid, and the browser identity-possession
+// handshake on that channel. Request/response correlation is scoped to one
+// channel: replacing or closing the channel rejects every request that was
+// in flight on it, and a stale channel can never settle the current one's
+// handshake. Fields (read through `state.<name>`): daemon_dc,
+// daemon_dc_fingerprint, daemon_pending, daemon_identity_ready,
+// daemon_identity_context.
+function createDaemonLink({ clearTimeout }) {
+  if (typeof clearTimeout !== "function") throw new TypeError("createDaemonLink needs clearTimeout");
+  let dc = null;
+  let fingerprint = null;
+  const pending = new Map(); // rid -> { resolve, reject, timer }
+  let identityReady = null;  // { dc, promise, resolve, reject, settled, verified }
+  let identityContext = null; // { dc, challenge }
+
+  function rejectAllPending(message) {
+    for (const [, entry] of pending) {
+      clearTimeout(entry.timer);
+      entry.reject(new Error(message));
+    }
+    pending.clear();
+  }
+
+  // Settle the handshake with a rejection, if it belongs to `channel` and
+  // has not settled yet. Returns whether it did.
+  function failIdentity(channel, error) {
+    const ready = identityReady;
+    if (!ready || ready.dc !== channel || ready.settled) return false;
+    ready.settled = true;
+    ready.reject(error instanceof Error ? error : new Error(String(error)));
+    return true;
+  }
+
+  // Make `channel` the daemon transport. A different previous channel's
+  // requests and unsettled handshake are rejected with `replacedMessage`.
+  // Returns the previous channel (the caller closes it) and the new
+  // handshake promise.
+  function attach(channel, daemonFingerprint, replacedMessage) {
+    const previous = dc;
+    if (previous && previous !== channel) {
+      rejectAllPending(replacedMessage);
+      failIdentity(previous, new Error(replacedMessage));
+    }
+    dc = channel;
+    fingerprint = daemonFingerprint;
+    identityContext = null;
+    let resolveIdentity;
+    let rejectIdentity;
+    const promise = new Promise((resolve, reject) => {
+      resolveIdentity = resolve;
+      rejectIdentity = reject;
+    });
+    identityReady = {
+      dc: channel,
+      promise,
+      resolve: resolveIdentity,
+      reject: rejectIdentity,
+      settled: false,
+      verified: false,
+    };
+    return { previous, identityPromise: promise };
+  }
+
+  // `channel` closed. A close from an older channel after a newer one took
+  // over owns no current state: returns null and changes nothing.
+  // Otherwise settles the handshake, clears the channel, rejects every
+  // in-flight request with `closedMessage`, and reports whether the
+  // channel had been verified (the caller may reconnect).
+  function detach(channel, handshakeMessage, closedMessage) {
+    if (dc !== channel) return null;
+    const ready = identityReady;
+    const wasVerified = Boolean(ready && ready.dc === channel && ready.verified);
+    failIdentity(channel, new Error(handshakeMessage));
+    dc = null;
+    fingerprint = null;
+    identityContext = null;
+    rejectAllPending(closedMessage);
+    return { wasVerified };
+  }
+
+  // The challenge this browser signed on `channel`.
+  function setIdentityContext(channel, challenge) {
+    identityContext = { dc: channel, challenge };
+  }
+
+  // The daemon verified possession on `channel`. Returns whether the
+  // handshake was open and is now resolved.
+  function verifyIdentity(channel, result) {
+    const ready = identityReady;
+    if (!ready || ready.dc !== channel || ready.settled) return false;
+    ready.settled = true;
+    ready.verified = true;
+    ready.resolve(result);
+    return true;
+  }
+
+  function addPending(rid, entry) {
+    pending.set(rid, entry);
+  }
+
+  // Remove and return the request waiting on `rid`, or null.
+  function takePending(rid) {
+    if (!pending.has(rid)) return null;
+    const entry = pending.get(rid);
+    pending.delete(rid);
+    return entry;
+  }
+
+  function dropPending(rid) {
+    return pending.delete(rid);
+  }
+
+  // Lifecycle: release every request timer and settle every waiter.
+  function dispose(message = "daemon link disposed") {
+    rejectAllPending(message);
+    if (dc) failIdentity(dc, new Error(message));
+    dc = null;
+    fingerprint = null;
+    identityContext = null;
+  }
+
+  return Object.freeze({
+    dc: () => dc,
+    fingerprint: () => fingerprint,
+    pending: () => pending,
+    identityReady: () => identityReady,
+    identityContext: () => identityContext,
+    attach,
+    detach,
+    failIdentity,
+    setIdentityContext,
+    verifyIdentity,
+    addPending,
+    takePending,
+    dropPending,
+    rejectAllPending,
+    dispose,
+  });
+}
+// peer-ui module: services/daemon_conversation.js
+// Isolated service: collaborators cross the factory parameter boundary.
+//
+// Owner of the peer page's daemon-chat view state: which conversation is
+// open (a peer or a group, never both), the message selected as the reply
+// target, and the roster rows the global search filters. Fields (read
+// through `state.<name>`): daemon_active_peer, daemon_active_group,
+// daemon_reply_to, daemon_roster_peers, daemon_roster_groups.
+function createDaemonConversation() {
+  let activePeer = null;
+  let activeGroup = null;
+  let replyTo = null;
+  let rosterPeers;   // absent until the first roster fetch
+  let rosterGroups;
+
+  function openPeer(peer) {
+    activePeer = peer;
+    activeGroup = null;
+  }
+
+  function openGroup(group) {
+    activePeer = null;
+    activeGroup = group;
+  }
+
+  // Back to the roster.
+  function close() {
+    activePeer = null;
+    activeGroup = null;
+  }
+
+  // The open group was left; any open peer chat is untouched.
+  function leaveGroup() {
+    activeGroup = null;
+  }
+
+  // A bounded preview of the message being replied to.
+  function setReplyTo(message) {
+    replyTo = {
+      id: String(message.id || ""),
+      body: String(message.body || message.file?.name || "(message)").slice(0, 160),
+    };
+    return replyTo;
+  }
+
+  function clearReplyTo() {
+    replyTo = null;
+  }
+
+  // The daemon confirmed a change to a peer record the chat opened (the
+  // same record object the roster lists), e.g. its alias or mute flag.
+  function updatePeer(peer, changes) {
+    if (!peer || typeof peer !== "object") throw new TypeError("updatePeer needs a peer record");
+    Object.assign(peer, changes);
+    return peer;
+  }
+
+  // The roster keeps its own copies; callers' arrays stay theirs.
+  function replaceRoster(peers, groups) {
+    rosterPeers = peers.slice();
+    rosterGroups = groups.slice();
+  }
+
+  // Lifecycle: no conversation, no reply, no roster.
+  function reset() {
+    activePeer = null;
+    activeGroup = null;
+    replyTo = null;
+    rosterPeers = undefined;
+    rosterGroups = undefined;
+  }
+
+  return Object.freeze({
+    activePeer: () => activePeer,
+    activeGroup: () => activeGroup,
+    replyTo: () => replyTo,
+    rosterPeers: () => rosterPeers,
+    rosterGroups: () => rosterGroups,
+    openPeer,
+    openGroup,
+    close,
+    leaveGroup,
+    setReplyTo,
+    clearReplyTo,
+    updatePeer,
+    replaceRoster,
+    reset,
+  });
+}
 (() => {
 // peer-ui module: ui/dom.js
   "use strict";
@@ -1192,7 +1542,6 @@ function createPeerProgress({
   const ED25519_WASM_ABI_VERSION = 1;
   const ED25519_WASM_MAX_BYTES = 256 * 1024;
   const ED25519_WASM_MAX_MESSAGE_BYTES = 1024 * 1024;
-  let _ed25519WasmPromise = null;
 
   class IdentityStorageError extends Error {
     constructor(message, cause) {
@@ -1222,6 +1571,9 @@ function createPeerProgress({
     return error.name === "OperationError" &&
       /^the operation is not supported\.?$/i.test(String(error.message || ""));
   }
+
+  // The one pinned WASM instantiation per page; owned by its only loader.
+  let _ed25519WasmPromise = null;
 
   async function _loadEd25519Wasm() {
     if (_ed25519WasmPromise) return _ed25519WasmPromise;
@@ -2578,6 +2930,19 @@ function createPeerProgress({
   // passphrase we need the user to re-enter the old one (proves
   // possession), or to re-wrap from the in-memory `state.rec`.
   const state = createPeerState();
+  // Feature state owners (MNT-03): identity here, daemon transport in
+  // daemon_chat/authority.js. `state.<field>` stays the read path; writing a
+  // published field throws and names its owner.
+  const stateOwners = createStatePublisher(state);
+  const peerIdentity = createPeerIdentity();
+  stateOwners.publish("peerIdentity", {
+    rec: peerIdentity.rec,
+    envelope: peerIdentity.envelope,
+    pending_rec: peerIdentity.pendingRec,
+    pending_authority: peerIdentity.pendingAuthority,
+    boot_error_msg: peerIdentity.bootError,
+    post_identity_flow_started: peerIdentity.postIdentityFlowStarted,
+  });
 
 // peer-ui module: identity/presentation.js
   function _renderIdentityCard(rec) {
@@ -2596,10 +2961,7 @@ function createPeerProgress({
   }
 
   function _showIdentitySetupGate(rec, currentAuthority) {
-    state.rec = null;
-    state.envelope = null;
-    state.pending_rec = rec;
-    state.pending_authority = currentAuthority;
+    peerIdentity.stagePending(rec, currentAuthority);
     hide($("#unlock-card"));
     hide($("#actions-card"));
     show($("#identity-setup-card"));
@@ -2627,10 +2989,7 @@ function createPeerProgress({
   }
 
   function _markIdentityReady(rec, envelope) {
-    state.rec = rec;
-    state.envelope = envelope;
-    state.pending_rec = null;
-    state.pending_authority = null;
+    peerIdentity.unlock(rec, envelope);
     hide($("#identity-setup-card"));
     hide($("#unlock-card"));
     _renderIdentityCard(rec);
@@ -2697,7 +3056,7 @@ function createPeerProgress({
 
   function _showIdentityStorageFailure(error) {
     const message = error && error.message ? error.message : String(error);
-    state.boot_error_msg = `identity storage blocked: ${message}`;
+    peerIdentity.failBoot(`identity storage blocked: ${message}`);
     setPill("bad", "identity blocked");
     setDiag(`${_identityStorageLabel()} blocked: ${message}`);
     text(
@@ -2733,7 +3092,7 @@ function createPeerProgress({
     // many phones land here with crypto.subtle present but
     // restricted, and "no web crypto" is misleading in that case.
     if (!window.isSecureContext) {
-      state.boot_error_msg = "page loaded over plain HTTP; Web Crypto needs HTTPS";
+      peerIdentity.failBoot("page loaded over plain HTTP; Web Crypto needs HTTPS");
       setPill("bad", "needs https");
       text($("#ident-status"),
         "This page needs to load over https://, not http://. " +
@@ -2742,7 +3101,7 @@ function createPeerProgress({
       return;
     }
     if (!window.crypto || !crypto.subtle) {
-      state.boot_error_msg = "Web Crypto not exposed";
+      peerIdentity.failBoot("Web Crypto not exposed");
       setPill("bad", "browser too old");
       text($("#ident-status"),
         "Your browser is too old to run One Link safely. " +
@@ -2752,7 +3111,7 @@ function createPeerProgress({
     }
     if ((!navigator.storage || !navigator.storage.getDirectory) &&
         typeof indexedDB === "undefined") {
-      state.boot_error_msg = "origin-private storage not exposed";
+      peerIdentity.failBoot("origin-private storage not exposed");
       setPill("bad", "browser too old");
       text($("#ident-status"),
         "Your browser doesn't support the origin-private storage One Link " +
@@ -2775,7 +3134,7 @@ function createPeerProgress({
     // authenticated private identity is available. Legacy PBKDF2 migrates
     // before this state can become ready.
     if (isWrappedEnvelope(onDisk)) {
-      state.envelope = onDisk;
+      peerIdentity.setEnvelope(onDisk);
       await _showUnlockGate(onDisk);
       return;
     }
@@ -2952,7 +3311,7 @@ function createPeerProgress({
     }
     try {
       const committed = await _replaceIdentityAuthority(expected, replacement);
-      state.envelope = committed;
+      peerIdentity.setEnvelope(committed);
     } catch (e) {
       alert(`Couldn't persist wrapped identity: ${e && e.message ? e.message : e}`);
       return;
@@ -5224,7 +5583,6 @@ function createPeerProgress({
   const MSG_RATE_WINDOW_MS = 60 * 1000;
   const MSG_RATE_MAX_PER_PEER = 240;
   const MSG_FUTURE_SKEW_MS = 5 * 60 * 1000;
-  const _messageRateByPeer = new Map();
 
   function _newMessageId() {
     if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
@@ -6148,6 +6506,10 @@ function createPeerProgress({
 
 // peer-ui module: messages/delivery.js
   // ── chat send + receive ────────────────────────────────────────────
+
+  // Inbound rate window per peer fingerprint (MSG_RATE_MAX_PER_PEER new
+  // messages per MSG_RATE_WINDOW_MS). Owned by the receive path below.
+  const _messageRateByPeer = new Map();
 
   async function sendChatMessage(body) {
     const p = state.pairing;
@@ -7089,6 +7451,13 @@ function createPeerProgress({
     // The deadline can reject while setup is still awaiting a browser API.
     // Attach a handler now; the original promise still rejects to the caller.
     void flowDone.catch(() => {});
+    // RUN-01: a browser can hold a WebRTC/crypto/fetch call for minutes (a
+    // stalled Firefox parent process held createOffer() from 2 s to 756 s).
+    // Every held step therefore races the flow itself: the deadline or a
+    // cancel rejects the caller's promise at once, and each await below
+    // re-checks `flowSettled` so a late browser result can neither rewrite
+    // the settled status nor start signaling.
+    const step = (promise) => Promise.race([promise, flowDone]);
     const cleanup = () => {
       if (pairingTimer) clearTimeout(pairingTimer);
       if (cancelPairing) {
@@ -7132,7 +7501,7 @@ function createPeerProgress({
     try {
       try {
         mark("ice_config");
-        const iceConfig = await loadPublicIceConfig();
+        const iceConfig = await step(loadPublicIceConfig());
         if (flowSettled) return flowDone;
         const iceServers = iceConfig.iceServers;
         localCandidateAddresses = iceConfig.localCandidateAddresses;
@@ -7142,6 +7511,7 @@ function createPeerProgress({
           rtcpMuxPolicy: "require",
         });
       } catch (e) {
+        if (flowSettled) return flowDone;
         _autopairSetState(
           "bad", "no webrtc",
           `WebRTC unavailable: ${e && e.message ? e.message : e}. Try a current ` +
@@ -7187,6 +7557,9 @@ function createPeerProgress({
           ]);
           if (flowSettled) return;
         } catch (error) {
+          // A channel the settled flow closed rejects its proof too; that is
+          // not a second, different failure.
+          if (flowSettled) return;
           _autopairSetState(
             "bad", "identity rejected",
             `The laptop did not accept this device identity: ${
@@ -7243,6 +7616,7 @@ function createPeerProgress({
 
       controlDc.onopen = () => {
         void finalize().catch((error) => {
+          if (flowSettled) return;
           _autopairSetState("bad", "identity failed", "Device identity verification could not finish.");
           failFlow(error);
         });
@@ -7274,9 +7648,12 @@ function createPeerProgress({
       let offer;
       try {
         mark("creating_offer", pc, controlDc);
-        offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
+        offer = await step(pc.createOffer());
+        if (flowSettled) return flowDone;
+        await step(pc.setLocalDescription(offer));
+        if (flowSettled) return flowDone;
       } catch (e) {
+        if (flowSettled) return flowDone;
         _autopairSetState(
           "bad", "offer failed",
           `Couldn't build offer: ${e && e.message ? e.message : e}`,
@@ -7289,7 +7666,7 @@ function createPeerProgress({
       // complete SDP, but retain already-gathered host candidates if an optional
       // STUN server is unresponsive so same-network pairing still works.
       mark("gathering_ice", pc, controlDc);
-      const iceComplete = await _waitForIceGatheringComplete(pc);
+      const iceComplete = await step(_waitForIceGatheringComplete(pc));
       if (flowSettled) return flowDone;
       if (!iceComplete) {
         _autopairSetState(
@@ -7315,11 +7692,12 @@ function createPeerProgress({
       try {
         mark("signing_offer", pc, controlDc);
         const enc = new TextEncoder();
-        sig = await _signEd25519(
+        sig = await step(_signEd25519(
           rec.private_key_jwk,
           enc.encode(_canonicalJson(offerEnvelope)),
-        );
+        ));
       } catch (e) {
+        if (flowSettled) return flowDone;
         _autopairSetState(
           "bad", "sign failed",
           `Couldn't sign offer: ${e && e.message ? e.message : e}`,
@@ -7356,7 +7734,7 @@ function createPeerProgress({
         }
       };
       ws.onerror = () => {
-        if (!dataChannelOpened) {
+        if (!dataChannelOpened && !flowSettled) {
           _autopairSetState(
             "bad", "ws error",
             "Signaling WebSocket failed. Check the laptop is reachable.",
@@ -7380,11 +7758,13 @@ function createPeerProgress({
             await pc.setRemoteDescription(
               new RTCSessionDescription({ sdp: msg.sdp, type: "answer" }),
             );
+            if (flowSettled) return;
             // Stash the daemon's pubkey for the OPFS save above.
             state._pendingDaemonPubkey = msg.daemon_pubkey_b64u || "";
             // Once setRemoteDescription resolves, ICE proceeds and
             // the DataChannel will fire onopen automatically.
           } catch (e) {
+            if (flowSettled) return;
             _autopairSetState(
               "bad", "answer failed",
               `Couldn't apply answer: ${e && e.message ? e.message : e}`,
@@ -7401,6 +7781,9 @@ function createPeerProgress({
       };
       return flowDone;
     } catch (error) {
+      // A step that lost its race to the deadline or a cancel lands here
+      // after the flow already reported why it stopped.
+      if (flowSettled) return flowDone;
       _autopairSetState(
         "bad", "pairing failed",
         `Pairing could not continue: ${error && error.message ? error.message : error}`,
@@ -7434,14 +7817,26 @@ function createPeerProgress({
   // browsers; v0.20.2's daemon-roster lives on the v0.20.0 daemon
   // control DataChannel. They never collide.
 
-  state.daemon_dc = null;
-  state.daemon_dc_fingerprint = null;
-  state.daemon_pending = new Map();   // rid → {resolve, reject, timer}
-  state.daemon_active_peer = null;     // currently-selected peer in the chat view
-  state.daemon_reply_to = null;        // {id, body} selected in phone chat
-  state.daemon_active_group = null;    // currently-selected group in the chat view
-  state.daemon_identity_ready = null;
-  state.daemon_identity_context = null;
+  // daemonLink owns the channel, its fingerprint, the in-flight requests
+  // (rid → {resolve, reject, timer}) and the identity-possession handshake.
+  const daemonLink = createDaemonLink({ clearTimeout: (id) => clearTimeout(id) });
+  stateOwners.publish("daemonLink", {
+    daemon_dc: daemonLink.dc,
+    daemon_dc_fingerprint: daemonLink.fingerprint,
+    daemon_pending: daemonLink.pending,
+    daemon_identity_ready: daemonLink.identityReady,
+    daemon_identity_context: daemonLink.identityContext,
+  });
+  // daemonConversation owns the open peer/group chat, the {id, body} reply
+  // target and the roster rows.
+  const daemonConversation = createDaemonConversation();
+  stateOwners.publish("daemonConversation", {
+    daemon_active_peer: daemonConversation.activePeer,
+    daemon_reply_to: daemonConversation.replyTo,
+    daemon_active_group: daemonConversation.activeGroup,
+    daemon_roster_peers: daemonConversation.rosterPeers,
+    daemon_roster_groups: daemonConversation.rosterGroups,
+  });
 
   const DAEMON_REQUEST_TIMEOUT_MS = 10_000;
   const BROWSER_IDENTITY_POSSESSION_SCHEMA =
@@ -7463,64 +7858,24 @@ function createPeerProgress({
   }
 
   function _registerDaemonDc(dc, daemonFingerprint) {
-    const previousDc = state.daemon_dc;
-    if (previousDc && previousDc !== dc) {
-      // Request/response correlation is scoped to one authenticated channel.
-      // A delayed reply from the replaced SCTP association must never settle
-      // a request issued on the replacement association.
-      for (const [, pending] of state.daemon_pending) {
-        clearTimeout(pending.timer);
-        pending.reject(new Error("daemon channel replaced"));
-      }
-      state.daemon_pending.clear();
-      const previousIdentityReady = state.daemon_identity_ready;
-      if (
-        previousIdentityReady &&
-        previousIdentityReady.dc === previousDc &&
-        !previousIdentityReady.settled
-      ) {
-        previousIdentityReady.settled = true;
-        previousIdentityReady.reject(new Error("daemon channel replaced"));
-      }
-    }
-    state.daemon_dc = dc;
-    state.daemon_dc_fingerprint = daemonFingerprint;
-    state.daemon_identity_context = null;
-    let resolveIdentity, rejectIdentity;
-    const identityPromise = new Promise((resolve, reject) => {
-      resolveIdentity = resolve;
-      rejectIdentity = reject;
-    });
-    state.daemon_identity_ready = {
-      dc,
-      promise: identityPromise,
-      resolve: resolveIdentity,
-      reject: rejectIdentity,
-      settled: false,
-      verified: false,
-    };
+    // Request/response correlation is scoped to one authenticated channel.
+    // A delayed reply from the replaced SCTP association must never settle
+    // a request issued on the replacement association: daemonLink rejects
+    // the replaced channel's requests and unsettled handshake.
+    const { previous: previousDc, identityPromise } =
+      daemonLink.attach(dc, daemonFingerprint, "daemon channel replaced");
     dc.addEventListener("close", () => {
       // A close callback from an older DataChannel can run after a newer
       // channel has become current. It owns no current state and must not
-      // clear the new channel or reject the new channel's requests.
-      if (state.daemon_dc !== dc) return;
-      const identityReady = state.daemon_identity_ready;
-      const wasVerified = Boolean(
-        identityReady && identityReady.dc === dc && identityReady.verified
+      // clear the new channel or reject the new channel's requests
+      // (daemonLink.detach returns null for it). Otherwise the handshake
+      // settles, the channel clears, and in-flight requests fail with
+      // "daemon channel closed".
+      const closed = daemonLink.detach(
+        dc, "identity-possession channel closed", "daemon channel closed",
       );
-      if (identityReady && identityReady.dc === dc && !identityReady.settled) {
-        identityReady.settled = true;
-        identityReady.reject(new Error("identity-possession channel closed"));
-      }
-      state.daemon_dc = null;
-      state.daemon_dc_fingerprint = null;
-      state.daemon_identity_context = null;
-      // Fail any in-flight requests.
-      for (const [, pending] of state.daemon_pending) {
-        clearTimeout(pending.timer);
-        pending.reject(new Error("daemon channel closed"));
-      }
-      state.daemon_pending.clear();
+      if (!closed) return;
+      const wasVerified = closed.wasVerified;
       // 2026-05-23: auto-reconnect attempt. If the DC closed
       // because of an oversized message / ICE failure / daemon
       // restart, the user is now stuck with "no live channel"
@@ -7536,11 +7891,7 @@ function createPeerProgress({
   }
 
   function _failDaemonIdentityPossession(dc, error) {
-    const ready = state.daemon_identity_ready;
-    if (ready && ready.dc === dc && !ready.settled) {
-      ready.settled = true;
-      ready.reject(error instanceof Error ? error : new Error(String(error)));
-    }
+    daemonLink.failIdentity(dc, error);
     try { dc.close(); } catch (_) {}
   }
 
@@ -7602,7 +7953,7 @@ function createPeerProgress({
       if (dc !== state.daemon_dc || dc.readyState !== "open") {
         throw new Error("identity channel changed while signing");
       }
-      state.daemon_identity_context = {dc, challenge: msg};
+      daemonLink.setIdentityContext(dc, msg);
       dc.send(JSON.stringify({
         v: "OL-PEER-1",
         t: "identity_possession_response",
@@ -7655,11 +8006,7 @@ function createPeerProgress({
       ) {
         throw new Error("identity verification binding does not match");
       }
-      const ready = state.daemon_identity_ready;
-      if (!ready || ready.dc !== dc || ready.settled) return;
-      ready.settled = true;
-      ready.verified = true;
-      ready.resolve({
+      daemonLink.verifyIdentity(dc, {
         challenge_id: msg.challenge_id,
         session_id: msg.session_id,
         verified_ms: msg.verified_ms,
@@ -7741,8 +8088,7 @@ function createPeerProgress({
     // don't want to lose any v0.19.x dispatch coverage.
     const rid = msg.rid || "";
     if (rid && state.daemon_pending.has(rid)) {
-      const pending = state.daemon_pending.get(rid);
-      state.daemon_pending.delete(rid);
+      const pending = daemonLink.takePending(rid);
       clearTimeout(pending.timer);
       if (msg.t === "error") {
         const error = new Error(msg.message || msg.code || "daemon error");
@@ -7774,16 +8120,15 @@ function createPeerProgress({
     const timeoutMs = (opts && opts.timeoutMs) || DAEMON_REQUEST_TIMEOUT_MS;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        if (state.daemon_pending.has(rid)) {
-          state.daemon_pending.delete(rid);
+        if (daemonLink.dropPending(rid)) {
           reject(new Error(`${t} timed out after ${timeoutMs}ms`));
         }
       }, timeoutMs);
-      state.daemon_pending.set(rid, { resolve, reject, timer });
+      daemonLink.addPending(rid, { resolve, reject, timer });
       try {
         dc.send(JSON.stringify(envelope));
       } catch (e) {
-        state.daemon_pending.delete(rid);
+        daemonLink.dropPending(rid);
         clearTimeout(timer);
         reject(e);
       }
@@ -8006,8 +8351,7 @@ function createPeerProgress({
         `Couldn't fetch chats: ${e && e.message ? e.message : e}`);
       return;
     }
-    state.daemon_roster_peers = peers.slice();
-    state.daemon_roster_groups = groups.slice();
+    daemonConversation.replaceRoster(peers, groups);
     if (!peers.length && !groups.length) {
       text(status, "No chats yet on this device. Pair a peer on your laptop first.");
       return;
@@ -8270,8 +8614,7 @@ function createPeerProgress({
       console.warn("_openDaemonChat called without peer.fingerprint", peer);
       return;
     }
-    state.daemon_active_peer = peer;
-    state.daemon_active_group = null;
+    daemonConversation.openPeer(peer);
     // Single-pane: chat takes the screen.
     _showOnly("#daemon-chat-card");
     const titleText =
@@ -8344,8 +8687,7 @@ function createPeerProgress({
 
   async function _openDaemonGroupChat(group) {
     if (!group || !group.group_id) return;
-    state.daemon_active_peer = null;
-    state.daemon_active_group = group;
+    daemonConversation.openGroup(group);
     _clearDaemonReply();
     _showOnly("#daemon-chat-card");
     text($("#daemon-chat-title"), group.name || "Group");
@@ -9101,7 +9443,7 @@ function createPeerProgress({
     if (statusEl) statusEl.textContent = "Leaving group...";
     try {
       await leaveDaemonGroup(group.group_id);
-      state.daemon_active_group = null;
+      daemonConversation.leaveGroup();
       await _refreshDaemonRoster();
       _showOnly("#daemon-roster-card");
     } catch (e) {
@@ -9121,7 +9463,7 @@ function createPeerProgress({
       const reply = await setDaemonPeerAlias(peer.fingerprint, alias);
       // Update the in-memory peer record so the chat title reflects
       // the new alias without a full roster refetch.
-      peer.alias = reply.alias || "";
+      daemonConversation.updatePeer(peer, { alias: reply.alias || "" });
       const titleEl = $("#daemon-chat-title");
       if (titleEl) {
         titleEl.textContent =
@@ -9144,7 +9486,7 @@ function createPeerProgress({
     if (statusEl) statusEl.textContent = muted ? "Muting…" : "Unmuting…";
     try {
       const reply = await setDaemonPeerMute(peer.fingerprint, muted);
-      peer.muted = !!reply.muted;
+      daemonConversation.updatePeer(peer, { muted: !!reply.muted });
       if (statusEl) statusEl.textContent = peer.muted ? "Muted." : "Unmuted.";
     } catch (e) {
       // Roll back the toggle on failure.
@@ -9688,16 +10030,13 @@ function createPeerProgress({
   }
 
   function _setDaemonReply(m) {
-    state.daemon_reply_to = {
-      id: String(m.id || ""),
-      body: String(m.body || m.file?.name || "(message)").slice(0, 160),
-    };
+    daemonConversation.setReplyTo(m);
     _renderDaemonReplyBar();
     $("#daemon-chat-input")?.focus();
   }
 
   function _clearDaemonReply() {
-    state.daemon_reply_to = null;
+    daemonConversation.clearReplyTo();
     _renderDaemonReplyBar();
   }
 
@@ -9711,8 +10050,7 @@ function createPeerProgress({
   }
 
   $("#btn-daemon-chat-back")?.addEventListener("click", () => {
-    state.daemon_active_peer = null;
-    state.daemon_active_group = null;
+    daemonConversation.close();
     _clearDaemonReply();
     _showOnly("#daemon-roster-card");
   });
@@ -9785,6 +10123,10 @@ function createPeerProgress({
     _identityTestReadRaw,
     _identityTestWriteRaw,
     _identityTestDeleteRaw,
+    // Test hook: make `rec` the unlocked in-memory identity, keeping the
+    // committed envelope. Identity fields on `state` are owned by
+    // peerIdentity and refuse raw writes.
+    _identityTestUseRecord: (rec) => { peerIdentity.unlock(rec, state.envelope); },
     generateIdentity,
     wrapIdentity,
     unwrapIdentity,
@@ -10082,8 +10424,8 @@ function createPeerProgress({
 
 // peer-ui module: ui/boot.js
   function _dispatchPostIdentityFlow() {
-    if (!state.rec || state.post_identity_flow_started) return;
-    state.post_identity_flow_started = true;
+    // Runs once per page, and only with an unlocked identity.
+    if (!peerIdentity.beginPostIdentityFlow()) return;
     // 2026-05-23: order matters. Cert-authed reconnect MUST be
     // checked before _setupDeviceInviteQuery so a Safari reload
     // with the old pair URL in history doesn't re-claim a

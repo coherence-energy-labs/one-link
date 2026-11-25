@@ -2157,7 +2157,7 @@ def test_register_daemon_dc_helper_present(peer_html: str):
     """Single source of truth for "this DataChannel is the daemon."
     Stores the dc reference + wires close handler."""
     snippet = _snippet(peer_html, "function _registerDaemonDc", 4000)
-    assert "state.daemon_dc = dc" in snippet
+    assert "daemonLink.attach(dc, daemonFingerprint" in snippet
     assert 'addEventListener("close"' in snippet
 
 
@@ -2195,7 +2195,7 @@ def test_daemon_request_clears_on_channel_close(peer_html: str):
     rejects with "daemon channel closed." Otherwise the phone hangs."""
     snippet = _snippet(peer_html, "function _registerDaemonDc", 4000)
     assert "daemon channel closed" in snippet
-    assert "state.daemon_pending.clear()" in snippet
+    assert "daemonLink.detach(" in snippet
 
 
 def test_fetch_daemon_peers_helper(peer_html: str):
@@ -2238,8 +2238,8 @@ def test_chat_back_button_returns_to_roster(peer_html: str):
     the active-peer reference."""
     snippet = _snippet(peer_html, '"#btn-daemon-chat-back"', 800)
     assert '_showOnly("#daemon-roster-card")' in snippet
-    assert "daemon_active_peer = null" in snippet
-    assert "state.daemon_active_peer = null" in snippet
+    assert "daemonConversation.close()" in snippet
+    assert "daemonConversation.close();" in snippet
 
 
 def test_render_message_bubble_handles_deleted_and_edited(peer_html: str):

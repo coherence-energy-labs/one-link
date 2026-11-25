@@ -14,10 +14,7 @@
   }
 
   function _showIdentitySetupGate(rec, currentAuthority) {
-    state.rec = null;
-    state.envelope = null;
-    state.pending_rec = rec;
-    state.pending_authority = currentAuthority;
+    peerIdentity.stagePending(rec, currentAuthority);
     hide($("#unlock-card"));
     hide($("#actions-card"));
     show($("#identity-setup-card"));
@@ -45,10 +42,7 @@
   }
 
   function _markIdentityReady(rec, envelope) {
-    state.rec = rec;
-    state.envelope = envelope;
-    state.pending_rec = null;
-    state.pending_authority = null;
+    peerIdentity.unlock(rec, envelope);
     hide($("#identity-setup-card"));
     hide($("#unlock-card"));
     _renderIdentityCard(rec);
@@ -115,7 +109,7 @@
 
   function _showIdentityStorageFailure(error) {
     const message = error && error.message ? error.message : String(error);
-    state.boot_error_msg = `identity storage blocked: ${message}`;
+    peerIdentity.failBoot(`identity storage blocked: ${message}`);
     setPill("bad", "identity blocked");
     setDiag(`${_identityStorageLabel()} blocked: ${message}`);
     text(

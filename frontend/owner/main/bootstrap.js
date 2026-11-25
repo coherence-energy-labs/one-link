@@ -3,7 +3,7 @@
     loadLocalCollections();
     try {
       const me = await _bootApiGetWithRetry("/api/me");
-      state.me = me;
+      identityStore.replaceMe(me);
       $("#me-host").textContent = me.display_name || me.hostname;
       // v0.10.4: apply persisted presence on load so the dot
       // matches the user's last choice.
@@ -93,13 +93,8 @@
     // session-expired banner — each one re-firing _maybe401 ->
     // _attemptAutoRecovery -> Promise pileup. The auth-loss
     // banner now stops the cluster; explicit recovery resumes.
-    state._mainPollTimers = state._mainPollTimers || [];
-    state._mainPollTimers.push(setInterval(refreshPeers, 5000));
-    state._mainPollTimers.push(setInterval(refreshTransfers, 4000));
-    state._mainPollTimers.push(setInterval(refreshStatus, 8000));
-    state._mainPollTimers.push(setInterval(refreshOneHealth, 15000));
-    state._mainPollTimers.push(setInterval(refreshFabricTruth, 30000));
-    state._mainPollTimers.push(setInterval(refreshGroups, 12000));
+    // pollingCluster owns the timers.
+    pollingCluster.start(_mainPollTasks());
     // T3-O: free in-tab File-cache blob URLs on page hide so a
     // long-lived tab that sent 200+ photos doesn't accumulate
     // 200+ retained Blob references. The daemon's
@@ -145,7 +140,7 @@
         const r = await api.del(`/api/groups/${gid}/history`);
         toast(`Cleared ${r.deleted || 0} message${r.deleted === 1 ? "" : "s"}`, "good");
         if (state.selectedGroup === gid) {
-          state.groupMessages = [];
+          messageStore.clearGroup();
           if (typeof renderGroupConversation === "function") {
             renderGroupConversation();
           }
@@ -252,7 +247,7 @@
   async function loadHistory() {
     try {
       const { messages } = await api.get("/api/messages?limit=300");
-      state.messages = messages;
+      messageStore.replaceDirect(messages);
       renderMessages();
     } catch (e) { console.warn(e); }
   }

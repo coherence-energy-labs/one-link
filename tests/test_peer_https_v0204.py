@@ -660,7 +660,7 @@ def test_boot_stashes_error_for_autopair(peer_html: str):
     set state.boot_error_msg so the autopair flow can surface the
     real reason instead of the generic 'no identity in 12s'."""
     snippet = _snippet(peer_html, "async function boot()", 6000)
-    assert "state.boot_error_msg" in snippet
+    assert "peerIdentity.failBoot(" in snippet
 
 
 def test_wait_for_identity_aborts_on_boot_error(peer_html: str):

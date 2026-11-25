@@ -89,10 +89,10 @@
   // active phase (peer_declined, invite_timeout, originator
   // cancelled). In-memory; the daemon-side persistence ship will
   // replace this with durable history.
-  if (!callUI._callTracking) callUI._callTracking = {};
+  callState.startCallTracking();
   function _trackCallStart(callId, info) {
     if (!callId) return;
-    callUI._callTracking[callId] = {
+    callState.trackCall(callId, {
       peerLabel: info.peerLabel || "",
       peerFp: info.peerFp || null,
       direction: info.direction || "out",
@@ -100,29 +100,40 @@
       startedMs: Date.now(),
       reachedActive: false,
       endedAt: null,
-    };
+    });
   }
   function _markCallActive(callId) {
-    const t = callUI._callTracking[callId];
-    if (t) t.reachedActive = true;
+    callState.markTrackedCallActive(callId);
   }
+  // The missed/ended bubble is cosmetic and runs after call teardown. A
+  // failure here is logged and can never keep a call's surfaces or media
+  // alive, and the call always leaves the tracking table.
   function _resolveCallEnded(callId, endCause) {
-    const t = callUI._callTracking[callId];
-    if (!t || t.endedAt) return;
-    t.endedAt = Date.now();
-    if (!t.reachedActive) {
-      _renderMissedCallBubble(callId, t, endCause);
-    } else {
-      _renderEndedCallBubble(callId, t, endCause);
+    const t = callState.endTrackedCall(callId, Date.now());
+    if (!t) return;
+    try {
+      if (!t.reachedActive) {
+        _renderMissedCallBubble(callId, t, endCause);
+      } else {
+        _renderEndedCallBubble(callId, t, endCause);
+      }
+    } catch (error) {
+      console.error("call bubble failed:", error);
+    } finally {
+      callState.forgetTrackedCall(callId);
     }
-    delete callUI._callTracking[callId];
   }
+  // The owner page's message history is reachable only through its
+  // explicit call-log bridge; without one (no owner page) there is no
+  // conversation to log into.
   function _peerShortIdForFp(fp) {
     if (!fp) return null;
-    for (const p of state.peers.values()) {
-      if (p.fingerprint === fp) return p.short_id;
-    }
-    return null;
+    const bridge = window.__oneLinkCallLog;
+    return bridge ? bridge.peerShortIdForFp(fp) : null;
+  }
+  function _appendCallLog(msg) {
+    const bridge = window.__oneLinkCallLog;
+    if (bridge) bridge.appendCallLog(msg);
   }
   function _renderMissedCallBubble(callId, t, endCause) {
     const peerShortId = _peerShortIdForFp(t.peerFp) || t.peerFp || "";
@@ -146,9 +157,7 @@
       call_end_label: labelByCause[endCause] || "No answer",
       call_duration_s: 0,
     };
-    state.messages.push(msg);
-    if (state.messages.length > 1000) state.messages = state.messages.slice(-800);
-    if (msg.peer === state.selectedPeer) renderMessages();
+    _appendCallLog(msg);
   }
   function _renderEndedCallBubble(callId, t, endCause) {
     const peerShortId = _peerShortIdForFp(t.peerFp) || t.peerFp || "";
@@ -170,9 +179,7 @@
       call_end_label: durLabel,
       call_duration_s: durSec,
     };
-    state.messages.push(msg);
-    if (state.messages.length > 1000) state.messages = state.messages.slice(-800);
-    if (msg.peer === state.selectedPeer) renderMessages();
+    _appendCallLog(msg);
   }
 
   window.handleLivingPresenceCallEvent = function (m) {
@@ -184,15 +191,15 @@
         const now = Date.now();
         const last = Number(callUI.lastAcceptRetryMs[callId] || 0);
         if (now - last > 3000) {
-          callUI.lastAcceptRetryMs[callId] = now;
+          callState.stampAcceptRetry(callId, now);
           callApiPost({ action: "accept", call_id: callId }).catch(() => {});
           reportCallEvent("accept_resend", { reason: "duplicate_ring" });
         }
         return true;
       }
-      callUI.inboundCallId = callId;
-      callUI.inboundCallPeer = (m.peer_label || callId.slice(0, 8));
-      callUI.inboundCallPeerFp = m.peer_master_vk_hex || null;
+      callState.set("inboundCallId", callId);
+      callState.set("inboundCallPeer", m.peer_label || callId.slice(0, 8));
+      callState.set("inboundCallPeerFp", m.peer_master_vk_hex || null);
       resolveSimultaneousCallIfNeeded(callId, callUI.inboundCallPeerFp);
       _trackCallStart(callId, {
         peerLabel: callUI.inboundCallPeer,
@@ -210,22 +217,23 @@
         hideOutgoingOverlay();
         hideIncomingRing();
         if (!callUI.activeCallId) {
-          callUI.activeCallId = callId;
-          callUI.activeCallPeer = callId.slice(0, 8);
+          callState.set("activeCallId", callId);
+          callState.set("activeCallPeer", callId.slice(0, 8));
         }
-        if (m.peer_master_vk_hex) callUI.activeCallPeerFp = m.peer_master_vk_hex;
-        callUI.activeCallLocalRole = callUI.activeCallLocalRole || "originator";
+        if (m.peer_master_vk_hex) callState.set("activeCallPeerFp", m.peer_master_vk_hex);
+        callState.set("activeCallLocalRole", callUI.activeCallLocalRole || "originator");
         showActiveSurface(callUI.activeCallPeer, "");
         ensureMediaNegotiation("active");
       } else if (phase === "async_capture") {
         hideOutgoingOverlay();
         hideIncomingRing();
-        if (!callUI.activeCallId) callUI.activeCallId = callId;
+        if (!callUI.activeCallId) callState.set("activeCallId", callId);
         beginCapsuleCapture(callId);
         updateOneChip("#call-one-engine", "Capsule");
         addOneCallEvent("Keep talking, then choose Save capsule when you're done.");
       } else if (phase === "ended" || phase === "resumable") {
-        _resolveCallEnded(callId, m.end_cause || "");
+        // Teardown first: surfaces, capsule capture and media (microphone
+        // and camera) always stop. The call-log bubble comes last.
         hideOutgoingOverlay();
         hideIncomingRing();
         hideActiveSurface();
@@ -233,9 +241,10 @@
           resetCapsuleCapture();
         }
         stopAllMedia();
-        if (callUI.activeCallId === callId) callUI.activeCallId = null;
-        if (callUI.activeCallId === null) callUI.activeCallPeerFp = null;
-        if (callUI.activeCallId === null) callUI.activeCallLocalRole = "";
+        if (callUI.activeCallId === callId) callState.set("activeCallId", null);
+        if (callUI.activeCallId === null) callState.set("activeCallPeerFp", null);
+        if (callUI.activeCallId === null) callState.set("activeCallLocalRole", "");
+        _resolveCallEnded(callId, m.end_cause || "");
       }
       return true;
     }
@@ -257,11 +266,11 @@
     if (tail === "sdp_offer") {
       // Recipient side: peer's SDP offer arrived. Track it so we
       // setRemoteDescription + createAnswer once we accept.
-      callUI.pendingRemoteOffer = m.sdp || "";
+      callState.set("pendingRemoteOffer", m.sdp || "");
       addOneCallEvent("Media offer received.");
       reportCallEvent("remote_offer_received");
       if (callUI.activeCallId === callId && media.pc && callUI.localMediaReady) {
-        callUI.pendingRemoteOffer = null;
+        callState.set("pendingRemoteOffer", null);
         applyRemoteSdpOffer(m.sdp);
       }
       return true;
@@ -281,9 +290,9 @@
       hideOutgoingOverlay();
       hideActiveSurface();
       stopAllMedia();
-      if (callUI.activeCallId === callId) callUI.activeCallId = null;
-      if (callUI.activeCallId === null) callUI.activeCallLocalRole = "";
-      if (callUI.inboundCallId === callId) callUI.inboundCallId = null;
+      if (callUI.activeCallId === callId) callState.set("activeCallId", null);
+      if (callUI.activeCallId === null) callState.set("activeCallLocalRole", "");
+      if (callUI.inboundCallId === callId) callState.set("inboundCallId", null);
       if (typeof toast === "function") {
         toast(m.user_message || "Call refused.", "warn", 6000);
       }

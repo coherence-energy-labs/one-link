@@ -32,8 +32,10 @@
     const key = `${callId}:${cleanReason}`;
     const now = Date.now();
     if (callUI.lastAutoTraceKey === key && now - Number(callUI.lastAutoTraceMs || 0) < 15000) return null;
-    callUI.lastAutoTraceKey = key;
-    callUI.lastAutoTraceMs = now;
+    callState.update({
+      lastAutoTraceKey: key,
+      lastAutoTraceMs: now,
+    });
     try {
       const [traceResp, localDebug] = await Promise.all([
         fetch(`/api/v1/calls/${encodeURIComponent(callId)}/trace`, {
@@ -50,8 +52,7 @@
         local_debug: localDebug || null,
         extra: extra || null,
       };
-      callUI.autoTraceBuffer.unshift(payload);
-      callUI.autoTraceBuffer = callUI.autoTraceBuffer.slice(0, 12);
+      callState.recordAutoTrace(payload);
       try {
         localStorage.setItem(
           "one_link_auto_call_traces",

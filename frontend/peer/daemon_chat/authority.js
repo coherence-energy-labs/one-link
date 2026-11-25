@@ -21,14 +21,26 @@
   // browsers; v0.20.2's daemon-roster lives on the v0.20.0 daemon
   // control DataChannel. They never collide.
 
-  state.daemon_dc = null;
-  state.daemon_dc_fingerprint = null;
-  state.daemon_pending = new Map();   // rid → {resolve, reject, timer}
-  state.daemon_active_peer = null;     // currently-selected peer in the chat view
-  state.daemon_reply_to = null;        // {id, body} selected in phone chat
-  state.daemon_active_group = null;    // currently-selected group in the chat view
-  state.daemon_identity_ready = null;
-  state.daemon_identity_context = null;
+  // daemonLink owns the channel, its fingerprint, the in-flight requests
+  // (rid → {resolve, reject, timer}) and the identity-possession handshake.
+  const daemonLink = createDaemonLink({ clearTimeout: (id) => clearTimeout(id) });
+  stateOwners.publish("daemonLink", {
+    daemon_dc: daemonLink.dc,
+    daemon_dc_fingerprint: daemonLink.fingerprint,
+    daemon_pending: daemonLink.pending,
+    daemon_identity_ready: daemonLink.identityReady,
+    daemon_identity_context: daemonLink.identityContext,
+  });
+  // daemonConversation owns the open peer/group chat, the {id, body} reply
+  // target and the roster rows.
+  const daemonConversation = createDaemonConversation();
+  stateOwners.publish("daemonConversation", {
+    daemon_active_peer: daemonConversation.activePeer,
+    daemon_reply_to: daemonConversation.replyTo,
+    daemon_active_group: daemonConversation.activeGroup,
+    daemon_roster_peers: daemonConversation.rosterPeers,
+    daemon_roster_groups: daemonConversation.rosterGroups,
+  });
 
   const DAEMON_REQUEST_TIMEOUT_MS = 10_000;
   const BROWSER_IDENTITY_POSSESSION_SCHEMA =
@@ -50,64 +62,24 @@
   }
 
   function _registerDaemonDc(dc, daemonFingerprint) {
-    const previousDc = state.daemon_dc;
-    if (previousDc && previousDc !== dc) {
-      // Request/response correlation is scoped to one authenticated channel.
-      // A delayed reply from the replaced SCTP association must never settle
-      // a request issued on the replacement association.
-      for (const [, pending] of state.daemon_pending) {
-        clearTimeout(pending.timer);
-        pending.reject(new Error("daemon channel replaced"));
-      }
-      state.daemon_pending.clear();
-      const previousIdentityReady = state.daemon_identity_ready;
-      if (
-        previousIdentityReady &&
-        previousIdentityReady.dc === previousDc &&
-        !previousIdentityReady.settled
-      ) {
-        previousIdentityReady.settled = true;
-        previousIdentityReady.reject(new Error("daemon channel replaced"));
-      }
-    }
-    state.daemon_dc = dc;
-    state.daemon_dc_fingerprint = daemonFingerprint;
-    state.daemon_identity_context = null;
-    let resolveIdentity, rejectIdentity;
-    const identityPromise = new Promise((resolve, reject) => {
-      resolveIdentity = resolve;
-      rejectIdentity = reject;
-    });
-    state.daemon_identity_ready = {
-      dc,
-      promise: identityPromise,
-      resolve: resolveIdentity,
-      reject: rejectIdentity,
-      settled: false,
-      verified: false,
-    };
+    // Request/response correlation is scoped to one authenticated channel.
+    // A delayed reply from the replaced SCTP association must never settle
+    // a request issued on the replacement association: daemonLink rejects
+    // the replaced channel's requests and unsettled handshake.
+    const { previous: previousDc, identityPromise } =
+      daemonLink.attach(dc, daemonFingerprint, "daemon channel replaced");
     dc.addEventListener("close", () => {
       // A close callback from an older DataChannel can run after a newer
       // channel has become current. It owns no current state and must not
-      // clear the new channel or reject the new channel's requests.
-      if (state.daemon_dc !== dc) return;
-      const identityReady = state.daemon_identity_ready;
-      const wasVerified = Boolean(
-        identityReady && identityReady.dc === dc && identityReady.verified
+      // clear the new channel or reject the new channel's requests
+      // (daemonLink.detach returns null for it). Otherwise the handshake
+      // settles, the channel clears, and in-flight requests fail with
+      // "daemon channel closed".
+      const closed = daemonLink.detach(
+        dc, "identity-possession channel closed", "daemon channel closed",
       );
-      if (identityReady && identityReady.dc === dc && !identityReady.settled) {
-        identityReady.settled = true;
-        identityReady.reject(new Error("identity-possession channel closed"));
-      }
-      state.daemon_dc = null;
-      state.daemon_dc_fingerprint = null;
-      state.daemon_identity_context = null;
-      // Fail any in-flight requests.
-      for (const [, pending] of state.daemon_pending) {
-        clearTimeout(pending.timer);
-        pending.reject(new Error("daemon channel closed"));
-      }
-      state.daemon_pending.clear();
+      if (!closed) return;
+      const wasVerified = closed.wasVerified;
       // 2026-05-23: auto-reconnect attempt. If the DC closed
       // because of an oversized message / ICE failure / daemon
       // restart, the user is now stuck with "no live channel"
@@ -123,11 +95,7 @@
   }
 
   function _failDaemonIdentityPossession(dc, error) {
-    const ready = state.daemon_identity_ready;
-    if (ready && ready.dc === dc && !ready.settled) {
-      ready.settled = true;
-      ready.reject(error instanceof Error ? error : new Error(String(error)));
-    }
+    daemonLink.failIdentity(dc, error);
     try { dc.close(); } catch (_) {}
   }
 
@@ -189,7 +157,7 @@
       if (dc !== state.daemon_dc || dc.readyState !== "open") {
         throw new Error("identity channel changed while signing");
       }
-      state.daemon_identity_context = {dc, challenge: msg};
+      daemonLink.setIdentityContext(dc, msg);
       dc.send(JSON.stringify({
         v: "OL-PEER-1",
         t: "identity_possession_response",
@@ -242,11 +210,7 @@
       ) {
         throw new Error("identity verification binding does not match");
       }
-      const ready = state.daemon_identity_ready;
-      if (!ready || ready.dc !== dc || ready.settled) return;
-      ready.settled = true;
-      ready.verified = true;
-      ready.resolve({
+      daemonLink.verifyIdentity(dc, {
         challenge_id: msg.challenge_id,
         session_id: msg.session_id,
         verified_ms: msg.verified_ms,

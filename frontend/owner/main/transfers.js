@@ -1,9 +1,7 @@
   async function refreshTransfers() {
     try {
       const { transfers } = await api.transfers();
-      state.transfers = transfers || [];
-      state.transfersById = new Map();
-      for (const t of state.transfers) state.transfersById.set(t.id, t);
+      transferStore.replaceAll(transfers || []);
       // T3-Z: rebuild the O(1) (dir|blob) → transfer lookup index.
       _rebuildTransferByDirBlob();
       renderTransfers();
@@ -206,7 +204,7 @@
         del.onclick = async () => {
           try {
             await api.del(`/api/transfers/${encodeURIComponent(t.id)}`);
-            state.transfers = state.transfers.filter(x => x.id !== t.id);
+            transferStore.dropListed(t.id);
             renderTransfers();
             await refreshStatus();
           } catch (e) {

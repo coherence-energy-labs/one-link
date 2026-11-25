@@ -148,11 +148,11 @@ def test_kdf_passphrase_not_kept_in_memory(peer_html: str):
     `state` object holds the unwrapped record + the wrapped
     envelope, NOT the passphrase. Verify by absence."""
     # The state declaration MUST list rec + envelope only.
-    idx = peer_html.find("const state = {")
-    end = peer_html.find("};", idx)
-    state_decl = peer_html[idx:end + 2]
-    assert "rec:" in state_decl
-    assert "envelope:" in state_decl
+    idx = peer_html.find("function createPeerIdentity() {")
+    end = peer_html.find("function stagePending", idx)
+    state_decl = peer_html[idx:end]
+    assert "let rec = null;" in state_decl
+    assert "let envelope = null;" in state_decl
     assert "passphrase" not in state_decl.lower()
 
 

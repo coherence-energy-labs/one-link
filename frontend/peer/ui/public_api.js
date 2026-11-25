@@ -64,6 +64,10 @@
     _identityTestReadRaw,
     _identityTestWriteRaw,
     _identityTestDeleteRaw,
+    // Test hook: make `rec` the unlocked in-memory identity, keeping the
+    // committed envelope. Identity fields on `state` are owned by
+    // peerIdentity and refuse raw writes.
+    _identityTestUseRecord: (rec) => { peerIdentity.unlock(rec, state.envelope); },
     generateIdentity,
     wrapIdentity,
     unwrapIdentity,

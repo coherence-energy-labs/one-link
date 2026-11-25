@@ -257,7 +257,7 @@
     if (newName && newName !== state.me?.display_name) {
       try {
         await api.post("/api/settings", { display_name: newName });
-        state.me = { ...(state.me || {}), display_name: newName };
+        identityStore.rename(newName);
         $("#me-host").textContent = newName;
       } catch (e) {
         toast(`Couldn't save name: ${e.message || e}`, "warn");

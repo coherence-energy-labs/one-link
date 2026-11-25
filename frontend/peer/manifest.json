@@ -68,15 +68,27 @@
           "responsibility": "Browser identity creation and temporary key cleanup"
         },
         {
+          "path": "services/state_publisher.js",
+          "kind": "service",
+          "responsibility": "Read-only publication of owned feature state; a raw write names its owner and throws",
+          "factory": "createStatePublisher"
+        },
+        {
+          "path": "services/identity.js",
+          "kind": "service",
+          "responsibility": "Identity state owner: unlocked record, committed envelope, pending commit, boot failure and post-unlock flow",
+          "factory": "createPeerIdentity"
+        },
+        {
           "path": "services/state.js",
           "kind": "service",
-          "responsibility": "Fresh identity session state per peer page",
+          "responsibility": "Shared peer read namespace; owned fields are published by their owners",
           "factory": "createPeerState"
         },
         {
           "path": "ui/state.js",
           "kind": "feature",
-          "responsibility": "Peer state construction"
+          "responsibility": "Peer state construction and identity owner composition"
         },
         {
           "path": "identity/presentation.js",
@@ -236,9 +248,21 @@
           "responsibility": "Auto-pair deadline, cancellation, signaling and channel handoff"
         },
         {
+          "path": "services/daemon_link.js",
+          "kind": "service",
+          "responsibility": "Daemon transport state owner: channel, in-flight requests and identity-possession handshake",
+          "factory": "createDaemonLink"
+        },
+        {
+          "path": "services/daemon_conversation.js",
+          "kind": "service",
+          "responsibility": "Daemon chat view state owner: open peer or group, reply target and roster rows",
+          "factory": "createDaemonConversation"
+        },
+        {
           "path": "daemon_chat/authority.js",
           "kind": "feature",
-          "responsibility": "Daemon channel registration and browser possession proof"
+          "responsibility": "Daemon channel registration through the transport owner and browser possession proof"
         },
         {
           "path": "daemon_chat/connection.js",

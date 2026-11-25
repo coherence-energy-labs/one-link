@@ -1,6 +1,6 @@
   function _dispatchPostIdentityFlow() {
-    if (!state.rec || state.post_identity_flow_started) return;
-    state.post_identity_flow_started = true;
+    // Runs once per page, and only with an unlocked identity.
+    if (!peerIdentity.beginPostIdentityFlow()) return;
     // 2026-05-23: order matters. Cert-authed reconnect MUST be
     // checked before _setupDeviceInviteQuery so a Safari reload
     // with the old pair URL in history doesn't re-claim a

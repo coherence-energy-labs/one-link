@@ -226,7 +226,7 @@
         // Do not paint this result into a different group if the user switched
         // conversations while the request was in flight.
         if (state.selectedGroup === groupId) {
-          state.groupMessages = r.messages || [];
+          messageStore.replaceGroup(r.messages || []);
           _forceNextMessagesToBottom();
           renderGroupConversation();
         }
@@ -334,7 +334,7 @@
           _attempts: 1,
         };
         if (replyToId) optimistic.reply_to = replyToId;
-        state.messages.push(optimistic);
+        messageStore.appendDirect(optimistic);
         _forceNextMessagesToBottom();
         // Clear composer up-front so the bubble is visible where it
         // landed — no "did it send?" ambiguity.

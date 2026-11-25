@@ -161,7 +161,7 @@
     }
     try {
       const committed = await _replaceIdentityAuthority(expected, replacement);
-      state.envelope = committed;
+      peerIdentity.setEnvelope(committed);
     } catch (e) {
       alert(`Couldn't persist wrapped identity: ${e && e.message ? e.message : e}`);
       return;

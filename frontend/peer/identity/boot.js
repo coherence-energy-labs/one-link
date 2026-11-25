@@ -6,7 +6,7 @@
     // many phones land here with crypto.subtle present but
     // restricted, and "no web crypto" is misleading in that case.
     if (!window.isSecureContext) {
-      state.boot_error_msg = "page loaded over plain HTTP; Web Crypto needs HTTPS";
+      peerIdentity.failBoot("page loaded over plain HTTP; Web Crypto needs HTTPS");
       setPill("bad", "needs https");
       text($("#ident-status"),
         "This page needs to load over https://, not http://. " +
@@ -15,7 +15,7 @@
       return;
     }
     if (!window.crypto || !crypto.subtle) {
-      state.boot_error_msg = "Web Crypto not exposed";
+      peerIdentity.failBoot("Web Crypto not exposed");
       setPill("bad", "browser too old");
       text($("#ident-status"),
         "Your browser is too old to run One Link safely. " +
@@ -25,7 +25,7 @@
     }
     if ((!navigator.storage || !navigator.storage.getDirectory) &&
         typeof indexedDB === "undefined") {
-      state.boot_error_msg = "origin-private storage not exposed";
+      peerIdentity.failBoot("origin-private storage not exposed");
       setPill("bad", "browser too old");
       text($("#ident-status"),
         "Your browser doesn't support the origin-private storage One Link " +
@@ -48,7 +48,7 @@
     // authenticated private identity is available. Legacy PBKDF2 migrates
     // before this state can become ready.
     if (isWrappedEnvelope(onDisk)) {
-      state.envelope = onDisk;
+      peerIdentity.setEnvelope(onDisk);
       await _showUnlockGate(onDisk);
       return;
     }

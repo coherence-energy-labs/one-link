@@ -11,7 +11,7 @@
   }
 
   $("#btn-settings").onclick = async () => {
-    _settingsHydrating = true;
+    settingsStore.beginHydration();
     markSettingsClean("Loading settings...");
     try {
       const r = await api.get("/api/settings");
@@ -80,7 +80,7 @@
       const aax = $("#set-auto-accept-exts");
       if (aax) aax.value = (r.auto_accept_extensions || []).join(", ");
       // Cache for runtime checks (DND + sound + theme).
-      state.runtimeSettings = {
+      settingsStore.replaceRuntime({
         theme: r.theme || "dark",
         ui_density: r.ui_density || "comfortable",
         message_bubble_style: r.message_bubble_style || "gradient",
@@ -103,7 +103,7 @@
         display_read_receipts: r.display_read_receipts !== false,
         send_typing_indicators: r.send_typing_indicators !== false,
         display_typing_indicators: r.display_typing_indicators !== false,
-      };
+      });
     } catch (e) {
       $("#set-name").value = "";
       $("#set-autoaccept").checked = false;
@@ -112,11 +112,11 @@
     // v0.5.3: load current rendezvous URLs + status
     try {
       const r = await api.get("/api/rendezvous");
-      state.rendezvousUrls = r.urls || [];
+      settingsStore.setRendezvousUrls(r.urls || []);
       $("#set-rendezvous").value = (r.urls || []).join("\n");
       renderRendezvousStatus(r);
     } catch (e) {
-      state.rendezvousUrls = [];
+      settingsStore.setRendezvousUrls([]);
       $("#set-rendezvous").value = "";
       renderRendezvousStatus({});
     }
@@ -136,7 +136,7 @@
     refreshSessionSettings();
     refreshSettingsPrivacyPresets();
     refreshSettingsSecurityAudit();
-    _settingsHydrating = false;
+    settingsStore.endHydration();
     markSettingsClean("No changes yet.");
     settingsBackdrop.classList.add("show");
   };
@@ -289,7 +289,7 @@
       applyTheme(payload.theme);
       applyAppearanceSettings(payload);
       if (payload.avatar_color) applyMyAvatarColor(payload.avatar_color);
-      state.runtimeSettings = {
+      settingsStore.replaceRuntime({
         theme: payload.theme,
         ui_density: payload.ui_density,
         message_bubble_style: payload.message_bubble_style,
@@ -312,7 +312,7 @@
         display_read_receipts: payload.display_read_receipts,
         send_typing_indicators: payload.send_typing_indicators,
         display_typing_indicators: payload.display_typing_indicators,
-      };
+      });
       if (!payload.display_typing_indicators) {
         state.peerTyping = {};
         state.groupTyping = {};
@@ -337,7 +337,7 @@
     if (changed) {
       try {
         const res = await api.post("/api/rendezvous", { urls: newUrls });
-        state.rendezvousUrls = res.urls || [];
+        settingsStore.setRendezvousUrls(res.urls || []);
         renderRendezvousStatus({ active: res.active, urls: res.urls });
         toast(
           res.urls.length === 0

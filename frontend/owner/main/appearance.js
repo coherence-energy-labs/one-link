@@ -20,8 +20,8 @@
   }
   // v0.10.0 - runtime settings cache populated when settings load.
   // Defaults are sane so notifyIncoming + soundOnIncoming work even
-  // before /api/settings has been fetched.
-  state.runtimeSettings = {
+  // before /api/settings has been fetched. settingsStore owns the cache.
+  settingsStore.replaceRuntime({
     theme: "dark",
     ui_density: "comfortable",
     message_bubble_style: "gradient",
@@ -39,7 +39,7 @@
     dnd_end: "07:00",
     notification_sound: true,
     pair_default_allow_all: true,
-  };
+  });
 
   // v0.10.0: live theme apply. Sets <html data-theme="..."> which
   // CSS variable overrides key off of. No element-by-element repaint.
@@ -58,7 +58,7 @@
           "--my-avatar", r.avatar_color,
         );
       }
-      state.runtimeSettings = {
+      settingsStore.replaceRuntime({
         theme: r.theme || "dark",
         ui_density: r.ui_density || "comfortable",
         message_bubble_style: r.message_bubble_style || "gradient",
@@ -84,7 +84,7 @@
         // v0.12.3 typing-indicator privacy.
         send_typing_indicators: r.send_typing_indicators !== false,
         display_typing_indicators: r.display_typing_indicators !== false,
-      };
+      });
       // Reuse this settings snapshot for the update toggle. The previous
       // DOMContentLoaded hook issued a second /api/settings request during
       // every boot solely to read this one field.

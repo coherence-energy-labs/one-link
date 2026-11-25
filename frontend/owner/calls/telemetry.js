@@ -75,18 +75,20 @@
         } else {
           loss = inboundPacketsLost / (inboundPacketsLost + inboundPacketsReceived);
         }
-        callUI.lastInboundPacketsLost = inboundPacketsLost;
-        callUI.lastInboundPacketsReceived = inboundPacketsReceived;
+        callState.update({
+          lastInboundPacketsLost: inboundPacketsLost,
+          lastInboundPacketsReceived: inboundPacketsReceived,
+        });
       }
       if (rttMs !== null) {
-        callUI.qualityEwmaRttMs = callUI.qualityEwmaRttMs === null
+        callState.set("qualityEwmaRttMs", callUI.qualityEwmaRttMs === null
           ? rttMs
-          : Math.round((callUI.qualityEwmaRttMs * 0.7) + (rttMs * 0.3));
+          : Math.round((callUI.qualityEwmaRttMs * 0.7) + (rttMs * 0.3)));
       }
       if (loss !== null) {
-        callUI.qualityEwmaLoss = callUI.qualityEwmaLoss === null
+        callState.set("qualityEwmaLoss", callUI.qualityEwmaLoss === null
           ? loss
-          : (callUI.qualityEwmaLoss * 0.75) + (loss * 0.25);
+          : (callUI.qualityEwmaLoss * 0.75) + (loss * 0.25));
       }
       if (rttMs !== null) updateOneChip("#call-one-rtt", `${rttMs} ms`);
       if (loss !== null) updateOneChip("#call-one-loss", `${Math.round(loss * 100)}%`);
@@ -148,7 +150,7 @@
       selected.media_health_renderer_detached = mediaHealth.renderer_detached;
       selected.media_health_renderer_hidden = mediaHealth.renderer_hidden;
       selected.media_health_no_video_frames = mediaHealth.no_video_frames;
-      callUI.lastMetricsSnapshot = {
+      callState.set("lastMetricsSnapshot", {
         at_ms: Date.now(),
         ...selected,
         media_health: mediaHealth,
@@ -160,7 +162,7 @@
         smoothed_rtt_ms: callUI.qualityEwmaRttMs,
         bandwidth_estimate_kbps: kbps,
         remote_tracks: remoteTrackSummary(),
-      };
+      });
       const quality = classifyCallQuality(callUI.lastMetricsSnapshot);
       applyCallQualityHysteresis(quality);
       renderParticipants();
@@ -194,19 +196,23 @@
       const audioElementFrozen = selected.remote_audio_tracks > 0
         && !audioElementMoving
         && !audioMoving;
-      callUI.lastRemoteVideoTime = remoteVideoTime;
-      callUI.lastRemoteAudioTime = remoteAudioTime;
-      callUI.lastInboundVideoBytes = inboundVideoBytes;
-      callUI.lastInboundAudioBytes = inboundAudioBytes;
-      callUI.lastInboundVideoFramesDecoded = inboundVideoFramesDecoded;
+      callState.update({
+        lastRemoteVideoTime: remoteVideoTime,
+        lastRemoteAudioTime: remoteAudioTime,
+        lastInboundVideoBytes: inboundVideoBytes,
+        lastInboundAudioBytes: inboundAudioBytes,
+        lastInboundVideoFramesDecoded: inboundVideoFramesDecoded,
+      });
       if (videoMoving || audioMoving || videoElementMoving || audioElementMoving) {
-        callUI.lastRemoteMediaMovingMs = Date.now();
-        callUI.frozenMediaTicks = 0;
+        callState.update({
+          lastRemoteMediaMovingMs: Date.now(),
+          frozenMediaTicks: 0,
+        });
         if (
           selected.ice_connection_state === "connected" ||
           selected.ice_connection_state === "completed"
         ) {
-          callUI.mediaRepairStage = 0;
+          callState.set("mediaRepairStage", 0);
           markMediaRepairHealthy();
         }
       }
@@ -216,30 +222,30 @@
         && selected.ice_connection_state !== "connected"
         && selected.ice_connection_state !== "completed"
       ) {
-        callUI.stalledMediaTicks += 1;
+        callState.increment("stalledMediaTicks", 1);
       } else if (mediaHealth.state === "remote_media_missing" || mediaHealth.state === "media_starved") {
-        callUI.stalledMediaTicks += 1;
+        callState.increment("stalledMediaTicks", 1);
       } else if (mediaHealth.state === "renderer_detached") {
         reviveRemotePlayback("renderer_detached");
-        callUI.stalledMediaTicks += 1;
+        callState.increment("stalledMediaTicks", 1);
       } else if (selected.remote_video_tracks > 0 && !videoMoving && selected.inbound_video_packets > 0) {
-        callUI.stalledMediaTicks += 1;
+        callState.increment("stalledMediaTicks", 1);
       } else if (selected.remote_audio_tracks > 0 && !audioMoving && selected.inbound_audio_packets > 0) {
-        callUI.stalledMediaTicks += 1;
+        callState.increment("stalledMediaTicks", 1);
       } else {
-        callUI.stalledMediaTicks = 0;
+        callState.set("stalledMediaTicks", 0);
       }
       if (videoElementFrozen || audioElementFrozen) {
-        callUI.frozenMediaTicks += 1;
+        callState.increment("frozenMediaTicks", 1);
       } else {
-        callUI.frozenMediaTicks = 0;
+        callState.set("frozenMediaTicks", 0);
       }
       if (callUI.stalledMediaTicks >= 3) {
-        callUI.stalledMediaTicks = 0;
+        callState.set("stalledMediaTicks", 0);
         repairMediaPath("stalled_media").catch(() => {});
       }
       if (callUI.frozenMediaTicks >= 3) {
-        callUI.frozenMediaTicks = 0;
+        callState.set("frozenMediaTicks", 0);
         reportCallEvent("remote_media_frozen", {
           video_frozen: videoElementFrozen,
           audio_frozen: audioElementFrozen,
@@ -259,7 +265,7 @@
       ) {
         const now = Date.now();
         if (now - callUI.lastFrameWarningMs > 5000) {
-          callUI.lastFrameWarningMs = now;
+          callState.set("lastFrameWarningMs", now);
           reportCallEvent("remote_video_no_frames", { media_kind: "video" });
         }
       }
@@ -284,14 +290,7 @@
         metricsResult && metricsResult.recovery_intent,
         callUI.lastMetricsSnapshot,
       );
-      if (metricsResult && metricsResult.routePolicy) {
-        media.routePolicyDetail = metricsResult.routePolicy;
-        media.bestRelayHealth = String(metricsResult.routePolicy.best_relay_health || "");
-        media.bestRelayScore = Number.isFinite(Number(metricsResult.routePolicy.best_relay_score))
-          ? Number(metricsResult.routePolicy.best_relay_score)
-          : null;
-        media.turnCredentialExpiresAtMs = Number(metricsResult.routePolicy.credential_expires_at_ms || 0) || null;
-      }
+      if (metricsResult && metricsResult.routePolicy) mediaState.recordRoutePolicy(metricsResult.routePolicy);
       applyBackendSessionAuthority(
         metricsResult && metricsResult.session_authority,
       );
@@ -376,21 +375,21 @@
   function startCallTelemetry() {
     if (callUI.metricsTimer) clearInterval(callUI.metricsTimer);
     reportCallMetricsOnce();
-    callUI.metricsTimer = setInterval(reportCallMetricsOnce, 2000);
+    callState.set("metricsTimer", setInterval(reportCallMetricsOnce, 2000));
     startMediaWatchdog();
   }
 
   function stopCallTelemetry() {
     if (callUI.metricsTimer) {
       clearInterval(callUI.metricsTimer);
-      callUI.metricsTimer = null;
+      callState.set("metricsTimer", null);
     }
     stopMediaWatchdog();
   }
 
   function startMediaWatchdog() {
     if (callUI.mediaWatchdogTimer) clearInterval(callUI.mediaWatchdogTimer);
-    callUI.mediaWatchdogTimer = setInterval(() => {
+    callState.set("mediaWatchdogTimer", setInterval(() => {
       syncRemoteMediaSurface("watchdog");
       ensureMediaNegotiation("watchdog");
       if (
@@ -407,13 +406,13 @@
         }).catch(() => {});
         repairMediaPath("watchdog_no_media_movement").catch(() => {});
       }
-    }, 1500);
+    }, 1500));
   }
 
   function stopMediaWatchdog() {
     if (callUI.mediaWatchdogTimer) {
       clearInterval(callUI.mediaWatchdogTimer);
-      callUI.mediaWatchdogTimer = null;
+      callState.set("mediaWatchdogTimer", null);
     }
   }
 
@@ -421,7 +420,7 @@
     window.addEventListener("online", () => {
       const now = Date.now();
       if (!callUI.activeCallId || now - Number(callUI.lastNetworkResumeRepairMs || 0) < 3000) return;
-      callUI.lastNetworkResumeRepairMs = now;
+      callState.set("lastNetworkResumeRepairMs", now);
       reportCallEvent("network_resume_repair");
       repairMediaPath("network_online").catch(() => {});
     });

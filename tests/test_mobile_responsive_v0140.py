@@ -335,14 +335,14 @@ def test_chat_render_sticks_to_bottom_for_live_edge_and_own_sends(index_html: st
     assert "_isMessagesNearBottom(m)" in scheduler
     assert "_forceNextMessagesToBottom(350)" in scheduler
 
-    send_idx = index_html.find("state.messages.push(optimistic);")
+    send_idx = index_html.find("messageStore.appendDirect(optimistic);")
     send_path = index_html[send_idx:send_idx + 700]
     assert "_forceNextMessagesToBottom();" in send_path
     assert "renderMessages();" in send_path
 
     switch_idx = index_html.find("function selectPeer(shortId)")
     switch_path = index_html[switch_idx:switch_idx + 1100]
-    assert "_lastRenderedLen = 0;" in switch_path
+    assert "_resetRenderedMessageCount();" in switch_path
     assert "_forceMessagesBottomNowAndAfter();" in switch_path
 
 

@@ -1,0 +1,1867 @@
+{
+  "schema": 1,
+  "description": "MNT-03 ownership ratchet. Every cross-module write the census measures in the shipped owner and peer pages is listed here with its writer, count and a named rationale; the census must match exactly (tests/js/test_ownership_census.cjs). migratedFeatures lists each feature state owner and the shared state it retired: any write to a retired target or directly to an owner fails. Regenerate the counts with `node tests/js/ownership_census.js --write-baseline` only after removing coupling.",
+  "rationales": {
+    "dom-handle": "Write to a DOM element property through another module's cached element handle (a const holding document.querySelector). The DOM is the page's shared presentation surface, not feature state; the write changes what the user sees and no JavaScript state is shared through it.",
+    "single-writer": "Every write to this owner-state field is in exactly the one feature module listed; the field is declared in the shared createOwnerState bag only so other modules can read it. Not one of the six MNT-03 features. The entry pins that writer and its write count: a second writer, or more writes, fails the census.",
+    "live-reconciliation": "main/events.js is the owner page's WebSocket reconciliation router: it applies daemon-pushed updates (courier media, folder progress, typing, read markers, debug entries) to state the listed feature module otherwise maintains. Two writers by design (snapshot owner plus live router); a third writer or more writes fails the census.",
+    "conversation-selection": "Conversation navigation state (selected peer or group, its detail, typing indicators, device drawer) is switched by main/selection.js and main/groups.js together, and settings_save.js clears typing when the user disables it. One navigation transition spread over the modules that own each surface; not one of the six MNT-03 features.",
+    "activity-feed": "Activity feed filters and events: main/activity.js owns them, main/status.js restores the saved filters at startup, and settings_storage.js clears the events when the user wipes local traces. Not one of the six MNT-03 features; the entry pins those writers.",
+    "status-snapshots": "Daemon status and fabric snapshots: main/status.js refreshes them on the polling cluster, and settings_network.js refreshes them while the network settings pane is open. Two readers of the same endpoint writing the same snapshot field; not one of the six MNT-03 features.",
+    "composer-staging": "Composer staging (attachments queued for one send): staged by composer_staging.js, edited by image_editor.js, consumed by composer_send.js. Three steps of one send intent; not one of the six MNT-03 features. The entry pins exactly those writers.",
+    "view-toggle": "A view toggle several surfaces switch (files pane mode, discovery sheet, folder conflict summary, frame budget, peer map refresh). Each write sets the visible mode or a fresh summary; not feature state of the six MNT-03 features. The entry pins the writers.",
+    "peer-function-hooks": "Deliberate one-time function-hook composition documented in frontend/peer/README.md: ui/public_api.js and ui/chat.js wrap transport and pairing functions at module load to install the pairing and chat handlers. tests/test_browser_peer_pairing_integrity.py executes these exact wrapper sections; rebinding is composition, not state.",
+    "peer-pairing-session": "The peer SAS pairing session object. tests/e2e/test_peer_chat_outbox_durability.py assigns window.__oneLinkPeer.state.pairing directly, so it stays an ordinary shared field (an owned read-only field would break that public test surface). pairing/handshake.js writes it; auto_pair.js stores the daemon key for it; outbox_contract.js binds it."
+  },
+  "migratedFeatures": [
+    {
+      "name": "message rendering",
+      "page": "owner",
+      "owners": [
+        {
+          "closure": "owner",
+          "binding": "messageStore"
+        }
+      ],
+      "retiredTargets": [
+        "state.messages",
+        "state.groupMessages"
+      ],
+      "moduleOwned": [
+        {
+          "binding": "_lastRenderedLen",
+          "module": "main/messages.js"
+        }
+      ]
+    },
+    {
+      "name": "transfers",
+      "page": "owner",
+      "owners": [
+        {
+          "closure": "owner",
+          "binding": "transferStore"
+        }
+      ],
+      "retiredTargets": [
+        "state.transfers",
+        "state.transfersById",
+        "state.transferByDirBlob",
+        "state.transferRates"
+      ]
+    },
+    {
+      "name": "settings",
+      "page": "owner",
+      "owners": [
+        {
+          "closure": "owner",
+          "binding": "settingsStore"
+        }
+      ],
+      "retiredTargets": [
+        "state.runtimeSettings",
+        "state.rendezvousUrls",
+        "state.chatPrefs"
+      ]
+    },
+    {
+      "name": "identity",
+      "page": "owner",
+      "owners": [
+        {
+          "closure": "owner",
+          "binding": "identityStore"
+        }
+      ],
+      "retiredTargets": [
+        "state.me",
+        "state.selfMesh"
+      ]
+    },
+    {
+      "name": "transport",
+      "page": "owner",
+      "owners": [
+        {
+          "closure": "owner",
+          "binding": "pollingCluster"
+        }
+      ],
+      "retiredTargets": [
+        "state._mainPollTimers",
+        "state._mainPollTimersPaused"
+      ]
+    },
+    {
+      "name": "calls",
+      "page": "owner",
+      "owners": [
+        {
+          "closure": "calls",
+          "binding": "callState"
+        },
+        {
+          "closure": "calls",
+          "binding": "mediaState"
+        },
+        {
+          "closure": "calls",
+          "binding": "callUI"
+        },
+        {
+          "closure": "calls",
+          "binding": "media"
+        }
+      ],
+      "retiredTargets": []
+    },
+    {
+      "name": "identity",
+      "page": "peer",
+      "owners": [
+        {
+          "closure": "peer",
+          "binding": "peerIdentity"
+        }
+      ],
+      "retiredTargets": [
+        "state.rec",
+        "state.envelope",
+        "state.pending_rec",
+        "state.pending_authority",
+        "state.boot_error_msg",
+        "state.post_identity_flow_started"
+      ],
+      "moduleOwned": [
+        {
+          "binding": "_ed25519WasmPromise",
+          "module": "identity/ed25519.js"
+        }
+      ]
+    },
+    {
+      "name": "transport",
+      "page": "peer",
+      "owners": [
+        {
+          "closure": "peer",
+          "binding": "daemonLink"
+        }
+      ],
+      "retiredTargets": [
+        "state.daemon_dc",
+        "state.daemon_dc_fingerprint",
+        "state.daemon_pending",
+        "state.daemon_identity_ready",
+        "state.daemon_identity_context"
+      ]
+    },
+    {
+      "name": "message rendering",
+      "page": "peer",
+      "owners": [
+        {
+          "closure": "peer",
+          "binding": "daemonConversation"
+        }
+      ],
+      "retiredTargets": [
+        "state.daemon_active_peer",
+        "state.daemon_active_group",
+        "state.daemon_reply_to",
+        "state.daemon_roster_peers",
+        "state.daemon_roster_groups"
+      ],
+      "moduleOwned": [
+        {
+          "binding": "_messageRateByPeer",
+          "module": "messages/delivery.js"
+        }
+      ]
+    }
+  ],
+  "entries": [
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "input.style",
+      "declaredIn": "main/composer_staging.js",
+      "writer": "main/composer_send.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "dom-handle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "input.style",
+      "declaredIn": "main/composer_staging.js",
+      "writer": "main/message_actions.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "dom-handle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "input.value",
+      "declaredIn": "main/composer_staging.js",
+      "writer": "main/composer_send.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "dom-handle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "input.value",
+      "declaredIn": "main/composer_staging.js",
+      "writer": "main/message_actions.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "dom-handle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "pairExplain.textContent",
+      "declaredIn": "main/pairing.js",
+      "writer": "main/events.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "dom-handle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "searchInput.value",
+      "declaredIn": "main/search.js",
+      "writer": "main/lifecycle.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "dom-handle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "searchWrap.classList",
+      "declaredIn": "main/search.js",
+      "writer": "main/lifecycle.js",
+      "writes": 1,
+      "kinds": {
+        "mutator": 1
+      },
+      "rationale": "dom-handle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "sendBtn.disabled",
+      "declaredIn": "main/composer_staging.js",
+      "writer": "main/composer_send.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "dom-handle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "settingsBackdrop.classList",
+      "declaredIn": "main/settings_shell.js",
+      "writer": "main/settings_save.js",
+      "writes": 1,
+      "kinds": {
+        "mutator": 1
+      },
+      "rationale": "dom-handle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state._archivedExpanded",
+      "declaredIn": "main/state.js",
+      "writer": "main/groups.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state._folderRecvRenderScheduled",
+      "declaredIn": "main/state.js",
+      "writer": "main/events.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "live-reconciliation"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state._peerArchiveExpanded",
+      "declaredIn": "main/state.js",
+      "writer": "main/peers.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state._updateInfo",
+      "declaredIn": "main/state.js",
+      "writer": "main/updates.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state._updateInstallInFlight",
+      "declaredIn": "main/state.js",
+      "writer": "main/updates.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.activePane",
+      "declaredIn": "main/state.js",
+      "writer": "main/diagnostics.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.activityEvents",
+      "declaredIn": "main/state.js",
+      "writer": "main/activity.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "activity-feed"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.activityEvents",
+      "declaredIn": "main/state.js",
+      "writer": "main/settings_storage.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "activity-feed"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.activityEvents",
+      "declaredIn": "main/state.js",
+      "writer": "main/status.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "activity-feed"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.activityExpandedGroups",
+      "declaredIn": "main/state.js",
+      "writer": "main/activity.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "activity-feed"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.activityExpandedGroups",
+      "declaredIn": "main/state.js",
+      "writer": "main/status.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "activity-feed"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.activityFailedOnly",
+      "declaredIn": "main/state.js",
+      "writer": "main/activity.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "activity-feed"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.activityFailedOnly",
+      "declaredIn": "main/state.js",
+      "writer": "main/status.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "activity-feed"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.activityFilter",
+      "declaredIn": "main/state.js",
+      "writer": "main/activity.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "activity-feed"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.activityFilter",
+      "declaredIn": "main/state.js",
+      "writer": "main/status.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "activity-feed"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.activityPeerFilter",
+      "declaredIn": "main/state.js",
+      "writer": "main/activity.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "activity-feed"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.activityPeerFilter",
+      "declaredIn": "main/state.js",
+      "writer": "main/status.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "activity-feed"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.activitySearch",
+      "declaredIn": "main/state.js",
+      "writer": "main/activity.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "activity-feed"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.activitySearch",
+      "declaredIn": "main/state.js",
+      "writer": "main/status.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "activity-feed"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.attentionItems",
+      "declaredIn": "main/state.js",
+      "writer": "main/attention.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.composerSendInFlight",
+      "declaredIn": "main/state.js",
+      "writer": "main/composer_send.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.courier",
+      "declaredIn": "main/state.js",
+      "writer": "main/courier.js",
+      "writes": 10,
+      "kinds": {
+        "property": 10
+      },
+      "rationale": "live-reconciliation"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.courier",
+      "declaredIn": "main/state.js",
+      "writer": "main/events.js",
+      "writes": 3,
+      "kinds": {
+        "property": 3
+      },
+      "rationale": "live-reconciliation"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.courierGuideMode",
+      "declaredIn": "main/state.js",
+      "writer": "main/courier.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.debugEntries",
+      "declaredIn": "main/state.js",
+      "writer": "main/events.js",
+      "writes": 2,
+      "kinds": {
+        "mutator": 1,
+        "property": 1
+      },
+      "rationale": "live-reconciliation"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.debugEntries",
+      "declaredIn": "main/state.js",
+      "writer": "main/folder_bindings.js",
+      "writes": 3,
+      "kinds": {
+        "property": 3
+      },
+      "rationale": "live-reconciliation"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.debugLastId",
+      "declaredIn": "main/state.js",
+      "writer": "main/events.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "live-reconciliation"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.debugLastId",
+      "declaredIn": "main/state.js",
+      "writer": "main/folder_bindings.js",
+      "writes": 3,
+      "kinds": {
+        "property": 3
+      },
+      "rationale": "live-reconciliation"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.deviceDrawerFp",
+      "declaredIn": "main/state.js",
+      "writer": "main/device_drawer.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "conversation-selection"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.deviceDrawerFp",
+      "declaredIn": "main/state.js",
+      "writer": "main/selection.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "conversation-selection"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.deviceDrawerPending",
+      "declaredIn": "main/state.js",
+      "writer": "main/device_drawer.js",
+      "writes": 4,
+      "kinds": {
+        "property": 4
+      },
+      "rationale": "conversation-selection"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.deviceDrawerPending",
+      "declaredIn": "main/state.js",
+      "writer": "main/selection.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "conversation-selection"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.deviceDrawerSas",
+      "declaredIn": "main/state.js",
+      "writer": "main/device_drawer.js",
+      "writes": 3,
+      "kinds": {
+        "property": 3
+      },
+      "rationale": "conversation-selection"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.deviceDrawerSas",
+      "declaredIn": "main/state.js",
+      "writer": "main/selection.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "conversation-selection"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.discoverLoading",
+      "declaredIn": "main/state.js",
+      "writer": "main/discovery.js",
+      "writes": 3,
+      "kinds": {
+        "property": 3
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.discoverOpen",
+      "declaredIn": "main/state.js",
+      "writer": "main/discovery.js",
+      "writes": 3,
+      "kinds": {
+        "property": 3
+      },
+      "rationale": "view-toggle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.discoverOpen",
+      "declaredIn": "main/state.js",
+      "writer": "main/lifecycle.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "view-toggle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.discoverSmart",
+      "declaredIn": "main/state.js",
+      "writer": "main/discovery.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.discoverable",
+      "declaredIn": "main/state.js",
+      "writer": "main/discovery.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.drafts",
+      "declaredIn": "main/state.js",
+      "writer": "main/message_actions.js",
+      "writes": 5,
+      "kinds": {
+        "property": 5
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.fabric",
+      "declaredIn": "main/state.js",
+      "writer": "main/settings_network.js",
+      "writes": 4,
+      "kinds": {
+        "property": 4
+      },
+      "rationale": "status-snapshots"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.fabric",
+      "declaredIn": "main/state.js",
+      "writer": "main/status.js",
+      "writes": 7,
+      "kinds": {
+        "property": 7
+      },
+      "rationale": "status-snapshots"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.filesMode",
+      "declaredIn": "main/state.js",
+      "writer": "main/activity.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "view-toggle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.filesMode",
+      "declaredIn": "main/state.js",
+      "writer": "main/attachments.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "view-toggle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.filesMode",
+      "declaredIn": "main/state.js",
+      "writer": "main/transfer_header.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "view-toggle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.folderBrowser",
+      "declaredIn": "main/state.js",
+      "writer": "main/folders.js",
+      "writes": 14,
+      "kinds": {
+        "property": 14
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.folderConflicts",
+      "declaredIn": "main/state.js",
+      "writer": "main/folder_conflicts.js",
+      "writes": 4,
+      "kinds": {
+        "property": 4
+      },
+      "rationale": "view-toggle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.folderConflicts",
+      "declaredIn": "main/state.js",
+      "writer": "main/folder_send.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "view-toggle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.folderOffers",
+      "declaredIn": "main/state.js",
+      "writer": "main/folders.js",
+      "writes": 3,
+      "kinds": {
+        "property": 3
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.folderRecvProgress",
+      "declaredIn": "main/state.js",
+      "writer": "main/events.js",
+      "writes": 6,
+      "kinds": {
+        "property": 6
+      },
+      "rationale": "live-reconciliation"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.folderSendConfirmCtx",
+      "declaredIn": "main/state.js",
+      "writer": "main/folder_send.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.folderSendInflight",
+      "declaredIn": "main/state.js",
+      "writer": "main/folder_send.js",
+      "writes": 3,
+      "kinds": {
+        "property": 3
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.folderSendProgress",
+      "declaredIn": "main/state.js",
+      "writer": "main/events.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "live-reconciliation"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.folderSettingsTarget",
+      "declaredIn": "main/state.js",
+      "writer": "main/folder_send.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.folders",
+      "declaredIn": "main/state.js",
+      "writer": "main/folders.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.frameBudget",
+      "declaredIn": "main/state.js",
+      "writer": "main/navigation_prediction.js",
+      "writes": 2,
+      "kinds": {
+        "mutator": 2
+      },
+      "rationale": "view-toggle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.frameBudget",
+      "declaredIn": "main/state.js",
+      "writer": "main/outbox.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "view-toggle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.groupDetail",
+      "declaredIn": "main/state.js",
+      "writer": "main/groups.js",
+      "writes": 3,
+      "kinds": {
+        "property": 3
+      },
+      "rationale": "conversation-selection"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.groupDetail",
+      "declaredIn": "main/state.js",
+      "writer": "main/selection.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "conversation-selection"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.groupTyping",
+      "declaredIn": "main/state.js",
+      "writer": "main/events.js",
+      "writes": 3,
+      "kinds": {
+        "property": 3
+      },
+      "rationale": "conversation-selection"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.groupTyping",
+      "declaredIn": "main/state.js",
+      "writer": "main/selection.js",
+      "writes": 3,
+      "kinds": {
+        "property": 3
+      },
+      "rationale": "conversation-selection"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.groupTyping",
+      "declaredIn": "main/state.js",
+      "writer": "main/settings_save.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "conversation-selection"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.groups",
+      "declaredIn": "main/state.js",
+      "writer": "main/groups.js",
+      "writes": 3,
+      "kinds": {
+        "mutator": 2,
+        "property": 1
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.installPromptEvent",
+      "declaredIn": "main/state.js",
+      "writer": "main/installation.js",
+      "writes": 4,
+      "kinds": {
+        "property": 4
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.lastSelectedShortId",
+      "declaredIn": "main/state.js",
+      "writer": "main/navigation_prediction.js",
+      "writes": 3,
+      "kinds": {
+        "property": 3
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.markov",
+      "declaredIn": "main/state.js",
+      "writer": "main/navigation_prediction.js",
+      "writes": 3,
+      "kinds": {
+        "property": 3
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.myPresence",
+      "declaredIn": "main/state.js",
+      "writer": "main/notifications.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.oneHealth",
+      "declaredIn": "main/state.js",
+      "writer": "main/health.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.oneHealthGuideReturnPending",
+      "declaredIn": "main/state.js",
+      "writer": "main/health.js",
+      "writes": 3,
+      "kinds": {
+        "property": 3
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.oneHealthGuideSelected",
+      "declaredIn": "main/state.js",
+      "writer": "main/health.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.oneSetup",
+      "declaredIn": "main/state.js",
+      "writer": "main/onboarding.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.outboundFileCache",
+      "declaredIn": "main/state.js",
+      "writer": "main/rich_text_files.js",
+      "writes": 2,
+      "kinds": {
+        "mutator": 1,
+        "property": 1
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.pairing",
+      "declaredIn": "main/state.js",
+      "writer": "main/pairing.js",
+      "writes": 6,
+      "kinds": {
+        "property": 6
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.paletteFocusIdx",
+      "declaredIn": "main/state.js",
+      "writer": "main/command_palette.js",
+      "writes": 4,
+      "kinds": {
+        "property": 4
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.paletteOpen",
+      "declaredIn": "main/state.js",
+      "writer": "main/command_palette.js",
+      "writes": 3,
+      "kinds": {
+        "property": 3
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.paletteQuery",
+      "declaredIn": "main/state.js",
+      "writer": "main/command_palette.js",
+      "writes": 3,
+      "kinds": {
+        "property": 3
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.paletteResults",
+      "declaredIn": "main/state.js",
+      "writer": "main/command_palette.js",
+      "writes": 9,
+      "kinds": {
+        "mutator": 6,
+        "property": 3
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.peerMessageCache",
+      "declaredIn": "main/state.js",
+      "writer": "main/navigation_prediction.js",
+      "writes": 3,
+      "kinds": {
+        "mutator": 2,
+        "property": 1
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.peerTyping",
+      "declaredIn": "main/state.js",
+      "writer": "main/events.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "conversation-selection"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.peerTyping",
+      "declaredIn": "main/state.js",
+      "writer": "main/selection.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "conversation-selection"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.peerTyping",
+      "declaredIn": "main/state.js",
+      "writer": "main/settings_save.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "conversation-selection"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.peers",
+      "declaredIn": "main/state.js",
+      "writer": "main/bootstrap.js",
+      "writes": 2,
+      "kinds": {
+        "mutator": 2
+      },
+      "rationale": "view-toggle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.peers",
+      "declaredIn": "main/state.js",
+      "writer": "main/mobile.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "view-toggle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.pendingFileOfferByTid",
+      "declaredIn": "main/state.js",
+      "writer": "main/file_offers.js",
+      "writes": 5,
+      "kinds": {
+        "property": 5
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.pendingFileOfferPeerEls",
+      "declaredIn": "main/state.js",
+      "writer": "main/file_offers.js",
+      "writes": 3,
+      "kinds": {
+        "property": 3
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.pendingFileOffersByPeer",
+      "declaredIn": "main/state.js",
+      "writer": "main/file_offers.js",
+      "writes": 6,
+      "kinds": {
+        "mutator": 1,
+        "property": 5
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.pins",
+      "declaredIn": "main/state.js",
+      "writer": "main/message_actions.js",
+      "writes": 8,
+      "kinds": {
+        "mutator": 2,
+        "property": 6
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.provenanceByBlob",
+      "declaredIn": "main/state.js",
+      "writer": "main/events.js",
+      "writes": 1,
+      "kinds": {
+        "mutator": 1
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.readMarkerReceivedAt",
+      "declaredIn": "main/state.js",
+      "writer": "main/events.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "live-reconciliation"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.readMarkers",
+      "declaredIn": "main/state.js",
+      "writer": "main/events.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.replyTo",
+      "declaredIn": "main/state.js",
+      "writer": "main/message_actions.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.searchPlain",
+      "declaredIn": "main/state.js",
+      "writer": "main/messages.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "view-toggle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.searchPlain",
+      "declaredIn": "main/state.js",
+      "writer": "main/search.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "view-toggle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.searchQuery",
+      "declaredIn": "main/state.js",
+      "writer": "main/messages.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "view-toggle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.searchQuery",
+      "declaredIn": "main/state.js",
+      "writer": "main/search.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "view-toggle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.searchResults",
+      "declaredIn": "main/state.js",
+      "writer": "main/messages.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "view-toggle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.searchResults",
+      "declaredIn": "main/state.js",
+      "writer": "main/search.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "view-toggle"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.selectedGroup",
+      "declaredIn": "main/state.js",
+      "writer": "main/groups.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "conversation-selection"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.selectedGroup",
+      "declaredIn": "main/state.js",
+      "writer": "main/selection.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "conversation-selection"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.selectedMessageIds",
+      "declaredIn": "main/state.js",
+      "writer": "main/message_selection.js",
+      "writes": 6,
+      "kinds": {
+        "mutator": 4,
+        "property": 2
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.selectedPeer",
+      "declaredIn": "main/state.js",
+      "writer": "main/groups.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "conversation-selection"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.selectedPeer",
+      "declaredIn": "main/state.js",
+      "writer": "main/selection.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "conversation-selection"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.selecting",
+      "declaredIn": "main/state.js",
+      "writer": "main/message_selection.js",
+      "writes": 3,
+      "kinds": {
+        "property": 3
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.sentReadUpTo",
+      "declaredIn": "main/state.js",
+      "writer": "main/selection.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.staged",
+      "declaredIn": "main/state.js",
+      "writer": "main/composer_send.js",
+      "writes": 2,
+      "kinds": {
+        "mutator": 1,
+        "property": 1
+      },
+      "rationale": "composer-staging"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.staged",
+      "declaredIn": "main/state.js",
+      "writer": "main/composer_staging.js",
+      "writes": 2,
+      "kinds": {
+        "mutator": 1,
+        "property": 1
+      },
+      "rationale": "composer-staging"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.staged",
+      "declaredIn": "main/state.js",
+      "writer": "main/image_editor.js",
+      "writes": 3,
+      "kinds": {
+        "property": 3
+      },
+      "rationale": "composer-staging"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.stagedSeq",
+      "declaredIn": "main/state.js",
+      "writer": "main/composer_staging.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.starred",
+      "declaredIn": "main/state.js",
+      "writer": "main/message_actions.js",
+      "writes": 5,
+      "kinds": {
+        "property": 5
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.status",
+      "declaredIn": "main/state.js",
+      "writer": "main/settings_network.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "status-snapshots"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.status",
+      "declaredIn": "main/state.js",
+      "writer": "main/status.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "status-snapshots"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.tier",
+      "declaredIn": "main/state.js",
+      "writer": "main/navigation_prediction.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.totalUnread",
+      "declaredIn": "main/state.js",
+      "writer": "main/notifications.js",
+      "writes": 3,
+      "kinds": {
+        "property": 3
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.unreadByPeer",
+      "declaredIn": "main/state.js",
+      "writer": "main/notifications.js",
+      "writes": 3,
+      "kinds": {
+        "property": 3
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.voiceCancelled",
+      "declaredIn": "main/state.js",
+      "writer": "main/voice.js",
+      "writes": 3,
+      "kinds": {
+        "property": 3
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.voiceChunks",
+      "declaredIn": "main/state.js",
+      "writer": "main/voice.js",
+      "writes": 4,
+      "kinds": {
+        "mutator": 1,
+        "property": 3
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.voiceRec",
+      "declaredIn": "main/state.js",
+      "writer": "main/voice.js",
+      "writes": 4,
+      "kinds": {
+        "property": 4
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.voiceStartedAt",
+      "declaredIn": "main/state.js",
+      "writer": "main/voice.js",
+      "writes": 2,
+      "kinds": {
+        "property": 2
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.voiceStream",
+      "declaredIn": "main/state.js",
+      "writer": "main/voice.js",
+      "writes": 4,
+      "kinds": {
+        "property": 4
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.voiceTargetPeer",
+      "declaredIn": "main/state.js",
+      "writer": "main/voice.js",
+      "writes": 4,
+      "kinds": {
+        "property": 4
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.voiceTimerId",
+      "declaredIn": "main/state.js",
+      "writer": "main/voice.js",
+      "writes": 3,
+      "kinds": {
+        "property": 3
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "owner",
+      "closure": "owner",
+      "target": "state.waveformCache",
+      "declaredIn": "main/state.js",
+      "writer": "main/voice.js",
+      "writes": 2,
+      "kinds": {
+        "mutator": 1,
+        "property": 1
+      },
+      "rationale": "single-writer"
+    },
+    {
+      "page": "peer",
+      "closure": "peer",
+      "target": "_maybeFinalizePairing",
+      "declaredIn": "pairing/handshake.js",
+      "writer": "ui/chat.js",
+      "writes": 1,
+      "kinds": {
+        "assign": 1
+      },
+      "rationale": "peer-function-hooks"
+    },
+    {
+      "page": "peer",
+      "closure": "peer",
+      "target": "_renderIdentityCard",
+      "declaredIn": "identity/presentation.js",
+      "writer": "ui/public_api.js",
+      "writes": 1,
+      "kinds": {
+        "assign": 1
+      },
+      "rationale": "peer-function-hooks"
+    },
+    {
+      "page": "peer",
+      "closure": "peer",
+      "target": "_routeControlMessage",
+      "declaredIn": "pairing/handshake.js",
+      "writer": "ui/chat.js",
+      "writes": 1,
+      "kinds": {
+        "assign": 1
+      },
+      "rationale": "peer-function-hooks"
+    },
+    {
+      "page": "peer",
+      "closure": "peer",
+      "target": "acceptOfferSignal",
+      "declaredIn": "transport/webrtc.js",
+      "writer": "ui/public_api.js",
+      "writes": 1,
+      "kinds": {
+        "assign": 1
+      },
+      "rationale": "peer-function-hooks"
+    },
+    {
+      "page": "peer",
+      "closure": "peer",
+      "target": "createOfferSignal",
+      "declaredIn": "transport/webrtc.js",
+      "writer": "ui/public_api.js",
+      "writes": 1,
+      "kinds": {
+        "assign": 1
+      },
+      "rationale": "peer-function-hooks"
+    },
+    {
+      "page": "peer",
+      "closure": "peer",
+      "target": "state._pendingDaemonPubkey",
+      "declaredIn": "ui/state.js",
+      "writer": "pairing/auto_pair.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "peer-pairing-session"
+    },
+    {
+      "page": "peer",
+      "closure": "peer",
+      "target": "state.pairing",
+      "declaredIn": "ui/state.js",
+      "writer": "messages/outbox_contract.js",
+      "writes": 1,
+      "kinds": {
+        "property": 1
+      },
+      "rationale": "peer-pairing-session"
+    },
+    {
+      "page": "peer",
+      "closure": "peer",
+      "target": "state.pairing",
+      "declaredIn": "ui/state.js",
+      "writer": "pairing/handshake.js",
+      "writes": 15,
+      "kinds": {
+        "property": 15
+      },
+      "rationale": "peer-pairing-session"
+    }
+  ],
+  "globalBridges": []
+}

@@ -10,7 +10,7 @@
       if (!existing.includes("video") && media.pc.addTransceiver) {
         media.pc.addTransceiver("video", { direction: "sendrecv" });
       }
-      media.transceiversReady = true;
+      mediaState.set("transceiversReady", true);
     } catch (_) {}
   }
 
@@ -128,10 +128,10 @@
     const btn = $$("#btn-call-share-screen");
     if (media.screenSharing) {
       try { media.screenStream?.getTracks().forEach((t) => t.stop()); } catch (_) {}
-      media.screenStream = null;
+      mediaState.set("screenStream", null);
       const cameraTrack = media.cameraVideoTrack || media.localStream?.getVideoTracks()[0] || null;
       if (cameraTrack) await replaceOutgoingTrack("video", cameraTrack);
-      media.screenSharing = false;
+      mediaState.set("screenSharing", false);
       surface?.classList.remove("screen-sharing");
       if (btn) {
         btn.textContent = "Share";
@@ -153,10 +153,10 @@
       });
       const screenTrack = display.getVideoTracks()[0];
       if (!screenTrack) return;
-      media.cameraVideoTrack = media.localStream?.getVideoTracks()[0] || null;
-      media.screenStream = display;
+      mediaState.set("cameraVideoTrack", media.localStream?.getVideoTracks()[0] || null);
+      mediaState.set("screenStream", display);
       await replaceOutgoingTrack("video", screenTrack);
-      media.screenSharing = true;
+      mediaState.set("screenSharing", true);
       screenTrack.onended = () => { toggleScreenShare().catch(() => {}); };
       surface?.classList.add("screen-sharing");
       if (btn) {
@@ -190,7 +190,7 @@
   }
 
   function toggleBackgroundBlur() {
-    media.backgroundBlur = !media.backgroundBlur;
+    mediaState.set("backgroundBlur", !media.backgroundBlur);
     const local = $$("#call-local-video");
     const btn = $$("#btn-call-blur");
     local?.classList.toggle("local-blur", media.backgroundBlur);
@@ -235,7 +235,7 @@
   }
 
   function setCallHold(on) {
-    media.held = !!on;
+    mediaState.set("held", !!on);
     if (media.localStream) {
       media.localStream.getTracks().forEach((t) => {
         t.enabled = !media.held && (
@@ -260,7 +260,7 @@
   function cycleCallLayout() {
     const modes = ["focus", "split", "compact"];
     const next = modes[(modes.indexOf(media.layoutMode) + 1) % modes.length] || "focus";
-    media.layoutMode = next;
+    mediaState.set("layoutMode", next);
     const surface = $$("#call-active-surface");
     if (surface) {
       surface.classList.toggle("layout-split", next === "split");
@@ -282,15 +282,17 @@
   }
 
   function _setCaptionsEnabled(enabled) {
-    media.captionsOn = !!enabled;
+    mediaState.set("captionsOn", !!enabled);
     const btn = $$("#btn-call-captions");
     if (btn) btn.setAttribute("aria-pressed", String(media.captionsOn));
   }
 
   function _failActiveCaptions(recognizer, message, reason = "runtime") {
     if (media.captionRecognizer !== recognizer) return;
-    media.captionRecognizer = null;
-    media.captionsStarting = false;
+    mediaState.update({
+      captionRecognizer: null,
+      captionsStarting: false,
+    });
     _setCaptionsEnabled(false);
     try { recognizer.abort(); } catch (_) {}
     addTranscriptLine(message, "One Link");
@@ -300,9 +302,9 @@
   async function toggleCaptions() {
     const btn = $$("#btn-call-captions");
     if (media.captionsOn || media.captionsStarting) {
-      media.captionsStarting = false;
+      mediaState.set("captionsStarting", false);
       const active = media.captionRecognizer;
-      media.captionRecognizer = null;
+      mediaState.set("captionRecognizer", null);
       _setCaptionsEnabled(false);
       try { active?.stop(); } catch (_) {}
       if (btn) btn.disabled = false;
@@ -310,7 +312,7 @@
       return;
     }
 
-    media.captionsStarting = true;
+    mediaState.set("captionsStarting", true);
     _setCaptionsEnabled(false);
     if (btn) btn.disabled = true;
     try {
@@ -378,15 +380,17 @@
           }
         }
       };
-      media.captionRecognizer = rec;
+      mediaState.set("captionRecognizer", rec);
       rec.start();
-      media.captionsStarting = false;
+      mediaState.set("captionsStarting", false);
       _setCaptionsEnabled(true);
       addTranscriptLine("On-device captions enabled.", "One Link");
       reportCallEvent("captions_started");
     } catch (error) {
-      media.captionRecognizer = null;
-      media.captionsStarting = false;
+      mediaState.update({
+        captionRecognizer: null,
+        captionsStarting: false,
+      });
       _setCaptionsEnabled(false);
       const message = error && error.message
         ? error.message

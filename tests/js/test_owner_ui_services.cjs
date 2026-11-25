@@ -12,10 +12,14 @@ const root = path.resolve(__dirname, "../..");
 const source = path.join(root, "frontend/owner");
 const manifest = JSON.parse(fs.readFileSync(path.join(source, "manifest.json"), "utf8"));
 
-function service(name, globals = {}) {
+// Load one or more service files into one fresh context (a service may use
+// another service of its own lifecycle group, e.g. createOwnedRecord).
+function service(names, globals = {}) {
   const context = vm.createContext(globals);
-  const body = fs.readFileSync(path.join(source, "services", name + ".js"), "utf8");
-  new vm.Script(body, { filename: name + ".js" }).runInContext(context);
+  for (const name of [].concat(names)) {
+    const body = fs.readFileSync(path.join(source, "services", name + ".js"), "utf8");
+    new vm.Script(body, { filename: name + ".js" }).runInContext(context);
+  }
   return context;
 }
 
@@ -43,21 +47,22 @@ test("owner, call, and media instances never share mutable collections", async (
   assert.equal(b.staged.length, 0);
   assert.equal(b.pairing.peerFp, null);
 
-  const calls = service("call_state");
+  const calls = service(["owned_record", "call_state"]);
   const c = calls.createCallState();
   const d = calls.createCallState();
-  c.acceptedCallIds.add("call-1");
-  c.pendingIceCandidates.push({ candidate: "x" });
-  assert.equal(d.acceptedCallIds.size, 0);
-  assert.equal(d.pendingIceCandidates.length, 0);
+  c.acceptCall("call-1");
+  c.queueIceCandidate({ candidate: "x" });
+  assert.equal(c.view.acceptedCallIds.size, 1);
+  assert.equal(d.view.acceptedCallIds.size, 0);
+  assert.equal(d.view.pendingIceCandidates.length, 0);
 
-  const media = service("media_state");
+  const media = service(["owned_record", "media_state"]);
   const e = media.createCallMediaState();
   const f = media.createCallMediaState();
-  e.localCandidateAddresses.push("127.0.0.1");
-  assert.equal(f.localCandidateAddresses.length, 0);
-  assert.notEqual(e.iceSignalChain, f.iceSignalChain);
-  await Promise.all([e.iceSignalChain, f.iceSignalChain]);
+  e.set("localCandidateAddresses", ["127.0.0.1"]);
+  assert.equal(f.view.localCandidateAddresses.length, 0);
+  assert.notEqual(e.view.iceSignalChain, f.view.iceSignalChain);
+  await Promise.all([e.view.iceSignalChain, f.view.iceSignalChain]);
 });
 
 test("formatting consumes injected DOM and current settings", () => {
@@ -175,11 +180,14 @@ test("file retries preserve one immutable intent while concurrent calls coalesce
 });
 
 function healthService() {
-  const callUI = service("call_state").createCallState();
-  const media = service("media_state").createCallMediaState();
+  const context = service(["owned_record", "call_state", "media_state", "call_health"]);
+  const callState = context.createCallState();
+  const mediaState = context.createCallMediaState();
+  const callUI = callState.view;
+  const media = mediaState.view;
   const changes = [];
-  const health = service("call_health").createCallHealth({
-    callUI, media,
+  const health = context.createCallHealth({
+    callUI, callState, media,
     setReconnectState: (on) => changes.push(["reconnecting", on]),
     updateCallQuality: (level) => changes.push(["quality", level]),
     targetMediaProfile: (level) => ({ maxBitrate: 800000 / (level + 1), scale: level + 1 }),
@@ -188,7 +196,7 @@ function healthService() {
     addOneCallEvent: () => {},
     reportCallEvent: (event) => changes.push(["event", event]),
   });
-  return { health, callUI, media, changes };
+  return { health, callUI, media, mediaState, changes };
 }
 
 const liveMetrics = {
@@ -204,29 +212,29 @@ const liveMetrics = {
 };
 
 test("call health distinguishes connecting, missing media, and transport recovery", () => {
-  const { health, media } = healthService();
+  const { health, mediaState } = healthService();
   assert.equal(health.classifyCallQuality(liveMetrics), "good");
   assert.equal(health.classifyCallQuality({ ...liveMetrics, has_remote_description: false }), "connecting");
   const missing = { ...liveMetrics, remote_live_audio_tracks: 0, inbound_audio_packets: 0 };
   assert.equal(health.classifyMediaHealth(missing).state, "remote_media_missing");
   assert.equal(health.classifyCallQuality(missing), "connecting");
-  media.reconnecting = true;
+  mediaState.set("reconnecting", true);
   assert.equal(health.classifyCallQuality(liveMetrics), "reconnecting");
 });
 
 test("call health state and adaptive actions stay inside the injected call instance", async () => {
-  const { health, callUI, media, changes } = healthService();
+  const { health, callUI, mediaState, changes } = healthService();
   const untouched = healthService();
   for (let i = 0; i < 3; i++) health.applyCallQualityHysteresis("bad", "high loss");
   assert.equal(callUI.qualityBadTicks, 3);
   assert.equal(untouched.callUI.qualityBadTicks, 0);
   assert.deepEqual(changes.at(-1), ["quality", "bad"]);
   let parameters;
-  media.pc = { getSenders: () => [{
+  mediaState.set("pc", { getSenders: () => [{
     track: { kind: "video" },
     getParameters: () => ({}),
     setParameters: async (value) => { parameters = value; },
-  }] };
+  }] });
   await health.tuneOutboundMediaForTau({ ...liveMetrics, ice_connection_state: "failed" });
   assert.equal(callUI.adaptationLevel, 3);
   assert.equal(parameters.encodings[0].maxBitrate, 200000);

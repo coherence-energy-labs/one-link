@@ -60,7 +60,7 @@
     // - a stale "↓ 3 new" badge from the previous conversation
     // would mislead the user about the new one.
     _hideNewMessagePill();
-    _lastRenderedLen = 0;
+    _resetRenderedMessageCount();
     _forceMessagesBottomNowAndAfter();
     // v0.14.0 prefetch: record this switch in the Markov chain
     // and pre-warm the predicted next peer in idle time.
@@ -71,7 +71,7 @@
     state.selectedPeer = shortId;
     state.selectedGroup = null;
     state.groupDetail = null;
-    state.groupMessages = [];
+    messageStore.clearGroup();
     // v0.21.x: opening a peer is "I've read everything queued there",
     // so the per-peer badge clears and the tab title + OS badge
     // recompute. Reading a group does the same in selectGroup below.

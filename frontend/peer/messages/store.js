@@ -43,7 +43,6 @@
   const MSG_RATE_WINDOW_MS = 60 * 1000;
   const MSG_RATE_MAX_PER_PEER = 240;
   const MSG_FUTURE_SKEW_MS = 5 * 60 * 1000;
-  const _messageRateByPeer = new Map();
 
   function _newMessageId() {
     if (window.crypto && crypto.randomUUID) return crypto.randomUUID();

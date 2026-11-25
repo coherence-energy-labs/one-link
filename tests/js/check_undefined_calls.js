@@ -131,6 +131,10 @@ const GLOBALS = new Set([
   "showDirectoryPicker", "showOpenFilePicker", "showSaveFilePicker",
   // Modern proposal globals
   "AggregateError",
+  // Receivers of member calls (``WebAssembly.instantiate``,
+  // ``IDBKeyRange.bound``), resolved since receivers are checked too.
+  "WebAssembly", "IDBKeyRange", "IDBDatabase", "IDBTransaction",
+  "IDBObjectStore", "IDBIndex", "IDBRequest", "IDBCursor",
 ]);
 
 // Extract inline <script> blocks (not src=).
@@ -152,6 +156,7 @@ class Analyzer {
     this.block = block;
     this.globalScope = globalScope;
     this.failures = [];
+    this.guards = []; // stack of Set<name> proven callable by a typeof probe
   }
 
   static parse(block) {
@@ -167,18 +172,45 @@ class Analyzer {
     });
   }
 
-  // ALL named bindings at ANY depth in the block. We use this as
-  // a "soft global" — script tags' inline JS very commonly wraps
-  // its whole body in an IIFE, and ``typeof foo === "function"``
-  // probes for cross-IIFE-script names that resolve at runtime
-  // via the script's lexical environment + script tag ordering.
-  // Strict per-IIFE scoping flags hundreds of false positives.
+  // The names every block can really reach at runtime: the script-level
+  // declarations of each block (the shared global lexical environment)
+  // and properties published on the global object (``window.foo = ...``).
   //
-  // What we WILL still catch with this softer model:
-  //   * misspelled names that aren't declared anywhere
-  //   * call sites referencing a function that was renamed
-  //     (call site has the old name, declaration has the new one)
+  // MNT-03: this used to pool every named binding at ANY depth of every
+  // block into one "soft global" scope. Each block wraps its body in an
+  // IIFE, so a name declared inside one block's closure is NOT visible in
+  // another block; the pooled scope hid exactly that class of defect (the
+  // call driver named the owner closure's `api`, `toast`, `state` and
+  // `renderMessages`, which threw ReferenceError at runtime). Resolution
+  // is now lexical per block. A call guarded by ``typeof foo ===
+  // "function"`` is a feature probe and is not reported when unresolved;
+  // tests/js/ownership_census.js separately reports any reference to
+  // another closure's top-level names, guarded or not.
   static collectTopLevel(ast, globalScope) {
+    for (const stmt of ast.body) {
+      switch (stmt.type) {
+        case "FunctionDeclaration":
+        case "ClassDeclaration":
+          if (stmt.id) globalScope.add(stmt.id.name);
+          break;
+        case "VariableDeclaration":
+          for (const d of stmt.declarations) {
+            Analyzer.collectBindingTargetsStatic(d.id, globalScope);
+          }
+          break;
+        case "ImportDeclaration":
+          for (const s of stmt.specifiers) {
+            if (s.local) globalScope.add(s.local.name);
+          }
+          break;
+        default:
+          break;
+      }
+    }
+    Analyzer.collectPublishedGlobals(ast, globalScope);
+  }
+
+  static collectPublishedGlobals(ast, globalScope) {
     function visit(node) {
       if (!node || typeof node !== "object") return;
       if (Array.isArray(node)) {
@@ -186,24 +218,6 @@ class Analyzer {
         return;
       }
       switch (node.type) {
-        case "FunctionDeclaration":
-        case "FunctionExpression":
-          if (node.id) globalScope.add(node.id.name);
-          break;
-        case "ClassDeclaration":
-        case "ClassExpression":
-          if (node.id) globalScope.add(node.id.name);
-          break;
-        case "VariableDeclaration":
-          for (const d of node.declarations) {
-            Analyzer.collectBindingTargetsStatic(d.id, globalScope);
-          }
-          break;
-        case "ImportDeclaration":
-          for (const s of node.specifiers) {
-            if (s.local) globalScope.add(s.local.name);
-          }
-          break;
         case "AssignmentExpression":
           // ``window.foo = function () { ... }`` and friends —
           // anything assigned to a ``window``/``self`` property
@@ -450,16 +464,55 @@ class Analyzer {
         if (node.computed) this._walk(node.key, scopes);
         this._walk(node.value, scopes);
         return;
+      case "IfStatement":
+      case "ConditionalExpression": {
+        // ``if (typeof foo === "function") foo()`` probes for foo.
+        this._walk(node.test, scopes);
+        const probed = Analyzer.typeofProbes(node.test);
+        this.guards.push(probed);
+        this._walk(node.consequent, scopes);
+        this.guards.pop();
+        this._walk(node.alternate, scopes);
+        return;
+      }
+      case "LogicalExpression": {
+        this._walk(node.left, scopes);
+        if (node.operator === "&&") {
+          this.guards.push(Analyzer.typeofProbes(node.left));
+          this._walk(node.right, scopes);
+          this.guards.pop();
+        } else {
+          this._walk(node.right, scopes);
+        }
+        return;
+      }
       case "CallExpression": {
         // ★ The check we care about.
         const callee = node.callee;
         if (callee.type === "Identifier") {
           const name = callee.name;
-          if (!GLOBALS.has(name) && !this._resolved(name, scopes)) {
+          const probed = this.guards.some((g) => g.has(name));
+          if (!GLOBALS.has(name) && !probed && !this._resolved(name, scopes)) {
             this.failures.push({
               name,
               line: callee.loc ? callee.loc.start.line : null,
               column: callee.loc ? callee.loc.start.column : null,
+              block: this.block.index,
+            });
+          }
+        }
+        // ``foo.bar()`` on a receiver that resolves nowhere throws the
+        // same ReferenceError (the call driver's ``api.post`` did).
+        let root = callee;
+        while (root && root.type === "MemberExpression") root = root.object;
+        if (root && root !== callee && root.type === "Identifier") {
+          const name = root.name;
+          const probed = this.guards.some((g) => g.has(name));
+          if (!GLOBALS.has(name) && !probed && !this._resolved(name, scopes)) {
+            this.failures.push({
+              name: `${name}.…`,
+              line: root.loc ? root.loc.start.line : null,
+              column: root.loc ? root.loc.start.column : null,
               block: this.block.index,
             });
           }
@@ -482,6 +535,31 @@ class Analyzer {
           this._walk(node[k], scopes);
         }
     }
+  }
+
+  // Names a condition proves callable: ``typeof foo === "function"`` or
+  // ``typeof foo !== "undefined"`` (either operand order), possibly joined
+  // with other conditions by ``&&``.
+  static typeofProbes(test, out = new Set()) {
+    if (!test) return out;
+    if (test.type === "LogicalExpression" && test.operator === "&&") {
+      Analyzer.typeofProbes(test.left, out);
+      Analyzer.typeofProbes(test.right, out);
+      return out;
+    }
+    if (test.type !== "BinaryExpression") return out;
+    const positive = test.operator === "===" || test.operator === "==";
+    const negative = test.operator === "!==" || test.operator === "!=";
+    if (!positive && !negative) return out;
+    for (const [a, b] of [[test.left, test.right], [test.right, test.left]]) {
+      if (a.type === "UnaryExpression" && a.operator === "typeof"
+          && a.argument.type === "Identifier" && b.type === "Literal") {
+        if ((positive && b.value === "function") || (negative && b.value === "undefined")) {
+          out.add(a.argument.name);
+        }
+      }
+    }
+    return out;
   }
 
   _resolved(name, scopes) {

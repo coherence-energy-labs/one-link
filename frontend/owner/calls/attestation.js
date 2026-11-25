@@ -162,7 +162,7 @@
         try { sender.replaceTrack(null).catch(() => {}); } catch (_) {}
       });
       try { media.pc.close(); } catch (_) {}
-      media.pc = null;
+      mediaState.set("pc", null);
     }
     if (media.localStream) {
       media.localStream.getVideoTracks().forEach((track) => {
@@ -229,9 +229,11 @@
       resetCapsuleCapture();
       stopAllMedia();
       hideActiveSurface();
-      if (callUI.activeCallId === finishedCallId) callUI.activeCallId = null;
-      callUI.activeCallPeerFp = null;
-      callUI.activeCallLocalRole = "";
+      if (callUI.activeCallId === finishedCallId) callState.set("activeCallId", null);
+      callState.update({
+        activeCallPeerFp: null,
+        activeCallLocalRole: "",
+      });
       reportCallEvent("capsule_capture_finalized", { reason, ok: true });
       return true;
     } catch (error) {

@@ -89,7 +89,7 @@
     closeMobileSidebar();
     // v0.21.1: reset the new-message pill on conversation switch.
     _hideNewMessagePill();
-    _lastRenderedLen = 0;
+    _resetRenderedMessageCount();
     _forceMessagesBottomNowAndAfter();
     // v0.14.1 persist for boot-time restore.
     _saveLastSelection("group", gidHex);
@@ -103,9 +103,9 @@
     }
     try {
       const r = await api.get(`/api/groups/${gidHex}/messages?limit=200`);
-      state.groupMessages = r.messages || [];
+      messageStore.replaceGroup(r.messages || []);
     } catch (e) {
-      state.groupMessages = [];
+      messageStore.clearGroup();
     }
     renderGroups();
     renderGroupConversation();
@@ -319,7 +319,7 @@
   // /api/chat-prefs at boot + kept in sync by chat_pref WS events.
   // localStorage is still written so the FIRST paint after a
   // reload is instant (we don't have to wait for the GET).
-  state.chatPrefs = state.chatPrefs || { peer: {}, group: {} };
+  settingsStore.startChatPrefs();
   function _readChatPref(scope, id, kind) {
     const cached = state.chatPrefs?.[scope]?.[id]?.[kind];
     if (cached !== undefined) return cached;
@@ -338,13 +338,8 @@
     return undefined;
   }
   function _writeChatPref(scope, id, kind, value) {
-    if (!state.chatPrefs[scope]) state.chatPrefs[scope] = {};
-    if (!state.chatPrefs[scope][id]) state.chatPrefs[scope][id] = {};
-    if (value === null || value === undefined || value === "") {
-      delete state.chatPrefs[scope][id][kind];
-    } else {
-      state.chatPrefs[scope][id][kind] = value;
-    }
+    // A local pick also clears on "" (an emptied picker).
+    settingsStore.setChatPref(scope, id, kind, value === "" ? null : value);
     // Mirror to localStorage for instant first-paint on reload.
     if (kind === "color") {
       const k = `one_link.${scope}_color.${id}`;
@@ -368,7 +363,7 @@
     try {
       const r = await api.get("/api/chat-prefs");
       // Server is the authority; replace any cached state.
-      state.chatPrefs = { peer: r.peer || {}, group: r.group || {} };
+      settingsStore.replaceChatPrefs(r.peer, r.group);
       // Re-render anything that consumed the prefs.
       renderGroups();
       renderPeers();
@@ -547,7 +542,7 @@
       closeGroupSettings();
       state.selectedGroup = null;
       state.groupDetail = null;
-      state.groupMessages = [];
+      messageStore.clearGroup();
       $("#convo-active").style.display = "none";
       $("#convo-empty").style.display = "grid";
       await refreshGroups();

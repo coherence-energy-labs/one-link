@@ -8,7 +8,7 @@
     }
     if (callUI.sdpOfferInFlight) return;
     try {
-      callUI.sdpOfferInFlight = true;
+      callState.set("sdpOfferInFlight", true);
       addOneCallEvent("Preparing media offer...");
       reportCallEvent("offer_preparing");
       if (media.iceConfigReady) await media.iceConfigReady;
@@ -16,10 +16,12 @@
       await ensureLocalTracksOnPeerConnectionSettled();
       const offer = await media.pc.createOffer();
       await media.pc.setLocalDescription(offer);
-      callUI.lastLocalOfferSdp = offer.sdp || "";
-      callUI.lastOfferSendMs = Date.now();
-      callUI.lastLocalOfferCreatedMs = callUI.lastOfferSendMs;
-      callUI.remoteOfferCollisionCount = 0;
+      callState.update({
+        lastLocalOfferSdp: offer.sdp || "",
+        lastOfferSendMs: Date.now(),
+      });
+      callState.set("lastLocalOfferCreatedMs", callUI.lastOfferSendMs);
+      callState.set("remoteOfferCollisionCount", 0);
       const result = await callApiPost({
         action: "send_sdp_offer",
         call_id: callUI.activeCallId,
@@ -35,7 +37,7 @@
       addOneCallEvent(`Media offer failed: ${e && e.name ? e.name : "error"}.`);
       reportCallEvent("offer_send_failed", { ok: false });
     } finally {
-      callUI.sdpOfferInFlight = false;
+      callState.set("sdpOfferInFlight", false);
     }
   }
 
@@ -58,8 +60,10 @@
     const now = Date.now();
     if (now - callUI.lastOfferSendMs < 3000) return;
     try {
-      callUI.sdpOfferInFlight = true;
-      callUI.lastOfferSendMs = now;
+      callState.update({
+        sdpOfferInFlight: true,
+        lastOfferSendMs: now,
+      });
       addOneCallEvent("Resending media offer...");
       reportCallEvent("offer_resend", { reason: reason || "watchdog" });
       const result = await callApiPost({
@@ -74,7 +78,7 @@
     } catch (_) {
       reportCallEvent("offer_resend_failed", { ok: false, reason: reason || "watchdog" });
     } finally {
-      callUI.sdpOfferInFlight = false;
+      callState.set("sdpOfferInFlight", false);
     }
   }
 
@@ -114,7 +118,7 @@
   function reviveRemotePlayback(reason) {
     const now = Date.now();
     if (now - Number(callUI.lastPlaybackReviveMs || 0) < 2500) return;
-    callUI.lastPlaybackReviveMs = now;
+    callState.set("lastPlaybackReviveMs", now);
     syncRemoteMediaSurface(reason || "playback_revive");
     reportCallEvent("remote_playback_revive", { reason: reason || "watchdog" });
   }
@@ -123,7 +127,7 @@
     if (!callUI.activeCallId || !media.localStream) return false;
     const now = Date.now();
     if (now - Number(callUI.lastPcRebuildMs || 0) < 30000) return false;
-    callUI.lastPcRebuildMs = now;
+    callState.set("lastPcRebuildMs", now);
     addOneCallEvent("Rebuilding media engine...");
     reportCallEvent("pc_rebuild_start", { reason: reason || "watchdog" });
     const remoteTracks = media.remoteStream ? media.remoteStream.getTracks() : [];
@@ -133,18 +137,14 @@
     attachRemoteStream(media.remoteStream || new MediaStream());
     if (media.pc) {
       try { media.pc.close(); } catch (_) {}
-      media.pc = null;
+      mediaState.set("pc", null);
     }
-    media.iceConfigReady = null;
-    media.transceiversReady = false;
-    callUI.pendingIceCandidates = [];
-    callUI.appliedIceKeys.clear();
-    callUI.appliedRemoteOfferKeys.clear();
-    callUI.appliedRemoteAnswerKeys.clear();
-    callUI.sdpOfferInFlight = false;
-    callUI.sdpAnswerInFlight = false;
-    callUI.lastLocalOfferSdp = "";
-    callUI.lastLocalAnswerSdp = "";
+    mediaState.update({
+      iceConfigReady: null,
+      transceiversReady: false,
+    });
+    // Queued/applied ICE, applied offers/answers and SDP in flight.
+    callState.forgetNegotiation();
     const pc = setupRtcPeerConnection();
     if (!pc) return false;
     ensureLocalTracksOnPeerConnection();
@@ -163,7 +163,7 @@
     if (!media.pc || !callUI.activeCallId) return;
     if (callUI.sdpAnswerInFlight) return;
     try {
-      callUI.sdpAnswerInFlight = true;
+      callState.set("sdpAnswerInFlight", true);
       addOneCallEvent("Preparing media answer...");
       reportCallEvent("answer_preparing");
       if (media.iceConfigReady) await media.iceConfigReady;
@@ -171,8 +171,10 @@
       await ensureLocalTracksOnPeerConnectionSettled();
       const answer = await media.pc.createAnswer();
       await media.pc.setLocalDescription(answer);
-      callUI.lastLocalAnswerSdp = answer.sdp || "";
-      callUI.lastAnswerSendMs = Date.now();
+      callState.update({
+        lastLocalAnswerSdp: answer.sdp || "",
+        lastAnswerSendMs: Date.now(),
+      });
       const result = await callApiPost({
         action: "send_sdp_answer",
         call_id: callUI.activeCallId,
@@ -188,7 +190,7 @@
       addOneCallEvent(`Media answer failed: ${e && e.name ? e.name : "error"}.`);
       reportCallEvent("answer_send_failed", { ok: false });
     } finally {
-      callUI.sdpAnswerInFlight = false;
+      callState.set("sdpAnswerInFlight", false);
     }
   }
 
@@ -204,8 +206,10 @@
     const now = Date.now();
     if (now - callUI.lastAnswerSendMs < 3000) return;
     try {
-      callUI.sdpAnswerInFlight = true;
-      callUI.lastAnswerSendMs = now;
+      callState.update({
+        sdpAnswerInFlight: true,
+        lastAnswerSendMs: now,
+      });
       addOneCallEvent("Resending media answer...");
       reportCallEvent("answer_resend", { reason: reason || "duplicate_offer" });
       const result = await callApiPost({
@@ -220,7 +224,7 @@
     } catch (_) {
       reportCallEvent("answer_resend_failed", { ok: false, reason: reason || "duplicate_offer" });
     } finally {
-      callUI.sdpAnswerInFlight = false;
+      callState.set("sdpAnswerInFlight", false);
     }
   }
 
@@ -236,7 +240,7 @@
     const hasLiveLocal = ensureLocalTracksOnPeerConnection();
     if (!hasLiveLocal) return;
     if (!callUI.localMediaReady) {
-      callUI.localMediaReady = true;
+      callState.set("localMediaReady", true);
       reportCallEvent("local_media_ready", { reason: reason || "watchdog" });
     }
     if (
@@ -309,10 +313,7 @@
       strategy = "renegotiate";
       severity = 2;
     }
-    const counts = callUI.repairDiagnosisCounts || {};
-    counts[kind] = Number(counts[kind] || 0) + 1;
-    callUI.repairDiagnosisCounts = counts;
-    callUI.repairEscalationScore = Math.min(10, Number(callUI.repairEscalationScore || 0) + severity);
+    const counts = callState.countRepairDiagnosis(kind, severity);
     if (
       callUI.repairEscalationScore >= 6 ||
       Number(counts[kind] || 0) >= 3 ||
@@ -344,27 +345,24 @@
       media_health: mediaHealth,
       seconds_since_media_moving: secondsSinceMoving,
     };
-    callUI.lastRepairDiagnosis = diagnosis;
+    callState.set("lastRepairDiagnosis", diagnosis);
     return diagnosis;
   }
 
   function markMediaRepairHealthy() {
-    callUI.repairEscalationScore = Math.max(0, Number(callUI.repairEscalationScore || 0) - 2);
-    if (callUI.repairEscalationScore === 0) {
-      callUI.repairDiagnosisCounts = {};
-      callUI.lastRepairDiagnosis = null;
-    }
+    callState.set("repairEscalationScore", Math.max(0, Number(callUI.repairEscalationScore || 0) - 2));
+    if (callUI.repairEscalationScore === 0) callState.clearRepairDiagnosis();
   }
 
   async function repairMediaPath(reason) {
     if (!callUI.activeCallId || !media.pc) return;
     const now = Date.now();
     if (now - Number(callUI.lastMediaRepairMs || 0) < 9000) return;
-    callUI.lastMediaRepairMs = now;
-    callUI.mediaRepairStage = Math.min(3, Number(callUI.mediaRepairStage || 0) + 1);
+    callState.set("lastMediaRepairMs", now);
+    callState.set("mediaRepairStage", Math.min(3, Number(callUI.mediaRepairStage || 0) + 1));
     const diagnosis = diagnoseMediaRepair(reason || "watchdog");
     if (now - Number(callUI.lastUserVisibleRepairMs || 0) > 15000 && callUI.qualityBadTicks >= 2) {
-      callUI.lastUserVisibleRepairMs = now;
+      callState.set("lastUserVisibleRepairMs", now);
       setReconnectState(true, "Repairing media path...");
     }
     addOneCallEvent("Repairing media path...");
@@ -411,7 +409,7 @@
       });
       if (diagnosis.strategy === "rebuild_peer_connection" || diagnosis.strategy === "relay_rebuild") {
         if (diagnosis.strategy === "relay_rebuild") {
-          media.preferRelayNext = true;
+          mediaState.set("preferRelayNext", true);
           updateOneChip("#call-one-engine", "Relay escape");
           reportCallEvent("relay_escape_requested", {
             reason: reason || "media_path_repair",

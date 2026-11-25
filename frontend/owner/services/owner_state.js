@@ -1,21 +1,12 @@
 // Isolated service: dependencies are explicit parameters; no owner closure access.
 function createOwnerState() {
   const state = {
-    me: null,
     peers: new Map(),     // short_id -> peer
     hiddenLocalPeers: 0,
     selectedPeer: null,   // short_id
-    messages: [],         // recent across all peers
-    transfers: [],
-    transfersById: new Map(),  // id -> transfer record (fast lookup for msg status)
-    // v0.8.8: per-transfer rate tracker. Each entry is
-    // {lastBytes, lastTs, bps} where bps is a rolling EWMA (alpha=0.4).
-    // Cleared on transfer completion / failure.
-    transferRates: new Map(),
     folders: [],
     status: null,
     fabric: null,
-    selfMesh: null,
     oneSetup: null,
     oneHealth: null,
     searchQuery: "",
@@ -44,7 +35,6 @@ function createOwnerState() {
     // When user clicks a group in the sidebar, we set this. Mutually
     // exclusive with selectedPeer (entering a group exits 1:1 view).
     selectedGroup: null,  // group_id_hex or null
-    groupMessages: [],    // current group's messages, refreshed on switch
     // Ephemeral group_id -> peer fingerprint -> expiry deadline. This is
     // deliberately memory-only; composition metadata never enters history.
     groupTyping: {},

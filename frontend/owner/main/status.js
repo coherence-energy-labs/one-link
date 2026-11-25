@@ -17,7 +17,7 @@
       console.warn(status.reason);
     }
     if (selfMesh.status === "fulfilled") {
-      state.selfMesh = selfMesh.value;
+      identityStore.replaceSelfMesh(selfMesh.value);
       renderSelfMesh();
     }
     // Keep rendezvous URLs cached so the empty-state nudge is accurate without
@@ -25,7 +25,7 @@
     if (rendezvous.status === "fulfilled") {
       const r = rendezvous.value;
       const before = (state.rendezvousUrls || []).length;
-      state.rendezvousUrls = r.urls || [];
+      settingsStore.setRendezvousUrls(r.urls || []);
       if (before === 0 && state.peers && state.peers.size === 0) {
         renderPeers();
       }

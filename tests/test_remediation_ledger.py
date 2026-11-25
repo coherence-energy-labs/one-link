@@ -55,6 +55,18 @@ def test_report_status_table_states_the_ledger_counts():
             assert int(match.group(1)) == count, f"report says {match.group(1)} {label}, ledger says {count}"
 
 
+def test_each_finding_is_stated_in_the_report_with_its_ledger_status():
+    """A finding's own section, or its row in the review table, names the status the ledger records."""
+    text = REPORT.read_text(encoding="utf-8")
+    for finding in DATA["findings"]:
+        fid, label = finding["id"], LABELS[finding["status"]]
+        section = re.search(rf"^#### {re.escape(fid)} — [^\n]*\n\n\*\*([^·\n]+?) · Original priority", text, re.M)
+        row = re.search(rf"^\|\s*{re.escape(fid)}\s*\|.*\|\s*([^|]+?)\s*\|\s*$", text, re.M)
+        stated = section.group(1) if section else (row.group(1) if row else None)
+        assert stated is not None, f"{fid} is in the ledger but not in the report"
+        assert stated == label, f"{fid}: report says {stated!r}, ledger says {label!r}"
+
+
 def test_cited_evidence_exists():
     catalog = {entry["id"] for entry in DATA["evidence_catalog"]}
     missing = sorted(

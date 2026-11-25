@@ -15,7 +15,7 @@ Substantial remediation is implemented across runtime correctness, native scanni
 
 Later final-head CI results will be recorded in the pull request; this dated report does not automatically inherit them.
 
-This report maps all 27 findings from the original audit to actual changes, commits, tests and remaining acceptance work. Its companion [machine-readable ledger](remediation-2026-11-24.json) contains the complete file and test lists, full commit identities, evidence paths, local artifact hashes and qualifications. Evidence IDs in this report refer to that ledger. The report consolidates implementation and verification already performed; it is not a supplemental adversarial assessment.
+This report maps all 27 findings from the original audit to actual changes, commits, tests and remaining acceptance work. An independent review on 2026-11-25 added eleven findings of its own and changed several statuses; they are in the last section, and the table below counts all 38. Its companion [machine-readable ledger](remediation-2026-11-24.json) contains the complete file and test lists, full commit identities, evidence paths, local artifact hashes and qualifications. Evidence IDs in this report refer to that ledger. The report consolidates implementation and verification already performed; it is not a supplemental adversarial assessment.
 
 The source revisions of individual runs matter. The broad local Linux execution used frozen source `3674060`; initial hosted execution used the tree of `dbb2f52`; the later Linux public bootstrap and completed Windows UI rerun used `d2de862`; full-checkout Python distribution validation used `f5fb842`. Subsequent browser, delivery and workflow changes require their own final acceptance. A passing focused selection on one revision is not substituted for a complete passing result on another.
 
@@ -26,9 +26,9 @@ The source revisions of individual runs matter. The broad local Linux execution 
 | Status | Findings | Meaning |
 | --- | ---: | --- |
 | Partially remediated | 3 | A substantive portion is repaired, while a material implementation/architecture or production-integration gap remains. Do not mark closed. |
-| Implemented; qualification pending | 11 | Implementation and focused verification exist, but a material acceptance step such as hosted, platform, artifact, realistic-workload or controlled-run qualification remains pending. |
+| Implemented; qualification pending | 9 | Implementation and focused verification exist, but a material acceptance step such as hosted, platform, artifact, realistic-workload or controlled-run qualification remains pending. |
 | Prepared; not applied | 1 | A concrete change payload and validation exist, but the external control has not been applied or read back. Do not describe it as enforced. |
-| Implemented and verified | 12 | The stated code/documentation defect has an implemented repair and relevant executed checks. This is bounded to cited evidence; it is not final CI, release, formal-security or all-platform certification. |
+| Implemented and verified | 25 | The stated code/documentation defect has an implemented repair and relevant executed checks. This is bounded to cited evidence; it is not final CI, release, formal-security or all-platform certification. |
 
 No overall maturity score is assigned from test counts, line reductions or the presence of advanced primitives. The judgment rests on operational behavior, exercised boundaries, credible measurements and accurately stated limitations.
 
@@ -127,7 +127,9 @@ Source: [pyproject.toml](../../pyproject.toml), [uv.lock](../../uv.lock), [nativ
 
 Python, rendezvous, npm, workspace and fuzz scans have no reported vulnerabilities in the retained checks. Before the backport, 87 of 88 observed default-branch alerts were outside the candidate's affected ranges; the remaining GLib issue was still affected. The backport now verifies all 121 original files and the exact two-line upstream diff, and the live OSV gate retains the two exact identifiers for that issue while rejecting any new affected advisory or incomplete query. Optimized regression, failure-path and source-provenance checks passed. The source-union SBOM contains 957 components and 958 dependency records. Evidence: E_DEP_PY, E_DEP_RUST, E_DEP_SHELL, E_DEP_NPM, E_CONTAINER, E_SBOM, E_DEP_ALERTS, E_GLIB_BACKPORT.
 
-**Remaining qualification:** Retain full hosted Linux shell compilation/window and final-candidate security outcomes. This is a project-maintained source backport, not an upstream-supported 0.18 release or a version outside the registry advisory range. The separate proc-macro-error maintenance warning remains. Verify the dependency inventory of each intended final artifact, maintain the source patch and migrate to a compatible maintained upstream toolkit when available.
+**Update 2026-11-25 (independent review):** Hosted on c3cd967: pip-audit + bandit + sbom; RustSec cargo-audit; Gitleaks full-history scan passed.
+
+**Remaining qualification:** No release artifact was built from this branch, so the dependency inventory of the intended release artifacts is not verified. The glib and ml-kem fixes are project-maintained backports; the registry versions stay in the advisories' affected ranges and the ancestor checks must keep running. RUSTSEC-2024-0370 (proc-macro-error, unmaintained) remains, exempted by exact id.
 
 #### RLS-02 — Release publication does not wait for reproducibility verification
 
@@ -137,27 +139,33 @@ Source: [.github/workflows/release.yml](../../.github/workflows/release.yml), [.
 
 Local negative comparison, artifact-identity and workflow ancestry contracts passed. Evidence: E_DELIVERY, E_RELEASE_LEDGER.
 
-**Remaining qualification:** Execute and retain a fresh hosted two-builder comparison on the exact release candidate; prove the publication path respects its result. Selected Linux native-wheel reproducibility does not prove whole-product/multi-platform byte reproducibility.
+**Update 2026-11-25 (independent review):** Workflow contract tests only; the release workflow was not executed.
+
+**Remaining qualification:** No release was cut: the two-builder comparison and the refusal to publish on a mismatch have not been observed on a real candidate. Windows and macOS wheels, the standalone archives and the SBOM have no independent rebuild.
 
 #### RLS-03 — The observed ruleset does not require approving review or named status checks
 
-**Prepared; not applied · Original priority: Medium.** Prepared a strict desired ruleset with ten named producer-bound checks, one approving review, no bypass actors and preserved existing controls. Native correctness, performance and shell contexts are included; the external policy remains unapplied. Commits: [48990e4](https://github.com/coherence-energy-labs/one-link/commit/48990e4469ed81520dd539d5fe2bf0741afbf33e), [876857f](https://github.com/coherence-energy-labs/one-link/commit/876857fbc389c2d486f8f99a4ad4ec33be13de9d), [d6594c8](https://github.com/coherence-energy-labs/one-link/commit/d6594c8d59aec0ba44277e0c9ca074f89a8cb030).
+**Partially remediated · Original priority: Medium.** Prepared a strict desired ruleset with ten named producer-bound checks, one approving review, no bypass actors and preserved existing controls. Native correctness, performance and shell contexts are included; the external policy remains unapplied. Commits: [48990e4](https://github.com/coherence-energy-labs/one-link/commit/48990e4469ed81520dd539d5fe2bf0741afbf33e), [876857f](https://github.com/coherence-energy-labs/one-link/commit/876857fbc389c2d486f8f99a4ad4ec33be13de9d), [d6594c8](https://github.com/coherence-energy-labs/one-link/commit/d6594c8d59aec0ba44277e0c9ca074f89a8cb030).
 
 Source: [.github/repository-policy.json](../../.github/repository-policy.json), [scripts/repository_policy.py](../../scripts/repository_policy.py), [docs/REPOSITORY_POLICY.md](../../docs/REPOSITORY_POLICY.md). Representative tests: [tests/test_delivery_evidence.py::test_ruleset_proposal_preserves_existing_controls_and_requires_real_producer](../../tests/test_delivery_evidence.py), [tests/test_delivery_evidence.py::test_required_contexts_are_defined_by_unfiltered_pr_workflows](../../tests/test_delivery_evidence.py).
 
 Proposal, source applicability and required-context contracts passed in the integrated 213-case selection. The shell follow-up passed 218 cases and requires its complete three-OS matrix whenever applicable. A fresh authenticated read confirms the original external policy still requires zero approvals and no named checks. No remote policy mutation has been applied at this snapshot. Evidence: E_POLICY, E_POLICY_DESIRED, E_DELIVERY, E_GATE_INTEGRATION, E_NATIVE_SHELL_GATE, E_POLICY_BEFORE_FINAL.
 
-**Remaining qualification:** Observe the ten required check names on the exact candidate, regenerate the API payload from the current desired policy, apply it and retain authenticated effective-policy readback.
+**Update 2026-11-25 (independent review):** The default-branch ruleset is active and was read back: one approving review and ten required status checks, no bypass actors.
+
+**Remaining qualification:** No tag ruleset exists and the 'release' environment does not exist; both payloads are prepared in docs/RELEASE_PROTECTION.md and neither is applied (see REV-S1). One approving review is required and there are no bypass actors, so this pull request needs an approver other than its author.
 
 #### RLS-04 — A failed Python dependency gate prevents later analysis and report upload
 
-**Implemented; qualification pending · Original priority: Medium.** Independent advisory/SAST/SBOM steps continue after a prior analyzer failure when tool setup succeeded; evidence upload is unconditional and enforcing commands still fail the job. Commits: [48990e4](https://github.com/coherence-energy-labs/one-link/commit/48990e4469ed81520dd539d5fe2bf0741afbf33e), [27cc28b](https://github.com/coherence-energy-labs/one-link/commit/27cc28be750027a8663893b5dacd5616188bf435).
+**Implemented and verified · Original priority: Medium.** Independent advisory/SAST/SBOM steps continue after a prior analyzer failure when tool setup succeeded; evidence upload is unconditional and enforcing commands still fail the job. Commits: [48990e4](https://github.com/coherence-energy-labs/one-link/commit/48990e4469ed81520dd539d5fe2bf0741afbf33e), [27cc28b](https://github.com/coherence-energy-labs/one-link/commit/27cc28be750027a8663893b5dacd5616188bf435).
 
 Source: [.github/workflows/security.yml](../../.github/workflows/security.yml), [.gitleaksignore](../../.gitleaksignore). Representative tests: [tests/test_delivery_evidence.py::test_independent_supply_chain_steps_and_evidence_survive_a_prior_failure](../../tests/test_delivery_evidence.py).
 
 Workflow evidence-retention contracts passed. Full-history Gitleaks revalidation at d2de862 passed with zero findings using the one reviewed exact historical fingerprint exception, without changing source or environment. The original failed scan remains retained. Evidence: E_DELIVERY, E_SHELL_TESTS, E_HOSTED_SECRET_SCAN, E_SECRET_REVALIDATION.
 
-**Remaining qualification:** Retain final combined-candidate hosted security conclusions. Commit 366d58e adds the second exact historical fingerprint for a rationale comment that repeated the same type annotation, and removes that literal from the current comment. Preserve both original detector matches and earlier scoped revalidation. No path-wide or detector-wide exception was added. Local workflow contracts and a clean earlier secret scan do not establish that every analyzer or dependency is clean.
+**Update 2026-11-25 (independent review):** Hosted on c3cd967: pip-audit + bandit + sbom; RustSec cargo-audit; Gitleaks full-history scan passed. Reports are uploaded whether or not a scanner fails.
+
+**Remaining qualification:** Two historical type-only and comment fingerprints stay documented; neither is a detector-wide or path-wide suppression.
 
 #### RLS-05 — A green native workflow includes an incomplete optional strict test pass
 
@@ -167,17 +175,21 @@ Source: [.github/workflows/native_build.yml](../../.github/workflows/native_buil
 
 The native correctness library run recorded 1,427 passes and one explicit corpus-dependent ignore. Timing success, failure and timeout result-state contracts passed. Evidence: E_DELIVERY, E_NATIVE_WORKSPACE.
 
-**Remaining qualification:** Dedicated timing runner is not provisioned/executed in this evidence. No claim of constant-time execution or complete strict timing qualification follows from ordinary tests.
+**Update 2026-11-25 (independent review):** Hosted on c3cd967: constant-time dataflow audit (valgrind) passed. 27 cases, including three negative controls. Statistical timing: 20 of 20 constant-time targets pass on Linux and on Windows with both leak controls detected.
+
+**Remaining qualification:** The dedicated timing runner is not provisioned, so the controlled-machine run the acceptance names has not happened. It is one manual dispatch of native_timing.yml on a runner labelled one-link-timing. Memcheck does not model variable-latency instructions, and the statistical runs were made on a loaded shared workstation. Neither is a proof of constant-time execution.
 
 #### RLS-06 — The documented source quickstart omits the required secure-channel native backend
 
-**Implemented; qualification pending · Original priority: Medium.** One documented bootstrap command resolves frozen dependencies, builds/installs matching native code and verifies version/binary/KEM ABI before supported source use; CI invokes that public path. Commits: [48990e4](https://github.com/coherence-energy-labs/one-link/commit/48990e4469ed81520dd539d5fe2bf0741afbf33e), [93a5d0d](https://github.com/coherence-energy-labs/one-link/commit/93a5d0d6e2c98d34760c01e6548232f0a9663fb1).
+**Implemented and verified · Original priority: Medium.** One documented bootstrap command resolves frozen dependencies, builds/installs matching native code and verifies version/binary/KEM ABI before supported source use; CI invokes that public path. Commits: [48990e4](https://github.com/coherence-energy-labs/one-link/commit/48990e4469ed81520dd539d5fe2bf0741afbf33e), [93a5d0d](https://github.com/coherence-energy-labs/one-link/commit/93a5d0d6e2c98d34760c01e6548232f0a9663fb1).
 
 Source: [scripts/bootstrap_source.py](../../scripts/bootstrap_source.py), [scripts/verify_native_runtime.py](../../scripts/verify_native_runtime.py), [README.md](../../README.md). Representative tests: [tests/test_delivery_evidence.py::test_native_runtime_checks_versions_binary_and_executed_abi](../../tests/test_delivery_evidence.py), [tests/test_delivery_evidence.py::test_bootstrap_source_identity_detects_edits_to_already_dirty_inputs](../../tests/test_delivery_evidence.py).
 
 Fresh public bootstrap commands passed on Linux at d2de862 and Windows at dbb2f52, with matching 0.22.1 versions, recorded native hashes and executed KEM self-tests. Sixty bootstrap and CI contract cases also passed. Independently validated full-checkout Python wheel and source-distribution builds at f5fb842 passed clean installations and exact payload checks; native backend qualification remains separately recorded. Evidence: E_BOOTSTRAP_SOURCE, E_BOOTSTRAP_CI, E_LINUX_BOOTSTRAP, E_WIN_BOOTSTRAP, E_HOSTED_INITIAL, E_PYTHON_DIST_REVIEW.
 
-**Remaining qualification:** Retain complete exact-final-source hosted clean-install and acceptance outcomes across supported platforms. Packaged-device qualification is separate from a source bootstrap.
+**Update 2026-11-25 (independent review):** Hosted on c3cd967: build acceptance native runtime / ubuntu-latest; build acceptance native runtime / windows-latest; full pytest suite / ubuntu-latest / py3.12; full pytest suite / windows-latest / py3.12 passed. Each job builds the native wheel from this source, installs exactly that wheel and verifies its identity before the suite runs.
+
+**Remaining qualification:** Packaged-device qualification is separate from a source bootstrap. macOS runs the native workspace tests and the picker smoke, not the full Python suite.
 
 #### RLS-07 — The release-status narrative is stale
 
@@ -197,19 +209,23 @@ Source: [scripts/verify_native_runtime.py](../../scripts/verify_native_runtime.p
 
 Linux and Windows public bootstrap executions have matching versions and explicit binary hashes. The 107 installed file-binding cases also passed on the fresh integrated Linux binary. The subsequent Windows browser execution at d2de862 passed all 63 Chromium and three Firefox cases. Evidence: E_NATIVE_RUNTIME, E_LINUX_BOOTSTRAP, E_WIN_BOOTSTRAP, E_LINUX_FULL, E_WIN_BROWSERS, E_WIN_BROWSERS_D2DE862.
 
-**Remaining qualification:** Attach exact-final-source binding, browser and live acceptance results for each supported platform. Package version and a single ABI self-test do not establish released-artifact compatibility on all devices.
+**Update 2026-11-25 (independent review):** Hosted on c3cd967: build acceptance native runtime / ubuntu-latest; build acceptance native runtime / windows-latest; full pytest suite / ubuntu-latest / py3.12; full pytest suite / windows-latest / py3.12; e2e (playwright) / ubuntu-latest; e2e (playwright) / windows-latest passed. The binding and browser suites run against the wheel built in the same run, after scripts/verify_native_runtime.py accepts it. 6 of 8 live shards passed against it.
+
+**Remaining qualification:** Linux and Windows only; released artifacts on other devices are not covered by a source run. Not every live shard passed on this revision (see MNT-02); the live half of the acceptance is therefore not complete.
 
 ### Observed runtime failures
 
 #### RUN-01 — Firefox required-identity browser-to-daemon pairing did not complete in the live test
 
-**Implemented; qualification pending · Original priority: Medium.** Bounded pairing lifecycle stages and diagnostics; retained exact required-identity flow; added authenticated HTTP fixture readiness after a separate Chromium read timeout. Commits: [0731ae5](https://github.com/coherence-energy-labs/one-link/commit/0731ae5c9ba39460769dfd6c6ef63ce7a157a3a4), [dcf9e5c](https://github.com/coherence-energy-labs/one-link/commit/dcf9e5c74d7e1a552c7a3362b122eb02d2b237b8), [dbb2f52](https://github.com/coherence-energy-labs/one-link/commit/dbb2f5221ffcc70d09a42b69aed03976b3b266e4).
+**Implemented and verified · Original priority: Medium.** Bounded pairing lifecycle stages and diagnostics; retained exact required-identity flow; added authenticated HTTP fixture readiness after a separate Chromium read timeout. Commits: [0731ae5](https://github.com/coherence-energy-labs/one-link/commit/0731ae5c9ba39460769dfd6c6ef63ce7a157a3a4), [dcf9e5c](https://github.com/coherence-energy-labs/one-link/commit/dcf9e5c74d7e1a552c7a3362b122eb02d2b237b8), [dbb2f52](https://github.com/coherence-energy-labs/one-link/commit/dbb2f5221ffcc70d09a42b69aed03976b3b266e4).
 
 Source: [src/one_link/web/peer.html](../../src/one_link/web/peer.html), [tests/e2e/test_browser_identity_possession_live.py](../../tests/e2e/test_browser_identity_possession_live.py), [tests/e2e/conftest.py](../../tests/e2e/conftest.py). Representative tests: [tests/e2e/test_browser_identity_possession_live.py::test_required_mode_live_pair_owner_request_and_immediate_revoke](../../tests/e2e/test_browser_identity_possession_live.py), [tests/test_peer_pairing_progress.py](../../tests/test_peer_pairing_progress.py).
 
 The exact local Windows Firefox case passed in 70.21 seconds and its integrated three-case selection passed in 81.58 seconds. Initial hosted Linux and Windows each passed 63 Chromium and three Firefox cases at the tree of dbb2f52. The older local Chromium timeout remains retained. The later Windows d2de862 run also passed all 63 Chromium and three Firefox cases, with zero skips, after both browser source extractions and the HTTP readiness correction. Evidence: E_BROWSER_FOCUSED, E_WIN_FIREFOX_EXACT, E_WIN_BROWSERS, E_HOSTED_INITIAL, E_HOSTED_WINDOWS_INITIAL, E_WIN_BROWSERS_D2DE862.
 
-**Remaining qualification:** The integrated Windows browser run at d2de862 is complete. Exact-final-source hosted acceptance remains pending. Intended released artifacts, broader browser, operating-system and network conditions, and long-duration qualification remain separate.
+**Update 2026-11-25 (independent review):** Hosted on c3cd967: e2e (playwright) / ubuntu-latest; e2e (playwright) / windows-latest passed. The Firefox lane runs the gate's own contract and the three pairing cases. On a loaded Windows workstation (median 86% CPU): 19 of 20 consecutive Firefox lane runs passed with no navigation stall; the one failure was the page defect fixed in 95403be. Without the change the same pairing case failed 4 of 10 runs.
+
+**Remaining qualification:** Released artifacts, other browsers and networks, and long-duration runs remain separate. macOS Firefox was not checked for the cache setting (Linux and Windows were).
 
 #### RUN-02 — Fresh passphrase-mode startup checks for a recovery envelope before creating it
 
@@ -301,7 +317,9 @@ Source: [.github/workflows/native_bench_gate.yml](../../.github/workflows/native
 
 Runner and gate contracts passed, and the execution transcript reports 23 coherence-field SLO and documentation cases passed. The initial hosted gate failed as INCONCLUSIVE after five pairs; no tolerance was relaxed. The follow-up profile is implemented in 3acb6fc, with 236 passed sampling contracts and a real 28-metric orchestration smoke. Windows scope portability passes all 70 cases after 9a8475a. Evidence: E_PERF_CONTRACT, E_PERF_HARNESS, E_HOSTED_BENCH, E_GATE_INTEGRATION, E_NATIVE_SAMPLING, E_NATIVE_SAMPLING_SMOKE, E_WIN_SCOPE_PORTABILITY.
 
-**Remaining qualification:** Retain the implemented 20-pair final-candidate comparison and meet the unchanged acceptance policy. A relative benchmark pass does not establish an absolute throughput target. The profile uses 31 storage and QUIC batches, three warmup batches and at least 16 MiB response payload per measured QUIC batch; its orchestration smoke does not supply a comparative acceptance result.
+**Update 2026-11-25 (independent review):** Hosted on c3cd967: the twenty-pair benchmark gate was INCONCLUSIVE, not passed. Three hosted twenty-pair studies were compared (c7d57a1, 64495c4, c3cd967). On every QUIC metric in every study the candidate is slower than the default branch: median ratios 0.976 to 0.990, 0.981 to 0.986 and 0.959 to 0.999. Two studies are inside the 5% limit; in the third, two round-trip metrics (0.964 [0.950, 0.985] and 0.959 [0.948, 0.976]) have an interval that reaches the limit.
+
+**Remaining qualification:** QUIC round trips are 1 to 4% slower than the default branch. No QUIC code of this project changed; the arms differ by the tokio and quinn-proto updates, and quinn-proto 0.11.19 is the security update RLS-01 requires. Which of the two costs the time has not been measured. The owner decides whether to accept that cost and re-baseline after merge. The same candidate code measured 0.981 to 0.986 in one study and 0.959 to 0.973 in the next: the between-run spread is larger than each study's own interval, so a 5% limit will sometimes be reached by a difference this size. The two chunk-store write metrics are disk-bound and bimodal on hosted runners (about 221 MB/s or about 1.1 GB/s in either arm, a runner disk cap); the study at 64495c4 was inconclusive on them for that reason alone. They should be measured against memory-backed storage or left out of the hosted gate. A relative benchmark result does not establish any absolute network throughput target.
 
 ### Maintainability and test coverage
 
@@ -313,7 +331,9 @@ Source: [src/one_link/file_source.py](../../src/one_link/file_source.py), [src/o
 
 The runtime, UI and courier selections passed 243, 86 and 168 cases respectively. These are separate overlapping runs. The preparation extraction removed 556 net daemon lines; courier extraction removed 654 net server lines while preserving send, receipt, authentication and public route contracts. Full-checkout Python distribution validation at f5fb842 includes the extracted services in the exact 232-file Python inventory. Evidence: E_RUNTIME, E_RUNTIME_UI, E_COURIER, E_FIXED_PREP, E_PYTHON_DIST_REVIEW.
 
-**Remaining qualification:** Daemon and UIServer remain very large; peer/outbound/call/folder/recovery orchestration still requires incremental service boundaries. Courier execution remains synchronous/serialized; concurrent import workers require a separate synchronization design.
+**Update 2026-11-25 (independent review):** Daemon 506 methods / 35,162 lines to 499 / 33,200; UIServer 450 / 25,683 to 445 / 25,032 (two merged methods recorded as growth with a written reason).
+
+**Remaining qualification:** Still in Daemon: the transfer domain (about 9,900 lines), the peer dispatcher (4,400), the rest of folder sync (3,200), groups and mesh. Still in UIServer: peer, folder and recovery routes. Courier imports remain serialized on the event loop; concurrent workers need a synchronization design first.
 
 #### MNT-02 — Many existing live-daemon tests are omitted from normal push/PR execution
 
@@ -323,7 +343,9 @@ Source: [tests/live_daemon_manifest.json](../../tests/live_daemon_manifest.json)
 
 Collection accounts for 139 functions and 152 parameter cases. Twenty-one hermetic pairing cases passed. The initial hosted Linux and Windows lanes each executed all 152 live cases with no failures or skips; exact-final-source acceptance remains pending. Evidence: E_LIVE_MANIFEST, E_HERMETIC_PAIRING, E_DELIVERY, E_LINUX_FULL, E_HOSTED_INITIAL, E_HOSTED_WINDOWS_INITIAL.
 
-**Remaining qualification:** Execute every required live shard at the final candidate and observe required hosted checks. Linux ifaddr EPERM blocks relevant execution here; source collection is not substituted for live qualification.
+**Update 2026-11-25 (independent review):** Hosted on c3cd967: 6 of 8 live shards passed; not passed: live daemon acceptance / windows-latest / shard 1; live daemon acceptance / windows-latest / shard 3. 142 registered live tests run in four shards per platform, and an unregistered live test fails before it spawns a daemon.
+
+**Remaining qualification:** Linux and Windows only. On hosted Windows runners single live cases fail intermittently: across the last runs on this branch, a daemon that took more than 20 to 30 s to start (a class the repository has carried diagnostics for since July), a folder send that did not land within 30 s, and two folder-sync tests whose expected counts depended on which delivery path won. The count race is fixed in the tests; the slow start and the folder send are not explained. Each now arrives with the daemons' logs and the startup step that was slow. The same cases passed 8 of 8 and 9 of 9 on a workstation.
 
 #### MNT-03 — Browser application logic remains concentrated in huge inline scripts
 
@@ -333,7 +355,9 @@ Source: [frontend/owner/manifest.json](../../frontend/owner/manifest.json), [fro
 
 Execution transcripts record 11 owner source cases and eight owner Node cases passed, plus 593 peer source cases passed, three skipped and six peer Node cases passed. All 311 original named peer function bodies were retained. The peer change is integrated as 296c721. Windows browser acceptance at d2de862 passed all 63 Chromium and three Firefox cases. Full-checkout Python distribution validation at f5fb842 also confirmed exact packaged assets and clean installations. Evidence: E_OWNER, E_PEER, E_DIST_FINAL, E_WIN_BROWSERS, E_WIN_BROWSERS_D2DE862, E_PYTHON_DIST_REVIEW.
 
-**Remaining qualification:** Both extracted UIs passed the Windows browser selection at d2de862. Final combined-candidate hosted and intended released-artifact qualification remain pending. Legacy feature modules still share page closures. The new factories improve boundaries but do not complete state separation or broader physical-device qualification.
+**Update 2026-11-25 (independent review):** Cross-module writes 844 to 336; the six named features 508 to 0; references from one closure to another's names 34 to 0. Hosted on c3cd967: e2e (playwright) / ubuntu-latest; e2e (playwright) / windows-latest passed.
+
+**Remaining qualification:** 336 cross-module writes remain outside the six named features, each listed with a rationale and held by the ratchet. Screenshots are captured for review; there is no pixel-level layout gate.
 
 #### MNT-04 — Protocol catalogue omits current completion states and historical test audit is not current evidence
 
@@ -359,23 +383,27 @@ Seventy-five Rust package cases and 107 installed-wheel cases passed. The same 1
 
 #### BRANCH-02 — Bounded payload buffering does not bound dense-record metadata memory
 
-**Implemented; qualification pending · Original priority: Medium.** Online record visitors absorb dense boundaries during traversal and scan accepted segments immediately, removing production candidate/accepted-cut/segment materialization. Commits: [8b42802](https://github.com/coherence-energy-labs/one-link/commit/8b42802bf883cb0eed2f017d0cca274b81e83b9d).
+**Implemented and verified · Original priority: Medium.** Online record visitors absorb dense boundaries during traversal and scan accepted segments immediately, removing production candidate/accepted-cut/segment materialization. Commits: [8b42802](https://github.com/coherence-energy-labs/one-link/commit/8b42802bf883cb0eed2f017d0cca274b81e83b9d).
 
 Source: [native/ol_chunk/src/stream.rs](../../native/ol_chunk/src/stream.rs), [native/ol_chunk/examples/stream_memory_probe.rs](../../native/ol_chunk/examples/stream_memory_probe.rs), [native/ol_chunk/tests/stream_contracts.rs](../../native/ol_chunk/tests/stream_contracts.rs). Representative tests: [native/ol_chunk/tests/stream_contracts.rs](../../native/ol_chunk/tests/stream_contracts.rs), [native/ol_chunk/examples/stream_memory_probe.rs](../../native/ol_chunk/examples/stream_memory_probe.rs).
 
 A two-million-record reader contract and 18 paired memory observations verify online behavior. At four million records, median native VmHWM decreased by 94.1 percent while exact output digests matched. Evidence: E_NATIVE_CHUNK, E_NATIVE_MEMORY.
 
-**Remaining qualification:** Realistic dense/sparse multi-GB logs, disk/network effects and supported-platform RSS still require qualification. Returned output remains O(chunks); public all-offset APIs intentionally retain O(records) compatibility behavior.
+**Update 2026-11-25 (independent review):** Hosted on c3cd967: scan memory qualification (ubuntu-latest); scan memory qualification (windows-latest); scan memory qualification (macos-latest) passed. Dense, sparse and plain logs of 256 MiB and 1 GiB on each platform: every workspace within its declared bound, per-record slope at most 0.05 bytes.
+
+**Remaining qualification:** Hosted sizes stop at 1 GiB; larger logs were measured on one Windows workstation only. The smaller buffers cost speed: about 15 to 30% on dense logs and up to a third on sparse ones (hosted runners and a 14-round workstation sweep agree on the direction; the workstation is too noisy to pick an optimum). A larger hashing batch with a small read-ahead should keep the memory limit and restore parallel hashing; that needs a quiet machine. Returned output remains O(chunks), and the explicit offset-list APIs keep their O(records) result by design.
 
 #### BRANCH-03 — New file APIs have no binding-level tests or in-repository runtime integration evidence
 
-**Partially remediated · Original priority: Low.** Installed exports now have format/profile/path/error/window/limit tests. Separately accelerated the existing descriptor-bound production Gear CDC path without substituting the distinct pathname/format-aware Rust semantics. Commits: [8b42802](https://github.com/coherence-energy-labs/one-link/commit/8b42802bf883cb0eed2f017d0cca274b81e83b9d), [74ae074](https://github.com/coherence-energy-labs/one-link/commit/74ae0742ca433118f4c0d4c52bcc731e569ca898).
+**Implemented; qualification pending · Original priority: Low.** Installed exports now have format/profile/path/error/window/limit tests. Separately accelerated the existing descriptor-bound production Gear CDC path without substituting the distinct pathname/format-aware Rust semantics. Commits: [8b42802](https://github.com/coherence-energy-labs/one-link/commit/8b42802bf883cb0eed2f017d0cca274b81e83b9d), [74ae074](https://github.com/coherence-energy-labs/one-link/commit/74ae0742ca433118f4c0d4c52bcc731e569ca898).
 
 Source: [native/one_link_native/src/chunk.rs](../../native/one_link_native/src/chunk.rs), [native/one_link_native/chunk.pyi](../../native/one_link_native/chunk.pyi), [tests/test_native_format_aware_file.py](../../tests/test_native_format_aware_file.py). Representative tests: [tests/test_native_format_aware_file.py](../../tests/test_native_format_aware_file.py), [tests/test_cdc_file_windows.py](../../tests/test_cdc_file_windows.py).
 
 The 107 binding and export cases passed, including a real 32 MiB window crossing and 256 MiB refusal. Production Gear acceleration has exact-boundary evidence. Evidence: E_NATIVE_BINDING, E_LINUX_FULL, E_CDC_PREP.
 
-**Remaining qualification:** A production consumer/end-to-end benchmark for the distinct format-aware Rust file API remains absent/unqualified. Binding tests and Gear acceleration do not prove that the product uses every new exported format-aware API.
+**Update 2026-11-25 (independent review):** The format-aware file API has a production caller, and its suite passes on this branch's wheel.
+
+**Remaining qualification:** No end-to-end benchmark with the real caller is recorded. One Link's own transfer path stays on plain content-defined chunking on purpose: a deduplication experiment on its corpus did not favour format-aware cuts.
 
 #### BRANCH-04 — cdc_file documentation still describes a 512 KiB buffer despite a 32 MiB window
 
@@ -389,13 +417,15 @@ Runtime limit constants and window/refusal contracts are exercised by installed-
 
 #### BRANCH-05 — Cross-platform determinism fixture does not yet pin exact boundary outputs
 
-**Implemented; qualification pending · Original priority: Medium.** Pinned exact pre-change starts/ends/hashes and corpus hashes for random/zero/edited fixtures; serial/parallel/streamed kernels share reviewed golden outputs. Commits: [8b42802](https://github.com/coherence-energy-labs/one-link/commit/8b42802bf883cb0eed2f017d0cca274b81e83b9d).
+**Implemented and verified · Original priority: Medium.** Pinned exact pre-change starts/ends/hashes and corpus hashes for random/zero/edited fixtures; serial/parallel/streamed kernels share reviewed golden outputs. Commits: [8b42802](https://github.com/coherence-energy-labs/one-link/commit/8b42802bf883cb0eed2f017d0cca274b81e83b9d).
 
 Source: [native/ol_chunk/tests/fixtures/cdc_golden_v1.txt](../../native/ol_chunk/tests/fixtures/cdc_golden_v1.txt), [native/ol_chunk/tests/cross_platform.rs](../../native/ol_chunk/tests/cross_platform.rs), [.github/workflows/native_build.yml](../../.github/workflows/native_build.yml). Representative tests: [native/ol_chunk/tests/cross_platform.rs](../../native/ol_chunk/tests/cross_platform.rs).
 
 Frozen vectors passed in local Linux package tests. Initial hosted all-targets/all-features Linux x86_64, Linux ARM64 and macOS jobs passed. Windows exposed a fixture parser that assumed LF. Commit 8bbb9c8 parses sections with portable line handling; the golden corpus and exact expected outputs are unchanged. The new LF/CRLF equivalence test fails against the old parser and passes against the repair. All six golden-vector tests then passed on actual Windows. Evidence: E_NATIVE_CHUNK, E_NATIVE_GOLDEN_PORTABILITY, E_WIN_PORTABILITY_ATTEMPT.
 
-**Remaining qualification:** Retain fresh exact-candidate x86_64/ARM64 and supported-OS executions before declaring cross-platform determinism qualified.
+**Update 2026-11-25 (independent review):** Hosted on c3cd967: cargo test (workspace) (ubuntu-latest); cargo test (workspace) (ubuntu-24.04-arm); cargo test (workspace) (windows-latest); cargo test (workspace) (macos-latest) passed. The pinned boundary and hash vectors, including the v2 format-aware vectors, run on x86_64 and ARM64 Linux, Windows and macOS.
+
+**Remaining qualification:** Format-aware boundaries changed definition (version 2); stores that mix versions deduplicate only where the definitions agree.
 
 ## Dependency coverage and remaining supply-chain issues
 
@@ -452,3 +482,49 @@ The companion JSON is the authoritative index of evidence IDs and complete paths
 | Windows | `C:\Users\Josh\Projects\OneDesktopConnection\test-results\one-link-remediation-20261124` | Original Windows bootstrap, browser and verified transfer evidence; aggregate counts and public test IDs are summarized here |
 
 The performance 81-case, owner source/Node and peer source/Node results were recorded in execution transcripts; no standalone pytest XML was retained for those local runs. They are labeled accordingly and must not be presented as archived raw result logs. The Windows XML remains on the Windows host; this report uses approved aggregate counts and public test identities. All reported measurements carry their workload, platform and source limits. There is no blanket security, performance, formal-verification or all-platform certification.
+
+## Independent review and follow-up (2026-11-25)
+
+After the report above was written, the pull request was reviewed adversarially by a second party: one reviewer per area (constant-time behaviour, native scanners, recovery and key authority, supply chain and CI, browser state, performance evidence), each asked to break a claim and to bring a witness. The findings below were confirmed by a witness before they were fixed, and each fix has a test that fails without it. Statuses in this document and in the ledger were updated from hosted results on `c3cd967a61cbdeb4e875c155344b564ffe08d29d`; the commit that records them changes documentation only.
+
+### What the review found that the first pass had not
+
+| Finding | What was wrong | Status |
+|---|---|---|
+| REV-CT1 | Shamir sharing re-rolled the top coefficient until it was non-zero. With k-1 shares that rules out one secret value per byte, and the loop branched on a secret. | Implemented and verified |
+| REV-CT2 | Secret-dependent branches or table lookups in the onion code (nine early-exit zero tests), in ml-kem 0.2.3 decapsulation, in the duress gate, and a QUIC timing test that never called the shipped comparison. | Implemented and verified |
+| REV-N1 | Chunk profiles that FastCDC refuses aborted the process or looped (a 100-byte file tried to allocate 27 GB); a 16-byte MP4 indexed past the end. | Implemented and verified |
+| REV-N2 | Format-aware chunking did not resynchronise on dense records: one inserted record re-sent 100% of a 64 MiB log of 32-byte records. | Implemented and verified |
+| REV-R1 | Setting or unsetting `ONE_LINK_PASSPHRASE` replaced the key that protected an install's rows; identity rotation orphaned state fields; key failures degraded to a stateless daemon instead of stopping startup. | Implemented and verified |
+| REV-R2 | A resumed transfer dropped the requested transport and its ledger row counted only the last attempt. | Implemented and verified |
+| REV-S1 | No tag ruleset and no protected release environment. | Prepared; not applied |
+| REV-S2 | Required native gates could pass without running, and a pull request could edit the policy that decided so. | Implemented; qualification pending |
+| REV-U1 | Ending an inbound call threw before media teardown, so capture could outlive the call. | Implemented and verified |
+| REV-P1 | A QUIC throughput regression in the five-pair study was read as a pass. | Implemented; qualification pending |
+| REV-D1 | A ledger that disagreed with its own report; a timing report that would have published machine details; a memory gate that reported growth for a flat scanner. | Implemented and verified |
+
+### What changed for the original findings
+
+- **RLS-05 (constant time).** The required check is now deterministic: production code built with release codegen runs under Valgrind with each secret marked undefined, and every secret-dependent branch or index must sit on a marked, reasoned verdict line; three negative controls must be flagged or the run fails. A statistical timing test with a stated power requirement was added beside it. On Linux and on Windows, 20 of 20 constant-time targets passed with both planted leaks detected; the same test, run before the fix, is what found the duress-gate leak. Both hosts were a loaded shared workstation and the reports say so. The controlled-runner run the audit asked for has still not happened: it is one manual dispatch of `native_timing.yml` on a runner labelled `one-link-timing`.
+- **RUN-01 (Firefox pairing).** The cause was measured, then measured again when the first fix proved incomplete. A freshly launched Firefox writes its startup cache 2 to 10 s after launch, again at about 120 s and at shutdown, and each write holds its parent process (7 to 175 s observed) as soon as that process touches the cache; the daemon answered in 15 to 312 ms throughout. Waiting for one write, the first fix, could not cover the second. The test browsers now run with that cache disabled, which removes the cause, and a gate proves it for every Firefox the tests launch and fails as a browser condition, never as a pairing verdict. Nineteen of twenty consecutive lane runs passed on a loaded workstation; the one failure was a real page defect (a connection-state update replaced the instruction to send a signal), now fixed with its own test. On the page itself, every held pairing step races the 90 s deadline, and two request paths that blocked the daemon's event loop for 600 to 700 ms moved to a worker thread. macOS Firefox was not checked.
+- **BRANCH-02 (scanner memory).** Three things were wrong, found in this order. The qualification reported per-record growth for a scanner whose memory was flat (its model gave dense and sparse logs one shared workspace). Its test logs repeated with the scanner's own batch size, which made the measured peak depend on where the first cut fell. And the dense header window grew by doubling: macOS measured 48.7 MiB against a 24.1 MiB bound. The window is now allocated once. The dense walk's read-ahead and hashing batch were then cut from 16 MiB and 8 MiB to 64 KiB, so a dense log needs about 2.4 MiB, no more than a sparse one, and the original limit on the dense-minus-sparse difference is enforced again. That last change costs speed, roughly 15 to 30% on dense logs and up to a third on sparse ones; each run now reports scan speed relative to its plain-log control so the trade is visible. Choosing better sizes needs a quiet machine.
+- **BRANCH-03 (format-aware API in use).** The API has a production caller, ONE Memory's `store.put_file`, and its suite passes on this branch's wheel. Descriptor-bound exports (`cdc_fd`, `format_aware_fd`) close the pathname-replacement race for callers that verify a file before scanning it. One Link's own transfer path stays on plain content-defined chunking: a deduplication experiment on its corpus did not favour format-aware cuts.
+- **MNT-01 (large classes).** Three services left the two orchestration classes behind typed interfaces, and a census is a ratchet against regrowth. This is an increment: the transfer domain, the peer dispatcher and most routes are still in those classes.
+- **MNT-03 (browser state).** The six named features have owners; cross-module writes went from 844 to 336, and the remaining 336 are listed with a rationale and held by a ratchet.
+- **RLS-03 (branch policy).** Read back on 2026-11-25: the default-branch ruleset is active with one required approval, ten required checks and no bypass actors. There is no tag ruleset and no `release` environment (REV-S1).
+
+### What is still open, and who decides
+
+1. **An approver.** The ruleset requires one approving review and has no bypass actors. This pull request cannot merge on its author's approval.
+2. **Tag ruleset and release environment.** The payloads are in `docs/RELEASE_PROTECTION.md`. Applying them is the repository owner's decision; this review changed no setting.
+3. **The controlled timing run (RLS-05).** Needs a dedicated runner. Until then the evidence is a deterministic dataflow audit plus statistical tests on a noisy host.
+4. **A release has not been cut.** RLS-02 (publication waits for reproducibility) and the release-artifact half of RLS-01 can only be observed on a real candidate.
+5. **MNT-01 and MNT-03 are increments.** What remains is listed in the ledger.
+6. **Benchmark gate.** On the revision these results are from, the hosted twenty-pair benchmark gate was inconclusive. Across three hosted studies the candidate is 1 to 4% slower than the default branch on every QUIC metric; the arms differ by the tokio and quinn-proto updates, and quinn-proto 0.11.19 is the security update the audit required. Which of the two costs the time has not been measured. Accept the cost and re-baseline after merge, or bisect it on a quiet machine.
+7. **Hosted Windows live suite.** Two of eight live shards failed on that revision. One was a test that bet on which delivery path reached the receiver first (fixed in def8556, after the run). The other, a folder send that did not land within 30 s, failed on two consecutive hosted runs and passed 8 of 8 on a workstation; it is not explained. A daemon on a hosted Windows runner is also intermittently slow to start, which the repository has carried diagnostics for since July. Live failures now arrive with both daemons' logs and the startup step that was slow.
+8. **Scanner speed.** The dense scanner's smaller buffers cost roughly 15 to 30% of scan speed on dense logs and up to a third on sparse ones. Each qualification run now reports speed beside memory. Choosing better sizes needs a quiet machine.
+
+### Corrections to this document
+
+- The status table above is regenerated from the ledger; `tests/test_remediation_ledger.py` fails if the two disagree.
+- An earlier headline for this pull request said 22 findings were verified while the committed ledger said 12. The ledger was right.

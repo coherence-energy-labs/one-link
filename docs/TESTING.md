@@ -54,7 +54,24 @@ its regression test).
 | `reproducible_release.yml` | `v*` tag + manual | Unsigned comparison evidence; byte equality is enforced only for two Linux native-wheel builds. |
 | `security.yml` | every push/PR + weekly | Lock drift, secret/history scan, workflow lint, Python/Rust advisories, SAST, and SBOM generation. JavaScript advisories are checked by `lint.yml`. |
 | `fuzz_nightly.yml` | daily + manual | Budgeted native parser/state-machine fuzz targets and crash-artifact upload. |
-| `native_timing.yml` | manual | Bounded strict timing diagnostics on a separately provisioned, controlled Linux runner; retains failures/timeouts and raw target logs. This does not certify constant-time execution. |
+| `native_build.yml` | every push + PR | Native workspace tests on x86_64 and ARM64 Linux, Windows and macOS; the constant-time dataflow audit (`scripts/run_ct_audit.py`: production code under Valgrind with each secret marked undefined, negative controls required); the scan-memory qualification (`scripts/bench_scan_memory.py`) on Linux, Windows and macOS. Which paths can skip this work is decided by the base revision's copy of `scripts/native_ci_scope.py`, never the pull request's. |
+| `native_timing.yml` | manual | On a separately provisioned, controlled Linux runner: bounded strict timing diagnostics, and a statistical timing-leak test (`scripts/run_ct_timing.py`) that passes a target only with no detected leak and the power to see a 1% difference, and fails if the machine is not as quiet as claimed. Failures, timeouts and raw logs are retained. Neither certifies constant-time execution. |
+
+Four checks in the main suite are ratchets. Each fails on growth, and also on
+an improvement that was not recorded, so its baseline always describes the
+tree:
+
+- `tests/test_class_census.py`: the `Daemon` and `UIServer` classes may not
+  gain methods or lines; recording growth needs a written reason
+  (`python tests/class_census.py --write --growth-reason "..."`).
+- `tests/test_frontend_state_ownership.py`: no new write to a page's top-level
+  state from a module that does not own it, and no reference from one script
+  closure to another's names.
+- `tests/test_remediation_ledger.py`: the audit ledger's counts equal its
+  findings, its report states the same counts, and every cited commit and
+  evidence id exists.
+- `tests/test_event_loop_never_blocks.py`: no `async def` in the daemon or the
+  UI server calls a known blocking operation directly.
 
 The `tests.yml` matrix is intentionally narrow for fast PR feedback.
 `full_suite_and_e2e.yml` is the broad source-level gate. Neither workflow can

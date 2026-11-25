@@ -2447,6 +2447,13 @@
       "subject": "test(live): failures carry the daemons' logs; the round-trip test stops betting on delivery order",
       "url": "https://github.com/coherence-energy-labs/one-link/commit/def8556e818c4ba150b38d36194474da616edb16",
       "integrated_in_review_basis": false
+    },
+    {
+      "id": "8944380",
+      "revision": "894438029286132a4e349bf3e964d299a3545c70",
+      "subject": "test(threshold): the last hard wall-clock gate becomes advisory on shared runners; the audit is what blocks (RLS-05)",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/894438029286132a4e349bf3e964d299a3545c70",
+      "integrated_in_review_basis": false
     }
   ],
   "findings": [
@@ -2766,6 +2773,16 @@
             "tests/test_ct_timing.py",
             ".github/workflows/native_timing.yml"
           ]
+        },
+        {
+          "summary": "The last secret-dependent wall-clock test that could still fail required CI on a shared runner (the GF(256) multiply gate, which reported 10.13% against a 5% limit on hosted macOS with unchanged code) now reports through the same non-strict convention as the other eleven; the dataflow audit case for that function is the blocking check, and two contract tests keep that pairing.",
+          "commits": [
+            "8944380"
+          ],
+          "files": [
+            "native/ol_threshold_recovery/tests/constant_time_gate.rs",
+            "tests/test_ct_audit_contract.py"
+          ]
         }
       ],
       "validation": [
@@ -2795,6 +2812,14 @@
           "evidence_ids": [
             "E_REV_CT_TIMING"
           ]
+        },
+        {
+          "summary": "Every secret-dataflow timing site reports through the non-strict gate and is covered by an audit case that must come out clean; the multiply's audit case keeps the table-based variant as its planted leak. The gate passes with and without strict mode on a workstation.",
+          "tests": [
+            "tests/test_ct_audit_contract.py::test_no_secret_timing_site_can_fail_required_ci_on_wall_clock_noise",
+            "tests/test_ct_audit_contract.py::test_the_gf_mul_gate_is_backed_by_an_audit_case_and_a_planted_leak"
+          ],
+          "evidence_ids": []
         }
       ],
       "remaining": [
@@ -4660,6 +4685,13 @@
       "benchmark gate": "On the revision these results are from, the hosted twenty-pair benchmark gate was inconclusive. Across three hosted studies the candidate is 1 to 4% slower than the default branch on every QUIC metric; the arms differ by the tokio and quinn-proto updates, and quinn-proto 0.11.19 is the security update the audit required. Which of the two costs the time has not been measured. Accept the cost and re-baseline after merge, or bisect it on a quiet machine.",
       "hosted Windows live suite": "Two of eight live shards failed on that revision. One was a test that bet on which delivery path reached the receiver first (fixed in def8556, after the run). The other, a folder send that did not land within 30 s, failed on two consecutive hosted runs and passed 8 of 8 on a workstation; it is not explained. A daemon on a hosted Windows runner is also intermittently slow to start, which the repository has carried diagnostics for since July. Live failures now arrive with both daemons' logs and the startup step that was slow.",
       "scanner speed": "The dense scanner's smaller buffers cost roughly 15 to 30% of scan speed on dense logs and up to a third on sparse ones. Each qualification run now reports speed beside memory. Choosing better sizes needs a quiet machine."
-    }
+    },
+    "later_hosted_runs": [
+      {
+        "revision": "072027f",
+        "summary": "47 checks passed, 2 failed, 3 skipped. All eight live shards, both browser suites and the twenty-pair benchmark gate passed. The two failures were the macOS native test job and the aggregate gate above it, on the GF(256) wall-clock timing gate (10.13% against 5%), which 8944380 then made advisory on shared runners.",
+        "reading": "The live shards and the benchmark gate failed on c3cd967 and passed on the next revision, whose only product-relevant difference is in tests. They are intermittent on hosted runners, not fixed."
+      }
+    ]
   }
 }

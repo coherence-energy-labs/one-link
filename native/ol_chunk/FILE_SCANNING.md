@@ -191,6 +191,10 @@ requires:
 - `b_chunk` at most 1,024 bytes and `b_record` at most 0.05 bytes;
 - repeat-to-repeat spread small enough to see one retained bit per record
   (otherwise the run fails as underpowered).
+- a same-size, chunk-adjusted dense-minus-sparse peak of at most
+  `max(8 MiB, 10% of the larger raw peak)`. Output cost is calibrated only
+  from the same API's plain-file samples and clipped to 0–1,024 bytes per
+  returned chunk; the joint record-growth fit cannot erase this density limit.
 
 Its logs are random throughout. Previously, a log that tiled one 8 MiB block
 repeated with the scanner's then 8 MiB batch size, locking the dense window to

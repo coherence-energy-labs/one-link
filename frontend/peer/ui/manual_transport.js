@@ -9,6 +9,13 @@
       text($("#webrtc-status"), e && e.message ? e.message : String(e));
     }
   }
+  // The browser reports connection state whenever it likes, including a few
+  // milliseconds after a signal is ready. It is shown on its own line: an
+  // instruction in #webrtc-status ("send this signal back") stays until the
+  // user's next action replaces it.
+  function _showLinkState(label) {
+    text($("#webrtc-link-state"), `WebRTC: ${label}`);
+  }
   function _writeLocalSignal(signal) {
     const out = $("#webrtc-local");
     if (out) out.value = encodeSignal(signal);
@@ -23,7 +30,7 @@
     text($("#webrtc-status"), "Creating signed WebRTC offer…");
     try {
       const res = await createOfferSignal({
-        onState: (label) => text($("#webrtc-status"), `WebRTC: ${label}`),
+        onState: _showLinkState,
       });
       _webrtcSession = res.session;
       _writeLocalSignal(res.signal);
@@ -44,7 +51,7 @@
       const signal = _readRemoteSignal();
       if (signal.type === "offer") {
         const res = await acceptOfferSignal(signal, {
-          onState: (label) => text($("#webrtc-status"), `WebRTC: ${label}`),
+          onState: _showLinkState,
         });
         _webrtcSession = res.session;
         _writeLocalSignal(res.signal);

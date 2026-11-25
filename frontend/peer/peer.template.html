@@ -833,6 +833,10 @@
         <button class="btn ghost" id="btn-webrtc-copy">Copy local signal</button>
       </div>
       <p class="help" id="webrtc-status" style="margin-top:10px;"></p>
+      <!-- Connection state has its own line. It arrives from the browser at
+           any moment, and must never replace the instruction above while the
+           user still has to act on it. -->
+      <p class="help" id="webrtc-link-state" style="margin-top:4px;" aria-live="polite"></p>
       <label class="help" for="webrtc-remote" style="display:block;margin-top:12px;margin-bottom:6px;">
         Remote signal
       </label>

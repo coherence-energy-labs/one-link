@@ -82,7 +82,14 @@ def inside(repository: Path, name: str, *, base: Path | None = None) -> Path:
     lexical = Path(os.path.normpath(origin / name))
     resolved = lexical.resolve()
     if not resolved.is_relative_to(repository) or not lexical.is_relative_to(repository):
-        raise VendorError(f"vendor path escapes the repository: {name!r}")
+        # Outside a git checkout repository_root() falls back to the starting
+        # directory, the narrowest boundary. That is fail-closed, but say so:
+        # the real cause is then the missing checkout, not the path.
+        hint = "" if (repository / ".git").exists() else (
+            f" (no .git entry at or above {repository}: outside a git checkout "
+            "the repository boundary is that directory)"
+        )
+        raise VendorError(f"vendor path escapes the repository: {name!r}{hint}")
     if os.path.normcase(str(lexical.relative_to(repository))) != os.path.normcase(str(resolved.relative_to(repository))):
         raise VendorError(f"vendor path passes through a symbolic link: {name!r}")
     return resolved

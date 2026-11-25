@@ -1,6 +1,6 @@
 # Dependency qualification
 
-Reviewed on **2026-11-25**. This is a dated dependency inventory and maintenance
+Reviewed on **2026-11-24 (America/New_York)**. This is a dated dependency inventory and maintenance
 record. A vulnerability scan describes the advisories known to its database at
 that time; it does not prove that a package or product has no vulnerabilities.
 Production release qualification remains incomplete as recorded in

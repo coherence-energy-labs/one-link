@@ -8,8 +8,8 @@
   "check_producer_evidence": {
     "app": "GitHub Actions",
     "integration_id": 15368,
-    "observed_on": "2026-11-25",
-    "source": "https://api.github.com/repos/coherence-energy-labs/one-link/commits/1279a450c74e0fdc745cf36e4a51d146d0b2f442/check-runs?per_page=100"
+    "observed_on": "2026-11-24",
+    "source": "https://api.github.com/repos/coherence-energy-labs/one-link/commits/dbb2f5221ffcc70d09a42b69aed03976b3b266e4/check-runs?per_page=100"
   },
   "required_status_checks": [
     {"context": "continuous acceptance gate", "integration_id": 15368},
@@ -18,7 +18,9 @@
     {"context": "browser JavaScript static contracts + dependency audit", "integration_id": 15368},
     {"context": "Gitleaks full-history scan", "integration_id": 15368},
     {"context": "pip-audit + bandit + sbom", "integration_id": 15368},
-    {"context": "RustSec cargo-audit", "integration_id": 15368}
+    {"context": "RustSec cargo-audit", "integration_id": 15368},
+    {"context": "native correctness gate", "integration_id": 15368},
+    {"context": "native performance gate", "integration_id": 15368}
   ],
   "qualification": "This file describes the desired policy; only a fresh authenticated ruleset API readback proves enforcement. Required contexts must be observed on an exact candidate commit before activation."
 }

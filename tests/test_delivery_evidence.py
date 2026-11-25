@@ -255,7 +255,8 @@ def test_release_signing_and_publication_require_the_actual_artifact_rebuild():
 def test_required_contexts_are_defined_by_unfiltered_pr_workflows():
     policy = json.loads(repository_policy.POLICY.read_text())
     available = set()
-    for name in ("full_suite_and_e2e.yml", "lint.yml", "security.yml"):
+    for name in ("full_suite_and_e2e.yml", "lint.yml", "security.yml",
+                 "native_build.yml", "native_bench_gate.yml"):
         document = workflow(name)
         assert "pull_request" in document["on"]
         assert document["on"]["pull_request"] in ("", None)

@@ -247,7 +247,13 @@ def request(control_port: int, *, timeout: float = 30.0, **req) -> dict:
     raise RuntimeError("control request returned no response")
 
 
-def _spawn(home: Path, log: Path, mdns_type: str | None = None) -> tuple[subprocess.Popen, BinaryIO]:
+def _spawn(
+    home: Path,
+    log: Path,
+    mdns_type: str | None = None,
+    *,
+    periodic_folder_sync: bool = True,
+) -> tuple[subprocess.Popen, BinaryIO]:
     """Returns (proc, log_fh). Caller stores the log_fh on the handle
     and closes it after the proc exits — keeps Python's GC from
     emitting ResourceWarning at random later moments."""
@@ -286,8 +292,11 @@ def _spawn(home: Path, log: Path, mdns_type: str | None = None) -> tuple[subproc
     env.setdefault("ONE_LINK_REQUIRE_FILE_ACCEPT", "0")
     log.parent.mkdir(parents=True, exist_ok=True)
     f = open(log, "wb")
+    daemon_module = (
+        "one_link.cli" if periodic_folder_sync else "tests.manual_folder_sync_daemon"
+    )
     proc = subprocess.Popen(
-        [sys.executable, "-m", "one_link.cli", "daemon", "-v"],
+        [sys.executable, "-m", daemon_module, "daemon", "-v"],
         env=env,
         stdout=f,
         stderr=subprocess.STDOUT,
@@ -439,7 +448,9 @@ def _stop(
                     lowered = [str(arg).strip().lower() for arg in argv]
                     is_daemon = (
                         "-m" in lowered
-                        and "one_link.cli" in lowered
+                        and any(module in lowered for module in (
+                            "one_link.cli", "tests.manual_folder_sync_daemon",
+                        ))
                         and "daemon" in lowered
                     )
                     candidate_home = candidate.environ().get("ONE_LINK_HOME")
@@ -532,8 +543,17 @@ def _read_log(p: Path, n: int = 4000) -> str:
         return "<no log>"
 
 
-def _bring_up(home: Path, log: Path, label: str, mdns_type: str | None = None) -> DaemonHandle:
-    proc, log_fh = _spawn(home, log, mdns_type=mdns_type)
+def _bring_up(
+    home: Path,
+    log: Path,
+    label: str,
+    mdns_type: str | None = None,
+    *,
+    periodic_folder_sync: bool = True,
+) -> DaemonHandle:
+    proc, log_fh = _spawn(
+        home, log, mdns_type=mdns_type, periodic_folder_sync=periodic_folder_sync,
+    )
     try:
         # 15 s was too tight for a loaded Windows hosted runner: three
         # unrelated live tests failed on one run purely because the daemon had
@@ -657,12 +677,19 @@ def _pin_test_peer(source: DaemonHandle, peer: DaemonHandle) -> None:
 
 
 @contextmanager
-def daemon_pair(*, pin_trust: bool = False) -> Iterator[DaemonPair]:
+def daemon_pair(
+    *, pin_trust: bool = False, periodic_folder_sync: bool = True,
+) -> Iterator[DaemonPair]:
     """Spin up two daemons, converge mDNS, and optionally pin both peers.
 
     ``pin_trust=False`` preserves the pending-peer surface needed by pairing
     and authorization tests. Live transport tests pass ``pin_trust=True`` so
     capability checks run with the same post-pairing authority as production.
+
+    ``periodic_folder_sync=False`` uses a test-only CLI entry point that omits
+    the scheduled folder pushes. Manual sync, watchers, authenticated transport,
+    and receipt verification still run normally, so a single-sync test cannot
+    accidentally prove convergence caused by an earlier background cycle.
     """
     # Gate: spawning real daemon subprocesses is the live-integration
     # lane. Skip the calling test in the default (hermetic) gate.
@@ -680,8 +707,14 @@ def daemon_pair(*, pin_trust: bool = False) -> Iterator[DaemonPair]:
     a: DaemonHandle | None = None
     b: DaemonHandle | None = None
     try:
-        a = _bring_up(a_home, a_log, "A", mdns_type=mdns_type)
-        b = _bring_up(b_home, b_log, "B", mdns_type=mdns_type)
+        a = _bring_up(
+            a_home, a_log, "A", mdns_type=mdns_type,
+            periodic_folder_sync=periodic_folder_sync,
+        )
+        b = _bring_up(
+            b_home, b_log, "B", mdns_type=mdns_type,
+            periodic_folder_sync=periodic_folder_sync,
+        )
         # Wait for cross-discovery
         deadline = time.time() + 20.0
         while time.time() < deadline:

@@ -101,22 +101,15 @@ def _assert_durable_sync_receipt(
     response: dict,
     *,
     expected_entries: int,
-    expected_wants: int | frozenset[int],
+    expected_wants: int,
 ) -> dict:
     """Validate the sender's exact, channel-bound folder commit proof.
 
-    ``expected_wants`` accepts a set when the count is legitimately
-    timing-dependent: the 250ms-debounced folder watcher and the explicit
-    /sync call are BOTH real delivery paths, so a file written after
-    registration may already be on the receiver when the explicit sync
-    runs (wants=0) or not yet (wants=1). Betting on which path wins made
-    this test hang or fail by machine load; the invariants that must hold
-    regardless are the manifest entry count, path verification, root
-    binding, and byte-exact convergence (asserted by the callers).
+    These tests disable only scheduled folder pushes and wait for the exact
+    initial manifests. Both counts must therefore be exact: the explicit sync
+    is the only delivery path, and an earlier background convergence cannot
+    satisfy the test's single-connection claim.
     """
-    allowed_wants = (
-        {expected_wants} if isinstance(expected_wants, int) else set(expected_wants)
-    )
     assert response.get("ok") is True, response
     results = response.get("results")
     assert isinstance(results, list) and len(results) == 1, response
@@ -125,7 +118,7 @@ def _assert_durable_sync_receipt(
     assert result.get("ok") is True, result
     assert result.get("durable_receipt") is True, result
     wants = result.get("wants")
-    assert wants in allowed_wants, result
+    assert wants == expected_wants, result
 
     sync_id = result.get("folder_sync_id")
     assert isinstance(sync_id, str) and sync_id, result
@@ -136,7 +129,7 @@ def _assert_durable_sync_receipt(
     assert isinstance(receipt.get("verify_id"), str) and receipt["verify_id"]
     assert receipt.get("entry_count") == expected_entries, receipt
     # The receipt must agree with the live result about how many blobs the
-    # receiver still wanted, whichever delivery path won the race.
+    # receiver still wanted on this exact channel.
     assert receipt.get("wanted_count") == wants, receipt
     assert receipt.get("paths_verified") == expected_entries, receipt
     assert receipt.get("source_root") == result.get("merkle_root"), receipt
@@ -188,6 +181,19 @@ async def _assert_exact_folder_state(
         assert cas_path.read_bytes() == payload
 
 
+async def _wait_for_exact_folder_state(s: aiohttp.ClientSession, **kwargs) -> None:
+    """Wait for watcher/initial-scan ingestion, proving the starting manifest."""
+    deadline = time.monotonic() + 15.0
+    while True:
+        try:
+            await _assert_exact_folder_state(s, **kwargs)
+            return
+        except AssertionError:
+            if time.monotonic() >= deadline:
+                raise
+            await asyncio.sleep(0.05)
+
+
 async def _wait_file(path: Path, payload: bytes, timeout=30) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -204,7 +210,7 @@ async def test_full_duplex_both_directions_one_connection():
     A single bidirectional sync from A must leave BOTH sides holding
     BOTH files — proving the initiator served its blob AND pulled the
     peer's blob on one channel."""
-    with daemon_pair(pin_trust=True) as p:
+    with daemon_pair(pin_trust=True, periodic_folder_sync=False) as p:
         tok_a = _read(p.a.home, "ui.token")
         tok_b = _read(p.b.home, "ui.token")
         base_a = f"http://127.0.0.1:{int(_read(p.a.home, 'server.port'))}"
@@ -221,12 +227,19 @@ async def test_full_duplex_both_directions_one_connection():
             pay_b = os.urandom(55_000)
             (local_a / "from_a.bin").write_bytes(pay_a)
             (local_b / "from_b.bin").write_bytes(pay_b)
-            await asyncio.sleep(1.5)  # let both watchers ingest
+            await _wait_for_exact_folder_state(
+                s, base=base_a, token=tok_a, home=p.a.home, folder="fd",
+                local_root=local_a, expected={"from_a.bin": pay_a},
+            )
+            await _wait_for_exact_folder_state(
+                s, base=base_b, token=tok_b, home=p.b.home, folder="fd",
+                local_root=local_b, expected={"from_b.bin": pay_b},
+            )
 
             # ONE bidirectional sync initiated by A.
             res = await _sync(s, base_a, tok_a, "fd")
             _assert_durable_sync_receipt(
-                res, expected_entries=1, expected_wants=frozenset({0, 1}),
+                res, expected_entries=1, expected_wants=1,
             )
 
             # B must receive A's file AND A must receive B's file.
@@ -271,7 +284,7 @@ async def test_full_duplex_both_directions_one_connection():
 async def test_full_duplex_forward_only():
     """Only A has a file. One bidirectional sync delivers it to B
     (degrades gracefully to the forward direction)."""
-    with daemon_pair(pin_trust=True) as p:
+    with daemon_pair(pin_trust=True, periodic_folder_sync=False) as p:
         tok_a = _read(p.a.home, "ui.token")
         tok_b = _read(p.b.home, "ui.token")
         base_a = f"http://127.0.0.1:{int(_read(p.a.home, 'server.port'))}"
@@ -284,10 +297,17 @@ async def test_full_duplex_forward_only():
             await _mk_folder(s, base_b, tok_b, "fo", local_b, [fp_a])
             pay = os.urandom(30_000)
             (local_a / "only.bin").write_bytes(pay)
-            await asyncio.sleep(1.5)
+            await _wait_for_exact_folder_state(
+                s, base=base_a, token=tok_a, home=p.a.home, folder="fo",
+                local_root=local_a, expected={"only.bin": pay},
+            )
+            await _wait_for_exact_folder_state(
+                s, base=base_b, token=tok_b, home=p.b.home, folder="fo",
+                local_root=local_b, expected={},
+            )
             res = await _sync(s, base_a, tok_a, "fo")
             _assert_durable_sync_receipt(
-                res, expected_entries=1, expected_wants=frozenset({0, 1}),
+                res, expected_entries=1, expected_wants=1,
             )
             assert await _wait_file(local_b / "only.bin", pay, timeout=30)
             expected = {"only.bin": pay}
@@ -316,7 +336,7 @@ async def test_full_duplex_forward_only():
 async def test_full_duplex_reverse_only():
     """Only B has a file. A initiates a bidirectional sync; the file
     flows in the REVERSE direction (B → A) on the same connection."""
-    with daemon_pair(pin_trust=True) as p:
+    with daemon_pair(pin_trust=True, periodic_folder_sync=False) as p:
         tok_a = _read(p.a.home, "ui.token")
         tok_b = _read(p.b.home, "ui.token")
         base_a = f"http://127.0.0.1:{int(_read(p.a.home, 'server.port'))}"
@@ -329,7 +349,14 @@ async def test_full_duplex_reverse_only():
             await _mk_folder(s, base_b, tok_b, "ro", local_b, [fp_a])
             pay = os.urandom(35_000)
             (local_b / "rev.bin").write_bytes(pay)
-            await asyncio.sleep(1.5)
+            await _wait_for_exact_folder_state(
+                s, base=base_a, token=tok_a, home=p.a.home, folder="ro",
+                local_root=local_a, expected={},
+            )
+            await _wait_for_exact_folder_state(
+                s, base=base_b, token=tok_b, home=p.b.home, folder="ro",
+                local_root=local_b, expected={"rev.bin": pay},
+            )
             # A initiates (A has nothing) — file must still arrive at A.
             res = await _sync(s, base_a, tok_a, "ro")
             _assert_durable_sync_receipt(

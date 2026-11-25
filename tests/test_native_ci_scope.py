@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import posixpath
 import re
+import shlex
 import subprocess
 import sys
 import tomllib
@@ -621,6 +622,14 @@ def test_every_pr_produces_exact_gate_and_preserves_required_work_dependencies(k
                                       "matrix": {"os": ["ubuntu-latest", "windows-latest", "macos-latest"]}}
         assert memory["defaults"]["run"]["shell"] == "bash"
         binding = jobs["python_binding"]["steps"]
+        regression = next(item for item in binding if "pytest tests/test_chunk_native_v0210.py" in item.get("run", ""))
+        assert "if" not in regression
+        # The module's optional import must not turn a broken required build
+        # into a skipped descriptor suite. Import it explicitly before pytest.
+        assert regression["run"].splitlines()[0] == (
+            'uv run --frozen --extra dev --extra release python -c "import one_link_native.chunk"'
+        )
+        assert "tests/test_native_fd_scan.py" in shlex.split(regression["run"], comments=True)
         for name in ("Install maturin + project deps", "Build + install one_link_native (editable)"):
             mine = next(item for item in memory["steps"] if item.get("name") == name)
             theirs = next(item for item in binding if item.get("name") == name)

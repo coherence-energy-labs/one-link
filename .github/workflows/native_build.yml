@@ -215,9 +215,11 @@ jobs:
         working-directory: native
         run: uv run --project .. --frozen --extra dev --extra release maturin develop --release --locked
 
-      - name: Run native regression tests (chunk + aead + wal + chunk_store + quic)
+      - name: Run native regressions (including fd ownership)
         run: |
+          uv run --frozen --extra dev --extra release python -c "import one_link_native.chunk"
           uv run --frozen --extra dev --extra release pytest tests/test_chunk_native_v0210.py \
+                 tests/test_native_fd_scan.py \
                  tests/test_aead_native_v0210.py \
                  tests/test_wal_native_v0210.py \
                  tests/test_chunk_store_native_v0210.py \

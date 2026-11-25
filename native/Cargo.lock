@@ -1799,6 +1799,7 @@ dependencies = [
  "curve25519-dalek",
  "ed25519-dalek",
  "hybrid-array 0.2.3",
+ "libc",
  "ml-kem",
  "ol_aead",
  "ol_align",
@@ -1839,6 +1840,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
  "x25519-dalek",
  "zeroize",
 ]

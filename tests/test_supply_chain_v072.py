@@ -417,7 +417,16 @@ def test_workflows_use_frozen_uv_and_explicit_root_for_native_builds():
         for job in workflow.get("jobs", {}).values():
             for step in job.get("steps", []):
                 run = str(step.get("run", ""))
-                if step.get("working-directory") == "native" and "maturin" in run:
+                # Builders may set cwd in YAML or enter either the candidate
+                # or separate baseline workspace explicitly inside the shell.
+                native_transition = re.search(
+                    r"(?m)^\s*cd\s+(?:[\"']?[^\n]*/)?native[\"']?\s*$", run
+                )
+                nested_native = step.get("working-directory") == "native" or (
+                    native_transition is not None
+                    and native_transition.start() < run.find("maturin")
+                )
+                if nested_native and "maturin" in run:
                     nested_maturin_workflows.add(path.name)
                     assert any(command in run for command in (
                         "uv run --project .. --frozen", "uv run --project .. --no-sync")), (

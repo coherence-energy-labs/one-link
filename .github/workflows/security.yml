@@ -46,6 +46,15 @@ jobs:
         run: >-
           ./gitleaks git . --no-banner --no-color --redact=100
           --max-decode-depth=5 --max-archive-depth=2 --timeout=300
+          --report-format=json --report-path=gitleaks-redacted.json
+
+      - name: Retain redacted full-history findings
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gitleaks-redacted
+          path: gitleaks-redacted.json
+          if-no-files-found: warn
 
   audit:
     name: pip-audit + bandit + sbom

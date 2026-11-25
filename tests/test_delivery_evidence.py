@@ -332,3 +332,18 @@ def test_shell_graph_is_audited_and_inventoried_without_hiding_upstream_warnings
     release = workflow("release.yml")["jobs"]
     assert not any("libwebkit2gtk" in step.get("run", "") for step in release["native_wheels"]["steps"])
     assert any("libwebkit2gtk" in step.get("run", "") for step in release["binaries"]["steps"])
+
+
+def test_full_history_secret_findings_are_redacted_and_retained_on_failure():
+    steps = workflow("security.yml")["jobs"]["secrets"]["steps"]
+    scan = next(step for step in steps if "./gitleaks git" in step.get("run", ""))
+    assert "--redact=100" in scan["run"]
+    assert "--report-format=json --report-path=gitleaks-redacted.json" in scan["run"]
+    assert not scan.get("continue-on-error")
+    upload = next(step for step in steps if "upload-artifact@" in step.get("uses", ""))
+    assert upload["if"] == "always()"
+    assert upload["with"]["path"] == "gitleaks-redacted.json"
+    release = workflow("release.yml")["jobs"]["release_quality_linux"]["steps"]
+    scan = next(step for step in release if "./gitleaks git" in step.get("run", ""))
+    assert "--redact=100" in scan["run"]
+    assert "--report-path=test-results/gitleaks-redacted.json" in scan["run"]

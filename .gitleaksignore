@@ -12,3 +12,8 @@ c0cfa5ea617c60c9eed010da60ac67d7e39a0001:native/one_link_native/src/proximity_pa
 c17f91deff5a51e103a5d745257dbcc2c10ea172:native/ol_chunk/src/blake3_wrap.rs:generic-api-key:64
 src/one_link/relay_client.py:generic-api-key:1366
 src/one_link/relay_routing.py:generic-api-key:146
+# Reviewed 2026-11-25: courier service protocol field type annotation only.
+# The historical line is signing_key: Ed25519PrivateKey (AST AnnAssign with
+# no value); the public class identifier is not a credential. Exempt exactly
+# this commit/path/rule/line, preserving scans of all other content and history.
+aac9f834855cf0f9fcd388d9579c4465178a61df:src/one_link/courier_service.py:generic-api-key:85

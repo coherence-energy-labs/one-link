@@ -266,9 +266,11 @@ jobs:
           ./gitleaks version
 
       - name: full-history secret gate
-        run: >-
-          ./gitleaks git . --no-banner --no-color --redact=100
-          --max-decode-depth=5 --max-archive-depth=2 --timeout=300
+        run: |
+          mkdir -p test-results
+          ./gitleaks git . --no-banner --no-color --redact=100 \
+            --max-decode-depth=5 --max-archive-depth=2 --timeout=300 \
+            --report-format=json --report-path=test-results/gitleaks-redacted.json
 
       - name: Preserve tagged Linux qualification evidence
         if: always()

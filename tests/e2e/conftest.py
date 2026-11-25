@@ -13,6 +13,7 @@ query string.
 from __future__ import annotations
 
 import contextlib
+import http.client
 import os
 import socket
 import subprocess
@@ -109,6 +110,33 @@ def _wait_for_file(path: Path, timeout: float = 30.0) -> bool:
     return False
 
 
+def _wait_for_owner_http(port: int, token: str, proc: subprocess.Popen, timeout: float = 30.0) -> None:
+    """A published port file is not proof the HTTP event loop is serving yet.
+
+    Keep startup readiness outside individual browser/API assertions. This
+    probes the exact owned daemon using its bearer; it never retries a test.
+    """
+    deadline = time.monotonic() + timeout
+    last_status = None
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError("test daemon exited before authenticated HTTP readiness")
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=1.0)
+        try:
+            connection.request("GET", "/api/me", headers={"Authorization": f"Bearer {token}"})
+            response = connection.getresponse()
+            last_status = response.status
+            response.read(65536)
+            if response.status == 200:
+                return
+        except (OSError, http.client.HTTPException):
+            pass
+        finally:
+            connection.close()
+        time.sleep(0.05)
+    raise RuntimeError(f"authenticated HTTP not ready after {timeout:g}s; last_status={last_status}")
+
+
 @pytest.fixture
 def live_daemon(tmp_path: Path) -> Iterator[LiveDaemon]:
     """Spawn a real daemon for E2E. Each test gets its own clean
@@ -160,6 +188,7 @@ def live_daemon(tmp_path: Path) -> Iterator[LiveDaemon]:
             )
         port = int(port_file.read_text().strip())
         token = token_file.read_text().strip()
+        _wait_for_owner_http(port, token, proc)
         yield LiveDaemon(
             home=home, port=port, token=token, proc=proc, log=log_path,
         )

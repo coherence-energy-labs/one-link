@@ -20,12 +20,21 @@ The `file-engine v2 bench gate` builds the candidate and comparison revision
 into **separate virtual environments**. For a pull request the comparison is
 the merge base; on master it is the commit in `DRIFT_ANCHOR`. Both native
 artifacts run on one host under the candidate's **same Python measurement
-harness and adapters**. Five pairs run in alternating order: candidate/base,
-base/candidate, and so on. Building does not occur between timed observations.
+harness and adapters**. Twenty pairs run in alternating order: candidate/base,
+base/candidate, and so on, with exactly ten pairs starting with each arm. Building does not occur between timed observations.
 Native wheel hashes, native source revisions, harness revision, host identity,
 measurement session, pair index, input contract and all raw timings are retained.
 This comparison includes changes to the native artifact and its environment;
 it does not measure historical Python-adapter behavior or entire user transfers.
+
+The explicit `ci` sampling profile retains **31 timed batches** for each WAL,
+chunk-store write and QUIC metric. QUIC executes three untimed warm-up batches
+on the same established connection, then each measured batch receives at least
+16 MiB of response payload. Batch sizes, sample counts and warm-up counts are
+recorded; none adapt to the comparison outcome. The default `quick` profile
+keeps the shorter build/local smoke workload and is not the CI acceptance plan.
+The [first hosted-study review](studies/2026-11-25-hosted-dbb2f52.md) preserves
+the reason for this predeclared change and its unresolved slower 16 KiB result.
 
 `scripts/bench_gate.py` validates every repetition before comparing. Missing
 files, duplicate/missing metrics, non-finite/zero throughput, unlike workloads,
@@ -52,7 +61,7 @@ requirements. Production completion rates, latency and resource budgets remain
 separate SLOs for specified devices, networks and workloads.
 
 A single-observation local comparison is supported for diagnosis but has no
-statistical interpretation; CI requires five complete pairs. Never collect
+statistical interpretation; CI requires twenty complete pairs. Never collect
 runs repeatedly until one passes. Retain an inconclusive or failed study,
 investigate workload/host variability or the implementation, then capture a new
 complete study with its own identity. Changing a limit or `DRIFT_ANCHOR` requires

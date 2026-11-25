@@ -118,13 +118,13 @@ jobs:
             --candidate-python "$GITHUB_WORKSPACE/.venv/bin/python" \
             --baseline-python "$BASE_ROOT/.venv/bin/python" \
             --candidate-source "$GITHUB_WORKSPACE" --baseline-source "$BASE_ROOT" \
-            --output bench-results --repeats 5 --size-mib 128
+            --output bench-results --profile ci --repeats 20 --size-mib 128
       - name: Evaluate complete paired observations
         run: |
           uv run --frozen --extra release python scripts/bench_gate.py \
-            --results bench-results/candidate-{1,2,3,4,5}.json \
-            --baseline bench-results/baseline-{1,2,3,4,5}.json \
-            --require-comparable-host --require-paired-runs --min-samples 5 \
+            --results bench-results/candidate-{1..20}.json \
+            --baseline bench-results/baseline-{1..20}.json \
+            --require-comparable-host --require-paired-runs --min-samples 20 \
             --max-regression-percent 5 \
             --metric-limit 'native_aead_*=12' \
             --metric-limit 'native_blake3_*=12' \
@@ -190,13 +190,13 @@ jobs:
             --candidate-python "$GITHUB_WORKSPACE/.venv/bin/python" \
             --baseline-python "$BASE_ROOT/.venv/bin/python" \
             --candidate-source "$GITHUB_WORKSPACE" --baseline-source "$BASE_ROOT" \
-            --output bench-results --repeats 5 --size-mib 128
+            --output bench-results --profile ci --repeats 20 --size-mib 128
       - name: Evaluate complete paired observations
         run: |
           uv run --frozen --extra release python scripts/bench_gate.py \
-            --results bench-results/candidate-{1,2,3,4,5}.json \
-            --baseline bench-results/baseline-{1,2,3,4,5}.json \
-            --require-comparable-host --require-paired-runs --min-samples 5 \
+            --results bench-results/candidate-{1..20}.json \
+            --baseline bench-results/baseline-{1..20}.json \
+            --require-comparable-host --require-paired-runs --min-samples 20 \
             --max-regression-percent 5 \
             --metric-limit 'native_aead_*=12' \
             --metric-limit 'native_blake3_*=12' \

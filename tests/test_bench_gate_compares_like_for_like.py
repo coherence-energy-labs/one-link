@@ -142,9 +142,9 @@ def test_workflows_build_separately_and_require_complete_paired_evidence():
         runs = "\n".join(step.get("run", "") for step in job["steps"])
         assert "git worktree add --detach" in runs
         assert "git checkout --force" not in runs
-        assert "bench_paired_native.py" in runs and "--repeats 5" in runs
+        assert "bench_paired_native.py" in runs and "--profile ci --repeats 20" in runs
         assert "--candidate-python" in runs and "--baseline-python" in runs
-        assert "--require-comparable-host --require-paired-runs --min-samples 5" in runs
+        assert "--require-comparable-host --require-paired-runs --min-samples 20" in runs
         assert "bench_baselines/native_chunk.json" not in runs
         assert any(step.get("if") == "always()" and "upload-artifact@" in step.get("uses", "") for step in job["steps"])
     events = spec.get("on", spec.get(True))

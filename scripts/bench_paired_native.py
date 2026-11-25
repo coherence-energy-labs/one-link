@@ -46,10 +46,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--size-mib", type=int, default=128)
+    parser.add_argument("--profile", choices=("quick", "ci"), default="quick")
     parser.add_argument("--timeout", type=float, default=600)
     args = parser.parse_args(argv)
     if args.repeats < 1 or args.size_mib < 1 or args.timeout <= 0:
         parser.error("repeats, size and timeout must be positive")
+    if args.profile == "ci" and args.repeats != 20:
+        parser.error("the predeclared CI profile requires exactly 20 balanced pairs")
     interpreters = {arm: interpreter_path(getattr(args, f"{arm}_python")) for arm in ("candidate", "baseline")}
     sources = {arm: getattr(args, f"{arm}_source").resolve(strict=True) for arm in interpreters}
     revisions = {arm: source_revision(path) for arm, path in sources.items()}
@@ -61,6 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest = {"schema": "one-link-paired-benchmark-v1", "session_id": session,
                 "harness_revision": source_revision(harness), "native_revisions": revisions,
                 "requested_pairs": args.repeats, "size_mib": args.size_mib,
+                "sampling_profile": args.profile,
                 "order": [], "status": "running"}
     manifest_path = args.output / "study.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -76,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             with filename.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
                 completed = subprocess.run(
-                    [str(interpreters[arm]), "-m", "one_link.perf_lab_native", "--json", "--no-legacy", "--size-mib", str(args.size_mib)],
+                    [str(interpreters[arm]), "-m", "one_link.perf_lab_native", "--json", "--no-legacy", "--size-mib", str(args.size_mib), "--profile", args.profile],
                     cwd=sources[arm], env=env, stdout=stdout, stderr=stderr,
                     timeout=args.timeout, check=False,
                 )
@@ -86,6 +90,8 @@ def main(argv: list[str] | None = None) -> int:
                 recorded = payload.get("provenance", {})
                 if recorded.get("session_id") != session or recorded.get("native_source_revision") != revisions[arm]:
                     raise ValueError("benchmark child omitted its source/session provenance")
+                if payload.get("measurement_contract", {}).get("sampling_profile") != args.profile:
+                    raise ValueError("benchmark child did not execute the requested sampling profile")
                 observation["status"] = "completed"
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             observation["error"] = str(exc)

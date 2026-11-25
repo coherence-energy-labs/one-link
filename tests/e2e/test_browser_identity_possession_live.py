@@ -178,9 +178,9 @@ def test_required_mode_live_pair_owner_request_and_immediate_revoke(
                     pair_token: handoff.pair_token,
                     daemon_fingerprint: handoff.daemon_fingerprint,
                     ws_url: handoff.ws_signaling_url,
-                  }).catch((error) => {
+                  });
+                void window.__olIdentityPairFlow.catch((error) => {
                     window.__olIdentityPairError = String(error?.message || error);
-                    throw error;
                   });
             }""",
             handoff,
@@ -194,7 +194,10 @@ def test_required_mode_live_pair_owner_request_and_immediate_revoke(
                 timeout=90_000,
             )
             pair_error = peer.evaluate("() => window.__olIdentityPairError")
-            assert pair_error is None, f"browser pairing rejected: {pair_error}"
+            assert pair_error is None, (
+                f"browser pairing rejected: {pair_error}; stages="
+                + repr(peer.evaluate("() => window.__oneLinkPeer.state.autopair_diagnostics"))
+            )
         except PlaywrightTimeoutError as exc:
             browser_state = peer.evaluate(
                 """() => ({
@@ -207,7 +210,7 @@ def test_required_mode_live_pair_owner_request_and_immediate_revoke(
                             verified: window.__oneLinkPeer.state.daemon_identity_ready.verified,
                           }
                         : null,
-                    identityContext: window.__oneLinkPeer.state.daemon_identity_context,
+                    pairingStages: window.__oneLinkPeer.state.autopair_diagnostics || null,
                 })"""
             )
             log_tail = live_daemon.log.read_text(

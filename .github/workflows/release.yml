@@ -246,9 +246,10 @@ jobs:
           cargo audit --file native/Cargo.lock --deny warnings
           cargo audit --file native/fuzz/Cargo.lock --deny warnings
 
-      - name: gate shell vulnerabilities with upstream warnings retained
+      - name: gate shell RustSec vulnerability category with warnings retained
         if: ${{ !cancelled() && steps.cargo_audit.outcome == 'success' }}
-        # See docs/DEPENDENCY_QUALIFICATION.md: Linux GTK warnings are open.
+        # The medium glib advisory is an unsoundness warning in RustSec.
+        # See docs/DEPENDENCY_QUALIFICATION.md; it remains unresolved.
         run: cargo audit --file native/ol_shell/Cargo.lock
 
       - name: install checksummed Gitleaks release
@@ -1102,9 +1103,10 @@ jobs:
             wheels and standalone bundles assembled by this run. The SBOM is
             itself covered by SHA256SUMS, Sigstore, and provenance attestation.
             It includes build and test dependencies and does not assert runtime
-            reachability in every artifact. Linux shell GTK dependency warnings
-            remain documented in `docs/DEPENDENCY_QUALIFICATION.md` and in this
-            run's RustSec evidence; this is not a warning-free qualification.
+            reachability in every artifact. A known medium Linux shell glib
+            advisory and a separate maintenance warning remain documented in
+            `docs/DEPENDENCY_QUALIFICATION.md` and this run's RustSec evidence;
+            this is not an advisory-free or production qualification.
 
             `UPDATE_MANIFEST.json` is the signed, commit-bound authority used by
             the standalone transactional updater. It names and hashes each

@@ -39,11 +39,13 @@ that any release has passed it.
 
 - [ ] **`security.yml` green on the target SHA.** `uv lock --check`,
       pip-audit against the frozen lock export, bandit SAST, and SBOM generation.
-      Any medium-or-higher Bandit finding or known dependency vulnerability
-      blocks release. Main native and fuzz RustSec warnings also fail the gate.
-      The shell's two upstream GTK warnings remain explicit qualification gaps
+      Medium-or-higher Bandit findings and advisories classified by the scanners
+      as vulnerabilities fail their gates. Main native and fuzz RustSec warnings
+      also fail the gate. The shell retains a known medium glib advisory
+      (classified by RustSec as an unsoundness warning) plus an unmaintained
+      dependency warning. These remain explicit production qualification gaps
       in [DEPENDENCY_QUALIFICATION.md](DEPENDENCY_QUALIFICATION.md); a green
-      vulnerability gate does not resolve or approve those warnings.
+      vulnerability gate does not resolve or approve those risks.
 
 - [ ] **`synthetic_monitor.yml` green for the past 7 days.**
       No transient failures in the morning + evening runs - if

@@ -192,10 +192,11 @@ jobs:
           cargo audit --file native/Cargo.lock --deny warnings
           cargo audit --file native/fuzz/Cargo.lock --deny warnings
 
-      # GTK's upstream glib/proc-macro-error warnings remain visible in full.
-      # This is a vulnerability gate, not a warning-free qualification; see
-      # docs/DEPENDENCY_QUALIFICATION.md. No advisory IDs are suppressed.
-      - name: Gate shell vulnerabilities and retain upstream warnings
+      # RustSec places the known medium glib advisory under unsound warnings.
+      # It remains unresolved alongside proc-macro-error's maintenance warning;
+      # this category gate does not certify an advisory-free Linux shell.
+      # See docs/DEPENDENCY_QUALIFICATION.md. No advisory IDs are suppressed.
+      - name: Gate shell RustSec vulnerability category with warnings retained
         if: ${{ !cancelled() && steps.rustsec_reports.outcome == 'success' }}
         run: cargo audit --file native/ol_shell/Cargo.lock
 

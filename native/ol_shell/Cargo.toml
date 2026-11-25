@@ -24,7 +24,9 @@ publish = false
 [workspace]
 
 # Remaining upstream warnings, reviewed 2026-11-25:
-# RUSTSEC-2024-0429: glib 0.18.5 VariantStrIter unsoundness; fixed in >=0.20.0.
+# RUSTSEC-2024-0429 / GHSA-wrw7-89jp-8q8g: glib 0.18.5 VariantStrIter
+# unsoundness, a known medium advisory; fixed in >=0.20.0. RustSec places this
+# in its warnings category, which does not make the dependency advisory-free.
 # RUSTSEC-2024-0370: proc-macro-error 1.x is unmaintained, with no patched release.
 # The Linux GTK 0.18 chain still appears in current tao/wry upstream manifests.
 # This crate has no direct VariantStrIter use, but that does not prove absence

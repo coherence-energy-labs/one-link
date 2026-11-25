@@ -15,15 +15,20 @@ the model is
 
     peak = workspace[kind] + b_chunk * chunks + b_record * records
 
-fitted per scanner code path. Within one kind chunks and records both grow
+fitted per API. Within one kind chunks and records both grow
 with file size; across kinds their ratio differs ~1000x, which is what
-separates the two slopes. The contract is then four statements:
+separates the two slopes. The contract also retains the original density
+overhead check, independently of that joint fit:
 
 * every workspace[kind] is within the bound FILE_SCANNING.md declares for
   that code path;
 * b_chunk is within the cost of one returned chunk;
 * b_record is ~0: memory does not grow with the number of records;
 * no single sample leaves the envelope  workspace bound + per-chunk cost.
+* at each size, dense-minus-sparse peak, adjusted for returned chunks, is at
+  most max(8 MiB, 10% of the larger raw peak). The adjustment uses only the
+  same API's plain-file output slope, clipped to [0, 1024] bytes per chunk;
+  a negative joint-fit coefficient cannot manufacture a density penalty.
 
 A run whose repeat-to-repeat spread could hide one retained bit per record is
 reported as underpowered and fails: it is not evidence either way.
@@ -64,15 +69,16 @@ BATCH = 8 * MIB
 # for the interpreter and allocator around them.
 #   windowed-stream: the plain-CDC payload window, max(32 MiB, 4 * max_size),
 #     plus the parallel candidate workspace that window bounds.
-#   record-walk: the dense header window (8 MiB + 2 * max_size + 2h + 64 KiB
-#     retained, plus one 16 MiB read-ahead block: 24.1 MiB at the default
-#     sizes) and, only when that window does not hold a batch, the
-#     8 MiB + max_size batch buffer: 32.4 MiB together.
+#   record-walk: with the bounded native fix, 64 KiB segment batches and
+#     64 KiB read-ahead bound the default header/batch capacities to 768/320
+#     KiB. Long segments can still use the plain-CDC window; the existing
+#     40 MiB qualification envelope remains unchanged.
 # One returned chunk costs a Python Boundary object, its 32-byte address bytes
 # object, a list slot and the Rust Vec entry it came from.
 MAX_WORKSPACE_BYTES = {"windowed-stream": 48 * MIB, "record-walk": 40 * MIB}
 MAX_BYTES_PER_CHUNK = 1024
 MAX_BYTES_PER_RECORD = 0.05
+DENSE_SPARSE_TOLERANCE = (8 * MIB, 0.10)
 # The smallest per-record retention worth the name is one bit. A run whose
 # repeat spread cannot resolve that proves nothing about records.
 MIN_RESOLVABLE_BYTES_PER_RECORD = 0.125
@@ -245,11 +251,60 @@ def code_path(sample: dict) -> str:
 
     The two have different workspaces (the windowed stream keeps a 32 MiB
     payload window; the record walk scans one segment at a time), so they are
-    fitted separately -- pooling them mis-specifies the intercept.
+    given separate kind intercepts and workspace bounds.
     """
     if sample["api"] in ("format_aware_file", "format_aware_fd") and sample["kind"].startswith("mcap"):
         return "record-walk"
     return "windowed-stream"
+
+
+def density_comparisons(api: str, rows: list[dict]) -> tuple[dict, list[dict], list[str]]:
+    """Keep the original density limit using an independent output-cost estimate."""
+    sizes = sorted(
+        {r["size"] for r in rows if r["kind"] == "mcap-dense"}
+        & {r["size"] for r in rows if r["kind"] == "mcap-sparse"}
+    )
+    if not sizes:
+        return {}, [], []
+    plain = [r for r in rows if r["kind"] == "plain"]
+    calibration = {"source": "plain-only", "samples": len(plain)}
+    if len({r["size"] for r in plain}) < 2:
+        return calibration, [], [
+            f"{api}: density comparison requires plain-file output calibration at two sizes"
+        ]
+    try:
+        _, fitted_cost = least_squares(
+            [[1.0] * len(plain), [float(r["chunks"]) for r in plain]],
+            [float(r["peak_delta_bytes"]) for r in plain],
+        )
+    except ValueError as exc:
+        return calibration, [], [f"{api}: density output calibration is underpowered: {exc}"]
+    # Output objects cannot have negative cost. Do not let a noisy estimate
+    # credit more than the contract's existing maximum per returned chunk.
+    cost = min(float(MAX_BYTES_PER_CHUNK), max(0.0, fitted_cost))
+    calibration.update({"fitted_bytes_per_chunk": fitted_cost, "applied_bytes_per_chunk": cost})
+    pairs, failures = [], []
+    for size in sizes:
+        dense = [r for r in rows if r["kind"] == "mcap-dense" and r["size"] == size]
+        sparse = [r for r in rows if r["kind"] == "mcap-sparse" and r["size"] == size]
+        raw_d = statistics.median(r["peak_delta_bytes"] for r in dense)
+        raw_s = statistics.median(r["peak_delta_bytes"] for r in sparse)
+        adjusted = statistics.median(r["peak_delta_bytes"] - cost * r["chunks"] for r in dense) \
+            - statistics.median(r["peak_delta_bytes"] - cost * r["chunks"] for r in sparse)
+        limit = max(DENSE_SPARSE_TOLERANCE[0], DENSE_SPARSE_TOLERANCE[1] * max(raw_d, raw_s))
+        pairs.append({
+            "api": api, "path": code_path(dense[0]), "size": size,
+            "dense_records": dense[0]["records"], "sparse_records": sparse[0]["records"],
+            "dense_chunks": dense[0]["chunks"], "sparse_chunks": sparse[0]["chunks"],
+            "dense_median": raw_d, "sparse_median": raw_s,
+            "output_cost_bytes_per_chunk": cost, "chunk_adjusted_difference": adjusted, "limit": limit,
+        })
+        if adjusted > limit:
+            failures.append(
+                f"{api} @ {size / MIB:.0f} MiB: chunk-adjusted dense exceeds sparse by "
+                f"{adjusted / MIB:.1f} MiB (limit {limit / MIB:.1f} MiB; plain-only output cost)"
+            )
+    return calibration, pairs, failures
 
 
 def evaluate(samples: list[dict]) -> dict:
@@ -268,6 +323,8 @@ def evaluate(samples: list[dict]) -> dict:
         groups.setdefault(sample["api"], []).append(sample)
     fits = {}
     growth = []
+    density_output_cost = {}
+    density_pairs = []
     for api, rows in sorted(groups.items()):
         label = api
         kinds = sorted({r["kind"] for r in rows})
@@ -339,7 +396,12 @@ def evaluate(samples: list[dict]) -> dict:
                 "median_peak_bytes": [statistics.median(r["peak_delta_bytes"] for r in small),
                                       statistics.median(r["peak_delta_bytes"] for r in large)],
             })
-    return {"fits": fits, "growth": growth, "failures": verdicts, "passed": not verdicts}
+        calibration, pairs, failures = density_comparisons(api, rows)
+        density_output_cost[api] = calibration
+        density_pairs.extend(pairs)
+        verdicts.extend(failures)
+    return {"fits": fits, "growth": growth, "density_output_cost": density_output_cost,
+            "dense_vs_sparse": density_pairs, "failures": verdicts, "passed": not verdicts}
 
 
 def print_verdict(verdict: dict) -> None:
@@ -352,6 +414,10 @@ def print_verdict(verdict: dict) -> None:
         print(f"  {g['api']} {g['kind']}: {g['smallest_size'] / MIB:.0f} -> {g['largest_size'] / MIB:.0f} MiB, "
               f"records {g['records'][0]:,} -> {g['records'][1]:,}, chunks {g['chunks'][0]:,} -> {g['chunks'][1]:,}: "
               f"peak {low / MIB:.1f} -> {high / MIB:.1f} MiB")
+    for pair in verdict["dense_vs_sparse"]:
+        print(f"  {pair['api']} {pair['size'] / MIB:.0f} MiB: plain-only chunk-adjusted dense-sparse "
+              f"{pair['chunk_adjusted_difference'] / MIB:+.2f} MiB (limit {pair['limit'] / MIB:.1f} MiB; "
+              f"{pair['output_cost_bytes_per_chunk']:.1f} B/chunk)")
     print("PASS" if verdict["passed"] else "FAIL: " + "; ".join(verdict["failures"]))
 
 
@@ -423,6 +489,7 @@ def main(argv: list[str] | None = None) -> int:
         },
         "bounds": {"max_workspace_bytes": MAX_WORKSPACE_BYTES, "max_bytes_per_chunk": MAX_BYTES_PER_CHUNK,
                    "max_bytes_per_record": MAX_BYTES_PER_RECORD,
+                   "dense_sparse_tolerance": DENSE_SPARSE_TOLERANCE,
                    "min_resolvable_bytes_per_record": MIN_RESOLVABLE_BYTES_PER_RECORD},
         "samples": samples,
         **verdict,

@@ -3,7 +3,8 @@ contract and pass what keeps it.
 
 Synthetic samples with known memory models exercise each clause: a bounded
 workspace per kind of log, a bounded per-chunk cost, no growth with records, a
-per-sample envelope, and enough measurement power to see one bit per record.
+per-sample envelope, the original same-size density overhead limit, and enough
+measurement power to see one bit per record.
 The samples three CI runners measured at c7d57a1 are replayed as well: they are
 the case an earlier model got wrong.
 """
@@ -49,7 +50,7 @@ def healthy(api, kind, chunks, records):
     if api == "cdc_file" or kind == "plain":
         workspace = 33 * MIB   # the 32 MiB payload window
     elif kind == "mcap-dense":
-        workspace = 25 * MIB   # the dense walk's sliding header window
+        workspace = 15 * MIB   # a bounded extra workspace, within the density limit
     else:
         workspace = 9 * MIB    # the sparse walk's 64 KiB window and one segment
     return workspace + 110 * chunks
@@ -66,7 +67,7 @@ def test_a_fixed_workspace_per_kind_plus_per_chunk_output_passes_and_is_recovere
         fit = verdict["fits"][api]
         assert abs(fit["bytes_per_chunk"] - 110) < 5, fit
         assert abs(fit["bytes_per_record"]) < 0.001, fit
-        expected = {"mcap-dense": 33 if api == "cdc_file" else 25,
+        expected = {"mcap-dense": 33 if api == "cdc_file" else 15,
                     "mcap-sparse": 33 if api == "cdc_file" else 9, "plain": 33}
         for kind, mib in expected.items():
             assert abs(fit["workspace_bytes"][kind] / MIB - mib) < 0.1, (api, kind, fit)
@@ -74,11 +75,77 @@ def test_a_fixed_workspace_per_kind_plus_per_chunk_output_passes_and_is_recovere
 
 
 def test_a_constant_difference_between_dense_and_sparse_is_not_charged_to_records():
-    """The false positive this model replaces: 16 MiB between the kinds, no growth with records."""
+    """A permitted fixed 6 MiB difference is not charged to record retention."""
     two_sizes = corpus(healthy, sizes_mib=(256, 1024), repeats=2)
     verdict = bench.evaluate(two_sizes)
     assert verdict["passed"], verdict["failures"]
     assert abs(verdict["fits"]["format_aware_file"]["bytes_per_record"]) < 0.001
+
+
+def test_a_constant_16_mib_density_overhead_still_fails_the_original_limit():
+    def excessive_density(api, kind, chunks, records):
+        extra = 10 * MIB if record_walk(api, kind) and kind == "mcap-dense" else 0
+        return healthy(api, kind, chunks, records) + extra
+
+    verdict = bench.evaluate(corpus(excessive_density, sizes_mib=(256, 1024), repeats=2))
+    assert not verdict["passed"]
+    for api in ("format_aware_file", "format_aware_fd"):
+        assert abs(verdict["fits"][api]["bytes_per_record"]) < 0.001
+        pairs = [p for p in verdict["dense_vs_sparse"] if p["api"] == api]
+        assert len(pairs) == 2
+        assert all(p["limit"] == 8 * MIB for p in pairs)
+        assert all(p["chunk_adjusted_difference"] == pytest.approx(16 * MIB) for p in pairs)
+        assert any(f.startswith(api + " @") for f in verdict["failures"])
+
+
+def test_extra_returned_chunks_are_adjusted_using_only_plain_file_cost():
+    rows = corpus(lambda api, kind, chunks, records: 2 * MIB + 700 * chunks)
+    verdict = bench.evaluate(rows)
+    assert verdict["passed"], verdict["failures"]
+    for cost in verdict["density_output_cost"].values():
+        assert cost["source"] == "plain-only"
+        assert cost["applied_bytes_per_chunk"] == pytest.approx(700)
+    assert any(p["dense_median"] - p["sparse_median"] > p["limit"] for p in verdict["dense_vs_sparse"])
+    assert all(abs(p["chunk_adjusted_difference"]) < 1 for p in verdict["dense_vs_sparse"])
+
+
+def test_negative_plain_output_slope_cannot_inflate_the_density_gap():
+    rows = corpus(healthy, sizes_mib=(256, 1024), repeats=2)
+    for row in rows:
+        if row["kind"] == "plain":
+            row["peak_delta_bytes"] = 33 * MIB - 100 * row["chunks"]
+    verdict = bench.evaluate(rows)
+    for cost in verdict["density_output_cost"].values():
+        assert cost["fitted_bytes_per_chunk"] == pytest.approx(-100)
+        assert cost["applied_bytes_per_chunk"] == 0
+    for pair in verdict["dense_vs_sparse"]:
+        assert pair["chunk_adjusted_difference"] == pair["dense_median"] - pair["sparse_median"]
+
+
+def test_plain_output_credit_cannot_exceed_the_existing_chunk_cost_limit():
+    verdict = bench.evaluate(corpus(lambda api, kind, chunks, records: 2 * MIB + 8192 * chunks))
+    assert not verdict["passed"] and any("bytes/chunk" in f for f in verdict["failures"])
+    assert all(cost["applied_bytes_per_chunk"] == 1024 for cost in verdict["density_output_cost"].values())
+
+
+def test_density_limit_retains_ten_percent_when_raw_peak_is_large():
+    def large_output(api, kind, chunks, records):
+        workspace = (18 if kind == "mcap-dense" else 9) * MIB
+        return workspace + 150 * chunks
+
+    verdict = bench.evaluate(corpus(large_output, sizes_mib=(40960, 65536), repeats=2))
+    assert verdict["passed"], verdict["failures"]
+    for pair in verdict["dense_vs_sparse"]:
+        assert pair["limit"] == pytest.approx(0.10 * max(pair["dense_median"], pair["sparse_median"]))
+        assert pair["chunk_adjusted_difference"] == pytest.approx(9 * MIB)
+
+
+def test_missing_plain_fd_samples_cannot_qualify_a_density_comparison():
+    rows = [r for r in corpus(healthy) if not (r["api"] == "format_aware_fd" and r["kind"] == "plain")]
+    verdict = bench.evaluate(rows)
+    assert not verdict["passed"]
+    assert any(f.startswith("format_aware_fd: density comparison requires plain-file")
+               for f in verdict["failures"])
 
 
 @pytest.mark.parametrize("per_record", [2.0, 8.0, 0.125])
@@ -96,7 +163,7 @@ def test_memory_that_grows_with_records_fails(per_record):
 def test_a_workspace_above_the_declared_bound_fails():
     """52 MiB is what macOS measured while the dense window grew by doubling."""
     def doubled(api, kind, chunks, records):
-        extra = 27 * MIB if (record_walk(api, kind) and kind == "mcap-dense") else 0
+        extra = 37 * MIB if (record_walk(api, kind) and kind == "mcap-dense") else 0
         return healthy(api, kind, chunks, records) + extra
 
     verdict = bench.evaluate(corpus(doubled))
@@ -150,16 +217,22 @@ def measured(runner: str) -> list[dict]:
 
 
 @pytest.mark.parametrize("runner", ["ubuntu", "windows"])
-def test_measured_samples_whose_memory_is_flat_in_records_pass(runner):
-    """CI at c7d57a1: 4x the records moved the dense peak by at most 0.6 MiB, and the old model failed it."""
+def test_measured_flat_record_growth_does_not_erase_density_or_coverage_failures(runner):
+    """Historical rows can have a flat record slope without qualifying the density contract."""
     rows = measured(runner)
     dense = [r for r in rows if r["api"] == "format_aware_file" and r["kind"] == "mcap-dense"]
     small = max(r["peak_delta_bytes"] for r in dense if r["size"] == 256 * MIB)
     large = max(r["peak_delta_bytes"] for r in dense if r["size"] == 1024 * MIB)
     assert large - small < 1 * MIB, "the fixture is the flat case"
     verdict = bench.evaluate(rows)
-    assert verdict["passed"], verdict["failures"]
+    assert not verdict["passed"]
     assert verdict["fits"]["format_aware_file"]["bytes_per_record"] < bench.MAX_BYTES_PER_RECORD / 5
+    assert not any("O(records)" in f for f in verdict["failures"])
+    # The historical protocol never measured plain files through the fd API.
+    assert any(f.startswith("format_aware_fd: density comparison requires plain-file")
+               for f in verdict["failures"])
+    if runner == "windows":
+        assert any(f.startswith("format_aware_file @") for f in verdict["failures"])
 
 
 def test_measured_samples_from_the_doubling_window_fail_on_workspace():

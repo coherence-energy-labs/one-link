@@ -16,7 +16,7 @@ jobs:
   strict_timing:
     name: controlled native timing measurements
     runs-on: [self-hosted, linux, x64, one-link-timing]
-    timeout-minutes: 110
+    timeout-minutes: 135
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -38,6 +38,22 @@ jobs:
         run: >-
           python scripts/run_native_timing.py --per-target-timeout 120
           --report test-results/native-timing/report.json
+      # Fixed-versus-random Welch t-test over every secret-dependent comparison
+      # in native/ol_ct_audit/timing_inventory.json. A target passes only when
+      # no leak is found AND the run had the power to see a 1% difference; a
+      # run without that power is INCONCLUSIVE-POWER and fails. Two planted
+      # leaks must be detected and two null controls must stay quiet, or the
+      # instrument itself is reported broken. --quiet-machine records this
+      # host as the dedicated runner and fails if it is measurably loaded.
+      # Runs even when the step above failed: each has its own conclusion.
+      - name: Statistical timing-leak test (dudect) with stated power
+        if: ${{ !cancelled() }}
+        timeout-minutes: 25
+        run: >-
+          python scripts/run_ct_timing.py
+          --report test-results/native-timing-dudect/report.json
+          --quiet-machine
+          --host-note "dedicated one-link-timing runner $RUNNER_NAME; no other job scheduled"
       - name: Preserve raw timing diagnostics even on failure or cancellation
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

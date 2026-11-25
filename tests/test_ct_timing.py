@@ -15,10 +15,13 @@ They run everywhere without building anything. They pin:
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
+import os
 import random
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -195,6 +198,79 @@ def test_report_dump_is_json_with_scalar_arrays_inline():
     text = timing.dump(value)
     assert json.loads(text) == value
     assert '"a": [1, 2.5, null]' in text
+
+
+def test_report_paths_are_repository_relative_never_absolute(tmp_path: Path):
+    """The report is committed to a public repository: it must not say where on a machine it was made."""
+    inside = timing.ROOT / "native" / "target" / "ct-audit" / "ol_ct_audit"
+    assert timing.display_path(inside) == "native/target/ct-audit/ol_ct_audit"
+    outside = tmp_path / "elsewhere" / "ol_ct_audit.exe"
+    assert timing.display_path(outside) == "ol_ct_audit.exe"
+    for shown in (timing.display_path(inside), timing.display_path(outside)):
+        assert not Path(shown).is_absolute() and ":" not in shown and not shown.startswith("/")
+
+
+def test_recorded_target_run_does_not_carry_this_machines_locations():
+    """A failing target's command and stderr are recorded; neither may name the repository's or home's location."""
+    args = argparse.Namespace(min_target_s=0.1, min_measurements=1, mde_goal=0.001, mde_bound=0.01, cpu=None)
+    # The interpreter stands in for the audit binary: it rejects the arguments
+    # and names its own absolute path on stderr, which is the text under test.
+    row = timing.run_target(Path(sys.executable), "no_such_target", 0.2, args, seed=1)
+    assert "exit status" in row["error"]
+    assert row["command"][1:3] == ["--dudect", "no_such_target"]
+    assert not Path(row["command"][0]).is_absolute()
+    recorded = json.dumps(row).lower()
+    for location in (timing.ROOT.resolve(), Path.home().resolve()):
+        for form in (str(location), location.as_posix()):
+            assert json.dumps(form).strip('"').lower() not in recorded, form
+
+
+def test_scrub_replaces_repository_and_home_in_both_slash_styles():
+    root, home = timing.ROOT.resolve(), Path.home().resolve()
+    text = f"panicked at {home.as_posix()}/.cargo/registry/x/lib.rs:1 and {root}{os.sep}native{os.sep}a.rs:2"
+    scrubbed = timing.scrub_paths(text)
+    assert "<home>/.cargo/registry/x/lib.rs:1" in scrubbed
+    assert f"<repo>{os.sep}native{os.sep}a.rs:2" in scrubbed
+    assert str(home) not in scrubbed and home.as_posix() not in scrubbed
+    assert timing.scrub_paths("nothing local here") == "nothing local here"
+
+
+def test_load_snapshot_publishes_load_not_process_identity():
+    raw = {
+        "utc": "t",
+        "loadavg": ["0.5", "1.0", "0.8"],
+        "processes": [{"pid": 4242, "name": "someones-other-project", "cpu_percent_of_one_core": 123.4}],
+        "windows_host": {
+            "processes": [{"pid": 7, "name": "editor", "cpu_percent_of_one_core": 45.0, "working_set_mb": 490}],
+            "memory_free_mb": 600,
+        },
+    }
+    shown = timing.publishable_load(raw, process_names=False)
+    text = json.dumps(shown)
+    assert "someones-other-project" not in text and "editor" not in text and "4242" not in text
+    assert shown["processes"] == [{"cpu_percent_of_one_core": 123.4}]
+    assert shown["windows_host"]["processes"] == [{"cpu_percent_of_one_core": 45.0, "working_set_mb": 490}]
+    assert shown["loadavg"] == raw["loadavg"] and shown["windows_host"]["memory_free_mb"] == 600
+    named = timing.publishable_load(raw, process_names=True)
+    assert named["processes"] == [{"name": "someones-other-project", "cpu_percent_of_one_core": 123.4}]
+
+
+def test_quiet_machine_claim_is_checked_not_assumed():
+    quiet = [{"name": "a", "load": {"other_load_cpus": 0.1}}, {"name": "b", "load": {"other_load_cpus": 0.5}}]
+    assert timing.quiet_machine_problems(quiet) == []
+    busy = [*quiet, {"name": "c", "load": {"other_load_cpus": 3.2}}]
+    assert timing.quiet_machine_problems(busy) == ["c: 3.2 other busy CPUs beside the measurement (limit 0.5)"]
+    unmeasured = [{"name": "d", "load": {"busy_fraction": None}}, {"name": "e"}]
+    problems = timing.quiet_machine_problems(unmeasured)
+    assert len(problems) == 2 and all("unverified" in p for p in problems)
+
+
+def test_controlled_runner_workflow_runs_the_statistical_test_as_a_checked_quiet_machine():
+    text = (ROOT / ".github" / "workflows" / "native_timing.yml").read_text(encoding="utf-8")
+    step = text[text.index("- name: Statistical timing-leak test (dudect)") :]
+    step = step[: step.index("- name:", 10)]
+    assert "scripts/run_ct_timing.py" in step and "--quiet-machine" in step
+    assert "continue-on-error" not in step and "--process-names" not in step
 
 
 def _valgrind_cases() -> dict[str, dict]:

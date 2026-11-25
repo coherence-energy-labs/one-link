@@ -47,6 +47,7 @@ import os
 import pathlib
 import platform
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -280,6 +281,77 @@ def is_wsl() -> bool:
     return "microsoft" in (read_text("/proc/version") or "").lower()
 
 
+def display_path(path: pathlib.Path) -> str:
+    """How a path is written into the report: relative to the repository, never absolute.
+
+    The report is evidence that gets committed and published. An absolute path
+    says where on someone's machine the work happened and under which account,
+    which no reader of the evidence needs.
+    """
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(ROOT.resolve()).as_posix()
+    except ValueError:
+        return resolved.name
+
+
+def scrub_paths(text: str) -> str:
+    """Free text from a tool (its stderr) with this machine's locations replaced by placeholders.
+
+    A panic message names source files, and for a dependency that is an
+    absolute path under the home directory. The repository goes first because
+    it usually lies inside the home directory.
+    """
+    for location, label in ((ROOT.resolve(), "<repo>"), (pathlib.Path.home().resolve(), "<home>")):
+        for form in sorted({str(location), location.as_posix()}, key=len, reverse=True):
+            text = re.sub(re.escape(form), lambda _match, label=label: label, text, flags=re.IGNORECASE)
+    return text
+
+
+def publishable_load(load: dict, process_names: bool) -> dict:
+    """A load snapshot fit to publish: how busy the busiest processes were, not which they were.
+
+    The names of whatever else runs on the measuring machine describe its
+    owner's other work, not this measurement, so they stay out of the report
+    unless --process-names asks for them. Process ids go either way: they
+    identify nothing once the run is over.
+    """
+    out: dict = {}
+    for key, value in load.items():
+        if key == "processes" and isinstance(value, list):
+            out[key] = [
+                {k: v for k, v in row.items() if k != "pid" and (process_names or k != "name")}
+                for row in value
+                if isinstance(row, dict)
+            ]
+        elif isinstance(value, dict):
+            out[key] = publishable_load(value, process_names)
+        else:
+            out[key] = value
+    return out
+
+
+# With --quiet-machine, the most other work, in busy logical CPUs beyond the
+# measuring thread, that may run beside any one target.
+QUIET_OTHER_LOAD_CPUS = 0.5
+
+
+def quiet_machine_problems(runs: list[dict], limit: float = QUIET_OTHER_LOAD_CPUS) -> list[str]:
+    """Why a host that was claimed quiet was not: one line per target, empty if the claim held.
+
+    A target whose host load could not be measured counts against the claim:
+    an unverified "quiet" is not a quiet machine.
+    """
+    problems = []
+    for run in runs:
+        other = run.get("load", {}).get("other_load_cpus")
+        if other is None:
+            problems.append(f"{run['name']}: host load was not measurable, so the quiet-machine claim is unverified")
+        elif other > limit:
+            problems.append(f"{run['name']}: {other} other busy CPUs beside the measurement (limit {limit})")
+    return problems
+
+
 def powershell() -> str | None:
     for candidate in ("powershell", "powershell.exe", "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"):
         found = shutil.which(candidate) or (candidate if os.path.isfile(candidate) else None)
@@ -366,10 +438,10 @@ def linux_load() -> dict:
     return load
 
 
-def load_snapshot() -> dict:
+def load_snapshot(process_names: bool = False) -> dict:
     snap = {"utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}
     snap.update(windows_load() if platform.system() == "Windows" else linux_load())
-    return snap
+    return publishable_load(snap, process_names)
 
 
 class BusyMeter:
@@ -497,7 +569,7 @@ def source_info(args: argparse.Namespace, binary: pathlib.Path) -> dict:
         "git_commit_from": "git" if commit else ("--source-commit" if args.source_commit else None),
         "uncommitted_paths": dirty.splitlines() if dirty is not None else None,
         "source_note": args.source_note,
-        "binary": str(binary),
+        "binary": display_path(binary),
         "binary_sha256": sha256(binary),
         "binary_bytes": binary.stat().st_size,
         "profile": "ct-audit (inherits release: opt-level 3, fat LTO, 1 codegen unit, panic=abort)",
@@ -527,7 +599,7 @@ def run_target(binary: pathlib.Path, name: str, budget_s: float, args: argparse.
 
     meter = BusyMeter()
     started = time.monotonic()
-    row: dict = {"command": command, "budget_s": round(budget_s, 1)}
+    row: dict = {"command": [display_path(binary), *command[1:]], "budget_s": round(budget_s, 1)}
     try:
         proc = subprocess.run(
             command, capture_output=True, text=True, timeout=budget_s + SETUP_MARGIN_S, preexec_fn=preexec, check=False
@@ -540,7 +612,7 @@ def run_target(binary: pathlib.Path, name: str, budget_s: float, args: argparse.
     row["load"] = meter.stop()
     row["returncode"] = proc.returncode
     if proc.returncode not in (0, 1, 4):
-        row["error"] = f"exit status {proc.returncode}: {proc.stderr.strip()[-2000:]}"
+        row["error"] = f"exit status {proc.returncode}: {scrub_paths(proc.stderr.strip())[-2000:]}"
         return row
     lines = [line for line in proc.stdout.splitlines() if line.strip()]
     if len(lines) != 1:
@@ -668,7 +740,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--cpu", type=int, default=None, help="Linux: pin each target to this logical CPU")
     parser.add_argument("--host-note", default="unspecified", help="what this host is and what else runs on it")
-    parser.add_argument("--quiet-machine", action="store_true", help="assert the host is a quiet, dedicated machine")
+    parser.add_argument(
+        "--quiet-machine",
+        action="store_true",
+        help="claim the host is a quiet, dedicated machine; the run FAILS if any target ran beside more than "
+        f"{QUIET_OTHER_LOAD_CPUS} other busy CPUs, or if the host load could not be measured",
+    )
+    parser.add_argument(
+        "--process-names",
+        action="store_true",
+        help="record the names of the busiest processes; such a report describes the machine's other work, "
+        "so do not publish one made on a personal machine",
+    )
     parser.add_argument("--source-commit", default=None, help="commit to record when git is unavailable here")
     parser.add_argument("--source-note", default=None)
     args = parser.parse_args(argv)
@@ -698,7 +781,8 @@ def main(argv: list[str] | None = None) -> int:
         "quiet_machine": bool(args.quiet_machine),
         "host_note": args.host_note,
         "statement": (
-            "Run on a host asserted to be quiet and dedicated."
+            "Run on a host claimed to be quiet and dedicated. The claim is checked: the run fails if any target "
+            f"ran beside more than {QUIET_OTHER_LOAD_CPUS} other busy CPUs or its host load was not measurable."
             if args.quiet_machine
             else "This host is NOT a quiet machine. Classes are interleaved at random, so its load cannot "
             "create a class difference; it only raises the variance, which every target's MDE states."
@@ -718,7 +802,7 @@ def main(argv: list[str] | None = None) -> int:
         "host": host_info(),
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
-    report["load_before"] = load_snapshot()
+    report["load_before"] = load_snapshot(args.process_names)
 
     started = time.monotonic()
     rows: list[dict] = []
@@ -751,9 +835,11 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
     report["measurement_wall_s"] = round(time.monotonic() - started, 1)
-    report["load_after"] = load_snapshot()
+    report["load_after"] = load_snapshot(args.process_names)
 
     failures = []
+    if args.quiet_machine:
+        failures.extend(f"<quiet-machine claim refuted> {problem}" for problem in quiet_machine_problems(runs))
     for row in rows:
         if row["outcome"] in ("error", "inconsistent", "blind", "biased", "leak"):
             failures.append(f"{row['name']}: {row['outcome']}" + (f" ({row.get('verdict')})" if row.get("verdict") else ""))

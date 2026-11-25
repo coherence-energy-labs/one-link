@@ -406,6 +406,11 @@ def _index_file_native(
         return None
     if scanner is None:
         return None
+    readinto = getattr(handle, "readinto", None)
+    if not callable(readinto):
+        # BinaryIO's public read/seek contract also permits wrapper streams
+        # without readinto. They retain the Python path without consuming data.
+        return None
     chunks: list[Chunk] = []
     file_hasher = blake3.blake3()
     chunk_hasher = blake3.blake3()
@@ -416,7 +421,7 @@ def _index_file_native(
     chunk_len = 0
     handle.seek(0)
     while True:
-        n = handle.readinto(buf)
+        n = readinto(buf)
         if n is None or n < 0 or n > len(buf):
             raise OSError("invalid read length while building CDC index")
         if not n:

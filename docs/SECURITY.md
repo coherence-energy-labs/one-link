@@ -139,9 +139,10 @@ Can attempt to MITM the TLS connection to our CDN.
 - Service Worker release-key pinning is planned, not current. The existing PWA
   cache path and mutable prerelease do not provide a cryptographically verified
   update channel.
-- WebRTC DataChannel uses DTLS-SRTP (active negotiation; certs
-  exchanged at handshake; tampered offer/answer breaks the
-  handshake). *The 2026-05-09 audit found unsigned-answer and SDP-fingerprint
+- WebRTC DataChannel carries SCTP over DTLS; audio/video media uses SRTP.
+  See [RFC 8831, section 1](https://www.rfc-editor.org/rfc/rfc8831.html#section-1).
+  DTLS establishes the channel certificate; signed signaling binds the intended
+  peer identity and certificate fingerprints. *The 2026-05-09 audit found unsigned-answer and SDP-fingerprint
   binding gaps. The current development tree contains signed/bound signaling
   changes, but those changes still need exact-commit hostile-network evidence
   and a verified release.*
@@ -466,8 +467,8 @@ them communicate with us back-side:
    it. Our CSP further restricts our own attack surface within
    the sandbox.
 
-5. **DTLS-SRTP (in WebRTC).** The browser's WebRTC stack does the
-   transport-layer encryption. Browser signaling and pairing add application
+5. **WebRTC transport encryption.** DataChannels use SCTP over DTLS and
+   media uses SRTP. Browser signaling and pairing add application
    identity checks, but browser/WebRTC paths do not inherit the daemon's
    ML-KEM or Double-Ratchet claim unless that exact session reports it.
 

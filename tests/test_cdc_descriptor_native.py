@@ -76,3 +76,21 @@ def test_native_scan_error_is_not_hidden_by_python_retry(monkeypatch):
     monkeypatch.setattr(native_cdc, "get_native_cdc_scanner", lambda: BrokenScanner())
     with pytest.raises(RuntimeError, match="scanner contract failure"):
         cdc.index_file(io.BytesIO(b"abc"), size=3)
+
+
+def test_read_seek_only_stream_retains_supported_python_fallback(monkeypatch):
+    class ReadSeekOnly:
+        def __init__(self, data):
+            self.inner = io.BytesIO(data)
+
+        def read(self, size=-1):
+            return self.inner.read(size)
+
+        def seek(self, offset):
+            return self.inner.seek(offset)
+
+    monkeypatch.delenv("ONE_LINK_DISABLE_NATIVE_CDC", raising=False)
+    payload = random.Random(3).randbytes(100000)
+    actual = cdc.index_file(ReadSeekOnly(payload), size=len(payload))
+    assert actual.chunks == cdc.chunk_bytes(payload)
+    assert actual.engine == "python-gear"

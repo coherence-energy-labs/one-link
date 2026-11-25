@@ -574,6 +574,7 @@ def test_macos_finalization_rebinds_both_native_binaries_before_helper_and_manif
     import zipfile
 
     from scripts.package_standalone_bundle import package_bundle
+    import one_link.native_cdc as native_cdc
     from one_link.update_transaction import _validate_zip_index
 
     mod = _load_module()
@@ -596,7 +597,10 @@ def test_macos_finalization_rebinds_both_native_binaries_before_helper_and_manif
             executable.parent.mkdir(parents=True)
             executable.write_bytes(b"final app launcher")
             executable.chmod(0o755)
-            for name in ("ol_shell", "ol_native_cdc.dylib"):
+            # The Darwin layout is simulated on every CI host; match the
+            # existing subprocess stub's host-native filename selection.
+            shell_name = "ol_shell.exe" if sys.platform == "win32" else "ol_shell"
+            for name in (shell_name, native_cdc.native_library_name()):
                 binary = bundle / "Contents" / "Frameworks" / name
                 sidecar = bundle / "Contents" / "Resources" / (name + ".sha256")
                 binary.parent.mkdir(parents=True, exist_ok=True)

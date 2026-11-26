@@ -2503,6 +2503,13 @@
       "subject": "fix(daemon): a daemon asked to stop ends its open connections instead of waiting for them",
       "url": "https://github.com/coherence-energy-labs/one-link/commit/4e73895d9a0d64e3b9b1c4b3e333568b590e3b2f",
       "integrated_in_review_basis": false
+    },
+    {
+      "id": "50fd4ee",
+      "revision": "50fd4ee8cdc9a0b370d74c28c80a403cddf3c15b",
+      "subject": "fix(bench): per-record scan memory is measured with the chunk count held fixed, not fitted",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/50fd4ee8cdc9a0b370d74c28c80a403cddf3c15b",
+      "integrated_in_review_basis": false
     }
   ],
   "findings": [
@@ -3886,6 +3893,18 @@
             "native/ol_chunk/src/stream.rs",
             "scripts/bench_scan_memory.py"
           ]
+        },
+        {
+          "summary": "The per-record memory check was sitting at its limit and failed once on hosted Linux with unchanged scanner code. Its model let the plain log fix the per-chunk cost, which three hosted reports show it cannot. The check now compares two dense logs of one size with different record sizes, so the chunk count is held nearly fixed; the limits are unchanged, and a pair that cannot tell is refused instead of passed. CI sizes moved from 256 and 1024 MiB to 192 and 768 MiB, clear of a measured step in peak memory at power-of-two chunk counts.",
+          "commits": [
+            "50fd4ee"
+          ],
+          "files": [
+            "scripts/bench_scan_memory.py",
+            "tests/test_scan_memory_contract.py",
+            "tests/scan_memory_ci_4621947.json",
+            ".github/workflows/native_build.yml"
+          ]
         }
       ],
       "validation": [
@@ -3914,7 +3933,8 @@
       "remaining": [
         "Hosted sizes stop at 1 GiB; larger logs were measured on one Windows workstation only.",
         "The smaller buffers cost speed: about 15 to 30% on dense logs and up to a third on sparse ones (hosted runners and a 14-round workstation sweep agree on the direction; the workstation is too noisy to pick an optimum). A larger hashing batch with a small read-ahead should keep the memory limit and restore parallel hashing; that needs a quiet machine.",
-        "Returned output remains O(chunks), and the explicit offset-list APIs keep their O(records) result by design."
+        "Returned output remains O(chunks), and the explicit offset-list APIs keep their O(records) result by design.",
+        "The redesigned per-record check has run on one Windows workstation; hosted Linux and macOS have not run it."
       ]
     },
     {
@@ -4983,6 +5003,16 @@
         "revision": "072027f",
         "summary": "47 checks passed, 2 failed, 3 skipped. All eight live shards, both browser suites and the twenty-pair benchmark gate passed. The two failures were the macOS native test job and the aggregate gate above it, on the GF(256) wall-clock timing gate (10.13% against 5%), which 8944380 then made advisory on shared runners.",
         "reading": "The live shards and the benchmark gate failed on c3cd967 and passed on the next revision, whose only product-relevant difference is in tests. They are intermittent on hosted runners, not fixed."
+      },
+      {
+        "revision": "4621947",
+        "summary": "55 checks passed, 4 failed, 2 skipped. Failed: the scan-memory per-record check on Linux (0.0501 against 0.05) with its roll-up, and one inconclusive disk-write benchmark with its roll-up.",
+        "reading": "Intermittent on hosted runners; one run each way is not a fix."
+      },
+      {
+        "revision": "1c7ae92",
+        "summary": "56 checks passed, 3 failed, 2 skipped, on a documents-only commit. Failed: one live test on hosted Windows (key rotation over the real wire: the forced dial after the restart was refused at once) with its two roll-ups. The same code passed that test on 4621947 and three times of three on a workstation. The scan-memory check and the benchmark gate passed on this run with unchanged code.",
+        "reading": "Intermittent on hosted runners; one run each way is not a fix."
       }
     ]
   },

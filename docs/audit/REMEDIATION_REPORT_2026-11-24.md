@@ -581,3 +581,9 @@ The install where these were found was rolled from `f55576f` to `4621947`. The p
 - FLD-02: the native window opened signed in on the fixed page, after being rebuilt for it. The window binary pins the hash of the page it renders, so the binary from before the roll would have refused the fixed page.
 - FLD-03 was not exercised there: nothing was waiting for acceptance after the roll.
 - A database backup from before the first start of the new code is kept beside the install's data folder.
+
+### After the roll
+
+- **Scan-memory per-record check (`50fd4ee`, BRANCH-02).** It failed on hosted Linux at `4621947` and passed at `1c7ae92` with the same scanner code: it was at its limit and flipping on noise. Its model let the plain log fix the per-chunk memory cost; three hosted reports show the dense walk's growth is the returned chunk list (141 to 235 bytes per chunk) while the plain scan reports 31 to 113, and the difference was being read as per-record memory. The check now compares two dense logs of the same size with different record sizes, so the chunk count is held nearly fixed. The limits are unchanged. It has run on one Windows workstation only.
+- **A live test failed once on hosted Windows at `1c7ae92`**, a documents-only commit: key rotation over the real wire, where the forced dial after the restart was refused at once. The other daemon had applied the rotation certificate two seconds earlier. The same code passed it at `4621947` and three times of three on a workstation. Not explained; the failure now carries both daemons' logs.
+- **Two required checks have each been red once and green once on identical code** (the scan-memory roll-up and the benchmark roll-up). The first is addressed above. The second is a disk-write metric whose interval was too wide to decide on that runner; it is not addressed.

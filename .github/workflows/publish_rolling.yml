@@ -26,11 +26,11 @@ on:
   workflow_dispatch:
     inputs:
       commit:
-        description: "Commit SHA on master to publish (defaults to master HEAD)"
+        description: "Current master SHA (optional; must equal dispatch SHA)"
         required: false
         type: string
 
-# Publishing REPLACES the asset set (delete-then-upload), so two overlapping
+# Publishing replaces individual assets, so two overlapping
 # runs could interleave into a half-empty release -- exactly the broken
 # download button this workflow exists to prevent. Serialize globally (not
 # per-ref), and never cancel: cancelling mid-publish is what would strand the
@@ -56,8 +56,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ github.sha }}
 
-      - name: resolve target commit
+      - name: resolve and qualify current master
         id: target
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -65,85 +66,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ -n "$REQUESTED" ]; then
-            SHA="$REQUESTED"
-          else
-            SHA=$(gh api "repos/$GITHUB_REPOSITORY/commits/master" --jq '.sha')
-          fi
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "Publishing from commit $SHA"
+          python3 scripts/rolling_publish_guard.py resolve --requested "$REQUESTED"
 
-      - name: require the gating workflows to be green for this commit
+      - name: download exact qualified continuous-build aggregate
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ steps.target.outputs.sha }}
+          RUN_ID: ${{ steps.target.outputs.build_run }}
         shell: bash
         run: |
           set -euo pipefail
-          # The public download must never move to a commit CI rejected.
-          for wf in "tests" "security" "auto-build standalone binary"; do
-            conclusion=$(gh api \
-              "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$SHA&per_page=100" \
-              --jq "[.workflow_runs[] | select(.name == \"$wf\")] | first | .conclusion // \"missing\"")
-            echo "$wf -> $conclusion"
-            if [ "$conclusion" != "success" ]; then
-              echo "refusing to publish: '$wf' is '$conclusion' for $SHA" >&2
-              exit 1
-            fi
-          done
-
-      - name: download the continuous-build artifacts for this commit
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SHA: ${{ steps.target.outputs.sha }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          RUN_ID=$(gh api \
-            "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$SHA&per_page=100" \
-            --jq '[.workflow_runs[] | select(.name == "auto-build standalone binary" and .conclusion == "success")] | first | .id')
-          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
-            echo "no successful auto-build run for $SHA" >&2
-            exit 1
-          fi
-          echo "using auto-build run $RUN_ID"
-          mkdir -p artifacts
-          gh run download "$RUN_ID" --dir artifacts
-
-      - name: flatten + verify the complete download set
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p out
-          find artifacts -name '*.zip' -exec cp {} out/ \;
-          find artifacts -name '*.dmg' -exec cp {} out/ \;
-          find artifacts -name '*.AppImage' -exec cp {} out/ \;
-          find artifacts -name '*.sha256' -exec cp {} out/ \;
-          find artifacts -name 'one-link-setup-*.exe' -exec cp {} out/ \;
-          # These exact names are what src/worker.js redirects to on the
-          # website. A missing one means a broken download button, so fail
-          # loudly rather than publish a partial set.
-          for required in \
-            one-link-setup-x86_64.exe \
-            one-link-setup-arm64.exe \
-            one-link-macos-arm64.dmg \
-            one-link-macos-arm64.zip \
-            one-link-linux-x86_64.AppImage \
-            one-link-linux-arm64.AppImage \
-            one-link-linux-x86_64.zip \
-            one-link-linux-arm64.zip; do
-            if [ ! -f "out/$required" ]; then
-              echo "missing required download asset: $required" >&2
-              exit 1
-            fi
-          done
-          cd out
-          : > manifest.txt
-          for f in *.zip *.dmg *.AppImage one-link-setup-*.exe; do
-            [ -f "$f" ] || continue
-            sha256sum "$f" >> manifest.txt
-          done
-          cat manifest.txt
+          test ! -e out
+          gh run download "$RUN_ID" --name "one-link-continuous-build-$SHA" --dir out
+          python3 scripts/rolling_publish_guard.py verify-assets --directory out
 
       - name: attest build provenance
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
@@ -158,21 +93,25 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ steps.target.outputs.sha }}
+          RUN_ID: ${{ steps.target.outputs.build_run }}
         shell: bash
         run: |
           set -euo pipefail
+          python3 scripts/rolling_publish_guard.py recheck --requested "$SHA" --build-run "$RUN_ID" --directory out
           TAG=auto-latest
           if ! gh release view "$TAG" > /dev/null 2>&1; then
             gh release create "$TAG" --prerelease --target "$SHA" \
               --title "Rolling build (master $SHA)" --notes "initialising"
           fi
+          test "$(gh release view "$TAG" --json isPrerelease --jq .isPrerelease)" = true
           # Upload FIRST, then prune. The original order deleted every asset
           # before uploading any, so an upload that failed part-way left the
           # release empty and every website download button returning 404 --
           # precisely the outage this workflow exists to prevent. --clobber
           # already replaces same-named assets, so the delete pass is only
           # needed for assets absent from the new set, and it is safe to run
-          # afterwards: at no point is the release without a complete set.
+          # afterwards. Per-asset clobber is not atomic; a failed upload can
+          # still leave a partially refreshed release, so do not claim atomicity.
           gh release upload "$TAG" out/* --clobber
           published=""
           for f in out/*; do
@@ -185,14 +124,15 @@ jobs:
             done
             if [ "$keep" -eq 0 ]; then
               echo "pruning stale asset: $existing"
-              gh release delete-asset "$TAG" "$existing" --yes || true
+              gh release delete-asset "$TAG" "$existing" --yes
             fi
           done
+          python3 scripts/rolling_publish_guard.py verify-published --directory out
           {
             echo "Rolling continuous build from master \`$SHA\`."
             echo
-            echo "Published only after \`tests\`, \`security\`, and the platform"
-            echo "build matrix were green for this exact commit."
+            echo "Published only after the master test, security, lint, formal,"
+            echo "native, browser, performance, and platform build workflows passed for this exact commit."
             echo
             echo "Every artifact carries a GitHub build-provenance attestation:"
             echo
@@ -202,10 +142,10 @@ jobs:
             echo
             echo "Read that attestation precisely. It proves the file was emitted"
             echo "by this repository's \`publish_rolling.yml\` on a GitHub-hosted"
-            echo "runner, so a third party cannot substitute their own upload. Its"
+            echo "runner and binds the artifact digest to the publisher identity. Its"
             echo "\`sourceRepositoryDigest\` is the commit the PUBLISHER ran from,"
-            echo "which is not necessarily the commit the binary was COMPILED from"
-            echo "(\`$SHA\`, named in the title above). It is not a reproducible"
+            echo "and must equal the verified master build source named above."
+            echo "This is not a reproducible"
             echo "build claim: it does not let you rebuild these bytes and compare."
             echo
             echo "**This is not a signed, reproducible release.** That pipeline is"

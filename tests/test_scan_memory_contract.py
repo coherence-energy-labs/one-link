@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -279,3 +281,82 @@ def test_generated_logs_are_exact_size_valid_mcap(tmp_path: Path, record_bytes: 
     assert boundaries[-1].end == 4 * MIB
     if record_bytes >= 262144:
         assert any(b.format_forced for b in boundaries), "the record walk must see the generated framing"
+
+def measured_grid():
+    rows = corpus(healthy, sizes_mib=(256, 1024), repeats=2)
+    for row in rows:
+        delta = row["peak_delta_bytes"]
+        row.update(bench._peak_evidence("linux-vmhwm", True, 12*MIB, 12*MIB,
+                                       12*MIB+delta, 12*MIB+delta))
+        row["seconds"] = 1.0
+    return rows, {"apis": list(APIS), "sizes": [256*MIB, 1024*MIB], "repeats": 2}
+
+
+def test_complete_valid_measurement_windows_promote_the_model():
+    rows, design = measured_grid()
+    result = bench.qualify(rows, design)
+    assert result["passed"] and result["measurement_valid"], result["failures"]
+
+
+@pytest.mark.parametrize("defect", ["missing", "duplicate", "empty", "counter", "reset",
+                                    "mask", "delta", "timing", "legacy", "mixed"])
+def test_measurement_gate_does_not_promote_incomplete_or_masked_samples(defect):
+    rows, design = measured_grid()
+    if defect == "missing":
+        rows.pop()
+    elif defect == "duplicate":
+        rows[-1] = rows[0].copy()
+    elif defect == "empty":
+        rows.clear()
+    elif defect == "counter":
+        rows[0].pop("peak_counter")
+    elif defect == "reset":
+        rows[0]["peak_reset"] = False
+    elif defect == "mask":
+        row = rows[0]
+        after = row["peak_after_bytes"]
+        row.update(bench._peak_evidence("windows-working-set", False,
+                                       after, row["current_before_bytes"], after, after))
+    elif defect == "delta":
+        rows[0]["peak_delta_bytes"] += 1
+    elif defect == "timing":
+        rows[0]["seconds"] = float("nan")
+    elif defect == "mixed":
+        rows[0]["peak_counter"] = "windows-working-set"
+        rows[0]["peak_reset"] = False
+    else:
+        design = None
+    result = bench.qualify(rows, design)
+    assert not result["passed"] and not result["measurement_valid"]
+    assert result["measurement_failures"]
+
+
+def test_actual_linux_high_water_reset_rejects_an_old_peak():
+    if not sys.platform.startswith("linux"):
+        pytest.skip("Linux VmHWM reset control")
+    # Run outside pytest: its lifetime peak is intentionally irrelevant.
+    code = r"""
+import importlib.util, mmap
+spec = importlib.util.spec_from_file_location("bench", __import__("sys").argv[1])
+bench = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bench)
+page = mmap.PAGESIZE
+large = mmap.mmap(-1, 64 << 20)
+large[::page] = b"x" * ((64 << 20)//page)
+old, _ = bench._peak_and_current()
+large.close()
+counter, reset, baseline, current = bench._start_peak_window()
+assert counter == "linux-vmhwm" and reset
+assert old - baseline >= 32 << 20, (old, baseline)
+small = mmap.mmap(-1, 8 << 20)
+small[::page] = b"x" * ((8 << 20)//page)
+after, current_after = bench._peak_and_current()
+assert 4 << 20 <= after - current <= 16 << 20, (current, after)
+assert after < old
+evidence = bench._peak_evidence(counter, reset, baseline, current, after, current_after)
+assert bench._measurement_error(evidence) is None
+small.close()
+"""
+    result = subprocess.run([sys.executable, "-c", code, str(ROOT/"scripts/bench_scan_memory.py")],
+                            text=True, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stderr

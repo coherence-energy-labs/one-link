@@ -38,9 +38,13 @@ gained its own bounded window, that model attributed the constant difference
 between the kinds to b_record and reported O(records) memory for a scanner
 whose memory was flat across a 4x change in record count.)
 
-Each measurement runs in a fresh child process and reports its own peak
-resident memory (Windows PeakWorkingSetSize, POSIX ru_maxrss) relative to its
-resident memory just before the call, so samples cannot contaminate each other.
+Each measurement runs in a fresh child process. Linux resets VmHWM immediately
+before the native scan; Windows uses PeakWorkingSetSize and macOS uses
+ru_maxrss with independently read current RSS. A lifetime peak that masks the
+scan is inconclusive, not a zero-growth pass. Qualification requires a complete
+grid of validated measurement-window records; replay of older reports is
+diagnostic only. The workspace, chunk, record, power, and density limits are
+unchanged.
 
 Usage:
     python scripts/bench_scan_memory.py --sizes-mib 256,1024,4096 --repeats 3 \
@@ -51,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -137,7 +142,24 @@ def write_plain(path: Path, size: int) -> int:
     return 0
 
 
+def _linux_peak_and_current() -> tuple[int, int]:
+    values: dict[str, int] = {}
+    with open("/proc/self/status", encoding="ascii") as status:
+        for line in status:
+            key, _, value = line.partition(":")
+            if key in {"VmHWM", "VmRSS"}:
+                parts = value.split()
+                if len(parts) != 2 or parts[1] != "kB":
+                    raise RuntimeError("invalid Linux RSS counter units")
+                values[key] = int(parts[0]) * 1024
+    if set(values) != {"VmHWM", "VmRSS"}:
+        raise RuntimeError("Linux RSS counters unavailable")
+    return values["VmHWM"], values["VmRSS"]
+
+
 def _peak_and_current() -> tuple[int, int]:
+    if sys.platform.startswith("linux"):
+        return _linux_peak_and_current()
     if sys.platform == "win32":
         import ctypes
         from ctypes import wintypes
@@ -166,24 +188,74 @@ def _peak_and_current() -> tuple[int, int]:
         if not psapi.GetProcessMemoryInfo(kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
             raise OSError("GetProcessMemoryInfo failed")
         return int(counters.PeakWorkingSetSize), int(counters.WorkingSetSize)
-    import resource
+    if sys.platform == "darwin":
+        import resource
+        import psutil
 
-    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    peak = peak if sys.platform == "darwin" else peak * 1024
-    current = peak
-    try:
-        with open("/proc/self/statm", encoding="ascii") as statm:
-            current = int(statm.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
-    except OSError:
-        pass
-    return int(peak), int(current)
+        # ru_maxrss is a lifetime maximum, in bytes on Darwin. It is
+        # NOT current RSS. Import both modules before reading the baseline.
+        current = psutil.Process().memory_info().rss
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return int(peak), int(current)
+    raise RuntimeError(f"unsupported peak-memory platform: {sys.platform}")
+
+
+def _start_peak_window() -> tuple[str, bool, int, int]:
+    if sys.platform.startswith("linux"):
+        # Linux exposes a resettable high-water counter; getrusage does not
+        # reset with clear_refs. Use the same VmHWM metric on both sides.
+        with open("/proc/self/clear_refs", "w", encoding="ascii") as refs:
+            refs.write("5\n")
+        counter, reset = "linux-vmhwm", True
+    elif sys.platform == "win32":
+        counter, reset = "windows-working-set", False
+    elif sys.platform == "darwin":
+        counter, reset = "darwin-rss", False
+    else:
+        raise RuntimeError(f"unsupported peak-memory platform: {sys.platform}")
+    peak, current = _peak_and_current()
+    return counter, reset, peak, current
+
+
+def _peak_evidence(counter: str, reset: bool, before: int, current: int,
+                   after: int, current_after: int) -> dict:
+    return {
+        "peak_counter": counter, "peak_reset": reset,
+        "peak_before_bytes": before, "current_before_bytes": current,
+        "peak_after_bytes": after, "current_after_bytes": current_after,
+        "peak_delta_bytes": after - current,
+        # If the prior maximum was not exceeded, the true peak over the
+        # scan window lies somewhere between current and that old maximum.
+        "masked_peak_uncertainty_bytes": before - current if after == before else 0,
+    }
+
+
+def _measurement_error(row: dict) -> str | None:
+    counter = row.get("peak_counter")
+    reset = row.get("peak_reset")
+    if counter not in {"linux-vmhwm", "windows-working-set", "darwin-rss"}:
+        return "missing or unknown peak counter"
+    if type(reset) is not bool or reset != (counter == "linux-vmhwm"):
+        return "invalid peak reset evidence"
+    keys = ("peak_before_bytes", "current_before_bytes", "peak_after_bytes",
+            "current_after_bytes", "peak_delta_bytes", "masked_peak_uncertainty_bytes")
+    if any(type(row.get(k)) is not int or row[k] < 0 for k in keys):
+        return "missing or invalid peak-window measurements"
+    before, current, after, current_after, delta, masked = (row[k] for k in keys)
+    if not (0 < current <= before <= after and 0 < current_after <= after):
+        return "inconsistent resident-memory counters"
+    if delta != after - current or masked != (before - current if before == after else 0):
+        return "peak-window delta or masking evidence is inconsistent"
+    if masked:
+        return f"prior lifetime peak masks the scanner by up to {masked} bytes"
+    return None
 
 
 def child(api: str, path: str, fmt: str) -> None:
     from one_link_native import chunk  # imported before the baseline
 
     size = os.path.getsize(path)
-    peak_before, current_before = _peak_and_current()
+    counter, reset, peak_before, current_before = _start_peak_window()
     started = time.perf_counter()
     # Boundary and FormatBoundary share start/end; only the latter has format_forced.
     result: Sequence[Any]
@@ -203,14 +275,13 @@ def child(api: str, path: str, fmt: str) -> None:
     else:
         raise SystemExit(f"unknown api {api}")
     elapsed = time.perf_counter() - started
-    peak_after, _ = _peak_and_current()
+    peak_after, current_after = _peak_and_current()
     if result[-1].end != size:
         raise SystemExit("scan did not cover the file")
     forced = sum(1 for b in result if getattr(b, "format_forced", False))
     print(json.dumps({
         "chunks": len(result), "forced_chunks": forced, "seconds": elapsed,
-        "peak_delta_bytes": peak_after - current_before,
-        "peak_before_bytes": peak_before, "current_before_bytes": current_before, "peak_after_bytes": peak_after,
+        **_peak_evidence(counter, reset, peak_before, current_before, peak_after, current_after),
     }))
 
 
@@ -405,6 +476,79 @@ def evaluate(samples: list[dict]) -> dict:
             "failures": verdicts, "passed": not verdicts}
 
 
+def qualify(samples: list[dict], design: dict | None) -> dict:
+    """Only complete, observed peak windows may promote the model to a pass."""
+    errors: list[str] = []
+    counters: set[str] = set()
+    expected: set[tuple] = set()
+    seen: set[tuple] = set()
+    valid_apis = {"format_aware_file", "format_aware_fd", "cdc_file"}
+    kinds = {"mcap-dense", "mcap-sparse", "plain"}
+    if not isinstance(design, dict):
+        errors.append("measurement design missing; historical report is diagnostic only")
+    else:
+        apis, sizes, repeats = (design.get(k) for k in ("apis", "sizes", "repeats"))
+        if not (isinstance(apis, list) and bool(apis) and
+                all(isinstance(x, str) and x in valid_apis for x in apis) and
+                len(set(apis)) == len(apis) and isinstance(sizes, list) and len(sizes) >= 2 and
+                all(type(x) is int and x > 0 for x in sizes) and len(set(sizes)) == len(sizes) and
+                type(repeats) is int and repeats >= 2):
+            errors.append("invalid or underpowered measurement design")
+        else:
+            # Limit expected grid construction to the number of supplied rows.
+            if len(apis) * len(sizes) * len(kinds) * repeats != len(samples):
+                errors.append("measurement grid has a missing or extra sample")
+            else:
+                expected = {(api, kind, size, rep) for api in apis for kind in kinds
+                            for size in sizes for rep in range(repeats)}
+    model_rows_valid = bool(samples)
+    for i, row in enumerate(samples):
+        if not isinstance(row, dict):
+            errors.append(f"sample {i}: not an object")
+            model_rows_valid = False
+            continue
+        api, kind = row.get("api"), row.get("kind")
+        if not (isinstance(api, str) and api in valid_apis and
+                isinstance(kind, str) and kind in kinds and
+                all(type(row.get(k)) is int and row[k] >= 0 for k in
+                    ("size", "records", "chunks", "repeat", "peak_delta_bytes")) and
+                row["size"] > 0 and row["chunks"] > 0 and
+                (row["records"] == 0 if kind == "plain" else row["records"] > 0)):
+            errors.append(f"sample {i}: invalid model fields")
+            model_rows_valid = False
+            continue
+        identity = (api, kind, row["size"], row["repeat"])
+        if identity in seen:
+            errors.append(f"sample {i}: duplicate measurement cell")
+        seen.add(identity)
+        error = _measurement_error(row)
+        if error:
+            errors.append(f"sample {i}: {error}")
+        else:
+            counters.add(row["peak_counter"])
+        seconds = row.get("seconds")
+        if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds <= 0:
+            errors.append(f"sample {i}: missing or invalid timing")
+    if not samples:
+        errors.append("no measurement samples")
+    if expected != seen:
+        errors.append("samples do not match the declared complete measurement grid")
+    if len(counters) != 1:
+        errors.append("no single validated memory counter covers the run")
+    result = {"fits": {}, "growth": [], "density_output_cost": {},
+              "dense_vs_sparse": [], "relative_throughput": [], "failures": [], "passed": False}
+    if model_rows_valid:
+        try:
+            result = evaluate(samples)
+        except (ValueError, KeyError, TypeError, ArithmeticError) as exc:
+            errors.append(f"model could not be evaluated: {exc}")
+    result["measurement_failures"] = errors
+    result["measurement_valid"] = not errors
+    result["failures"] = [*result["failures"], *errors]
+    result["passed"] = not result["failures"] and model_rows_valid
+    return result
+
+
 def relative_throughput(samples: list[dict]) -> list[dict]:
     """Scan speed of each kind of log against the plain log of the same size, in the same run.
 
@@ -471,7 +615,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.evaluate:
         saved = json.loads(args.evaluate.read_text(encoding="utf-8"))
-        verdict = evaluate(saved["samples"])
+        verdict = qualify(saved["samples"], saved.get("design"))
         saved.update(verdict)
         out = args.report or args.evaluate
         out.write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8")
@@ -482,6 +626,13 @@ def main(argv: list[str] | None = None) -> int:
     args.workdir.mkdir(parents=True, exist_ok=True)
     sizes = [int(x) * MIB for x in args.sizes_mib.split(",")]
     apis = args.apis.split(",")
+    if (len(sizes) < 2 or len(set(sizes)) != len(sizes) or any(x <= 0 for x in sizes)
+            or not apis or len(set(apis)) != len(apis)
+            or any(a not in {"format_aware_file", "format_aware_fd", "cdc_file"} for a in apis)
+            or args.repeats < 2 or not 9 <= args.dense_record_bytes < args.sparse_record_bytes):
+        parser.error("qualification requires at least two distinct positive sizes, two repeats, "
+                     "valid unique APIs, and valid dense/sparse record sizes")
+    design = {"apis": apis, "sizes": sizes, "repeats": args.repeats}
     samples = []
     kinds = [("mcap-dense", args.dense_record_bytes), ("mcap-sparse", args.sparse_record_bytes), ("plain", 0)]
     for size in sizes:
@@ -511,11 +662,12 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 path.unlink(missing_ok=True)
             print(f"  generated {kind} {size / MIB:.0f} MiB in {gen_s:.1f}s", flush=True)
-    verdict = evaluate(samples)
+    verdict = qualify(samples, design)
     from one_link_native import __version__ as native_version  # type: ignore[attr-defined]
 
     report = {
-        "schema": "one-link/scan-memory-qualification/v1",
+        "schema": "one-link/scan-memory-qualification/v2",
+        "design": design,
         "environment": {
             "platform": platform.platform(), "machine": platform.machine(), "processor": platform.processor(),
             "python": sys.version.split()[0], "native_version": native_version, "cpus": os.cpu_count(),

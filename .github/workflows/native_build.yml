@@ -307,8 +307,10 @@ jobs:
   # (cdc_file, format_aware_file, format_aware_fd) must be a bounded workspace
   # plus O(returned chunks), never O(records). This is a deterministic
   # threshold gate on fitted coefficients, not a wall-clock timing gate; the
-  # script exits 1 on a contract violation. 1 GiB inputs are generated one at
-  # a time and deleted after use, so peak disk use is about 1 GiB.
+  # script exits 1 on a contract violation. Inputs of up to 768 MiB are
+  # generated one at a time and deleted after use, so peak disk use is about
+  # 768 MiB. The sizes are 3*2^k MiB on purpose: a 2^k MiB log returns about
+  # 2^n chunks, where the measured peak steps (scripts/bench_scan_memory.py).
   scan_memory:
     name: scan memory qualification (${{ matrix.os }})
     needs: applicability
@@ -369,7 +371,7 @@ jobs:
           SCAN_REPORT: test-results/scan-memory/${{ matrix.os }}.json
         run: >-
           uv run --frozen --extra dev --extra release python scripts/bench_scan_memory.py
-          --sizes-mib 256,1024 --repeats 2
+          --sizes-mib 192,768 --repeats 2
           --workdir "$SCAN_WORKDIR" --report "$SCAN_REPORT"
 
       - name: Preserve scan memory evidence

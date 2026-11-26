@@ -195,16 +195,32 @@ could not be extended in place. The recorded macOS peak was 48.7 MiB for a
 smaller capacities in the table above.
 
 `scripts/bench_scan_memory.py` qualifies this table on real files (in CI:
-256 MiB and 1 GiB, dense, sparse and plain, on Linux, Windows and macOS). Each
-kind of log has its own fixed workspace, so it fits
+192 MiB and 768 MiB, dense, sparse and plain, on Linux, Windows and macOS, and
+at 768 MiB a second dense log of 512-byte records). Each kind of log has its
+own fixed workspace, so it fits
 `peak = workspace[kind] + b_chunk * chunks + b_record * records` per API and
 requires:
 
 - every workspace within the bound declared here plus room for the
   interpreter: 40 MiB for the record walk, 48 MiB for the windowed stream;
-- `b_chunk` at most 1,024 bytes and `b_record` at most 0.05 bytes;
-- repeat-to-repeat spread small enough to see one retained bit per record
-  (otherwise the run fails as underpowered).
+- `b_chunk` at most 1,024 bytes;
+- at most 0.05 bytes per record, measured between the two dense logs of the
+  largest size (32- and 512-byte records): they return about the same number
+  of chunks for 16 times fewer records, so their peaks differ by per-record
+  memory. The fit's `b_record` is reported and decides nothing. It did decide
+  until hosted Linux at `4621947` read 0.0501 for a scanner whose growth was
+  its returned chunk list: the plain log shows less of a chunk's cost than the
+  record walk does, and the fit charged the difference to records;
+- that pair able to resolve one retained bit per record: twice its repeat
+  spread, plus 1,024 bytes for each chunk the two logs differ by (otherwise
+  the run fails as underpowered);
+- that pair's two chunk counts on the same side of every power of two
+  (otherwise underpowered). Measured on Windows, the peak steps by 0.1 to
+  0.4 MiB where the chunk count passes 4,096 and 16,384, whatever the record
+  size; the cause is taken to be the returned list's capacity doubling. A
+  2^k MiB log returns about 2^n chunks at the default 64 KiB average, so two
+  such logs fall on opposite sides of a step and differ by it with no
+  per-record memory. CI's sizes are 3 * 2^k MiB, midway between doublings;
 - a same-size, chunk-adjusted dense-minus-sparse peak of at most
   `max(8 MiB, 10% of the larger raw peak)`. Output cost is calibrated only
   from the same API's plain-file samples and clipped to 0–1,024 bytes per

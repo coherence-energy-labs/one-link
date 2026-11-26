@@ -636,7 +636,8 @@ def test_every_pr_produces_exact_gate_and_preserves_required_work_dependencies(k
             assert mine["run"] == theirs["run"], name
         measure = next(item for item in memory["steps"] if "bench_scan_memory.py" in item.get("run", ""))
         assert measure["timeout-minutes"] == 30 and "if" not in measure
-        assert "--sizes-mib 256,1024 --repeats 2" in measure["run"]
+        # 3*2^k MiB, not 2^k: a 2^k MiB log returns about 2^n chunks, where the measured peak steps.
+        assert "--sizes-mib 192,768 --repeats 2" in measure["run"]
         assert '--workdir "$SCAN_WORKDIR" --report "$SCAN_REPORT"' in measure["run"]
         assert measure["env"] == {"SCAN_WORKDIR": "${{ runner.temp }}/scanmem",
                                   "SCAN_REPORT": "test-results/scan-memory/${{ matrix.os }}.json"}

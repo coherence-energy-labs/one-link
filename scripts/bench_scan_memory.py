@@ -15,39 +15,96 @@ the model is
 
     peak = workspace[kind] + b_chunk * chunks + b_record * records
 
-fitted per API. Within one kind chunks and records both grow
-with file size; across kinds their ratio differs ~1000x, which is what
-separates the two slopes. The contract also retains the original density
-overhead check, independently of that joint fit:
+fitted per API. The fit decides the workspace and per-chunk clauses. It does
+not decide the per-record clause: within one kind chunks and records both grow
+with file size, and the kinds do not show one per-chunk cost (see the end of
+this section), so no fit over these logs separates the two slopes at the ~1 MiB
+the record limit needs (0.05 bytes over the 25 million records between 256 MiB
+and 1 GiB is 1.2 MiB).
+
+Records are separated by experiment instead. At the largest size a second
+dense log, mcap-mid, has the same file size and larger records (512 bytes
+against 32). Both take the dense walk, whose cuts fall about avg_size apart
+whatever the record size, so the two logs return about the same number of
+chunks (measured: within about 2%) for 16 times fewer records. With chunks
+held nearly fixed, the difference between the two peaks is per-record memory:
+
+    bytes_per_record = (peak[dense] - peak[mid] - chunk_cost * d_chunks) / d_records
+
+Peaks are medians over a cell's repeats; d_chunks and d_records are dense
+minus mid. chunk_cost is the dense log's own growth per returned chunk between
+its smallest and largest size, with ALL of that growth attributed to chunks
+and clipped to [0, 1024]; that over-credits chunks only through d_chunks. What
+the pair can resolve is
+
+    (2 * max(repeat spread of dense, of mid) + |d_chunks| * 1024) / d_records
+
+so a pair whose chunk counts differ widely declares itself underpowered rather
+than trusting a guessed chunk cost. The contract:
 
 * every workspace[kind] is within the bound FILE_SCANNING.md declares for
   that code path;
 * b_chunk is within the cost of one returned chunk;
-* b_record is ~0: memory does not grow with the number of records;
+* the dense/mid pair's bytes_per_record is at most 0.05: memory does not grow
+  with the number of records;
 * no single sample leaves the envelope  workspace bound + per-chunk cost.
 * at each size, dense-minus-sparse peak, adjusted for returned chunks, is at
   most max(8 MiB, 10% of the larger raw peak). The adjustment uses only the
   same API's plain-file output slope, clipped to [0, 1024] bytes per chunk;
   a negative joint-fit coefficient cannot manufacture a density penalty.
 
-A run whose repeat-to-repeat spread could hide one retained bit per record is
-reported as underpowered and fails: it is not evidence either way.
+A run whose pair cannot resolve one retained bit per record, or that has no
+pair, is reported as underpowered and fails: it is not evidence either way,
+so it gets that verdict alone, with its estimate shown.
+
+What the pair does not see. It has one size, so a constant difference between
+the 32-byte and the 512-byte walk is charged to records (1.1 MiB of it reaches
+the limit at 768 MiB).
+
+What the pair refuses to judge. Repeats rescan one file, so their spread
+cannot see a difference between files, and there is one: measured on Windows,
+the peak steps up by 0.1-0.4 MiB when the chunk count passes 4,096 and 16,384,
+for 32- and 512-byte records alike. The cause is a hypothesis (the capacity of
+the returned chunk list doubling); the step is measured. With a 64 KiB average
+chunk a file of 2^k MiB returns about 2^n chunks, exactly where that capacity
+doubles, so two logs of the same size land on opposite sides of a step for a
+difference of a few dozen chunks. At 256 MiB and 1 GiB the pair read 0.01 to
+0.04 bytes/record low with no per-record memory at all, several times the
+resolution above and enough to pass a leak just over the limit. So a pair
+whose two chunk counts lie on opposite sides of a power of two is
+underpowered, whatever its spread. Sizes of 3 * 2^k MiB put the count midway
+between doublings: at 192 and 768 MiB the pair read zero within its stated
+resolution. CI measures those two, and the default sizes have the same form.
 
 (An earlier model gave both kinds one shared intercept. When the dense walk
 gained its own bounded window, that model attributed the constant difference
 between the kinds to b_record and reported O(records) memory for a scanner
 whose memory was flat across a 4x change in record count.)
 
+(A later one read b_record off the joint fit, arguing that the plain log pins
+b_chunk for every kind. Hosted CI at 4621947 measured otherwise. Median peak
+growth from 256 MiB to 1 GiB per returned chunk, format_aware_fd: Linux dense
+141 B, sparse 126, plain 31; Windows 155, 42, 106; macOS 210, 237, 195. The
+dense walk grew 1.65-2.75 MiB while records grew by 25 million, and the sparse
+walk, with 3 thousand records, grew as much per chunk on Linux and macOS: the
+growth is the returned chunk list. The plain scan under-reports it, because
+its 32 MiB window dominates the peak and is freed before the output list is
+complete, and the sparse log's 0.1-0.4 MiB of growth is at allocator
+granularity. With b_chunk pinned low by the plain log, the fit charged the
+dense walk's remaining per-chunk growth to records: 0.0501 bytes/record on
+Linux, a failure for a scanner with no per-record memory. The joint fit's
+record coefficient is still reported, as a diagnostic that decides nothing.)
+
 Each measurement runs in a fresh child process. Linux resets VmHWM immediately
 before the native scan; Windows uses PeakWorkingSetSize and macOS uses
 ru_maxrss with independently read current RSS. A lifetime peak that masks the
 scan is inconclusive, not a zero-growth pass. Qualification requires a complete
-grid of validated measurement-window records; replay of older reports is
-diagnostic only. The workspace, chunk, record, power, and density limits are
-unchanged.
+grid of validated measurement-window records, the mcap-mid cell at the largest
+size included; replay of older reports is diagnostic only. The workspace,
+chunk, record, power, and density limits are unchanged.
 
 Usage:
-    python scripts/bench_scan_memory.py --sizes-mib 256,1024,4096 --repeats 3 \
+    python scripts/bench_scan_memory.py --sizes-mib 192,768,3072 --repeats 3 \
         --workdir <scratch dir on the disk to test> --report test-results/scan-memory.json
 """
 
@@ -85,8 +142,11 @@ MAX_BYTES_PER_CHUNK = 1024
 MAX_BYTES_PER_RECORD = 0.05
 DENSE_SPARSE_TOLERANCE = (8 * MIB, 0.10)
 # The smallest per-record retention worth the name is one bit. A run whose
-# repeat spread cannot resolve that proves nothing about records.
+# dense/mid pair cannot resolve that proves nothing about records.
 MIN_RESOLVABLE_BYTES_PER_RECORD = 0.125
+# The pair that measures per-record memory: two dense logs of one size. The
+# mid log is generated, and required, at the largest size only.
+DENSE_KIND, MID_KIND = "mcap-dense", "mcap-mid"
 
 
 def write_mcap(path: Path, size: int, record_bytes: int) -> int:
@@ -378,15 +438,119 @@ def density_comparisons(api: str, rows: list[dict]) -> tuple[dict, list[dict], l
     return calibration, pairs, failures
 
 
+def record_pair(api: str, rows: list[dict]) -> dict:
+    """Per-record memory from the dense and mid logs of the largest size.
+
+    The two logs have one file size and one scanner; they return about the
+    same number of chunks and differ ~16x in records. So
+
+        bytes_per_record = (peak[dense] - peak[mid] - chunk_cost * d_chunks) / d_records
+
+    needs no model of what a chunk costs beyond the small d_chunks. For that
+    term chunk_cost is the dense log's own growth per chunk between its
+    smallest and largest size, all of it attributed to chunks, clipped to
+    [0, MAX_BYTES_PER_CHUNK]. ``resolvable_bytes_per_record`` is what the pair
+    can tell from zero: twice the larger repeat spread, plus the most that
+    d_chunks chunks may cost, over d_records.
+
+    That resolution assumes a chunk costs at most MAX_BYTES_PER_CHUNK more
+    than the one before it. Measured, the peak steps by 0.1-0.4 MiB where the
+    chunk count passes a power of two, and two logs on opposite sides of one
+    differ by the step with no per-record memory. Such a pair is refused:
+    ``straddles_power_of_two`` names the boundary.
+
+    ``underpowered`` is None, or why this pair is no evidence about records.
+    """
+    largest = max(r["size"] for r in rows)
+    pair: dict[str, Any] = {
+        "api": api, "path": code_path({"api": api, "kind": DENSE_KIND}), "size": largest,
+        "bytes_per_record": None, "resolvable_bytes_per_record": None, "underpowered": None,
+    }
+    dense_rows = [r for r in rows if r["kind"] == DENSE_KIND]
+    dense = [r for r in dense_rows if r["size"] == largest]
+    mid = [r for r in rows if r["kind"] == MID_KIND and r["size"] == largest]
+    absent = [kind for kind, cell in ((DENSE_KIND, dense), (MID_KIND, mid)) if not cell]
+    if absent:
+        pair["underpowered"] = (f"no {' or '.join(absent)} log at the largest size ({largest / MIB:.0f} MiB), "
+                                "so per-record memory was not measured")
+        return pair
+    smallest = min(r["size"] for r in dense_rows)
+    small = [r for r in dense_rows if r["size"] == smallest]
+    peak_dense, peak_mid, peak_small = (
+        statistics.median(r["peak_delta_bytes"] for r in cell) for cell in (dense, mid, small)
+    )
+    spread_dense, spread_mid = (
+        max(r["peak_delta_bytes"] for r in cell) - min(r["peak_delta_bytes"] for r in cell) for cell in (dense, mid)
+    )
+    d_records = dense[0]["records"] - mid[0]["records"]
+    d_chunks = dense[0]["chunks"] - mid[0]["chunks"]
+    growth_chunks = dense[0]["chunks"] - small[0]["chunks"]
+    pair.update({
+        "dense_records": dense[0]["records"], "mid_records": mid[0]["records"], "d_records": d_records,
+        "dense_chunks": dense[0]["chunks"], "mid_chunks": mid[0]["chunks"], "d_chunks": d_chunks,
+        "dense_median": peak_dense, "mid_median": peak_mid,
+        "dense_repeat_spread_bytes": spread_dense, "mid_repeat_spread_bytes": spread_mid,
+    })
+    if d_records <= 0:
+        pair["underpowered"] = "the mid log does not have fewer records than the dense log"
+        return pair
+    if growth_chunks <= 0:
+        pair["underpowered"] = ("the dense log was not measured at a smaller size with fewer chunks, "
+                                "so a returned chunk could not be costed")
+        return pair
+    fitted_cost = (peak_dense - peak_small) / growth_chunks
+    # As in density_comparisons: output cannot cost less than nothing, and no
+    # estimate may credit more than the contract allows one returned chunk.
+    cost = min(float(MAX_BYTES_PER_CHUNK), max(0.0, fitted_cost))
+    per_record = (peak_dense - peak_mid - cost * d_chunks) / d_records
+    resolvable = (2.0 * max(spread_dense, spread_mid) + abs(d_chunks) * MAX_BYTES_PER_CHUNK) / d_records
+    # floor(log2) of the two counts differs: a power of two lies between them
+    # (a count exactly on one is past it).
+    chunk_counts = (dense[0]["chunks"], mid[0]["chunks"])
+    boundary = 1 << (max(chunk_counts).bit_length() - 1)
+    straddles = chunk_counts[0].bit_length() != chunk_counts[1].bit_length()
+    pair.update({
+        "chunk_cost_source": "dense-growth", "chunk_cost_sizes": [smallest, largest],
+        "fitted_bytes_per_chunk": fitted_cost, "applied_bytes_per_chunk": cost,
+        "bytes_per_record": per_record, "resolvable_bytes_per_record": resolvable,
+        "straddles_power_of_two": boundary if straddles else None,
+    })
+    if resolvable > MIN_RESOLVABLE_BYTES_PER_RECORD:
+        pair["underpowered"] = (
+            f"the dense/mid pair at {largest / MIB:.0f} MiB resolves only {resolvable:.3f} bytes/record "
+            f"(repeat spread {max(spread_dense, spread_mid) / MIB:.2f} MiB, chunk counts differ by "
+            f"{abs(d_chunks):,}, {d_records:,} fewer records; estimate {per_record:+.4f}); use a larger size, "
+            "more repeats, or a mid record size whose chunk count matches the dense log's"
+        )
+    elif straddles:
+        pair["underpowered"] = (
+            f"the dense and mid logs at {largest / MIB:.0f} MiB returned {chunk_counts[0]:,} and "
+            f"{chunk_counts[1]:,} chunks, on opposite sides of {boundary:,}: the peak steps there with no "
+            f"per-record memory, and repeats of one file cannot see it (estimate {per_record:+.4f}); use sizes "
+            "of the form 3*2^k MiB (192, 768), whose chunk counts fall midway between powers of two"
+        )
+    return pair
+
+
 def evaluate(samples: list[dict]) -> dict:
     """Fit  peak = workspace[kind] + b_chunk*chunks + b_record*records  per API; test the contract.
 
-    One API's samples are fitted together. The cost of a returned chunk is the
-    same whichever scanner produced it, so the plain log (thousands of chunks,
-    no records) pins b_chunk and the dense log is left to speak about records.
-    Fitting each code path alone leaves b_chunk to the sparse log, whose few
-    chunks cannot resolve it, and the dense log's ordinary per-chunk growth is
-    then charged to records.
+    One API's samples are fitted together, each kind of log with its own
+    workspace. The fit decides the workspace bounds and the per-chunk bound.
+    Its b_record is reported as ``diagnostic_bytes_per_record`` and decides
+    nothing: the per-record verdict comes from ``record_pair``.
+
+    An earlier version let b_record decide, reasoning that a returned chunk
+    costs the same whichever scanner produced it, so the plain log (thousands
+    of chunks, no records) pins b_chunk and the dense log is left to speak
+    about records. Measured, the plain log shows a lower per-chunk cost than
+    the record walk does (hosted Linux: 31 against 141 bytes), and the fit
+    charged the difference to records (module docstring).
+
+    The mid log is fitted with its own workspace like every other kind, so
+    that workspace is held to the record walk's bound. Measured at one size,
+    it has no leverage on either slope: b_chunk and the diagnostic are the
+    same with or without it.
     """
     verdicts: list[str] = []
     groups: dict[str, list[dict]] = {}
@@ -396,6 +560,7 @@ def evaluate(samples: list[dict]) -> dict:
     growth = []
     density_output_cost = {}
     density_pairs = []
+    record_pairs = []
     for api, rows in sorted(groups.items()):
         label = api
         kinds = sorted({r["kind"] for r in rows})
@@ -419,18 +584,13 @@ def evaluate(samples: list[dict]) -> dict:
             max(r["peak_delta_bytes"] for r in cell) - min(r["peak_delta_bytes"] for r in cell)
             for cell in cells.values()
         )
-        # Records vary WITHIN a kind only through file size (the level of each
-        # kind is its workspace), so this span is the lever arm b_record rests on.
-        record_span = max(
-            max(r["records"] for r in rows if r["kind"] == kind) - min(r["records"] for r in rows if r["kind"] == kind)
-            for kind in kinds
-        )
-        resolvable = (2.0 * spread / record_span) if record_span else None
         fits[label] = {
             "workspace_bytes": workspace, "workspace_bound_bytes": bounds, "code_paths": paths,
-            "bytes_per_chunk": b_chunk, "bytes_per_record": b_record, "records_vary": with_records,
-            "repeat_spread_bytes": spread, "record_span": record_span,
-            "resolvable_bytes_per_record": resolvable, "samples": len(rows),
+            "bytes_per_chunk": b_chunk,
+            # NOT the gate. The fit cannot separate records from chunks to the
+            # precision the record limit needs; see dense_vs_mid.
+            "diagnostic_bytes_per_record": b_record, "records_vary": with_records,
+            "repeat_spread_bytes": spread, "samples": len(rows),
         }
         for kind, value in workspace.items():
             if value > bounds[kind]:
@@ -438,16 +598,20 @@ def evaluate(samples: list[dict]) -> dict:
                                 f"{bounds[kind] / MIB:.0f} MiB ({paths[kind]})")
         if b_chunk > MAX_BYTES_PER_CHUNK:
             verdicts.append(f"{label}: {b_chunk:.0f} bytes/chunk exceeds {MAX_BYTES_PER_CHUNK}")
-        # One-sided: the contract forbids memory that GROWS with records.
+        # One-sided: the contract forbids memory that GROWS with records. The
+        # verdict rests on the dense/mid pair, never on b_record above. A pair
+        # that is missing, cannot resolve one bit per record, or straddles a
+        # power-of-two chunk count is no evidence either way, so it is
+        # reported as that and as nothing else.
         if with_records:
-            if b_record > MAX_BYTES_PER_RECORD:
-                verdicts.append(f"{label}: {b_record:.4f} bytes/record exceeds {MAX_BYTES_PER_RECORD} "
+            pair = record_pair(api, rows)
+            record_pairs.append(pair)
+            per_record = pair["bytes_per_record"]
+            if pair["underpowered"]:
+                verdicts.append(f"{label}: underpowered: {pair['underpowered']}")
+            elif per_record > MAX_BYTES_PER_RECORD:
+                verdicts.append(f"{label}: {per_record:.4f} bytes/record exceeds {MAX_BYTES_PER_RECORD} "
                                 "(O(records) memory)")
-            elif resolvable is None or resolvable > MIN_RESOLVABLE_BYTES_PER_RECORD:
-                shown = "nothing (records do not vary within a kind)" if resolvable is None \
-                    else f"only {resolvable:.3f} bytes/record"
-                verdicts.append(f"{label}: underpowered: repeat spread {spread / MIB:.2f} MiB over a span of "
-                                f"{record_span:,} records resolves {shown}; use larger sizes or more repeats")
         for r in rows:
             envelope = bounds[r["kind"]] + MAX_BYTES_PER_CHUNK * r["chunks"]
             if r["peak_delta_bytes"] > envelope:
@@ -472,7 +636,8 @@ def evaluate(samples: list[dict]) -> dict:
         density_pairs.extend(pairs)
         verdicts.extend(failures)
     return {"fits": fits, "growth": growth, "density_output_cost": density_output_cost,
-            "dense_vs_sparse": density_pairs, "relative_throughput": relative_throughput(samples),
+            "dense_vs_sparse": density_pairs, "dense_vs_mid": record_pairs,
+            "relative_throughput": relative_throughput(samples),
             "failures": verdicts, "passed": not verdicts}
 
 
@@ -483,7 +648,7 @@ def qualify(samples: list[dict], design: dict | None) -> dict:
     expected: set[tuple] = set()
     seen: set[tuple] = set()
     valid_apis = {"format_aware_file", "format_aware_fd", "cdc_file"}
-    kinds = {"mcap-dense", "mcap-sparse", "plain"}
+    kinds = {DENSE_KIND, "mcap-sparse", "plain"}  # measured at every size
     if not isinstance(design, dict):
         errors.append("measurement design missing; historical report is diagnostic only")
     else:
@@ -495,12 +660,15 @@ def qualify(samples: list[dict], design: dict | None) -> dict:
                 type(repeats) is int and repeats >= 2):
             errors.append("invalid or underpowered measurement design")
         else:
+            # The grid is every kind at every size, plus the mid log at the
+            # largest size: the cell the per-record verdict rests on.
             # Limit expected grid construction to the number of supplied rows.
-            if len(apis) * len(sizes) * len(kinds) * repeats != len(samples):
+            if len(apis) * (len(sizes) * len(kinds) + 1) * repeats != len(samples):
                 errors.append("measurement grid has a missing or extra sample")
             else:
                 expected = {(api, kind, size, rep) for api in apis for kind in kinds
                             for size in sizes for rep in range(repeats)}
+                expected |= {(api, MID_KIND, max(sizes), rep) for api in apis for rep in range(repeats)}
     model_rows_valid = bool(samples)
     for i, row in enumerate(samples):
         if not isinstance(row, dict):
@@ -509,7 +677,7 @@ def qualify(samples: list[dict], design: dict | None) -> dict:
             continue
         api, kind = row.get("api"), row.get("kind")
         if not (isinstance(api, str) and api in valid_apis and
-                isinstance(kind, str) and kind in kinds and
+                isinstance(kind, str) and (kind in kinds or kind == MID_KIND) and
                 all(type(row.get(k)) is int and row[k] >= 0 for k in
                     ("size", "records", "chunks", "repeat", "peak_delta_bytes")) and
                 row["size"] > 0 and row["chunks"] > 0 and
@@ -535,8 +703,8 @@ def qualify(samples: list[dict], design: dict | None) -> dict:
         errors.append("samples do not match the declared complete measurement grid")
     if len(counters) != 1:
         errors.append("no single validated memory counter covers the run")
-    result = {"fits": {}, "growth": [], "density_output_cost": {},
-              "dense_vs_sparse": [], "relative_throughput": [], "failures": [], "passed": False}
+    result = {"fits": {}, "growth": [], "density_output_cost": {}, "dense_vs_sparse": [],
+              "dense_vs_mid": [], "relative_throughput": [], "failures": [], "passed": False}
     if model_rows_valid:
         try:
             result = evaluate(samples)
@@ -582,7 +750,19 @@ def print_verdict(verdict: dict) -> None:
     for label, fit in verdict["fits"].items():
         spaces = "  ".join(f"{kind} {value / MIB:.1f}" for kind, value in fit["workspace_bytes"].items())
         print(f"fit {label}: workspace MiB [{spaces}]  {fit['bytes_per_chunk']:.0f} B/chunk  "
-              f"{fit['bytes_per_record']:.5f} B/record  (repeat spread {fit['repeat_spread_bytes'] / MIB:.2f} MiB)")
+              f"(repeat spread {fit['repeat_spread_bytes'] / MIB:.2f} MiB; joint-fit diagnostic, not gated: "
+              f"{fit['diagnostic_bytes_per_record']:.5f} B/record)")
+    for pair in verdict["dense_vs_mid"]:
+        if pair["bytes_per_record"] is None:
+            print(f"  {pair['api']} {pair['size'] / MIB:.0f} MiB: dense-mid pair not measured: {pair['underpowered']}")
+            continue
+        print(f"  {pair['api']} {pair['size'] / MIB:.0f} MiB: dense-mid pair {pair['bytes_per_record']:+.5f} B/record "
+              f"(limit {MAX_BYTES_PER_RECORD}; resolves {pair['resolvable_bytes_per_record']:.4f}"
+              f"{', UNDERPOWERED' if pair['underpowered'] else ''}): "
+              f"records {pair['dense_records']:,} vs {pair['mid_records']:,}, "
+              f"chunks {pair['dense_chunks']:,} vs {pair['mid_chunks']:,}, "
+              f"peak {pair['dense_median'] / MIB:.2f} vs {pair['mid_median'] / MIB:.2f} MiB, "
+              f"{pair['applied_bytes_per_chunk']:.0f} B/chunk from dense growth")
     for g in verdict["growth"]:
         low, high = g["median_peak_bytes"]
         print(f"  {g['api']} {g['kind']}: {g['smallest_size'] / MIB:.0f} -> {g['largest_size'] / MIB:.0f} MiB, "
@@ -601,9 +781,13 @@ def print_verdict(verdict: dict) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--child", nargs=3, metavar=("API", "PATH", "FORMAT"), help=argparse.SUPPRESS)
-    parser.add_argument("--sizes-mib", default="256,1024,4096")
+    # 3 * 2^k MiB: chunk counts midway between powers of two (module docstring).
+    parser.add_argument("--sizes-mib", default="192,768,3072")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--dense-record-bytes", type=int, default=32)
+    parser.add_argument("--mid-record-bytes", type=int, default=512,
+                        help="record size of the mcap-mid log, written at the largest size only; it must take the "
+                             "dense walk (stay below min_size) so that it returns about as many chunks as the dense log")
     parser.add_argument("--sparse-record-bytes", type=int, default=256 * 1024)
     parser.add_argument("--apis", default="format_aware_file,cdc_file,format_aware_fd")
     parser.add_argument("--workdir", type=Path, required=False)
@@ -629,13 +813,18 @@ def main(argv: list[str] | None = None) -> int:
     if (len(sizes) < 2 or len(set(sizes)) != len(sizes) or any(x <= 0 for x in sizes)
             or not apis or len(set(apis)) != len(apis)
             or any(a not in {"format_aware_file", "format_aware_fd", "cdc_file"} for a in apis)
-            or args.repeats < 2 or not 9 <= args.dense_record_bytes < args.sparse_record_bytes):
+            or args.repeats < 2
+            or not 9 <= args.dense_record_bytes < args.mid_record_bytes < args.sparse_record_bytes):
         parser.error("qualification requires at least two distinct positive sizes, two repeats, "
-                     "valid unique APIs, and valid dense/sparse record sizes")
+                     "valid unique APIs, and record sizes with dense < mid < sparse")
     design = {"apis": apis, "sizes": sizes, "repeats": args.repeats}
     samples = []
-    kinds = [("mcap-dense", args.dense_record_bytes), ("mcap-sparse", args.sparse_record_bytes), ("plain", 0)]
     for size in sizes:
+        kinds = [(DENSE_KIND, args.dense_record_bytes)]
+        if size == max(sizes):
+            # Straight after the dense log it is paired with.
+            kinds.append((MID_KIND, args.mid_record_bytes))
+        kinds += [("mcap-sparse", args.sparse_record_bytes), ("plain", 0)]
         for kind, record_bytes in kinds:
             path = args.workdir / f"scan-{kind}-{size // MIB}MiB.bin"
             t0 = time.perf_counter()
@@ -666,7 +855,7 @@ def main(argv: list[str] | None = None) -> int:
     from one_link_native import __version__ as native_version  # type: ignore[attr-defined]
 
     report = {
-        "schema": "one-link/scan-memory-qualification/v2",
+        "schema": "one-link/scan-memory-qualification/v3",
         "design": design,
         "environment": {
             "platform": platform.platform(), "machine": platform.machine(), "processor": platform.processor(),

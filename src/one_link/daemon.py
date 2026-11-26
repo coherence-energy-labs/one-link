@@ -24913,6 +24913,8 @@ class Daemon:
 
         v0.7.0: also stamps the round-trip latency into pair health so the
         UI can show "32ms" or whatever instead of guessing from regime."""
+        asked_at = ping_at = time.monotonic()
+        seen: list[str] = []
         try:
             async with sess.lock:
                 ping_at = time.monotonic()
@@ -24931,12 +24933,13 @@ class Daemon:
                 while True:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        return False
+                        raise asyncio.TimeoutError("no PONG before the deadline")
                     plaintext = await asyncio.wait_for(
                         sess.channel.recv(), timeout=remaining
                     )
                     reply = decode_msg(plaintext)
                     rt = reply.get("t")
+                    seen.append(str(rt))
                     if rt == "PONG" and reply.get("of") == ping.get("id"):
                         sess.last_used = time.time()
                         latency_ms = (time.monotonic() - ping_at) * 1000.0
@@ -24961,9 +24964,15 @@ class Daemon:
                     # unrelated frames forever.
                     await self._on_peer_message(sess.channel, reply)
                     continue
-        except (asyncio.TimeoutError, ConnectionError, OSError):
-            return False
-        except Exception:
+        except Exception as exc:
+            # A refused probe used to leave no trace at all.
+            now = time.monotonic()
+            log.info(
+                "session probe to %s failed: %s%s; %.2fs waiting for the session, "
+                "%.2fs for the answer; frames read: %s",
+                sess.peer_fp[:8], type(exc).__name__, f" ({exc})" if str(exc) else "",
+                ping_at - asked_at, now - ping_at, ", ".join(seen) or "none",
+            )
             return False
 
     async def _get_outbound_session(

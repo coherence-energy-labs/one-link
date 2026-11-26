@@ -1,7 +1,7 @@
 {
   "classes": {
     "Daemon": {
-      "class_lines": 33961,
+      "class_lines": 33970,
       "domains": {
         "call": {
           "lines": 660,
@@ -28,7 +28,7 @@
           "methods": 21
         },
         "other": {
-          "lines": 10922,
+          "lines": 10931,
           "methods": 206
         },
         "peer": {
@@ -48,7 +48,7 @@
           "methods": 124
         }
       },
-      "method_lines": 33284,
+      "method_lines": 33293,
       "methods": 499,
       "self_attributes_assigned": 192
     },
@@ -236,6 +236,20 @@
       "totals": {
         "Daemon": {
           "method_lines": 33284,
+          "methods": 499
+        },
+        "UIServer": {
+          "method_lines": 25034,
+          "methods": 445
+        }
+      }
+    },
+    {
+      "growth_reason": "Daemon +10 lines, no method and no attribute added. The probe returned False for a timeout, a reset and any other error alike and logged nothing; it now logs the cause, how long it waited for the session and for the answer, and which frames it read. One hosted failure of it could not be read for want of exactly this line.",
+      "label": "sessions: a session probe that fails logs why",
+      "totals": {
+        "Daemon": {
+          "method_lines": 33293,
           "methods": 499
         },
         "UIServer": {

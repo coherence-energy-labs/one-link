@@ -188,9 +188,21 @@ async def settle_offer_against_held_offer(
             holder.delivery_id or "(none)", held_ms,
         )
         return "waiting"
-    # ``accept_file_offer`` removes the entry as soon as its reply reaches the
-    # sender. An accepted entry that is still here is one whose reply could not
-    # be sent, so no byte of this transfer has moved.
+    # Consent is recorded BEFORE async swarm assistance and reply delivery.
+    # Merely seeing an accepted pending entry does not establish that its
+    # acceptance reply failed, and a reply can fail after sending FILE_WANTS.
+    # Do not displace a writer with bytes or staged chunk state, or one whose
+    # reply is still in flight. The original delivery owns that progress.
+    if (
+        ctx.get("accept_reply_failed") is not True
+        or not holder.acceptance_granted
+        or holder.received
+        or holder.next_seq
+        or holder.cdc_streamed
+        or holder.cdc_parts
+        or holder.cdc_pending_state
+    ):
+        return "refuse"
     if (
         (holder.delivery_name or holder.name) != delivery_name
         or holder.delivery_rel_path != delivery_rel_path

@@ -36,6 +36,7 @@ from pathlib import Path
 import pytest
 
 from tests.daemon_readiness import wait_for_owner_http
+from tests import harness
 from tests.harness import DaemonHandle, daemon_pair, request, wait_for_inbox_file
 
 pytestmark = pytest.mark.timeout(120)
@@ -276,3 +277,82 @@ def test_a_session_waiting_for_the_owner_outlives_the_ordinary_idle_limit(monkey
         assert received.read_bytes() == payload
         send.join(timeout=60.0)
         assert send.outcome() == "delivered", send.outcome()
+
+@pytest.mark.live_daemon
+@pytest.mark.timeout(240)
+def test_accepted_offer_survives_sender_disconnect_and_new_delivery(monkeypatch):
+    """Real owner consent, a dead sender, a fresh session and a new delivery.
+
+    The initial raw offer deliberately carries no outbound queue entry, so a
+    later normal send_file creates a new delivery rather than replaying the
+    first one. No sender mock or direct mutation of the receiver is involved.
+    """
+    monkeypatch.setenv("ONE_LINK_REQUIRE_FILE_ACCEPT", "1")
+    scope = harness.private_mdns_type()
+    monkeypatch.setattr(harness, "private_mdns_type", lambda: scope)
+    with daemon_pair(pin_trust=True, periodic_folder_sync=False) as p:
+        _open_session(p)
+        payload = b"owner accepted while sender was away\\n" * 800
+        source = p.tmp / "reconnect.txt"
+        source.write_bytes(payload)
+        first = _offer_frame(source.name, payload)
+        _offer(p, first)
+        held = _wait_for_pending(p.b, 1)
+        old_tid = held[0]["transfer_id"]
+        old_fp = p.a.fingerprint
+        assert held[0]["size"] == len(payload)
+
+        stop = request(p.a.control_port, cmd="shutdown")
+        assert stop.get("ok") is True and stop.get("stopping") is True
+        assert p.a.proc.wait(timeout=20) == 0
+        # The offer channel may already have disconnected before shutdown
+        # (for example due to endpoint/transport changes); no particular log
+        # count is an invariant. The process exit and owner response are.
+        accepted = _owner_api(p.b, "POST", f"/api/transfers/{old_tid}/accept")
+        assert accepted == {"ok": False, "error": "sender offline; it will resend"}, accepted
+        assert _pending(p.b) == []
+        assert not list((p.b.home / "data" / "inbox").glob("*reconnect.txt"))
+
+        # Restart only the disposable sender in its original private scope.
+        # The context manager owns this handle; mutate its fields so teardown
+        # reaps the restarted process even if an assertion fails.
+        if p.a.log_fh is not None:
+            p.a.log_fh.close()
+        for stale in ("server.port", "control.port", "peer.port", "ui.token"):
+            (p.a.home / "data" / stale).unlink(missing_ok=True)
+        replacement = harness._bring_up(
+            p.a.home, p.a.log, "A (fresh session)", mdns_type=scope,
+            periodic_folder_sync=False,
+        )
+        p.a.__dict__.update(replacement.__dict__)
+        assert p.a.fingerprint == old_fp
+        assert _owner_api(p.a, "POST", f"/api/peers/{p.b.fingerprint}/_test_force_dial") == {
+            "ok": True, "fingerprint": p.b.fingerprint,
+        }
+
+        # Same content is not enough: a changed public name must not inherit
+        # the consent. The receiver's real admission path must refuse it.
+        renamed = _offer_frame("not-accepted.txt", payload)
+        _offer(p, renamed)
+        _wait_for_log(p.b, "REFUSED (blob_in_use_by_another_delivery)")
+        assert not list((p.b.home / "data" / "inbox").glob("*not-accepted.txt"))
+
+        # Only the identical presentation from the same authenticated device
+        # may inherit that single consent. No second owner click is supplied.
+        send = _Send(p.a, p.b, source, timeout=100.0)
+        send.start()
+        _wait_for_log(p.b, "accepted file offer SUPERSEDED")
+        received = wait_for_inbox_file(p.b.home, source.name, expected_size=len(payload), timeout=60.0)
+        assert received.read_bytes() == payload
+        send.join(timeout=60.0)
+        assert send.outcome() == "delivered", send.outcome()
+        assert _pending(p.b) == []
+        rows = request(p.b.control_port, cmd="transfers")["transfers"]
+        old = next(row for row in rows if row["id"] == old_tid)
+        assert old["status"] == "failed"
+        assert old["metadata"]["delivery_state"] == "superseded"
+        completed = [row for row in rows if row["direction"] == "in"
+                     and row["name"] == source.name and row["status"] == "complete"]
+        assert len(completed) == 1
+        assert completed[0]["id"] != old_tid
+        assert completed[0]["metadata"]["delivery_id"] != first["delivery_id"]

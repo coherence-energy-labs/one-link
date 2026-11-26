@@ -289,7 +289,7 @@ from one_link.transfer_safety import (
     known_bytes_from_chunks,
     same_storage_volume,
 )
-from one_link import held_offers
+from one_link import connection_shutdown, held_offers
 from one_link.wire import decode_msg, encode_msg, make_msg
 
 log = logging.getLogger("one_link.daemon")
@@ -3198,6 +3198,10 @@ class Daemon:
         self.discovery: Discovery | None = None
         self._peer_server: asyncio.base_events.Server | None = None
         self._control_server: asyncio.base_events.Server | None = None
+        # What both servers have accepted, and the signal to stop serving:
+        # a stop ends these connections itself (see connection_shutdown).
+        self._accepted_connections = connection_shutdown.AcceptedConnections()
+        self._stop_serving = asyncio.Event()
         self._loop_watchdog_stop: threading.Event | None = None
         self._tail_subs: set[asyncio.StreamWriter] = set()
         self._incoming_files: dict[str, IncomingFile] = {}
@@ -34447,6 +34451,9 @@ class Daemon:
             self._peer_server.close()
         if self._control_server is not None:
             self._control_server.close()
+        stop_serving = getattr(self, "_stop_serving", None)
+        if stop_serving is not None:
+            stop_serving.set()
 
     async def _control_shutdown(self) -> None:
         await self.request_shutdown(delay_s=0.05)
@@ -35307,7 +35314,8 @@ class Daemon:
             self.state = None
 
         self._peer_server = await asyncio.start_server(
-            self._handle_peer, host="0.0.0.0", port=0,  # nosec B104
+            self._accepted_connections.tracking(self._handle_peer),
+            host="0.0.0.0", port=0,  # nosec B104
         )
         peer_port = self._peer_server.sockets[0].getsockname()[1]
         _publish_runtime_ascii_scalar(_peer_port_path(), str(peer_port))
@@ -35396,7 +35404,8 @@ class Daemon:
                 )
 
         self._control_server = await asyncio.start_server(
-            self._handle_control, host="127.0.0.1", port=0,
+            self._accepted_connections.tracking(self._handle_control),
+            host="127.0.0.1", port=0,
             limit=control_ipc.CONTROL_REQUEST_MAX_BYTES + 1,
         )
         ctrl_port = self._control_server.sockets[0].getsockname()[1]
@@ -35899,14 +35908,14 @@ class Daemon:
 
     async def serve_forever(self) -> None:
         assert self._peer_server and self._control_server
-        try:
-            await asyncio.gather(
-                self._peer_server.serve_forever(),
-                self._control_server.serve_forever(),
-            )
-        except RuntimeError as e:
-            if "is closed" not in str(e):
-                raise
+        # Returns when request_shutdown() asks or this task is cancelled. It
+        # ends every open connection on the way out instead of waiting for
+        # each to finish by itself, which on Python 3.12 is what a closed
+        # asyncio server does (connection_shutdown has the measurements).
+        await connection_shutdown.serve_until_stopped(
+            (self._peer_server, self._control_server),
+            self._stop_serving, self._inbound_live_channels, self._accepted_connections,
+        )
 
     async def send_chunks_via_quic_parallel(
         self,
@@ -37000,8 +37009,11 @@ class Daemon:
         if self._control_server:
             self._control_server.close()
             await self._control_server.wait_closed()
-        # Existing asyncio.Server client handlers outlive wait_closed(); it
-        # only prevents new accepts.  Close every authenticated inbound
+        # serve_forever() has already ended every accepted connection, so
+        # the waits above return at once. (Before Python 3.12 handlers
+        # outlived wait_closed(); since 3.12 it waits for them.) What follows
+        # stays as the guarantee for a stop() that did not come through
+        # serve_forever(): close every authenticated inbound
         # channel before retiring repositories those handlers can mutate.
         # In particular, a CAPSULE_COMPLETE already in flight must either
         # finish its durable commit or fail while the repository is still

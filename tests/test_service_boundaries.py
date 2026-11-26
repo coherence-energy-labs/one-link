@@ -25,6 +25,7 @@ REPO = Path(__file__).resolve().parent.parent
 EXTRACTED_MODULES = (
     "one_link.call_lifecycle",
     "one_link.call_routes",
+    "one_link.connection_shutdown",
     "one_link.fabric_snapshot",
     "one_link.folder_manifest_policy",
     "one_link.folder_sync_receipts",

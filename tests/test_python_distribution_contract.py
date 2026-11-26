@@ -87,7 +87,9 @@ def test_stable_distribution_contract_exactly_matches_source_tree() -> None:
     # 224: held_offers (imported by daemon) and owner_auth_note (imported by
     # server), 2026-11-25. Both hold logic that would otherwise have been added
     # to the two orchestration classes.
-    assert len(build_identity.EXPECTED_STABLE_RUNTIME_MODULES) == 224
+    # 225: connection_shutdown (imported by daemon), 2026-11-26: how a stopping
+    # daemon ends its open connections.
+    assert len(build_identity.EXPECTED_STABLE_RUNTIME_MODULES) == 225
     assert build_identity.EXPECTED_STABLE_RUNTIME_MODULES == tuple(
         sorted(set(build_identity.EXPECTED_STABLE_RUNTIME_MODULES))
     )
@@ -165,9 +167,10 @@ def test_distribution_source_contract_hashes_every_packaged_python_file() -> Non
     # call_routes, fabric_snapshot, folder_manifest_policy, folder_sync_receipts,
     # folder_sync_scheduler, off_loop_import.
     # (239 / 262 before them.) Two more the same day: held_offers, owner_auth_note.
-    assert len(source_python) == 241
+    # (241 / 264 before it.) connection_shutdown, 2026-11-26.
+    assert len(source_python) == 242
     assert packaged_python == source_python
-    assert len(contract.payload_hashes) == 264
+    assert len(contract.payload_hashes) == 265
 
 
 def test_developer_only_modules_are_not_stable_distribution_requirements() -> None:

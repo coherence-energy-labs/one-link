@@ -1,7 +1,7 @@
 {
   "classes": {
     "Daemon": {
-      "class_lines": 33928,
+      "class_lines": 33940,
       "domains": {
         "call": {
           "lines": 660,
@@ -28,7 +28,7 @@
           "methods": 21
         },
         "other": {
-          "lines": 10910,
+          "lines": 10922,
           "methods": 206
         },
         "peer": {
@@ -48,9 +48,9 @@
           "methods": 124
         }
       },
-      "method_lines": 33251,
+      "method_lines": 33263,
       "methods": 499,
-      "self_attributes_assigned": 190
+      "self_attributes_assigned": 192
     },
     "UIServer": {
       "class_lines": 25844,
@@ -194,6 +194,20 @@
       "totals": {
         "Daemon": {
           "method_lines": 33251,
+          "methods": 499
+        },
+        "UIServer": {
+          "method_lines": 25034,
+          "methods": 445
+        }
+      }
+    },
+    {
+      "growth_reason": "Daemon +12 lines, +2 attributes, no method added. The attributes are the registry of accepted connections and the stop-serving event (4 lines with their comment in __init__); both start_server calls wrap their handler with the registry (+2 lines); request_shutdown sets the event (+3); serve_forever delegates to connection_shutdown.serve_until_stopped (net 0); stop()'s comment is corrected for Python 3.12 (+3). All logic is in connection_shutdown.py.",
+      "label": "stop path: a stopping daemon ends its open connections; the logic lives in one_link.connection_shutdown",
+      "totals": {
+        "Daemon": {
+          "method_lines": 33263,
           "methods": 499
         },
         "UIServer": {

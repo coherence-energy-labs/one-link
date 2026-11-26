@@ -4693,7 +4693,8 @@
       ],
       "remaining": [
         "What first answered 401 to the window on 2026-11-25 was not recorded anywhere; FLD-01 explains a 401 after the restart, and the daemon now records the next one.",
-        "The call backfill poll is not suspended during recovery, and the update, key-rotation and install banners are still fixed overlays at the top of the window."
+        "The call backfill poll is not suspended during recovery, and the update, key-rotation and install banners are still fixed overlays at the top of the window.",
+        "The browser restart test failed once on hosted Linux for a reason in the test (a probe count over a fixed window). It was corrected to count from the injected 401; with recovery capped at two attempts it still fails."
       ]
     },
     {
@@ -5024,6 +5025,11 @@
         "revision": "403c77f",
         "summary": "59 checks passed, none failed, 2 skipped, including the Windows live shard that failed on the previous commit and the redesigned scan-memory check on three systems.",
         "reading": "One clean run. The key-rotation live test and the disk-write benchmark have each failed once on identical code and are not explained."
+      },
+      {
+        "revision": "e3548b7",
+        "summary": "57 checks passed, 2 failed, 2 skipped, on a documents-only commit. Failed: the browser test of a window left open across a daemon restart, on hosted Linux, with its roll-up.",
+        "reading": "A defect in that test, not in the product: it required three recovery probes inside a fixed nine seconds, and the probes back off, so the count depended on where the page's poll timers stood when the daemon died. It now waits for the fourth probe counted from the injected 401."
       }
     ]
   },

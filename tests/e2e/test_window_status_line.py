@@ -25,6 +25,7 @@ import contextlib
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -151,12 +152,16 @@ def test_a_window_left_open_across_a_daemon_restart_recovers_with_nobody_touchin
     page.on("request", lambda request: "/api/" in request.url and api_requests.append(request.url))
 
     # The daemon goes away, and one API answer on its way out says 401 --
-    # the combination the old page could not get out of.
+    # the combination the old page could not get out of. The 401 is given to
+    # one of the page's own background polls, so it is certain to reach the
+    # page's session handling; the call backfill uses a separate request path.
     injected: list[str] = []
+    injected_at: list[int] = []
 
     def one_unauthorized_answer(route):
-        if not injected and "/api/me" not in route.request.url:
+        if not injected and urlsplit(route.request.url).path in _CLUSTER_POLLS:
             injected.append(route.request.url)
+            injected_at.append(len(api_requests))
             route.fulfill(status=401, content_type="application/json", body='{"error": "unauthorized"}')
         else:
             route.continue_()
@@ -173,15 +178,33 @@ def test_a_window_left_open_across_a_daemon_restart_recovers_with_nobody_touchin
     assert "access key" not in restoring["everything"].lower()
     _assert_one_line_in_the_layout(restoring)
 
-    # Stay down long enough that a page which gives up after two attempts
-    # has given up. This page must still be asking, and asking only whether
-    # its credential works: the cluster's background polls are suspended.
+    # The page that shipped asked twice and then never again. This one must
+    # keep asking by itself, so it has to reach a FOURTH probe with nothing
+    # prompting it.
+    #
+    # The probes are counted from the injected 401, not over a fixed window.
+    # They back off (1, 2, 4, 8 s, each +-25%), so how many fall inside any
+    # particular nine seconds depends on where the page's poll timers stood
+    # when the daemon died. The first version of this test counted such a
+    # window ("at least three in nine seconds after the status appears") and
+    # failed once on a hosted runner with two: an instrument that measured
+    # the timers' phase. The fourth probe is due at most 8.75 s after the 401.
+    def probes_since_the_401() -> list[str]:
+        return [url for url in api_requests[injected_at[0]:] if url.endswith("/api/me")]
+
+    deadline = time.monotonic() + 40.0
+    while len(probes_since_the_401()) < 4 and time.monotonic() < deadline:
+        page.wait_for_timeout(250)
+    assert len(probes_since_the_401()) >= 4, (
+        "recovery stopped probing while the daemon was away: "
+        f"{api_requests[injected_at[0]:]}"
+    )
+
+    # And it asks only whether its credential works: the background polls it
+    # suspended at the 401 stay suspended while the daemon is away.
     mark = len(api_requests)
-    page.wait_for_timeout(9000)
-    during = api_requests[mark:]
-    probes = [url for url in during if url.endswith("/api/me")]
-    assert len(probes) >= 3, f"recovery stopped probing while the daemon was away: {during}"
-    polls = _cluster_polls(during)
+    page.wait_for_timeout(5000)
+    polls = _cluster_polls(api_requests[mark:])
     assert not polls, f"background polls kept firing during recovery: {polls}"
     assert _status(page)["kind"] == "restoring"
     assert page.evaluate("() => !!localStorage.getItem('ol_persistent_session_token')"), (

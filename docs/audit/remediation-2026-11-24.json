@@ -4697,11 +4697,18 @@
             "tests/test_held_offers_two_daemon_e2e.py"
           ],
           "evidence_ids": []
+        },
+        {
+          "summary": "Hosted on 9428729, which contains the size check: 59 checks passed, none failed, 2 skipped. Both full suites, all eight live shards and both browser lanes passed.",
+          "tests": [
+            "tests/test_held_offer_makes_later_offers_wait.py",
+            "tests/test_held_offers_two_daemon_e2e.py"
+          ],
+          "evidence_ids": []
         }
       ],
       "remaining": [
-        "Hosted CI on 2729992, which adds the size check after the hosted run above.",
-        "Inheriting an undeliverable acceptance is unit-tested but not exercised between two daemons.",
+        "What keeps this pending: inheriting an undeliverable acceptance is unit-tested but not exercised between two real daemons, and the independent read of this change was by reading, not execution.",
         "Read from the code, not measured: once the stall deadline parks an accepted offer whose sender never returned, a different delivery of the same file is refused as resume_owned_by_another_delivery, even when the parked copy holds no bytes. The inheritance above covers only the time before that.",
         "A waiting sender is not told when the wait ends; it finds out on its next retry.",
         "'Accept all from this device' is remembered only until the daemon restarts; whether it should persist is an owner decision.",
@@ -4920,7 +4927,11 @@
     "hosted_ci": {
       "revision": "6eb2af7",
       "summary": "59 checks passed, none failed, 2 skipped.",
-      "earlier": "0a720cc failed two tests of the class-size ratchet (10,654 passed): a method had been added to a class the ratchet keeps from growing, and the push was made without running that test. c171699 moves the logic to a module."
+      "earlier": "0a720cc failed two tests of the class-size ratchet (10,654 passed): a method had been added to a class the ratchet keeps from growing, and the push was made without running that test. c171699 moves the logic to a module.",
+      "later": {
+        "revision": "9428729",
+        "summary": "59 checks passed, none failed, 2 skipped."
+      }
     },
     "independent_review": "One adversarial read of 5621199 and 6eb2af7 by a reviewer that did not write them. It executed its attacks on the migration guard and read the held-offer change without executing. Result: one defect (inherited acceptance did not compare size), one dead test probe, three statements that claimed more than was checked. All addressed in 2729992. It did not read the decline path or the rest of the offer handler after a superseded offer, and said so."
   }

@@ -26,9 +26,9 @@ The source revisions of individual runs matter. The broad local Linux execution 
 | Status | Findings | Meaning |
 | --- | ---: | --- |
 | Partially remediated | 3 | A substantive portion is repaired, while a material implementation/architecture or production-integration gap remains. Do not mark closed. |
-| Implemented; qualification pending | 9 | Implementation and focused verification exist, but a material acceptance step such as hosted, platform, artifact, realistic-workload or controlled-run qualification remains pending. |
+| Implemented; qualification pending | 10 | Implementation and focused verification exist, but a material acceptance step such as hosted, platform, artifact, realistic-workload or controlled-run qualification remains pending. |
 | Prepared; not applied | 1 | A concrete change payload and validation exist, but the external control has not been applied or read back. Do not describe it as enforced. |
-| Implemented and verified | 25 | The stated code/documentation defect has an implemented repair and relevant executed checks. This is bounded to cited evidence; it is not final CI, release, formal-security or all-platform certification. |
+| Implemented and verified | 27 | The stated code/documentation defect has an implemented repair and relevant executed checks. This is bounded to cited evidence; it is not final CI, release, formal-security or all-platform certification. |
 
 No overall maturity score is assigned from test counts, line reductions or the presence of advanced primitives. The judgment rests on operational behavior, exercised boundaries, credible measurements and accurately stated limitations.
 
@@ -530,3 +530,40 @@ On the next revision (`072027f`) the hosted run passed 47 checks and failed 2: a
 
 - The status table above is regenerated from the ledger; `tests/test_remediation_ledger.py` fails if the two disagree.
 - An earlier headline for this pull request said 22 findings were verified while the committed ledger said 12. The ledger was right.
+
+## Field findings from a running install (2026-11-25)
+
+After the review above, one running install showed two things the audit and the review had not looked for. Its owner window, left open across an update restart, displayed two status banners printed over each other and stayed that way for hours. A second device sending files to it was refused for sixteen minutes. Both were read from that install's daemon log and then reproduced with real daemons and a real browser.
+
+| Finding | What was wrong | Status |
+| --- | --- | --- |
+| FLD-01 | Every daemon start re-applied a one-way database migration that replaces each stored sign-in with its hash, so each restart (each update) hashed the stored values again and signed every open window out. In master since 2026-07-25; "Stay signed in across daemon restarts" could not work, and no test restarted a daemon with a session. | Implemented and verified |
+| FLD-02 | The window's session banner was a second element fixed exactly where its status line sits, so the two overlapped. Recovery was attempted at most twice per page and then never again, so the window stayed stranded. The page said the key had "expired" when the daemon had only failed to answer. | Implemented and verified |
+| FLD-03 | A file waiting for the owner's acceptance was treated as a transfer in progress: the same file sent again was refused, a fourth file was refused as over quota, and the receiver closed the waiting session after 120 seconds although the sender waits 300. | Implemented; qualification pending |
+
+### What changed
+
+- **FLD-01** (`5621199`). One-way migration steps are listed and run only on the start that first crosses their version. Measured on a real daemon: the window's sign-in answered 200 before a restart and 401 after it before the fix, 200 both times after. A test now re-opens a database with rows in four tables (sessions, settings, folders, devices) and fails on any of those rows a re-open changes, so the next one-way step on those tables is caught without anyone remembering this one. A refused owner request also leaves one log line saying what was presented, never the credential (`0875392`, `c171699`); its first use is what pointed at the migration.
+- **FLD-02** (`0a720cc`). One service owns the window's link to the daemon and the single status line. It keeps retrying for as long as the credential is not disproved, forgets the credential only after two consecutive refusals, and treats the event socket as connected when the daemon greets it. The first version of this fix used the socket's `open` event; a real daemon showed that to be wrong, because it accepts an unauthenticated socket and then closes it.
+- **FLD-03** (`6eb2af7`). A second send of a held file, files beyond the per-device limit while earlier ones are unanswered, and the session carrying a held offer are all told to wait instead of being refused or closed. An acceptance that could not be delivered is inherited by the same file sent again.
+
+### What is still open
+
+1. **None of this is on the install where it was found.** That install runs a revision without these fixes. Until it is updated, each restart signs its windows out, and a file waiting for acceptance still blocks the sender's later files.
+2. Sign-ins already invalidated cannot be restored; the hash is one-way. Each window signs in once more after the fix.
+3. What first answered 401 to the window was not recorded. FLD-01 explains a 401 after the restart; the new log line will explain the next one.
+4. Inheriting an undeliverable acceptance is unit-tested but has not been exercised between two real daemons. It also covers only the first minutes: read from the code, not measured, once the stall deadline parks such an offer, a different delivery of the same file is refused as `resume_owned_by_another_delivery`, even when the parked copy holds no bytes.
+5. "Accept all from this device" lasts only until the daemon restarts. Whether that choice should persist is a decision for the owner, not something this change makes.
+6. If a delivery inherits an acceptance and is then refused for another reason (disk space, say), the acceptance is not kept and the owner is asked again. Read from the code; not exercised.
+7. A build older than the sign-in migration writing into a database already past it leaves a row the migration will not convert; that browser signs in once more.
+
+### Hosted results and independent review
+
+On `6eb2af7` the hosted run passed 59 checks, failed none and skipped 2: both full suites, all eight live shards and both browser lanes. The real-restart browser test is named as passed in the Linux and Windows browser logs. The live shards report totals, not test names: they split a manifest of 147 functions that includes the four two-daemon tests and the daemon-restart test, and every shard passed on both systems. The push before it (`0a720cc`) had failed two tests of the class-size ratchet: a method was added to a class the ratchet keeps from growing, and that push was made without running the ratchet's test. `c171699` moves the logic into a module.
+
+A reviewer that did not write these changes then read `5621199` and `6eb2af7` adversarially. Against the migration guard it executed its attacks and could not make the step apply twice (two processes opening at once, twenty crash points, every starting version). It found one defect, one dead test probe and three statements that claimed more than was checked, all addressed in `2729992`:
+
+- An inherited acceptance did not compare the declared size. Admission reserves the declared size and receives up to it before the content hash can be checked, so the same hash re-offered with a larger size would have been given storage the owner never agreed to. The size now has to match.
+- The re-open test's helper guarded one of its rows on a column the table does not have, so the check covered two tables while claiming more. It now covers four and asserts each is populated.
+
+The reviewer read the held-offer change without executing it, and did not read the decline path or the rest of the offer handler after a superseded offer. FLD-01 and FLD-02 are marked verified on the hosted run above. FLD-03 stays pending: its size check was added after that run and has run on a workstation only.

@@ -18,8 +18,8 @@
     "prepared_not_applied": "A concrete change payload and validation exist, but the external control has not been applied or read back. Do not describe it as enforced."
   },
   "status_counts": {
-    "implemented_and_verified": 25,
-    "implemented_pending_qualification": 9,
+    "implemented_and_verified": 27,
+    "implemented_pending_qualification": 10,
     "partially_remediated": 3,
     "prepared_not_applied": 1
   },
@@ -2454,6 +2454,48 @@
       "subject": "test(threshold): the last hard wall-clock gate becomes advisory on shared runners; the audit is what blocks (RLS-05)",
       "url": "https://github.com/coherence-energy-labs/one-link/commit/894438029286132a4e349bf3e964d299a3545c70",
       "integrated_in_review_basis": false
+    },
+    {
+      "id": "5621199",
+      "revision": "56211991b5bc76c10d7670b1abfaf3051967b40f",
+      "subject": "fix(state): a one-way migration runs once; every restart was signing every window out",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/56211991b5bc76c10d7670b1abfaf3051967b40f",
+      "integrated_in_review_basis": false
+    },
+    {
+      "id": "0875392",
+      "revision": "087539242f7a4c0bd94ac7850473986adfb42045",
+      "subject": "feat(server): a refused owner request says what it presented, once a minute, never the credential",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/087539242f7a4c0bd94ac7850473986adfb42045",
+      "integrated_in_review_basis": false
+    },
+    {
+      "id": "0a720cc",
+      "revision": "0a720ccc19e41f4f77af50aacce21ca13c16e063",
+      "subject": "fix(ui): one status line with one owner; recovery that does not give up; \"connected\" means greeted",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/0a720ccc19e41f4f77af50aacce21ca13c16e063",
+      "integrated_in_review_basis": false
+    },
+    {
+      "id": "c171699",
+      "revision": "c171699452bcd5bc12baa2c55c8042c6f80ec444",
+      "subject": "refactor(server): the refusal note moves to its own module; the class keeps two call lines",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/c171699452bcd5bc12baa2c55c8042c6f80ec444",
+      "integrated_in_review_basis": false
+    },
+    {
+      "id": "6eb2af7",
+      "revision": "6eb2af7577e0f203e414baaf46d918a459311d9f",
+      "subject": "fix(transfer): a file waiting for the owner makes later files wait; it no longer fails them",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/6eb2af7577e0f203e414baaf46d918a459311d9f",
+      "integrated_in_review_basis": false
+    },
+    {
+      "id": "2729992",
+      "revision": "2729992ed530a26ec10a6f53c001d0cd7de70bfa",
+      "subject": "fix(transfer): an inherited acceptance is for the size the owner saw; two tests said more than they checked",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/2729992ed530a26ec10a6f53c001d0cd7de70bfa",
+      "integrated_in_review_basis": false
     }
   ],
   "findings": [
@@ -4494,6 +4536,177 @@
       "remaining": [
         "Older tracked audit files in this public repository contain a local user-profile path; removing them from history is an owner decision."
       ]
+    },
+    {
+      "id": "FLD-01",
+      "priority": "Critical",
+      "title": "Every daemon restart invalidated every saved window sign-in",
+      "owner": "state",
+      "acceptance": "A browser session minted before a daemon restart authenticates after it, for any number of restarts, and re-opening a populated database changes no row.",
+      "status": "implemented_and_verified",
+      "changes": [
+        {
+          "summary": "The schema runner re-applies every migration step on every start. Step 28, which replaces each stored session bearer with its SHA-256 record key, is one-way, and a record key has the shape of a bearer, so each start hashed the stored keys again. In master since 2026-07-25. One-way steps are now listed and skipped once the database has reached their version; the stamp is written in the same transaction as the step.",
+          "commits": [
+            "5621199"
+          ],
+          "files": [
+            "src/one_link/state.py",
+            "tests/test_state_migrations_rerun.py",
+            "tests/test_lifecycle.py"
+          ]
+        },
+        {
+          "summary": "A refused owner request now leaves one line saying where a credential was presented and whether it has the shape of a session bearer (never the credential). Its first use is what identified this defect.",
+          "commits": [
+            "0875392",
+            "c171699"
+          ],
+          "files": [
+            "src/one_link/owner_auth_note.py",
+            "src/one_link/server.py",
+            "tests/test_owner_auth_refusal_note.py"
+          ]
+        },
+        {
+          "summary": "The re-open test's helper guarded its folder row on a column the table does not have, so the check covered two tables while claiming more (found by the independent read). It now writes real rows to four tables with no guard that can skip them and asserts each is populated before comparing re-opens.",
+          "commits": [
+            "2729992"
+          ],
+          "files": [
+            "tests/test_state_migrations_rerun.py",
+            "src/one_link/state.py"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Measured on a real daemon before the fix: the window's bearer answered 200, then 401 after a restart on the same home and port, and the stored record key had changed. After: 200 both times, key unchanged. Seven state tests, five of which fail with the defect put back; one live test restarts a real daemon twice.",
+          "tests": [
+            "tests/test_state_migrations_rerun.py",
+            "tests/test_lifecycle.py::test_a_browser_session_survives_daemon_restarts",
+            "tests/test_owner_auth_refusal_note.py"
+          ],
+          "evidence_ids": []
+        },
+        {
+          "summary": "Hosted on 6eb2af7: 59 checks passed, none failed, 2 skipped. Both full suites, all eight live shards and both browser lanes passed, including the live test that restarts a real daemon twice. An independent adversarial read could not make the step apply twice: two processes opening at once, twenty crash points across steps 27 to 30, and every starting version from 1 to 30 all ended with the step applied once.",
+          "tests": [
+            "tests/test_state_migrations_rerun.py",
+            "tests/test_lifecycle.py::test_a_browser_session_survives_daemon_restarts"
+          ],
+          "evidence_ids": []
+        }
+      ],
+      "remaining": [
+        "The install where this was found still runs the code with the defect; each of its restarts signs its windows out until it is updated. Sessions already invalidated cannot be restored.",
+        "Not covered: a binary older than step 28 writing into a database already past it leaves a row the step will not convert. That row cannot authenticate, so the browser signs in once more. Making the step idempotent needs a stored form that tells a record key from a bearer."
+      ]
+    },
+    {
+      "id": "FLD-02",
+      "priority": "High",
+      "title": "An owner window showed two status banners over each other and never recovered by itself",
+      "owner": "owner-ui",
+      "acceptance": "The window shows at most one status, in the layout flow; while its credential is not disproved it keeps retrying and resumes with nobody touching it; it calls itself signed out only after the daemon has refused the credential twice.",
+      "status": "implemented_and_verified",
+      "changes": [
+        {
+          "summary": "One service owns the window's link to the daemon and the one status line. The session banner was a second element fixed where the status line sits; recovery was attempted at most twice per page; the page said 'expired' when the daemon had merely not answered. The event socket counts as connected when the daemon greets it, not when it opens: the daemon accepts an unauthenticated socket and closes it with 4401.",
+          "commits": [
+            "0a720cc"
+          ],
+          "files": [
+            "frontend/owner/services/window_link.js",
+            "frontend/owner/main/session.js",
+            "frontend/owner/main/live_refresh.js",
+            "frontend/owner/main/events.js",
+            "frontend/owner/index.template.html",
+            "src/one_link/web/index.html"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "18 unit tests with a virtual clock, 30 of 30 planted defects caught. In a real browser against a real daemon: a window left open across a restart on the same port recovers untouched; with FLD-01 put back the same test fails with the window correctly signed out on one line. Signed-out, offline and narrow layouts are checked geometrically.",
+          "tests": [
+            "tests/js/test_window_link.cjs",
+            "tests/e2e/test_window_status_line.py"
+          ],
+          "evidence_ids": []
+        },
+        {
+          "summary": "Hosted on 6eb2af7: 59 checks passed, none failed, 2 skipped. Both full suites, all eight live shards and both browser lanes passed; the three browser tests, including the real daemon restart, passed on hosted Linux and Windows.",
+          "tests": [
+            "tests/js/test_window_link.cjs",
+            "tests/e2e/test_window_status_line.py"
+          ],
+          "evidence_ids": []
+        }
+      ],
+      "remaining": [
+        "What first answered 401 to the window on 2026-11-25 was not recorded anywhere; FLD-01 explains a 401 after the restart, and the daemon now records the next one.",
+        "The call backfill poll is not suspended during recovery, and the update, key-rotation and install banners are still fixed overlays at the top of the window."
+      ]
+    },
+    {
+      "id": "FLD-03",
+      "priority": "High",
+      "title": "A file waiting for the owner's acceptance made the sender's later files fail",
+      "owner": "transfer",
+      "acceptance": "While an offer waits for the owner, a second send of that file, further files beyond the per-device limit, and the waiting session itself are all told to wait; none is refused for load and the waiting session is not closed at the ordinary idle limit.",
+      "status": "implemented_pending_qualification",
+      "changes": [
+        {
+          "summary": "A held offer keeps its blob entry and admission reservation, and the offer handler read that as a transfer in progress: a second send was refused as content in use by another delivery, a fourth file as over quota, and the receiver closed the waiting session at 120 seconds although the sender waits 300. Each now gets FILE_OFFER_HELD or the acceptance window. An acceptance that could not be delivered is inherited by the same file sent again.",
+          "commits": [
+            "6eb2af7"
+          ],
+          "files": [
+            "src/one_link/held_offers.py",
+            "src/one_link/daemon.py",
+            "tests/test_held_offer_makes_later_offers_wait.py",
+            "tests/test_held_offers_two_daemon_e2e.py"
+          ]
+        },
+        {
+          "summary": "An inherited acceptance now also requires the declared size the owner saw. Admission reserves the declared size and receives up to it before the content hash can be checked, so the same hash re-offered with a larger size would have been given storage the owner never agreed to (found by the independent read, before any release). A decline after an undeliverable acceptance is shown to leave nothing to inherit.",
+          "commits": [
+            "2729992"
+          ],
+          "files": [
+            "src/one_link/held_offers.py",
+            "src/one_link/daemon.py",
+            "tests/test_held_offer_makes_later_offers_wait.py"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "21 unit tests, 8 planted wrong decisions each caught. Four tests between two real daemons with the real accept API, the first to accept a held offer end to end; with the three defects put back three of them fail, one with the incident's own error.",
+          "tests": [
+            "tests/test_held_offer_makes_later_offers_wait.py",
+            "tests/test_held_offers_two_daemon_e2e.py"
+          ],
+          "evidence_ids": []
+        },
+        {
+          "summary": "Hosted on 6eb2af7: 59 checks passed, none failed, 2 skipped. Both full suites, all eight live shards and both browser lanes passed, including the four two-daemon tests. The size check added afterwards has run on a workstation only.",
+          "tests": [
+            "tests/test_held_offer_makes_later_offers_wait.py",
+            "tests/test_held_offers_two_daemon_e2e.py"
+          ],
+          "evidence_ids": []
+        }
+      ],
+      "remaining": [
+        "Hosted CI on 2729992, which adds the size check after the hosted run above.",
+        "Inheriting an undeliverable acceptance is unit-tested but not exercised between two daemons.",
+        "Read from the code, not measured: once the stall deadline parks an accepted offer whose sender never returned, a different delivery of the same file is refused as resume_owned_by_another_delivery, even when the parked copy holds no bytes. The inheritance above covers only the time before that.",
+        "A waiting sender is not told when the wait ends; it finds out on its next retry.",
+        "'Accept all from this device' is remembered only until the daemon restarts; whether it should persist is an owner decision.",
+        "If an inheriting delivery is then refused for another reason (disk space, say), the acceptance is not kept and the owner is asked again. Read from the code; not exercised."
+      ]
     }
   ],
   "product_claim_qualification": [
@@ -4693,5 +4906,22 @@
         "reading": "The live shards and the benchmark gate failed on c3cd967 and passed on the next revision, whose only product-relevant difference is in tests. They are intermittent on hosted runners, not fixed."
       }
     ]
+  },
+  "field_findings": {
+    "date": "2026-11-25",
+    "source": "One running install: an owner window left stranded by an update restart, and a second device whose file sends to it were refused. Read from that install's daemon log, then reproduced with real daemons and a real browser.",
+    "finding_ids": [
+      "FLD-01",
+      "FLD-02",
+      "FLD-03"
+    ],
+    "fix_revision": "2729992",
+    "not_deployed": "The install where these were found runs a revision without the fixes. Nothing in this branch has been applied to it.",
+    "hosted_ci": {
+      "revision": "6eb2af7",
+      "summary": "59 checks passed, none failed, 2 skipped.",
+      "earlier": "0a720cc failed two tests of the class-size ratchet (10,654 passed): a method had been added to a class the ratchet keeps from growing, and the push was made without running that test. c171699 moves the logic to a module."
+    },
+    "independent_review": "One adversarial read of 5621199 and 6eb2af7 by a reviewer that did not write them. It executed its attacks on the migration guard and read the held-offer change without executing. Result: one defect (inherited acceptance did not compare size), one dead test probe, three statements that claimed more than was checked. All addressed in 2729992. It did not read the decline path or the rest of the offer handler after a superseded offer, and said so."
   }
 }

@@ -20313,6 +20313,9 @@ class Daemon:
         # original channel already timed out, the next retry must inherit the
         # user's decision instead of prompting again.
         ctx["accepted"] = True
+        # Only a completed failed reply permits consent inheritance by a
+        # new delivery. In-flight async acceptance is not a failed reply.
+        ctx["accept_reply_failed"] = False
         if accept_all:
             self._file_accept_allow.add(ctx["peer_fp"])
         f = self._incoming_files.get(ctx["blob"])
@@ -20351,6 +20354,8 @@ class Daemon:
             # Channel almost certainly closed (sender timed out + went
             # away). Keep the partial; the sender retries + re-offers.
             log.info("accept_file_offer %s: send failed: %s", transfer_id, e)
+            if self._pending_file_offers.get(transfer_id) is ctx:
+                ctx["accept_reply_failed"] = True
             self._update_transfer(
                 transfer_id, status="paused",
                 metadata=self._merge_transfer_metadata(transfer_id, {

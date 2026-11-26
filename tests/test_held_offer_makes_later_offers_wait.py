@@ -24,6 +24,7 @@ tests/test_held_offers_two_daemon_e2e.py.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -101,6 +102,7 @@ def _hold(
         reservation_id=f"res:{transfer_id}",
     )
     f.finalizing = finalizing
+    f.acceptance_granted = accepted
     d._incoming_files[blob] = f
     reserved = d._transfer_reservation_ledger().reserve(
         reservation_id=f.reservation_id,
@@ -120,6 +122,7 @@ def _hold(
         "channel": _Channel(), "peer_fp": peer_fp, "peer_sid": peer_fp[:8], "blob": blob,
         "msg_id": "first", "msg": {"id": "first"}, "mode": "stream", "missing": None,
         "name": name, "size": 10, "created_ms": 1, "accepted": accepted,
+        "accept_reply_failed": accepted,
     }
     return f
 
@@ -458,3 +461,76 @@ def test_the_quota_reasons_named_here_are_the_ones_admission_produces():
     assert produced == set(held_offers.QUOTA_REASONS_PER_PEER | held_offers.QUOTA_REASONS_GLOBAL), (
         "admission has a quota reason the waiting rule does not know about"
     )
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("progress", [
+    {"received": 1}, {"next_seq": 1}, {"cdc_streamed": {0}},
+    {"cdc_parts": {0: b""}}, {"cdc_pending_state": [{"chunk_hash": "a" * 64}]},
+])
+async def test_a_failed_accept_reply_cannot_displace_partial_progress(daemon, tmp_path, progress):
+    """FILE_WANTS may have reached the sender before a later reply step failed."""
+    holder = _hold(daemon, tmp_path, accepted=True)
+    for key, value in progress.items():
+        setattr(holder, key, value)
+    assert await _settle(daemon, holder, _Channel()) == "refuse"
+    assert daemon._incoming_files[BLOB] is holder
+    assert daemon._pending_file_offers[HOLDER_ID]["accept_reply_failed"] is True
+    assert _reservations(daemon) == [f"res:{HOLDER_ID}"]
+    assert not holder.handle.closed
+    assert holder.out_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_accepted_context_without_failed_reply_evidence_is_not_superseded(daemon, tmp_path):
+    holder = _hold(daemon, tmp_path, accepted=True)
+    daemon._pending_file_offers[HOLDER_ID].pop("accept_reply_failed")
+    assert await _settle(daemon, holder, _Channel()) == "refuse"
+    assert daemon._incoming_files[BLOB] is holder
+    assert not holder.handle.closed
+
+
+@pytest.mark.asyncio
+async def test_accept_reply_in_flight_cannot_be_superseded(daemon, tmp_path):
+    holder = _hold(daemon, tmp_path)
+    entered, proceed = asyncio.Event(), asyncio.Event()
+
+    class SlowChannel:
+        async def send(self, payload):
+            entered.set()
+            await proceed.wait()
+
+    ctx = daemon._pending_file_offers[HOLDER_ID]
+    ctx["channel"] = SlowChannel()
+    accept = asyncio.create_task(daemon.accept_file_offer(HOLDER_ID))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert ctx["accepted"] is True
+        assert ctx["accept_reply_failed"] is False
+        assert await _settle(daemon, holder, _Channel()) == "refuse"
+        assert daemon._incoming_files[BLOB] is holder
+        assert not holder.handle.closed
+    finally:
+        proceed.set()
+        result = await asyncio.wait_for(accept, timeout=5)
+    assert result == {"ok": True}
+    assert HOLDER_ID not in daemon._pending_file_offers
+    assert daemon._incoming_files[BLOB] is holder
+
+
+@pytest.mark.asyncio
+async def test_real_failed_accept_reply_records_inheritance_eligibility(daemon, tmp_path):
+    holder = _hold(daemon, tmp_path)
+
+    class DeadChannel:
+        async def send(self, payload):
+            raise ConnectionError("synthetic lost reply")
+
+    ctx = daemon._pending_file_offers[HOLDER_ID]
+    ctx["channel"] = DeadChannel()
+    assert await daemon.accept_file_offer(HOLDER_ID) == {
+        "ok": False, "error": "sender offline; it will resend",
+    }
+    assert ctx["accepted"] is True and ctx["accept_reply_failed"] is True
+    assert holder.acceptance_granted is True
+    assert await _settle(daemon, holder, _Channel()) == "superseded"
+    assert BLOB not in daemon._incoming_files

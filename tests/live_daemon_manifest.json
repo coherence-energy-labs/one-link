@@ -29,6 +29,7 @@
     "tests/test_held_offers_two_daemon_e2e.py::test_a_held_file_arrives_after_the_owner_accepts",
     "tests/test_held_offers_two_daemon_e2e.py::test_a_second_offer_of_a_held_file_waits_and_is_not_recorded_as_refused",
     "tests/test_held_offers_two_daemon_e2e.py::test_a_session_waiting_for_the_owner_outlives_the_ordinary_idle_limit",
+    "tests/test_held_offers_two_daemon_e2e.py::test_accepted_offer_survives_sender_disconnect_and_new_delivery",
     "tests/test_held_offers_two_daemon_e2e.py::test_files_beyond_the_transfer_limit_wait_while_the_owner_has_not_answered",
     "tests/test_integration.py::test_chat_reuses_long_lived_session_and_capability_policy",
     "tests/test_integration.py::test_concurrent_sends_via_threads",

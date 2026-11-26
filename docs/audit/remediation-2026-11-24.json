@@ -3928,13 +3928,19 @@
             "E_REV_HOSTED_CI",
             "E_REV_SCAN_MEMORY"
           ]
+        },
+        {
+          "summary": "Hosted on 403c77f, Linux, Windows and macOS: the redesigned check passed on all three. Per-record memory read between -0.011 and +0.003 bytes per record against a limit of 0.05, resolving 0.004 to 0.024 where 0.125 is required; the dense and mid logs returned 12,327 to 12,492 chunks (10,572 to 10,694 for plain CDC). On Linux, where the previous model had read 0.0501, it read -0.0001. The whole run passed: 59 checks, none failed.",
+          "tests": [
+            "tests/test_scan_memory_contract.py"
+          ],
+          "evidence_ids": []
         }
       ],
       "remaining": [
         "Hosted sizes stop at 1 GiB; larger logs were measured on one Windows workstation only.",
         "The smaller buffers cost speed: about 15 to 30% on dense logs and up to a third on sparse ones (hosted runners and a 14-round workstation sweep agree on the direction; the workstation is too noisy to pick an optimum). A larger hashing batch with a small read-ahead should keep the memory limit and restore parallel hashing; that needs a quiet machine.",
-        "Returned output remains O(chunks), and the explicit offset-list APIs keep their O(records) result by design.",
-        "The redesigned per-record check has run on one Windows workstation; hosted Linux and macOS have not run it."
+        "Returned output remains O(chunks), and the explicit offset-list APIs keep their O(records) result by design."
       ]
     },
     {
@@ -5013,6 +5019,11 @@
         "revision": "1c7ae92",
         "summary": "56 checks passed, 3 failed, 2 skipped, on a documents-only commit. Failed: one live test on hosted Windows (key rotation over the real wire: the forced dial after the restart was refused at once) with its two roll-ups. The same code passed that test on 4621947 and three times of three on a workstation. The scan-memory check and the benchmark gate passed on this run with unchanged code.",
         "reading": "Intermittent on hosted runners; one run each way is not a fix."
+      },
+      {
+        "revision": "403c77f",
+        "summary": "59 checks passed, none failed, 2 skipped, including the Windows live shard that failed on the previous commit and the redesigned scan-memory check on three systems.",
+        "reading": "One clean run. The key-rotation live test and the disk-write benchmark have each failed once on identical code and are not explained."
       }
     ]
   },

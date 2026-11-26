@@ -55,5 +55,6 @@ Nothing irreversible has happened. Move the checkout back to the branch left in 
 ## What this does not cover
 
 - macOS and Linux. The steps are the same in outline; the process inspection, the way a detached process is started and the window build differ, and none of that was exercised.
+- An install that runs on the system Python with no `.venv`, or a checkout that follows `master`. One such install is known and neither part was exercised. For a checkout that follows `master`, the change has to reach `master` first; moving it to an unmerged branch is a different, larger step than the one described here.
 - A machine with no Rust toolchain. Steps 2 and 7 need one. Without the window build One Link still opens, in a browser window.
 - An install whose data key is protected by a passphrase. A daemon from `61ab3e1` on refuses to start without `ONE_LINK_PASSPHRASE`; that is intended.

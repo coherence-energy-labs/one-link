@@ -1575,8 +1575,15 @@ class State:
     #       and "stay signed in across daemon restarts" could not work.
     #
     # tests/test_state_migrations_rerun.py re-opens a populated database and
-    # fails on any row a re-run changes, so a new one-way step that is not
-    # listed here is caught.
+    # fails on any row a re-run changes in the tables it populates, so a new
+    # one-way step on those tables that is not listed here is caught.
+    #
+    # Not covered (independent review, 2026-11-25): a binary older than v28
+    # opening a database already stamped >= 28 stores a raw bearer, and this
+    # step will not convert it later. That row cannot authenticate here
+    # (lookups hash what is presented), so the browser signs in once more.
+    # Making the step idempotent would need a stored form that tells a record
+    # key from a bearer; the two are indistinguishable today.
     _EXACTLY_ONCE_MIGRATIONS = frozenset({28})
 
     def _run_atomic_migration(

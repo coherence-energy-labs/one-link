@@ -195,12 +195,31 @@ def _populate(state: State) -> None:
     state.set_setting("sovereignty_preset", "just_works")
     conn = state._conn
     with state._write_lock:
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(folders)").fetchall()}
-        if {"name", "path"} <= columns:
-            # A folder without a root id is what v2's boot-time backfill
-            # heals; after the first open it has one and must keep it.
-            conn.execute("INSERT INTO folders(name, path) VALUES(?, ?)", ("rerun-probe", "probe-path"))
+        # No "insert if the columns exist" here. The first version of this
+        # helper guarded its folder row on a column the table does not have,
+        # so the row was never written and the check below ran on two tables
+        # while claiming more (found by independent review). If the schema
+        # moves, these statements fail and the helper is updated on purpose.
+        #
+        # A folder without a root id is what v2's boot-time backfill heals:
+        # after the first re-open it has one and must keep it.
+        conn.execute(
+            "INSERT INTO folders(name, local_path, shared_with_json, created_ms, root_id)"
+            " VALUES(?, ?, ?, ?, NULL)",
+            ("rerun-probe", "probe-path", "[]", 1_700_000_000_000),
+        )
+        # A device whose legacy flag says revoked while its safety state does
+        # not is what v21's boot-time backfill heals, once.
+        conn.execute(
+            "INSERT INTO self_mesh_devices(root_pub, device_pub, device_kind, revoked, added_ms, updated_ms)"
+            " VALUES(?, ?, ?, 1, ?, ?)",
+            (b"r" * 32, b"d" * 32, "desktop", 1_700_000_000_000, 1_700_000_000_000),
+        )
         conn.commit()
+
+
+# The tables _populate writes. The no-change check is a statement about these.
+_POPULATED = ("folders", "self_mesh_devices", "settings", "ui_sessions")
 
 
 def test_reopening_a_populated_database_changes_no_row(tmp_path: Path):
@@ -214,8 +233,18 @@ def test_reopening_a_populated_database_changes_no_row(tmp_path: Path):
     settled = _reopen(db)
     before = _dump(settled)
     settled.close()
-    assert before["ui_sessions"], "the dump is empty where it matters"
+    for table in _POPULATED:
+        assert before[table], f"{table} is empty: the check would say nothing about it"
     assert len(before) > 10
+    # The first re-open did its healing, and only that: the folder has a root
+    # id, the revoked device's safety state says so.
+    probe = [row for row in before["folders"] if row[0] == "rerun-probe"]
+    assert len(probe) == 1
+    root_id = probe[0][4]  # folders: name, local_path, shared_with_json, created_ms, root_id, ...
+    assert isinstance(root_id, str) and root_id, f"the folder was not given a root id: {probe}"
+    assert any("revoked" in row for row in before["self_mesh_devices"]), (
+        "the revoked device's safety state was not brought in line with its flag"
+    )
 
     for reopen in range(1, 4):
         state = _reopen(db)

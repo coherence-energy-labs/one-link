@@ -8680,7 +8680,7 @@ class Daemon:
                     holder=existing_owner,
                     peer_fp=peer_fp,
                     peer_sid=peer_sid,
-                    name=name,
+                    name=name, size=size,
                     blob=blob,
                     delivery_id=delivery_id,
                     delivery_name=delivery_name,

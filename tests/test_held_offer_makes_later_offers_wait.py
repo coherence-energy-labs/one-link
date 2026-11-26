@@ -135,6 +135,7 @@ async def _settle(d: Daemon, holder: IncomingFile, channel: _Channel, **over) ->
         delivery_name=holder.delivery_name,
         delivery_rel_path=holder.delivery_rel_path,
         delivery_kind=holder.delivery_kind,
+        size=holder.size,
     )
     args.update(over)
     return await held_offers.settle_offer_against_held_offer(d, channel, {"id": "second"}, **args)
@@ -279,10 +280,14 @@ async def test_a_new_send_inherits_an_acceptance_that_could_not_be_delivered(dae
         {"delivery_name": "other-name.txt"},
         {"delivery_rel_path": "elsewhere/notes.txt"},
         {"delivery_kind": "folder"},
+        # Same content hash, a larger declared size: admission would reserve
+        # the declared size and receive up to it before the hash is checked.
+        {"size": 10 * 1024 * 1024 * 1024},
+        {"size": 9},
     ],
 )
 async def test_an_acceptance_is_not_inherited_by_a_different_name_or_destination(daemon, tmp_path, difference):
-    """The owner accepted one file under one name going to one place."""
+    """The owner accepted one file, of one size, under one name, going to one place."""
     holder = _hold(daemon, tmp_path, accepted=True)
     channel = _Channel()
     assert await _settle(daemon, holder, channel, **difference) == "refuse"
@@ -291,6 +296,27 @@ async def test_an_acceptance_is_not_inherited_by_a_different_name_or_destination
     assert daemon._pending_file_offers[HOLDER_ID]["accepted"] is True
     assert _reservations(daemon) == [f"res:{HOLDER_ID}"]
     assert not holder.handle.closed
+
+
+@pytest.mark.asyncio
+async def test_a_decline_after_an_undeliverable_acceptance_leaves_nothing_to_inherit(daemon, tmp_path):
+    """Accepted, could not be delivered, then the owner changed their mind.
+
+    Inheritance needs a holder that is still pending and accepted. A decline
+    removes both the pending entry and the holder, so the same file sent again
+    is an ordinary new offer and the owner is asked."""
+    holder = _hold(daemon, tmp_path, accepted=True)
+    result = await daemon.decline_file_offer(HOLDER_ID)
+    assert result == {"ok": True}
+    assert BLOB not in daemon._incoming_files, "a declined offer still claims its content"
+    assert HOLDER_ID not in daemon._pending_file_offers
+    assert _reservations(daemon) == []
+    assert holder.handle.closed
+    row = daemon.state.get_transfer(HOLDER_ID)
+    assert row.metadata["delivery_state"] == "declined"
+    # With no holder for the blob, the offer handler never reaches the
+    # settle step; and asked directly, a released holder gives nothing.
+    assert await _settle(daemon, holder, _Channel()) == "refuse"
 
 
 # ── a quota that is full of unanswered offers ───────────────────────────────
@@ -409,6 +435,8 @@ def test_the_offer_handler_consults_these_decisions_at_its_three_points():
     assert source.count("await held_offers.settle_offer_against_held_offer(") == 1
     assert source.count("if held_offers.quota_is_waiting_on_the_owner(") == 1
     assert source.count("await held_offers.tell_sender_offer_waits(") == 1
+    # The declared size reaches the inheritance decision.
+    assert "name=name, size=size," in source
     # The inherited consent must reach the acceptance decision.
     decision = source[source.index("acceptance_granted = bool("):]
     assert "or inherited_acceptance" in decision[:400]

@@ -107,8 +107,12 @@ def read_deadline_s(
     ``idle_s`` bounds a peer that opens a channel and goes quiet (security
     audit H4). A channel carrying an offer we HELD is quiet because we told its
     sender to keep the session open while our owner decides; it gets the
-    acceptance window instead. It stays bounded: one window per silence, and
-    held offers are bounded by the admission quotas.
+    acceptance window instead. It stays bounded: one window per silence, for
+    the channel a held offer is currently bound to. A retry re-binds the
+    offer to its own channel, and a wait already started on the earlier
+    channel runs out its window, so the number of channels a peer can hold
+    this way is bounded by its connection cap, not by its held offers. An
+    authenticated peer could already keep any channel open by sending on it.
     """
     for ctx in pending_offers.values():
         if ctx.get("channel") is channel and not ctx.get("accepted"):
@@ -136,6 +140,7 @@ async def settle_offer_against_held_offer(
     peer_fp: str,
     peer_sid: str,
     name: str,
+    size: int,
     blob: str,
     delivery_id: str,
     delivery_name: str,
@@ -151,9 +156,12 @@ async def settle_offer_against_held_offer(
                       the one prompt the owner sees is unchanged.
     ``"superseded"``  the owner ACCEPTED the holder but the acceptance could not
                       be delivered (its sender went away) and no byte has moved.
-                      This delivery is the same file under the same name to the
-                      same place, from the same device, with a live connection:
-                      it inherits the acceptance. The stale holder was released.
+                      This delivery is the same file under the same name and
+                      declared size to the same place, from the same device, with
+                      a live connection: it inherits the acceptance. The stale
+                      holder was released. If the handler then refuses this
+                      delivery for another reason (disk space, say), the
+                      acceptance is not kept: the owner is asked again next time.
     ``"refuse"``      anything else: the content really is being delivered under
                       another identity, and the guard that keeps one delivery
                       from adopting another's data applies.
@@ -187,9 +195,14 @@ async def settle_offer_against_held_offer(
         (holder.delivery_name or holder.name) != delivery_name
         or holder.delivery_rel_path != delivery_rel_path
         or holder.delivery_kind != delivery_kind
+        or int(holder.size) != int(size)
     ):
-        # The owner accepted a specific name and destination. A delivery that
-        # differs in either is not what was accepted.
+        # The owner accepted a specific name, size and destination. A delivery
+        # that differs in any of them is not what was accepted. Size matters
+        # even though the content hash is the same: admission reserves the
+        # DECLARED size and bytes are received up to it before the hash can be
+        # checked, so a larger declaration under an inherited acceptance would
+        # be storage the owner never agreed to. (Found by independent review.)
         return "refuse"
     port._pending_file_offers.pop(holder_id, None)
     port._abort_incoming_file(blob, holder)
@@ -205,9 +218,11 @@ async def settle_offer_against_held_offer(
             "transient": False,
             "attention_dismissed": True,
             "superseded_by_delivery": delivery_id,
+            # Says only what is known here. Whether the newer request goes on
+            # to be received is decided later in the handler.
             "user_message": (
-                "The sender sent this file again, and that newer send is the "
-                "one being received."
+                "The sender sent this file again. This earlier request was "
+                "replaced by the newer one."
             ),
         }),
     )

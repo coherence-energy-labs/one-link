@@ -676,6 +676,13 @@ def _pin_test_peer(source: DaemonHandle, peer: DaemonHandle) -> None:
         )
 
 
+# How much of each daemon's log a failing live test carries. It was 4000
+# characters, and two hosted failures arrived unreadable: one "peer caps" line
+# is about 700 characters, so the tail began some twenty lines before the end,
+# after the events that mattered. A whole short test's log is 20 to 60 thousand.
+FAILED_TEST_LOG_TAIL = 60_000
+
+
 def _attach_daemon_logs(exc: BaseException, logs: dict[str, Path]) -> None:
     """Add each daemon's log tail to a failing live test's exception.
 
@@ -688,7 +695,7 @@ def _attach_daemon_logs(exc: BaseException, logs: dict[str, Path]) -> None:
         return
     for label, path in logs.items():
         try:
-            tail = _read_log(path)
+            tail = _read_log(path, FAILED_TEST_LOG_TAIL)
         except Exception as read_error:
             tail = f"<log unreadable: {type(read_error).__name__}: {read_error}>"
         exc.add_note(f"--- daemon {label} log tail ---\n{tail}")

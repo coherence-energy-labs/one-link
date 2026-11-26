@@ -112,18 +112,26 @@ def test_real_subprocess_that_never_writes_a_port_file_is_reaped_as_dead(
 
 def test_a_failing_live_test_carries_both_daemon_log_tails(tmp_path: Path) -> None:
     """A hosted failure must arrive with the daemons' own account, not just the assertion."""
-    from tests.harness import _attach_daemon_logs
+    from tests.harness import FAILED_TEST_LOG_TAIL, _attach_daemon_logs
 
     a_log, b_log = tmp_path / "a.log", tmp_path / "b.log"
     a_log.write_text("A started\nA sent the offer\n", encoding="utf-8")
-    b_log.write_text("x" * 9000 + "B never committed the file\n", encoding="utf-8")
+    # Longer than the tail, with the line that explains the failure thirty
+    # thousand characters before the end: the place a 4000-character tail
+    # cut off in the two hosted failures that arrived unreadable.
+    b_log.write_text(
+        "x" * 200_000 + "B received the offer\n" + "y" * 30_000 + "B never committed the file\n",
+        encoding="utf-8",
+    )
     failure = AssertionError("a.txt didn't land on B within 30s after Accept")
     _attach_daemon_logs(failure, {"A": a_log, "B": b_log})
     notes = getattr(failure, "__notes__", [])
     assert len(notes) == 2
     assert notes[0].startswith("--- daemon A log tail ---") and "A sent the offer" in notes[0]
     assert "B never committed the file" in notes[1]
-    assert len(notes[1]) < 4200, "only the tail travels, not the whole log"
+    assert "B received the offer" in notes[1], "the tail is too short to hold the cause"
+    assert len(notes[1]) < FAILED_TEST_LOG_TAIL + 200, "only the tail travels, not the whole log"
+    assert FAILED_TEST_LOG_TAIL >= 40_000
     assert str(failure) == "a.txt didn't land on B within 30s after Accept", "the failure itself is unchanged"
 
 

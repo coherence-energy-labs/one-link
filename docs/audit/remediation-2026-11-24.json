@@ -19,7 +19,7 @@
   },
   "status_counts": {
     "implemented_and_verified": 27,
-    "implemented_pending_qualification": 10,
+    "implemented_pending_qualification": 11,
     "partially_remediated": 3,
     "prepared_not_applied": 1
   },
@@ -2496,6 +2496,13 @@
       "subject": "fix(transfer): an inherited acceptance is for the size the owner saw; two tests said more than they checked",
       "url": "https://github.com/coherence-energy-labs/one-link/commit/2729992ed530a26ec10a6f53c001d0cd7de70bfa",
       "integrated_in_review_basis": false
+    },
+    {
+      "id": "4e73895",
+      "revision": "4e73895d9a0d64e3b9b1c4b3e333568b590e3b2f",
+      "subject": "fix(daemon): a daemon asked to stop ends its open connections instead of waiting for them",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/4e73895d9a0d64e3b9b1c4b3e333568b590e3b2f",
+      "integrated_in_review_basis": false
     }
   ],
   "findings": [
@@ -4714,6 +4721,44 @@
         "'Accept all from this device' is remembered only until the daemon restarts; whether it should persist is an owner decision.",
         "If an inheriting delivery is then refused for another reason (disk space, say), the acceptance is not kept and the owner is asked again. Read from the code; not exercised."
       ]
+    },
+    {
+      "id": "FLD-04",
+      "priority": "High",
+      "title": "A daemon asked to stop kept running while any connection stayed open",
+      "owner": "daemon",
+      "acceptance": "A daemon that acknowledges a stop exits cleanly within seconds, whatever is connected to it: a message-tail subscriber, a quiet peer session, a command in progress or a held file offer.",
+      "status": "implemented_pending_qualification",
+      "changes": [
+        {
+          "summary": "Since Python 3.12 a closed asyncio server waits for every connection it accepted; the stop path was written for the earlier behaviour. A stop therefore waited for each peer session to go quiet for its idle limit and, indefinitely, for any message-tail subscriber. The daemon now registers what its two servers accept and ends those connections itself when it stops, whether the stop is requested or the serving task is interrupted.",
+          "commits": [
+            "4e73895"
+          ],
+          "files": [
+            "src/one_link/connection_shutdown.py",
+            "src/one_link/daemon.py",
+            "tests/test_connection_shutdown.py",
+            "tests/test_daemon_stops_with_open_connections.py"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Measured on scratch daemons, Python 3.12.13. Before: nothing connected, stopped in 1.8 s; a tail client attached or one quiet peer session, still running 45 s after acknowledging the stop. After: 0.2 to 1.5 s and exit code 0 in every case, including a held file offer. Eleven tests against real asyncio servers (14 of 14 planted defects caught) and three tests with real daemons, all three of which fail with the defect put back.",
+          "tests": [
+            "tests/test_connection_shutdown.py",
+            "tests/test_daemon_stops_with_open_connections.py"
+          ],
+          "evidence_ids": []
+        }
+      ],
+      "remaining": [
+        "Hosted CI on the fix revision.",
+        "An explicit stop now interrupts a transfer or a control command in progress instead of waiting for it, which is what it did before Python 3.12. The updater's own drain still refuses to begin while transfers are active.",
+        "The interrupt path (Ctrl-C, Ctrl-Break) is covered against real asyncio servers but not by a real-daemon test.",
+        "On Python 3.11 a closed server does not wait, so only the 3.12 lanes can fail these tests."
+      ]
     }
   ],
   "product_claim_qualification": [
@@ -4920,9 +4965,10 @@
     "finding_ids": [
       "FLD-01",
       "FLD-02",
-      "FLD-03"
+      "FLD-03",
+      "FLD-04"
     ],
-    "fix_revision": "2729992",
+    "fix_revision": "4e73895",
     "not_deployed": "The install where these were found runs a revision without the fixes. Nothing in this branch has been applied to it.",
     "hosted_ci": {
       "revision": "6eb2af7",

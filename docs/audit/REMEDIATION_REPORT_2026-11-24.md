@@ -26,7 +26,7 @@ The source revisions of individual runs matter. The broad local Linux execution 
 | Status | Findings | Meaning |
 | --- | ---: | --- |
 | Partially remediated | 3 | A substantive portion is repaired, while a material implementation/architecture or production-integration gap remains. Do not mark closed. |
-| Implemented; qualification pending | 10 | Implementation and focused verification exist, but a material acceptance step such as hosted, platform, artifact, realistic-workload or controlled-run qualification remains pending. |
+| Implemented; qualification pending | 11 | Implementation and focused verification exist, but a material acceptance step such as hosted, platform, artifact, realistic-workload or controlled-run qualification remains pending. |
 | Prepared; not applied | 1 | A concrete change payload and validation exist, but the external control has not been applied or read back. Do not describe it as enforced. |
 | Implemented and verified | 27 | The stated code/documentation defect has an implemented repair and relevant executed checks. This is bounded to cited evidence; it is not final CI, release, formal-security or all-platform certification. |
 
@@ -540,12 +540,14 @@ After the review above, one running install showed two things the audit and the 
 | FLD-01 | Every daemon start re-applied a one-way database migration that replaces each stored sign-in with its hash, so each restart (each update) hashed the stored values again and signed every open window out. In master since 2026-07-25; "Stay signed in across daemon restarts" could not work, and no test restarted a daemon with a session. | Implemented and verified |
 | FLD-02 | The window's session banner was a second element fixed exactly where its status line sits, so the two overlapped. Recovery was attempted at most twice per page and then never again, so the window stayed stranded. The page said the key had "expired" when the daemon had only failed to answer. | Implemented and verified |
 | FLD-03 | A file waiting for the owner's acceptance was treated as a transfer in progress: the same file sent again was refused, a fourth file was refused as over quota, and the receiver closed the waiting session after 120 seconds although the sender waits 300. | Implemented; qualification pending |
+| FLD-04 | A daemon asked to stop kept running while any connection stayed open. Since Python 3.12 a closed asyncio server waits for every connection it accepted, and the stop path predates that: it waited for each peer session to go quiet and, indefinitely, for any message-tail subscriber. Found while preparing to restart the install for FLD-01 to FLD-03. | Implemented; qualification pending |
 
 ### What changed
 
 - **FLD-01** (`5621199`). One-way migration steps are listed and run only on the start that first crosses their version. Measured on a real daemon: the window's sign-in answered 200 before a restart and 401 after it before the fix, 200 both times after. A test now re-opens a database with rows in four tables (sessions, settings, folders, devices) and fails on any of those rows a re-open changes, so the next one-way step on those tables is caught without anyone remembering this one. A refused owner request also leaves one log line saying what was presented, never the credential (`0875392`, `c171699`); its first use is what pointed at the migration.
 - **FLD-02** (`0a720cc`). One service owns the window's link to the daemon and the single status line. It keeps retrying for as long as the credential is not disproved, forgets the credential only after two consecutive refusals, and treats the event socket as connected when the daemon greets it. The first version of this fix used the socket's `open` event; a real daemon showed that to be wrong, because it accepts an unauthenticated socket and then closes it.
 - **FLD-03** (`6eb2af7`). A second send of a held file, files beyond the per-device limit while earlier ones are unanswered, and the session carrying a held offer are all told to wait instead of being refused or closed. An acceptance that could not be delivered is inherited by the same file sent again.
+- **FLD-04** (`4e73895`). The daemon registers every connection its two servers accept and ends them itself when it stops, whether the stop is requested or the serving task is interrupted. Measured on scratch daemons: before, a daemon with a message-tail client or one quiet peer session was still running 45 seconds after acknowledging a stop (with nothing connected it stopped in 1.8 seconds); after, 0.2 to 1.5 seconds and a clean exit in every case, including a held file offer. This is also why the update on 2026-11-25 took 90 seconds to stop and why the next start reported an unclean shutdown.
 
 ### What is still open
 
@@ -556,6 +558,7 @@ After the review above, one running install showed two things the audit and the 
 5. "Accept all from this device" lasts only until the daemon restarts. Whether that choice should persist is a decision for the owner, not something this change makes.
 6. If a delivery inherits an acceptance and is then refused for another reason (disk space, say), the acceptance is not kept and the owner is asked again. Read from the code; not exercised.
 7. A build older than the sign-in migration writing into a database already past it leaves a row the migration will not convert; that browser signs in once more.
+8. FLD-04: an explicit stop now interrupts a transfer or a command in progress instead of waiting for it, as it did before Python 3.12; the updater's drain still refuses to begin while transfers are active. The interrupt path is tested against real asyncio servers, not with a real daemon. FLD-04 has not been through hosted CI or an independent read.
 
 ### Hosted results and independent review
 

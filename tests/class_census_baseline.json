@@ -1,7 +1,7 @@
 {
   "classes": {
     "Daemon": {
-      "class_lines": 33953,
+      "class_lines": 33961,
       "domains": {
         "call": {
           "lines": 660,
@@ -32,7 +32,7 @@
           "methods": 206
         },
         "peer": {
-          "lines": 4462,
+          "lines": 4470,
           "methods": 35
         },
         "recovery": {
@@ -48,7 +48,7 @@
           "methods": 124
         }
       },
-      "method_lines": 33276,
+      "method_lines": 33284,
       "methods": 499,
       "self_attributes_assigned": 192
     },
@@ -222,6 +222,20 @@
       "totals": {
         "Daemon": {
           "method_lines": 33276,
+          "methods": 499
+        },
+        "UIServer": {
+          "method_lines": 25034,
+          "methods": 445
+        }
+      }
+    },
+    {
+      "growth_reason": "Daemon +7 lines, no method and no attribute added: the CAPS handler asks the channel whether a send made now would wait for the caller's first ratcheted frame, and if so hands the delivery to a tracked task. The question itself is a method on Channel.",
+      "label": "rotation: the accepting side delivers an owed rotation certificate from a task instead of from its own read loop",
+      "totals": {
+        "Daemon": {
+          "method_lines": 33284,
           "methods": 499
         },
         "UIServer": {

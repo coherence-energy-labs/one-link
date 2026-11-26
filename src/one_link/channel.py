@@ -539,6 +539,17 @@ class Channel:
         bootstrapped. Read-only — flipped exactly once."""
         return self._dr_state is not None
 
+    def waits_for_peer_before_sending(self) -> bool:
+        """Whether a send made now would wait for the peer's first ratcheted frame.
+
+        True only on the accepting side of a ratcheted channel, from the CAPS
+        exchange until that frame has been read. The task that reads the
+        channel must not send while this holds: its send would wait on a read
+        that only it can make, for as long as the connection exists and
+        beyond, since nothing else closes the channel.
+        """
+        return self._dr_cutover_phase == "ratchet_wait_peer"
+
     # ─── v0.8.2: caps-driven ratchet activation ────────────────────
 
     def note_caps_sent(self) -> None:

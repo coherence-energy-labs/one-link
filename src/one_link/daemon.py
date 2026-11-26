@@ -7832,8 +7832,16 @@ class Daemon:
             # ROTATION_CERT frames will be processed by the peer's
             # dispatcher. Safe to call every CAPS - already-acked
             # certs are skipped.
+            # On the side that accepted the connection this handler runs in
+            # the task that reads it, and that side cannot send before it has
+            # read the caller's first ratcheted frame: deliver from a task,
+            # and let it take its place in the send queue ahead of replies.
             with contextlib.suppress(Exception):
-                await self._drain_pending_rotation_certs_to(channel, peer_fp)
+                if channel.waits_for_peer_before_sending():
+                    self._track(self._drain_pending_rotation_certs_to(channel, peer_fp))
+                    await asyncio.sleep(0)
+                else:
+                    await self._drain_pending_rotation_certs_to(channel, peer_fp)
             # A newly negotiated async-capsule capability may unblock durable
             # outbox rows retained while this peer was offline.
             self._wake_capsule_delivery()

@@ -359,9 +359,16 @@ def test_rolling_publisher_is_deliberate_gated_and_unsigned():
 
     # Gated: it must verify the gating workflows concluded successfully for
     # the exact commit before the public download moves.
-    assert "conclusion" in text and "refusing to publish" in text
-    for gate in ('"tests"', '"security"', '"auto-build standalone binary"'):
-        assert gate in text, f"rolling publisher does not require {gate}"
+    guard = (path.parents[2] / "scripts" / "rolling_publish_guard.py").read_text(encoding="utf-8")
+    assert "rolling_publish_guard.py resolve" in text
+    assert "rolling_publish_guard.py recheck" in text
+    assert "rolling_publish_guard.py verify-assets" in text
+    assert "conclusion" in guard and "refusing to publish" in guard
+    for gate in ('"tests"', '"security"', '"auto-build standalone binary"',
+                 '"full-suite + e2e"', '"file-engine v2 native build"',
+                 '"file-engine v2 bench gate"', '"native shell builds"',
+                 '"lint"', '"formal verification"'):
+        assert gate in guard, f"rolling publisher does not require {gate}"
 
     # Unsigned tier, honestly labelled: prerelease, no code-signing primitive,
     # and it must not touch a tagged release.

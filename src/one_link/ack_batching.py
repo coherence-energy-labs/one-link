@@ -34,6 +34,15 @@ Two rules, one on each side, either of which is sufficient by itself:
   sender keeping its promise, which is what protects a transfer from a sender
   that predates this module.
 
+Both rules assume every chunk is answered. One that the receiver refuses is
+answered at once, out of turn, and the transfer is over; an independent review
+of the first version of this module found that case outside what it had
+claimed. A sender now takes a refusal of any chunk it has outstanding as the
+refusal it is (``refusal_of_unanswered_chunk``), and a receiver that abandons
+a transfer drops the answers it was holding for it instead of sending them
+later. A sender that predates this still waits out its deadline in that case,
+whatever the receiver runs.
+
 Tests: ``tests/test_ack_batching.py`` searches every reachable state of the
 sender's send loop against the receiver's rule, driven by the real window
 controller, for a wait that can never end. It finds none with either rule in
@@ -44,7 +53,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
 log = logging.getLogger("one_link.ack_batching")
 
@@ -90,6 +99,29 @@ def sender_waits(scheduler: Any, unanswered: int, last_declared_batch: int) -> b
     that runs.
     """
     return not scheduler.can_send(unanswered) and may_wait(unanswered, last_declared_batch)
+
+
+def refusal_of_unanswered_chunk(
+    message: Mapping[str, Any],
+    pending_queues: Iterable[Iterable[Sequence[Any]]],
+) -> str | None:
+    """The receiver's reason, if ``message`` refuses a chunk that is still unanswered.
+
+    A sender waits for its chunks' answers in the order it sent them. A
+    receiver that refuses a chunk (a full disk, a broken sequence) says so at
+    once, and may be holding the answers to the chunks before it. A sender
+    that looked only at the answer it was waiting for dropped the refusal,
+    then waited out its whole deadline and reported a silent peer instead of
+    the reason. ``pending_queues`` are the sender's queues of unanswered
+    chunks, each entry's first item being its message id. Returns ``None``
+    for anything else, including a refusal of a chunk that is not pending.
+    """
+    if message.get("t") != "ACK" or not (message.get("rejected") or message.get("ok") is False):
+        return None
+    refused = message.get("of")
+    if not any(entry[0] == refused for pending in pending_queues for entry in pending):
+        return None
+    return str(message.get("rejected") or message.get("error") or "peer rejected file-transfer request")
 
 
 def batch_is_due(held: int, batch_size: int) -> bool:

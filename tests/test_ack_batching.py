@@ -64,6 +64,10 @@ def _whenever_the_window_is_full(scheduler, unanswered: int, _last_declared_batc
     return not scheduler.can_send(unanswered)
 
 
+class _Refused(Exception):
+    """The sender was told its transfer is refused. That ends it; it is not a stall."""
+
+
 class _NeedsChoice(Exception):
     def __init__(self, state: tuple) -> None:
         super().__init__("the next acknowledgement's speed has not been chosen")
@@ -80,8 +84,16 @@ def _simulate(
     chunks: int,
     waits,
     receiver_answers_partial_batches: bool,
-) -> dict[str, Any] | None:
-    """One transfer. Returns ``None`` when it completes, or a description of the stall.
+    refuses: int | None = None,
+    sender_hears_any_refusal: bool = True,
+    receiver_forgets_on_abandon: bool = True,
+) -> dict[str, Any] | str | None:
+    """One transfer. Returns ``None`` when it completes, ``"refused"`` when the
+    sender is told the receiver refused a chunk, or a description of the stall.
+
+    ``refuses`` is the chunk the receiver refuses, abandoning the transfer (a
+    full disk, a broken sequence): it says so at once and answers nothing
+    after it.
 
     Raises ``_NeedsChoice`` when ``speeds`` runs out, carrying the full state at
     that point so the search can recognise a state it has already expanded.
@@ -98,6 +110,7 @@ def _simulate(
     last_batch = 0
     sent = 0
     sent_past_a_full_window = False
+    abandoned = False
 
     def settle_front() -> None:
         # The settle closures of Daemon.send_file: one chunk per call.
@@ -105,7 +118,7 @@ def _simulate(
         front = pending[0]
         if used == len(speeds):
             raise _NeedsChoice((
-                sent, scheduler.window_chunks, scheduler._good_acks, sent_past_a_full_window,
+                sent, scheduler.window_chunks, scheduler._good_acks, sent_past_a_full_window, abandoned,
                 tuple(pending), tuple(sorted(acknowledged_early)), tuple(held), tuple(frames),
             ))
         pending.popleft()
@@ -116,6 +129,16 @@ def _simulate(
         assert front not in pending
 
     def receive(chunk: int, batch: int) -> None:
+        nonlocal abandoned
+        if abandoned:
+            return  # a chunk for a transfer the receiver abandoned gets no reply
+        if chunk == refuses:
+            # The chunk handlers' reject paths: Daemon._abort_incoming_file, then the refusal.
+            abandoned = True
+            if receiver_forgets_on_abandon:
+                held.clear()
+            frames.append(("refused", (chunk,)))
+            return
         # Daemon._ack_file_chunk
         if batch <= 1:
             if held:
@@ -142,6 +165,12 @@ def _simulate(
                     continue
                 return False
             kind, ids = frames.popleft()
+            if kind == "refused":
+                # ack_batching.refusal_of_unanswered_chunk. Before it, only a
+                # refusal of the very chunk being waited for was heard.
+                if ids == (front,) or (sender_hears_any_refusal and ids[0] in pending):
+                    raise _Refused()
+                continue
             if kind == "batch":
                 rest = set(ids)
                 if front in rest:
@@ -167,49 +196,65 @@ def _simulate(
         settle_front()
         return None
 
-    for index in range(chunks):
-        last_batch = ack_batching.declared_batch(negotiated, scheduler.window_chunks, chunks - index)
-        receive(index, last_batch)
-        pending.append(index)
-        sent += 1
-        waited = False
-        while waits(scheduler, len(pending), last_batch):
+    def send_everything() -> dict[str, Any] | None:
+        nonlocal last_batch, sent, sent_past_a_full_window
+        for index in range(chunks):
+            last_batch = ack_batching.declared_batch(negotiated, scheduler.window_chunks, chunks - index)
+            receive(index, last_batch)
+            pending.append(index)
+            sent += 1
+            waited = False
+            while waits(scheduler, len(pending), last_batch):
+                stall = settle_one()
+                if stall is not None:
+                    return stall
+                waited = True
+            if not scheduler.can_send(len(pending)):
+                # The loop is about to send although the window is full, because
+                # the last promise is not met yet. It may do that for one chunk.
+                assert not sent_past_a_full_window or waited, "two chunks in a row were sent past a full window"
+                sent_past_a_full_window = True
+            else:
+                sent_past_a_full_window = False
+        while pending:
             stall = settle_one()
             if stall is not None:
                 return stall
-            waited = True
-        if not scheduler.can_send(len(pending)):
-            # The loop is about to send although the window is full, because
-            # the last promise is not met yet. It may do that for one chunk.
-            assert not sent_past_a_full_window or waited, "two chunks in a row were sent past a full window"
-            sent_past_a_full_window = True
-        else:
-            sent_past_a_full_window = False
-    while pending:
-        stall = settle_one()
-        if stall is not None:
-            return stall
-    return None
+        return None
+
+    try:
+        return send_everything()
+    except _Refused:
+        return "refused"
 
 
-def _search(*, chunks: int = _CHUNKS, **config) -> tuple[dict[str, Any] | None, int]:
-    """Try every sequence of acknowledgement speeds. Returns (first stall or None, transfers completed)."""
+def _search(
+    *, chunks: int = _CHUNKS, outcomes: dict[str, int] | None = None, **config,
+) -> tuple[dict[str, Any] | None, int]:
+    """Try every sequence of acknowledgement speeds.
+
+    Returns (first stall or None, transfers that ended without one). ``outcomes``
+    is filled with how many of those completed and how many were refused.
+    """
     seen: set[tuple] = set()
     stack: list[tuple[float, ...]] = [()]
-    completed = 0
+    ended = 0
     while stack:
         speeds = stack.pop()
         try:
-            stall = _simulate(speeds, chunks=chunks, **config)
+            result = _simulate(speeds, chunks=chunks, **config)
         except _NeedsChoice as need:
             if need.state not in seen:
                 seen.add(need.state)
                 stack.extend(speeds + (speed,) for speed in _SPEEDS)
             continue
-        if stall is not None:
-            return stall, completed
-        completed += 1
-    return None, completed
+        if isinstance(result, dict):
+            return result, ended
+        ended += 1
+        if outcomes is not None:
+            kind = "refused" if result == "refused" else "completed"
+            outcomes[kind] = outcomes.get(kind, 0) + 1
+    return None, ended
 
 
 # ── the rules, searched ──────────────────────────────────────────────
@@ -290,6 +335,77 @@ def test_a_receiver_that_answers_partial_batches_ends_every_wait_of_the_shipped_
         assert finished > 0, config
 
 
+# ── a chunk the receiver refuses ─────────────────────────────────────
+#
+# Everything above assumes each chunk is answered. A receiver that refuses a
+# chunk says so at once, out of turn, and abandons the transfer. An independent
+# review of the first version of this change produced the case below; the
+# claim had not covered it.
+
+_REFUSAL_CHUNKS = 6
+_REFUSAL_GRID = tuple(
+    config for config in _GRID
+    if config["negotiated"] in (1, 2, 4, 8) and config["initial_window"] in (1, 2, 4, 8)
+    and config["max_window"] == 8 and config["growth"] in (1, 2)
+)
+
+
+def _refusals(**rules) -> tuple[list[tuple[dict, int, dict]], dict[str, int]]:
+    """Every configuration and every chunk the receiver could refuse: (stalls, how the rest ended)."""
+    stalls = []
+    outcomes: dict[str, int] = {}
+    for config in _REFUSAL_GRID:
+        for refused in range(_REFUSAL_CHUNKS):
+            stall, _ended = _search(
+                chunks=_REFUSAL_CHUNKS, outcomes=outcomes, refuses=refused,
+                waits=ack_batching.sender_waits, **rules, **config,
+            )
+            if stall is not None:
+                stalls.append((config, refused, stall))
+    return stalls, outcomes
+
+
+@pytest.mark.parametrize("receiver_is_current", [True, False])
+def test_a_refused_chunk_ends_the_transfer_whatever_the_receiver_was_holding(receiver_is_current):
+    stalls, outcomes = _refusals(
+        receiver_answers_partial_batches=receiver_is_current, receiver_forgets_on_abandon=receiver_is_current,
+    )
+    assert stalls == [], stalls[:1]
+    # Every history ended with the sender told of the refusal. None completed:
+    # a refused chunk is never answered, so a sender that finished would have
+    # been told a lie.
+    assert outcomes.get("completed", 0) == 0
+    assert outcomes["refused"] >= len(_REFUSAL_GRID) * _REFUSAL_CHUNKS
+
+
+@pytest.mark.parametrize("receiver_is_current", [True, False])
+def test_a_sender_that_hears_only_the_answer_it_awaits_misses_a_refusal_behind_a_held_answer(receiver_is_current):
+    """The search can fail here too. It is also what remains for a sender that predates the change."""
+    stalls, _outcomes = _refusals(
+        sender_hears_any_refusal=False,
+        receiver_answers_partial_batches=receiver_is_current, receiver_forgets_on_abandon=receiver_is_current,
+    )
+    assert stalls, "the old reply wait no longer misses a refusal in this model"
+    for config, refused, stall in stalls:
+        # It waits for an earlier chunk, having thrown away the refusal of a later one.
+        assert stall["sender_waits_for"] < refused, (config, refused, stall)
+        assert config["negotiated"] > 1, "without batching, answers arrive in the order awaited"
+
+
+def test_the_smallest_missed_refusal():
+    """Two chunks: the first held for a batch of two, the second refused."""
+    config = {"negotiated": 2, "initial_window": 2, "max_window": 8, "growth": 1}
+    rules = {"waits": ack_batching.sender_waits, "receiver_answers_partial_batches": False, "refuses": 1}
+    stall, _ended = _search(
+        chunks=2, sender_hears_any_refusal=False, receiver_forgets_on_abandon=False, **rules, **config,
+    )
+    assert stall is not None
+    assert stall["sender_waits_for"] == 0 and stall["receiver_holds"] == [0] and stall["chunks_sent"] == 2
+    outcomes: dict[str, int] = {}
+    assert _search(chunks=2, outcomes=outcomes, receiver_forgets_on_abandon=False, **rules, **config)[0] is None
+    assert outcomes == {"refused": 1}
+
+
 # ── the pieces ───────────────────────────────────────────────────────
 
 
@@ -316,6 +432,35 @@ def test_declared_batch(negotiated, window, remaining, expected):
 )
 def test_a_sender_waits_only_on_a_promise_it_has_kept(unanswered, promised, expected):
     assert ack_batching.may_wait(unanswered, promised) is expected
+
+
+_PENDING = [("c1", 10, 0.0), ("c2", 10, 0.0), ("c3", 10, 0.0)]
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ({"t": "ACK", "of": "c2", "rejected": "receiver_disk_write_failed"}, "receiver_disk_write_failed"),
+        ({"t": "ACK", "of": "c3", "ok": False, "error": "no room"}, "no room"),
+        ({"t": "ACK", "of": "c3", "ok": False}, "peer rejected file-transfer request"),
+        ({"t": "ACK", "of": "c1", "rejected": "bad_file_chunk_sequence"}, "bad_file_chunk_sequence"),
+        ({"t": "ACK", "of": "c2"}, None),                                   # an ordinary answer
+        ({"t": "ACK", "of": "c2", "ok": True}, None),
+        ({"t": "ACK", "of": "c9", "rejected": "something"}, None),          # not one of ours: left to the caller
+        ({"t": "ACK", "rejected": "something"}, None),
+        ({"t": "FILE_ACK_BATCH", "ofs": ["c2"], "rejected": "x"}, None),    # only an ACK refuses a chunk
+        ({"t": "FILE_DECLINED", "of": "c2", "rejected": "x"}, None),        # even one that names a pending chunk
+    ],
+)
+def test_a_refusal_is_recognised_only_for_a_chunk_that_is_still_unanswered(message, expected):
+    assert ack_batching.refusal_of_unanswered_chunk(message, [deque(_PENDING)]) == expected
+
+
+def test_a_refusal_is_looked_for_in_every_queue_and_in_none_when_there_is_none():
+    refusal = {"t": "ACK", "of": "c2", "rejected": "why"}
+    assert ack_batching.refusal_of_unanswered_chunk(refusal, [deque(), deque(_PENDING)]) == "why"
+    assert ack_batching.refusal_of_unanswered_chunk(refusal, [deque()]) is None
+    assert ack_batching.refusal_of_unanswered_chunk(refusal, []) is None
 
 
 def test_a_partial_batch_is_answered_after_the_delay_and_only_once():
@@ -491,6 +636,33 @@ def test_an_individual_answer_sends_what_was_held_first_so_answers_stay_in_order
     asyncio.run(scenario())
 
 
+def test_an_abandoned_transfer_drops_the_answers_it_was_holding():
+    """Otherwise the timer answers for a transfer that has ended, a tenth of a second after it did."""
+
+    async def scenario(tmp: Path) -> None:
+        daemon, channel = _bare_daemon(), _RecordingChannel()
+        incoming = IncomingFile(
+            name="f.bin", size=1, blob_hex="ab" * 32, out_path=tmp / "f.part", handle=io.BytesIO(), hasher=object(),
+        )
+        daemon.state = None
+        daemon._incoming_files = {incoming.blob_hex: incoming}
+        daemon._release_inbound_reservation = lambda f: None
+        daemon._resume_metadata_root = tmp
+        daemon._update_transfer = lambda *args, **kwargs: None
+        await daemon._ack_file_chunk(channel, {"id": "c1", "ack_batch": 4}, incoming)
+        assert incoming.ack_batch_ids == ["c1"] and incoming.ack_batch_timer is not None
+        daemon._abort_incoming_file(incoming.blob_hex, incoming)
+        assert incoming.ack_batch_ids == [] and incoming.ack_batch_timer is None
+        assert incoming.blob_hex not in daemon._incoming_files
+        await asyncio.sleep(ack_batching.PARTIAL_BATCH_FLUSH_S * 3)
+        assert _acks(channel) == [], "an answer was sent for a transfer that had been abandoned"
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        asyncio.run(scenario(Path(tmp)))
+
+
 # ── the daemon's sender is the loop that was searched ────────────────
 
 
@@ -519,4 +691,13 @@ def test_both_send_loops_are_the_loop_that_was_searched():
     assert "chunk_ack_batch = min(" not in source, "a batch is still computed inline"
     assert flat.count("ack_batching.batch_is_due(len(f.ack_batch_ids), batch_size)") == 1
     assert flat.count("ack_batching.arm_partial_flush(") == 1
-    assert flat.count("ack_batching.disarm_partial_flush(f)") == 1
+    # A flush disarms the timer, and so does abandoning the transfer, which also drops what was held.
+    assert flat.count("ack_batching.disarm_partial_flush(f)") == 2
+    assert flat.count(
+        "def _abort_incoming_file(self, blob: str, f: IncomingFile) -> None: "
+        "ack_batching.disarm_partial_flush(f) f.ack_batch_ids.clear()"
+    ) == 1
+    # The reply wait hears a refusal of any chunk still in either loop's queue.
+    assert flat.count("refusal = ack_batching.refusal_of_unanswered_chunk(m, unanswered_chunks)") == 1
+    assert flat.count("unanswered_chunks.append(pending_cdc_sizes)") == 1
+    assert flat.count("unanswered_chunks.append(pending_sizes)") == 1

@@ -19981,6 +19981,8 @@ class Daemon:
             out_path.unlink()
 
     def _abort_incoming_file(self, blob: str, f: IncomingFile) -> None:
+        ack_batching.disarm_partial_flush(f)
+        f.ack_batch_ids.clear()
         with contextlib.suppress(Exception):
             f.handle.close()
         # Flush any deferred chunk-availability records — the
@@ -31559,6 +31561,7 @@ class Daemon:
             except ImportError:
                 bloom_response_capable = False
         batched_acks: set[str] = set()
+        unanswered_chunks: list[Any] = []  # the pending queue of whichever send loop runs
         commit_verification_count = 0
         commit_verification_seq = -1
         commit_verification_absolute_at: float | None = None
@@ -31699,6 +31702,11 @@ class Daemon:
                         # a crossed/replayed receipt instead of silently
                         # accepting a later unrelated frame.
                         raise ReceiverCommitError("crossed file commit receipt: offer id mismatch")
+                    refusal = ack_batching.refusal_of_unanswered_chunk(m, unanswered_chunks)
+                    if refusal is not None:
+                        raise RuntimeError(
+                            f"file send to {peer.short_id}: peer rejected request {of}: {refusal}"
+                        )
                     log.debug(
                         "ignored stale file-transfer reply %s of=%s while waiting for %s",
                         t, of, request_id,
@@ -32216,6 +32224,7 @@ class Daemon:
                     self._assert_file_signature(path, file_sig)
                     with self._open_verified_outbound_source(path, file_sig) as f:
                         pending_cdc_sizes: deque[tuple[str, int, int, float]] = deque()
+                        unanswered_chunks.append(pending_cdc_sizes)
                         compression_enabled = True
                         compression_trials = 0
                         compression_misses = 0
@@ -32689,6 +32698,7 @@ class Daemon:
                     with self._open_verified_outbound_source(path, file_sig) as f:
                         seq = 0
                         pending_sizes: deque[tuple[str, int, float]] = deque()
+                        unanswered_chunks.append(pending_sizes)
                         total_stream_chunks = max(
                             1, (size + stream_chunk_size - 1) // stream_chunk_size,
                         )

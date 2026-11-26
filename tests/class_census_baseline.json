@@ -1,7 +1,7 @@
 {
   "classes": {
     "Daemon": {
-      "class_lines": 33970,
+      "class_lines": 33980,
       "domains": {
         "call": {
           "lines": 660,
@@ -44,11 +44,11 @@
           "methods": 13
         },
         "transfer": {
-          "lines": 9868,
+          "lines": 9878,
           "methods": 124
         }
       },
-      "method_lines": 33293,
+      "method_lines": 33303,
       "methods": 499,
       "self_attributes_assigned": 192
     },
@@ -250,6 +250,20 @@
       "totals": {
         "Daemon": {
           "method_lines": 33293,
+          "methods": 499
+        },
+        "UIServer": {
+          "method_lines": 25034,
+          "methods": 445
+        }
+      }
+    },
+    {
+      "growth_reason": "Daemon +10 lines, no method and no attribute added: the reply wait asks one_link.ack_batching whether a frame refuses a chunk still in a send loop's queue (the two queues are registered where they are created), and abandoning an incoming file disarms its short-batch timer and clears what it held. The recognition rule is in the module.",
+      "label": "file transfer: a refusal of any outstanding chunk reaches the sender; an abandoned transfer drops the answers it held",
+      "totals": {
+        "Daemon": {
+          "method_lines": 33303,
           "methods": 499
         },
         "UIServer": {

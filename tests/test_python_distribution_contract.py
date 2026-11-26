@@ -89,7 +89,9 @@ def test_stable_distribution_contract_exactly_matches_source_tree() -> None:
     # to the two orchestration classes.
     # 225: connection_shutdown (imported by daemon), 2026-11-26: how a stopping
     # daemon ends its open connections.
-    assert len(build_identity.EXPECTED_STABLE_RUNTIME_MODULES) == 225
+    # 226: ack_batching (imported by daemon), 2026-11-26: when a file sender may
+    # wait for an acknowledgement and when a receiver answers a short batch.
+    assert len(build_identity.EXPECTED_STABLE_RUNTIME_MODULES) == 226
     assert build_identity.EXPECTED_STABLE_RUNTIME_MODULES == tuple(
         sorted(set(build_identity.EXPECTED_STABLE_RUNTIME_MODULES))
     )
@@ -168,9 +170,10 @@ def test_distribution_source_contract_hashes_every_packaged_python_file() -> Non
     # folder_sync_scheduler, off_loop_import.
     # (239 / 262 before them.) Two more the same day: held_offers, owner_auth_note.
     # (241 / 264 before it.) connection_shutdown, 2026-11-26.
-    assert len(source_python) == 242
+    # (242 / 265 before it.) ack_batching, 2026-11-26.
+    assert len(source_python) == 243
     assert packaged_python == source_python
-    assert len(contract.payload_hashes) == 265
+    assert len(contract.payload_hashes) == 266
 
 
 def test_developer_only_modules_are_not_stable_distribution_requirements() -> None:

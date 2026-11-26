@@ -289,7 +289,7 @@ from one_link.transfer_safety import (
     known_bytes_from_chunks,
     same_storage_volume,
 )
-from one_link import connection_shutdown, held_offers
+from one_link import ack_batching, connection_shutdown, held_offers
 from one_link.wire import decode_msg, encode_msg, make_msg
 
 log = logging.getLogger("one_link.daemon")
@@ -2994,6 +2994,8 @@ class IncomingFile:
     cdc_chunks_since_progress: int = 0
     transfer_id: str | None = None
     ack_batch_ids: list[str] = field(default_factory=list)
+    # Answers a batch the sender has not filled (ack_batching.arm_partial_flush).
+    ack_batch_timer: Any = field(default=None, repr=False, compare=False)
     # Authorization is transfer-scoped, not connection-scoped. Once the
     # accept-first gate has been cleared, reconnects must not turn the same
     # blob from the same peer back into a new prompt.
@@ -21805,6 +21807,7 @@ class Daemon:
         return PriorInboundCommitResolution.committed(candidate)
 
     async def _flush_file_ack_batch(self, channel, f: IncomingFile) -> None:
+        ack_batching.disarm_partial_flush(f)
         if not f.ack_batch_ids:
             return
         ids = [str(v) for v in f.ack_batch_ids if v]
@@ -21840,8 +21843,12 @@ class Daemon:
             )))
             return
         f.ack_batch_ids.append(msg_id)
-        if len(f.ack_batch_ids) >= batch_size:
+        if ack_batching.batch_is_due(len(f.ack_batch_ids), batch_size):
             await self._flush_file_ack_batch(channel, f)
+        else:  # a batch the sender never fills is answered anyway
+            ack_batching.arm_partial_flush(
+                f, lambda: self._flush_file_ack_batch(channel, f), spawn=self._track,
+            )
 
     def _inbound_is_rejected(self, peer_fp: str) -> bool:
         """Returns True if the peer is on our local rejection list.
@@ -32483,9 +32490,9 @@ class Daemon:
                                 wire_size=len(payload),
                             )
                             remaining_wanted = max(1, wanted_total - wanted_sent_index + 1)
-                            chunk_ack_batch = min(
+                            chunk_ack_batch = ack_batching.declared_batch(
                                 negotiated_ack_batch,
-                                max(1, int(cdc_scheduler.window_chunks)),
+                                cdc_scheduler.window_chunks,
                                 remaining_wanted,
                             )
                             if chunk_ack_batch > 1:
@@ -32535,7 +32542,10 @@ class Daemon:
                                 len(payload),
                                 time.perf_counter(),
                             ))
-                            while not cdc_scheduler.can_send(len(pending_cdc_sizes)):
+                            # Not merely a full window: see ack_batching.
+                            while ack_batching.sender_waits(
+                                cdc_scheduler, len(pending_cdc_sizes), chunk_ack_batch,
+                            ):
                                 await _flush_if_queued(channel, queued_write)
                                 queued_write = False
                                 await _settle_one_cdc_ack()
@@ -32790,7 +32800,10 @@ class Daemon:
                                         fb_size,
                                         time.perf_counter(),
                                     ))
-                                    while not stream_scheduler.can_send(len(pending_sizes)):
+                                    while ack_batching.sender_waits(
+                                        stream_scheduler, len(pending_sizes),
+                                        int(fb_msg.get("ack_batch") or 1),
+                                    ):
                                         await _flush_if_queued(channel, queued_write)
                                         queued_write = False
                                         await _settle_one_stream_ack()
@@ -32808,9 +32821,9 @@ class Daemon:
                             # the user hasn't set a bandwidth cap.
                             await self.bandwidth_pacer.pace(len(data))
                             remaining_stream_chunks = max(1, total_stream_chunks - seq)
-                            chunk_ack_batch = min(
+                            chunk_ack_batch = ack_batching.declared_batch(
                                 negotiated_ack_batch,
-                                max(1, int(stream_scheduler.window_chunks)),
+                                stream_scheduler.window_chunks,
                                 remaining_stream_chunks,
                             )
                             quic_dispatched = False  # Wave 2e fork flag
@@ -32979,7 +32992,9 @@ class Daemon:
                                     len(data),
                                     time.perf_counter(),
                                 ))
-                                while not stream_scheduler.can_send(len(pending_sizes)):
+                                while ack_batching.sender_waits(
+                                    stream_scheduler, len(pending_sizes), chunk_ack_batch,
+                                ):
                                     await _flush_if_queued(channel, queued_write)
                                     queued_write = False
                                     await _settle_one_stream_ack()

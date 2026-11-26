@@ -23,6 +23,7 @@ from one_link import call_lifecycle, call_routes, folder_sync_receipts, folder_s
 
 REPO = Path(__file__).resolve().parent.parent
 EXTRACTED_MODULES = (
+    "one_link.ack_batching",
     "one_link.call_lifecycle",
     "one_link.call_routes",
     "one_link.connection_shutdown",

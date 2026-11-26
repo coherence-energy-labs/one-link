@@ -26,9 +26,9 @@ The source revisions of individual runs matter. The broad local Linux execution 
 | Status | Findings | Meaning |
 | --- | ---: | --- |
 | Partially remediated | 3 | A substantive portion is repaired, while a material implementation/architecture or production-integration gap remains. Do not mark closed. |
-| Implemented; qualification pending | 11 | Implementation and focused verification exist, but a material acceptance step such as hosted, platform, artifact, realistic-workload or controlled-run qualification remains pending. |
+| Implemented; qualification pending | 10 | Implementation and focused verification exist, but a material acceptance step such as hosted, platform, artifact, realistic-workload or controlled-run qualification remains pending. |
 | Prepared; not applied | 1 | A concrete change payload and validation exist, but the external control has not been applied or read back. Do not describe it as enforced. |
-| Implemented and verified | 27 | The stated code/documentation defect has an implemented repair and relevant executed checks. This is bounded to cited evidence; it is not final CI, release, formal-security or all-platform certification. |
+| Implemented and verified | 28 | The stated code/documentation defect has an implemented repair and relevant executed checks. This is bounded to cited evidence; it is not final CI, release, formal-security or all-platform certification. |
 
 No overall maturity score is assigned from test counts, line reductions or the presence of advanced primitives. The judgment rests on operational behavior, exercised boundaries, credible measurements and accurately stated limitations.
 
@@ -540,7 +540,7 @@ After the review above, one running install showed two things the audit and the 
 | FLD-01 | Every daemon start re-applied a one-way database migration that replaces each stored sign-in with its hash, so each restart (each update) hashed the stored values again and signed every open window out. In master since 2026-07-25; "Stay signed in across daemon restarts" could not work, and no test restarted a daemon with a session. | Implemented and verified |
 | FLD-02 | The window's session banner was a second element fixed exactly where its status line sits, so the two overlapped. Recovery was attempted at most twice per page and then never again, so the window stayed stranded. The page said the key had "expired" when the daemon had only failed to answer. | Implemented and verified |
 | FLD-03 | A file waiting for the owner's acceptance was treated as a transfer in progress: the same file sent again was refused, a fourth file was refused as over quota, and the receiver closed the waiting session after 120 seconds although the sender waits 300. | Implemented; qualification pending |
-| FLD-04 | A daemon asked to stop kept running while any connection stayed open. Since Python 3.12 a closed asyncio server waits for every connection it accepted, and the stop path predates that: it waited for each peer session to go quiet and, indefinitely, for any message-tail subscriber. Found while preparing to restart the install for FLD-01 to FLD-03. | Implemented; qualification pending |
+| FLD-04 | A daemon asked to stop kept running while any connection stayed open. Since Python 3.12 a closed asyncio server waits for every connection it accepted, and the stop path predates that: it waited for each peer session to go quiet and, indefinitely, for any message-tail subscriber. Found while preparing to restart the install for FLD-01 to FLD-03. | Implemented and verified |
 
 ### What changed
 
@@ -551,14 +551,14 @@ After the review above, one running install showed two things the audit and the 
 
 ### What is still open
 
-1. **None of this is on the install where it was found.** That install runs a revision without these fixes. Until it is updated, each restart signs its windows out, and a file waiting for acceptance still blocks the sender's later files.
+1. **The owner's second device has not been rolled.** The install where these were found was rolled to `4621947` on 2026-11-26 (see below). Until the second device is updated, each of its restarts signs its own windows out, and a file waiting for acceptance there still blocks the sender's later files.
 2. Sign-ins already invalidated cannot be restored; the hash is one-way. Each window signs in once more after the fix.
 3. What first answered 401 to the window was not recorded. FLD-01 explains a 401 after the restart; the new log line will explain the next one.
 4. Inheriting an undeliverable acceptance is unit-tested but has not been exercised between two real daemons. It also covers only the first minutes: read from the code, not measured, once the stall deadline parks such an offer, a different delivery of the same file is refused as `resume_owned_by_another_delivery`, even when the parked copy holds no bytes.
 5. "Accept all from this device" lasts only until the daemon restarts. Whether that choice should persist is a decision for the owner, not something this change makes.
 6. If a delivery inherits an acceptance and is then refused for another reason (disk space, say), the acceptance is not kept and the owner is asked again. Read from the code; not exercised.
 7. A build older than the sign-in migration writing into a database already past it leaves a row the migration will not convert; that browser signs in once more.
-8. FLD-04: an explicit stop now interrupts a transfer or a command in progress instead of waiting for it, as it did before Python 3.12; the updater's drain still refuses to begin while transfers are active. The interrupt path is tested against real asyncio servers, not with a real daemon. FLD-04 has not been through hosted CI or an independent read.
+8. FLD-04: an explicit stop now interrupts a transfer or a command in progress instead of waiting for it, as it did before Python 3.12; the updater's drain still refuses to begin while transfers are active. The interrupt path is tested against real asyncio servers, not with a real daemon. FLD-04 has not had an independent read.
 
 ### Hosted results and independent review
 
@@ -570,3 +570,14 @@ A reviewer that did not write these changes then read `5621199` and `6eb2af7` ad
 - The re-open test's helper guarded one of its rows on a column the table does not have, so the check covered two tables while claiming more. It now covers four and asserts each is populated.
 
 The reviewer read the held-offer change without executing it, and did not read the decline path or the rest of the offer handler after a superseded offer. FLD-01 and FLD-02 are marked verified on the hosted run above. On `9428729`, which contains that fix, the hosted run again passed 59 checks, failed none and skipped 2. FLD-03 stays pending for a different reason: inheriting an undeliverable acceptance has not been exercised between two real daemons, and the independent read of that change was by reading, not execution.
+
+### Rolled onto the install (2026-11-26)
+
+The install where these were found was rolled from `f55576f` to `4621947`. The procedure, with what it found, is in `docs/ROLLING_A_SOURCE_INSTALL.md`.
+
+- Hosted run on `4621947` before the roll: 55 passed, 4 failed, 2 skipped. Both full suites, all eight live shards, both browser lanes and the four unit lanes passed. The four failures are the scan-memory per-record model on Linux (0.0501 fitted against a limit of 0.05; Windows and macOS passed) with its roll-up, and one inconclusive disk-write benchmark with its roll-up. Neither is part of the daemon runtime. Both are open.
+- Downtime was 71 seconds. The daemon running the old code could not finish stopping while a message tail was attached (FLD-04) and exited within 0.2 seconds of the tail ending.
+- FLD-01, measured there: the stored record keys of the four saved sign-ins were identical before and after the restart.
+- FLD-02: the native window opened signed in on the fixed page, after being rebuilt for it. The window binary pins the hash of the page it renders, so the binary from before the roll would have refused the fixed page.
+- FLD-03 was not exercised there: nothing was waiting for acceptance after the roll.
+- A database backup from before the first start of the new code is kept beside the install's data folder.

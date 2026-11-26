@@ -18,8 +18,8 @@
     "prepared_not_applied": "A concrete change payload and validation exist, but the external control has not been applied or read back. Do not describe it as enforced."
   },
   "status_counts": {
-    "implemented_and_verified": 27,
-    "implemented_pending_qualification": 11,
+    "implemented_and_verified": 28,
+    "implemented_pending_qualification": 10,
     "partially_remediated": 3,
     "prepared_not_applied": 1
   },
@@ -4603,11 +4603,18 @@
             "tests/test_lifecycle.py::test_a_browser_session_survives_daemon_restarts"
           ],
           "evidence_ids": []
+        },
+        {
+          "summary": "On the install where it was found, across the restart that rolled this fix (2026-11-26): the stored record keys of its four saved sign-ins were identical before and after. Under the old code every restart changed them.",
+          "tests": [
+            "tests/test_lifecycle.py::test_a_browser_session_survives_daemon_restarts"
+          ],
+          "evidence_ids": []
         }
       ],
       "remaining": [
-        "The install where this was found still runs the code with the defect; each of its restarts signs its windows out until it is updated. Sessions already invalidated cannot be restored.",
-        "Not covered: a binary older than step 28 writing into a database already past it leaves a row the step will not convert. That row cannot authenticate, so the browser signs in once more. Making the step idempotent needs a stored form that tells a record key from a bearer."
+        "Not covered: a binary older than step 28 writing into a database already past it leaves a row the step will not convert. That row cannot authenticate, so the browser signs in once more. Making the step idempotent needs a stored form that tells a record key from a bearer.",
+        "Rolled onto the install where it was found. The owner's second device still runs older code. Sign-ins invalidated before the roll cannot be restored."
       ]
     },
     {
@@ -4646,6 +4653,13 @@
           "summary": "Hosted on 6eb2af7: 59 checks passed, none failed, 2 skipped. Both full suites, all eight live shards and both browser lanes passed; the three browser tests, including the real daemon restart, passed on hosted Linux and Windows.",
           "tests": [
             "tests/js/test_window_link.cjs",
+            "tests/e2e/test_window_status_line.py"
+          ],
+          "evidence_ids": []
+        },
+        {
+          "summary": "On that install after the roll: the native window opened signed in on the fixed page with no browser fallback. The daemon's refusal note recorded the old window's two refused requests before that window was closed, and none afterwards.",
+          "tests": [
             "tests/e2e/test_window_status_line.py"
           ],
           "evidence_ids": []
@@ -4728,7 +4742,7 @@
       "title": "A daemon asked to stop kept running while any connection stayed open",
       "owner": "daemon",
       "acceptance": "A daemon that acknowledges a stop exits cleanly within seconds, whatever is connected to it: a message-tail subscriber, a quiet peer session, a command in progress or a held file offer.",
-      "status": "implemented_pending_qualification",
+      "status": "implemented_and_verified",
       "changes": [
         {
           "summary": "Since Python 3.12 a closed asyncio server waits for every connection it accepted; the stop path was written for the earlier behaviour. A stop therefore waited for each peer session to go quiet for its idle limit and, indefinitely, for any message-tail subscriber. The daemon now registers what its two servers accept and ends those connections itself when it stops, whether the stop is requested or the serving task is interrupted.",
@@ -4751,13 +4765,26 @@
             "tests/test_daemon_stops_with_open_connections.py"
           ],
           "evidence_ids": []
+        },
+        {
+          "summary": "Hosted on 4621947: both full suites, all eight live shards (whose manifest includes the three real-daemon stop tests), both browser lanes and the four unit lanes passed. Four checks failed for reasons outside this finding: the scan-memory per-record model on Linux with its roll-up, and one inconclusive disk benchmark with its roll-up.",
+          "tests": [
+            "tests/test_connection_shutdown.py",
+            "tests/test_daemon_stops_with_open_connections.py"
+          ],
+          "evidence_ids": []
+        },
+        {
+          "summary": "On the install (2026-11-26): the daemon running the old code, asked to stop with a message tail attached, was still running ten seconds later and exited within 0.2 s of the tail ending. The next start reported no unclean shutdown. The new daemon's own stop has not been exercised there.",
+          "tests": [],
+          "evidence_ids": []
         }
       ],
       "remaining": [
-        "Hosted CI on the fix revision.",
         "An explicit stop now interrupts a transfer or a control command in progress instead of waiting for it, which is what it did before Python 3.12. The updater's own drain still refuses to begin while transfers are active.",
         "The interrupt path (Ctrl-C, Ctrl-Break) is covered against real asyncio servers but not by a real-daemon test.",
-        "On Python 3.11 a closed server does not wait, so only the 3.12 lanes can fail these tests."
+        "On Python 3.11 a closed server does not wait, so only the 3.12 lanes can fail these tests.",
+        "No independent read of this change."
       ]
     }
   ],
@@ -4969,7 +4996,6 @@
       "FLD-04"
     ],
     "fix_revision": "4e73895",
-    "not_deployed": "The install where these were found runs a revision without the fixes. Nothing in this branch has been applied to it.",
     "hosted_ci": {
       "revision": "6eb2af7",
       "summary": "59 checks passed, none failed, 2 skipped.",
@@ -4977,8 +5003,20 @@
       "later": {
         "revision": "9428729",
         "summary": "59 checks passed, none failed, 2 skipped."
+      },
+      "rolled_revision": {
+        "revision": "4621947",
+        "summary": "55 checks passed, 4 failed, 2 skipped.",
+        "failures": "scan memory qualification on Linux (format_aware_fd fitted 0.0501 bytes per record against a limit of 0.05; Windows and macOS passed) and its roll-up; the benchmark gate (27 metrics passed, one disk-write metric inconclusive) and its roll-up. Neither is part of the daemon runtime."
       }
     },
-    "independent_review": "One adversarial read of 5621199 and 6eb2af7 by a reviewer that did not write them. It executed its attacks on the migration guard and read the held-offer change without executing. Result: one defect (inherited acceptance did not compare size), one dead test probe, three statements that claimed more than was checked. All addressed in 2729992. It did not read the decline path or the rest of the offer handler after a superseded offer, and said so."
+    "independent_review": "One adversarial read of 5621199 and 6eb2af7 by a reviewer that did not write them. It executed its attacks on the migration guard and read the held-offer change without executing. Result: one defect (inherited acceptance did not compare size), one dead test probe, three statements that claimed more than was checked. All addressed in 2729992. It did not read the decline path or the rest of the offer handler after a superseded offer, and said so.",
+    "rolled": {
+      "date": "2026-11-26",
+      "revision": "4621947",
+      "where": "The install where these were found. The owner's second device has not been rolled.",
+      "downtime_seconds": 71,
+      "procedure": "docs/ROLLING_A_SOURCE_INSTALL.md"
+    }
   }
 }

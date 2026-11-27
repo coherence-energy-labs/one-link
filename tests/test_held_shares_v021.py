@@ -436,7 +436,9 @@ def test_restore_shares_endpoint_registered_guarded_ratelimited():
     assert "self._guarded(" in src[line_start:line_end]
     handler_idx = src.find("async def api_recovery_restore_shares(")
     assert handler_idx > 0
-    body = src[handler_idx:handler_idx + 6000]
+    # The whole handler, however long it grows: up to the next method.
+    handler_end = src.find("\n    async def ", handler_idx + 1)
+    body = src[handler_idx:handler_end if handler_end > 0 else None]
     assert "_rate_limited(" in body
     assert '"recovery_restore_shares"' in body
     assert "destructive_restore_requires_confirmation" in body

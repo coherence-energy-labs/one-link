@@ -152,10 +152,11 @@ def test_2_of_5_does_not_reconstruct():
             my_ed_priv_seed=contacts[i][0],
         )
         decrypted.append((idx, share))
-    # combine still runs (Shamir doesn't know the threshold), but
-    # the result is unrelated to the master seed.
-    bogus = sr.combine_shares(decrypted)
-    assert bogus != master
+    # Shamir doesn't know the threshold and would hand back unrelated
+    # bytes. The seed's digest travels inside the split secret, so the
+    # wrong reconstruction is recognised and refused.
+    with pytest.raises(ValueError, match="do not reconstruct the original seed"):
+        sr.combine_shares(decrypted)
 
 
 # ── failure modes ───────────────────────────────────────────────────
@@ -242,9 +243,8 @@ def test_cross_setup_shares_dont_combine_correctly():
             wrapped=src[i].encoded, my_ed_priv_seed=contacts[i][0],
         )
         decrypted.append((idx, share))
-    bogus = sr.combine_shares(decrypted)
-    assert bogus != seed_a
-    assert bogus != seed_b
+    with pytest.raises(ValueError, match="do not reconstruct the original seed"):
+        sr.combine_shares(decrypted)
 
 
 # ── parsing ────────────────────────────────────────────────────────
@@ -306,3 +306,134 @@ def test_setup_helper_round_trip():
         )
         decrypted.append((idx, share_bytes))
     assert sr.reconstruct_from_decrypted_shares(decrypted) == master
+
+
+# ── a recovery can tell when it has gone wrong ─────────────────────
+
+
+def _split(k: int = 3, n: int = 5):
+    master = os.urandom(32)
+    contacts = [_gen_ed25519() for _ in range(n)]
+    wrapped = sr.split_and_wrap(
+        seed=master, contact_ed_pubs=[c[1] for c in contacts],
+        threshold_k=k, total_n=n,
+    )
+    opened = [
+        sr.unwrap_share(wrapped=w.encoded, my_ed_priv_seed=c[0])
+        for w, c in zip(wrapped, contacts)
+    ]
+    return master, contacts, wrapped, opened
+
+
+def test_any_threshold_subset_reconstructs_and_is_verified():
+    import itertools
+
+    master, _contacts, _wrapped, opened = _split()
+    for subset in itertools.combinations(opened, 3):
+        assert sr.combine_shares_checked(list(subset)) == (master, True)
+    # More than the threshold is fine too.
+    assert sr.combine_shares(opened) == master
+
+
+def test_one_damaged_share_is_detected():
+    master, _contacts, _wrapped, opened = _split()
+    idx, payload = opened[0]
+    damaged = (idx, bytes([payload[0] ^ 0x01]) + payload[1:])
+    with pytest.raises(ValueError, match="do not reconstruct the original seed"):
+        sr.combine_shares([damaged, opened[1], opened[2]])
+
+
+def test_the_same_share_twice_is_refused():
+    _master, _contacts, _wrapped, opened = _split()
+    with pytest.raises(ValueError, match="more than once"):
+        sr.combine_shares([opened[0], opened[0], opened[1]])
+
+
+def test_a_guardian_cannot_be_given_two_shares():
+    master = os.urandom(32)
+    contacts = [_gen_ed25519() for _ in range(3)]
+    pubs = [contacts[0][1], contacts[0][1], contacts[1][1]]
+    with pytest.raises(ValueError, match="must not repeat a guardian"):
+        sr.split_and_wrap(seed=master, contact_ed_pubs=pubs, threshold_k=2, total_n=3)
+
+
+def test_legacy_shares_are_reported_as_unverifiable():
+    from one_link import threshold
+
+    master = os.urandom(32)
+    legacy = [(s.x, s.y) for s in threshold.split(secret=master, threshold=3, num_shares=5)]
+    assert sr.combine_shares_checked(legacy[:3]) == (master, False)
+    with pytest.raises(sr.UnverifiableSharesError):
+        sr.combine_shares(legacy[:3])
+    assert sr.combine_shares(legacy[:3], allow_unverified=True) == master
+    # The reason they are refused by default: two of three look just as valid.
+    wrong, verified = sr.combine_shares_checked(legacy[:2])
+    assert wrong != master and verified is False
+
+
+def test_legacy_and_current_shares_do_not_mix():
+    from one_link import threshold
+
+    master, _contacts, _wrapped, opened = _split()
+    legacy = [(s.x, s.y) for s in threshold.split(secret=master, threshold=3, num_shares=5)]
+    with pytest.raises(ValueError, match="different lengths"):
+        sr.combine_shares([opened[0], opened[1], legacy[2]])
+
+
+# ── shares are signed by their creator ─────────────────────────────
+
+
+def test_share_names_the_identity_the_seed_derives():
+    from one_link import master_seed
+
+    master, _contacts, wrapped, _opened = _split()
+    expected = master_seed.derive_identity_priv(master).public_key().public_bytes_raw()
+    for share in wrapped:
+        assert share.version == sr.SHARE_VERSION
+        assert share.creator_ed_pub == expected
+        assert sr.WrappedShare.parse(share.encoded).creator_ed_pub == expected
+
+
+def test_altered_share_is_refused_before_decryption():
+    _master, contacts, wrapped, _opened = _split()
+    blob = bytearray(wrapped[0].encoded)
+    blob[sr.HEADER_LEN + 3] ^= 0x01  # one ciphertext bit
+    with pytest.raises(ValueError, match="signature is invalid"):
+        sr.WrappedShare.parse(bytes(blob))
+    with pytest.raises(ValueError, match="signature is invalid"):
+        sr.unwrap_share(wrapped=bytes(blob), my_ed_priv_seed=contacts[0][0])
+
+
+def test_header_fields_are_covered_by_the_signature():
+    _master, _contacts, wrapped, _opened = _split()
+    blob = bytearray(wrapped[0].encoded)
+    blob[7] = 2  # claim a lower threshold
+    with pytest.raises(ValueError, match="signature is invalid"):
+        sr.WrappedShare.parse(bytes(blob))
+
+
+def test_share_cannot_be_re_signed_under_another_identity():
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    _master, contacts, wrapped, _opened = _split()
+    body = wrapped[0].encoded[: -sr.SIGNER_TRAILER_LEN]
+    imposter = Ed25519PrivateKey.generate()
+    imposter_pub = imposter.public_key().public_bytes_raw()
+    forged = body + imposter_pub + imposter.sign(sr.SIGNATURE_DOMAIN + imposter_pub + body)
+    # The signature is valid for the imposter, so it parses and names them...
+    assert sr.WrappedShare.parse(forged).creator_ed_pub == imposter_pub
+    # ...but the creator's key is bound into the ciphertext, so it will not open.
+    with pytest.raises(ValueError, match="decrypt failed"):
+        sr.unwrap_share(wrapped=forged, my_ed_priv_seed=contacts[0][0])
+
+
+def test_explicit_signing_key_is_used():
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    signer = Ed25519PrivateKey.generate()
+    contacts = [_gen_ed25519() for _ in range(3)]
+    wrapped = sr.split_and_wrap(
+        seed=os.urandom(32), contact_ed_pubs=[c[1] for c in contacts],
+        threshold_k=2, total_n=3, signing_key=signer,
+    )
+    assert {w.creator_ed_pub for w in wrapped} == {signer.public_key().public_bytes_raw()}

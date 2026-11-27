@@ -5,17 +5,21 @@ The public key's BLAKE3 fingerprint (first 8 hex chars) is the device ID
 shown to the user. The private key never leaves disk.
 
 Optional passphrase encryption-at-rest:
-    Set the ONE_LINK_PASSPHRASE environment variable before launching the
-    daemon and the private key file is wrapped with PKCS#8
-    BestAvailableEncryption (currently AES-256 + PBKDF2). The same
-    variable must be set on subsequent launches to decrypt.
+    Set ONE_LINK_PASSPHRASE (or point ONE_LINK_PASSPHRASE_FILE at a file
+    holding it) before launching the daemon and the private key file is
+    sealed with ChaCha20-Poly1305 under a key derived from the passphrase
+    by scrypt (N=2^17, r=8, p=1: about 128 MiB of memory per guess). The
+    same passphrase must be available on subsequent launches to decrypt.
 
-    If you switch from unencrypted to encrypted, the existing file is
-    transparently re-saved with encryption on next successful load.
+    Two older on-disk forms are still read: unencrypted PKCS#8 PEM, and
+    PKCS#8 PEM encrypted by ``BestAvailableEncryption``, whose PBKDF2 runs
+    only 2,048 iterations. Either one is transparently re-saved in the
+    sealed form on the next successful load with a passphrase.
 """
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import logging
 import os
@@ -33,15 +37,168 @@ from typing import NoReturn, Optional
 log = logging.getLogger(__name__)
 
 import blake3
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
 from one_link.paths import key_path
 
 PASSPHRASE_ENV = "ONE_LINK_PASSPHRASE"
+
+# ─── sealed identity key ────────────────────────────────────────────
+#
+# A passphrase-protected identity key is stored as PEM-style armor: a BEGIN
+# line and an END line labelled ONE LINK ENCRYPTED PRIVATE KEY (built by
+# ``_armor_line`` below), around
+#
+#     base64( header || nonce || ciphertext+tag )
+#
+#     header = magic(5) || kdf(1) || log2_n(1) || r(1) || p(1) || salt(16)
+#
+# The plaintext is the key's unencrypted PKCS#8 DER. The header is the AEAD
+# associated data, so the KDF parameters cannot be swapped without the tag
+# failing. ``cryptography``'s own PKCS#8 encryption is not used for writing:
+# it offers no way to choose the KDF and derives the key with 2,048 rounds of
+# PBKDF2, which a GPU can test at millions of guesses per second.
+
+
+def _armor_line(edge: str, label: str) -> bytes:
+    """One PEM armor line: five dashes, BEGIN or END, the label, five dashes.
+
+    Built here and written out nowhere. To a secret scanner a literal
+    BEGIN/END pair in source is a private key, and exempting this module from
+    that rule would also exempt a real key pasted into it.
+    """
+    return f"-----{edge} {label}-----".encode("ascii")
+
+
+_SEALED_LABEL = "ONE LINK ENCRYPTED PRIVATE KEY"
+_SEALED_BEGIN = _armor_line("BEGIN", _SEALED_LABEL)
+_SEALED_END = _armor_line("END", _SEALED_LABEL)
+# The first line of what ``cryptography`` writes for an encrypted PKCS#8 key.
+_LEGACY_ENCRYPTED_BEGIN = _armor_line("BEGIN", "ENCRYPTED PRIVATE KEY")
+_SEALED_MAGIC = b"OLIK\x01"
+_SEALED_KDF_SCRYPT = 1
+_SEALED_SALT_LEN = 16
+_SEALED_NONCE_LEN = 12
+_SEALED_HEADER_LEN = len(_SEALED_MAGIC) + 4 + _SEALED_SALT_LEN
+# Parameters written today. They match the lockbox, so the identity key is
+# no easier to brute-force than the other secret the same passphrase guards.
+_SEALED_LOG2_N = 17
+_SEALED_R = 8
+_SEALED_P = 1
+# Parameters accepted when reading. The floor refuses a file that was
+# rewritten to be cheap to attack; the ceiling refuses one that would make
+# this process allocate gigabytes before it can reject a wrong passphrase.
+_SEALED_LOG2_N_RANGE = range(15, 21)
+
+PROTECTION_SEALED = "sealed"
+PROTECTION_LEGACY_PEM = "legacy-pem"
+PROTECTION_NONE = "none"
+
+
+def _sealed_key(passphrase: bytes, salt: bytes, log2_n: int, r: int, p: int) -> bytes:
+    return Scrypt(salt=salt, length=32, n=1 << log2_n, r=r, p=p).derive(passphrase)
+
+
+def _seal_private_key(priv: Ed25519PrivateKey, passphrase: bytes) -> bytes:
+    """Serialize ``priv`` in the sealed form described above."""
+    if not passphrase:
+        raise ValueError("sealing an identity key requires a passphrase")
+    salt = os.urandom(_SEALED_SALT_LEN)
+    header = (
+        _SEALED_MAGIC
+        + bytes([_SEALED_KDF_SCRYPT, _SEALED_LOG2_N, _SEALED_R, _SEALED_P])
+        + salt
+    )
+    nonce = os.urandom(_SEALED_NONCE_LEN)
+    der = priv.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    key = _sealed_key(passphrase, salt, _SEALED_LOG2_N, _SEALED_R, _SEALED_P)
+    sealed = ChaCha20Poly1305(key).encrypt(nonce, der, header)
+    body = base64.encodebytes(header + nonce + sealed)
+    return _SEALED_BEGIN + b"\n" + body + _SEALED_END + b"\n"
+
+
+def _open_sealed_private_key(blob: bytes, passphrase: Optional[bytes]):
+    text = blob.strip()
+    if not text.endswith(_SEALED_END):
+        raise ValueError("sealed identity key is truncated")
+    if not passphrase:
+        raise TypeError("identity key is sealed and no passphrase was given")
+    try:
+        raw = base64.b64decode(
+            text[len(_SEALED_BEGIN) : -len(_SEALED_END)], validate=False
+        )
+    except ValueError as exc:
+        raise ValueError("sealed identity key is not valid base64") from exc
+    if len(raw) < _SEALED_HEADER_LEN + _SEALED_NONCE_LEN + 16:
+        raise ValueError("sealed identity key is too short")
+    header = raw[:_SEALED_HEADER_LEN]
+    if not header.startswith(_SEALED_MAGIC):
+        raise ValueError("sealed identity key has an unknown format version")
+    kdf, log2_n, r, p = header[len(_SEALED_MAGIC) : len(_SEALED_MAGIC) + 4]
+    if (
+        kdf != _SEALED_KDF_SCRYPT
+        or log2_n not in _SEALED_LOG2_N_RANGE
+        or r != _SEALED_R
+        or p != _SEALED_P
+    ):
+        raise ValueError("sealed identity key declares unsupported KDF parameters")
+    salt = header[-_SEALED_SALT_LEN:]
+    nonce = raw[_SEALED_HEADER_LEN : _SEALED_HEADER_LEN + _SEALED_NONCE_LEN]
+    key = _sealed_key(passphrase, salt, log2_n, r, p)
+    try:
+        der = ChaCha20Poly1305(key).decrypt(
+            nonce, raw[_SEALED_HEADER_LEN + _SEALED_NONCE_LEN :], header
+        )
+    except InvalidTag as exc:
+        raise ValueError("wrong passphrase or damaged sealed identity key") from exc
+    return serialization.load_der_private_key(der, password=None)
+
+
+def key_file_protection(blob: bytes) -> str:
+    """Which protection an identity key file carries, judged by its header.
+
+    Reads no secret and needs no passphrase, so a health check can report it.
+    """
+    head = blob.lstrip()
+    if head.startswith(_SEALED_BEGIN):
+        return PROTECTION_SEALED
+    if head.startswith(_LEGACY_ENCRYPTED_BEGIN):
+        return PROTECTION_LEGACY_PEM
+    return PROTECTION_NONE
+
+
+def decode_private_key_file(blob: bytes, passphrase: Optional[bytes]):
+    """Decode an identity key file in any form this project has written.
+
+    Returns ``(private_key, protection)`` where ``protection`` is one of
+    :data:`PROTECTION_SEALED`, :data:`PROTECTION_LEGACY_PEM` or
+    :data:`PROTECTION_NONE`. Raises ``TypeError`` when the file is encrypted
+    and no passphrase was given, and ``ValueError`` when it cannot be decoded
+    (wrong passphrase included). An unencrypted file loads whether or not a
+    passphrase is configured; the caller decides whether to re-save it.
+    """
+    head = blob.lstrip()
+    if head.startswith(_SEALED_BEGIN):
+        return _open_sealed_private_key(blob, passphrase), PROTECTION_SEALED
+    if head.startswith(_LEGACY_ENCRYPTED_BEGIN):
+        if not passphrase:
+            raise TypeError("identity key is encrypted and no passphrase was given")
+        return (
+            serialization.load_pem_private_key(blob, password=passphrase),
+            PROTECTION_LEGACY_PEM,
+        )
+    return serialization.load_pem_private_key(blob, password=None), PROTECTION_NONE
 
 
 @dataclass(frozen=True)
@@ -94,6 +251,9 @@ def _fingerprint(public_bytes: bytes) -> str:
 
 def _resolve_passphrase(passphrase: Optional[bytes | str]) -> Optional[bytes]:
     if passphrase is None:
+        from one_link.passphrase_source import adopt_passphrase_file
+
+        adopt_passphrase_file()
         env = os.environ.get(PASSPHRASE_ENV)
         if env:
             return env.encode("utf-8")
@@ -500,25 +660,29 @@ def _save_key(
         atomic_replace_bytes,
     )
 
-    enc = (
-        serialization.BestAvailableEncryption(passphrase)
-        if passphrase
-        else serialization.NoEncryption()
-    )
-    pem = priv.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=enc,
-    )
+    if passphrase:
+        pem = _seal_private_key(priv, passphrase)
+        wanted_protection = PROTECTION_SEALED
+    else:
+        pem = priv.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        wanted_protection = PROTECTION_NONE
     expected = priv.private_bytes_raw()
 
     def _validate(blob: bytes) -> None:
         try:
-            loaded = serialization.load_pem_private_key(blob, password=passphrase)
+            loaded, protection = decode_private_key_file(blob, passphrase)
         except (TypeError, ValueError) as exc:
             raise KeyMaterialIntegrityError(
                 "persisted identity key cannot be decoded with its requested protection"
             ) from exc
+        if protection != wanted_protection:
+            raise KeyMaterialIntegrityError(
+                "persisted identity key does not carry its requested protection"
+            )
         if not isinstance(loaded, Ed25519PrivateKey):
             raise KeyMaterialIntegrityError(
                 "persisted identity key has an unexpected key type"
@@ -626,24 +790,18 @@ def _load_existing_private_key(
     if blob is None:
         return None
     pw = _resolve_passphrase(passphrase)
-    errors: list[Exception] = []
-    candidates: tuple[Optional[bytes], ...] = (pw, None) if pw else (None,)
-    for candidate in candidates:
-        try:
-            loaded = serialization.load_pem_private_key(blob, password=candidate)
-        except (TypeError, ValueError) as exc:
-            errors.append(exc)
-            continue
-        if not isinstance(loaded, Ed25519PrivateKey):
-            raise KeyMaterialIntegrityError(
-                f"identity key at {p} is not an Ed25519 private key"
-            )
-        return loaded
-    detail = errors[0] if errors else "unknown decode failure"
-    raise KeyMaterialIntegrityError(
-        f"identity key at {p} could not be decoded with the configured protection: "
-        f"{detail}"
-    )
+    try:
+        loaded, _protection = decode_private_key_file(blob, pw)
+    except (TypeError, ValueError) as exc:
+        raise KeyMaterialIntegrityError(
+            f"identity key at {p} could not be decoded with the configured protection: "
+            f"{exc}"
+        ) from exc
+    if not isinstance(loaded, Ed25519PrivateKey):
+        raise KeyMaterialIntegrityError(
+            f"identity key at {p} is not an Ed25519 private key"
+        )
+    return loaded
 
 
 def identity_file_matches_seed(
@@ -727,72 +885,46 @@ def load_or_create(
     )
 
     if existing_bytes is not None:
-        data = existing_bytes
-        # Try the passphrase we have first; fall back to no-password to
-        # support transparent migration unencrypted → encrypted.
-        priv = None
-        first_err: Optional[Exception] = None
         try:
-            priv = serialization.load_pem_private_key(data, password=pw)
-        except (TypeError, ValueError) as e:
-            first_err = e
-            try:
-                priv = serialization.load_pem_private_key(data, password=None)
-                # File was unencrypted on disk; if a passphrase is set now,
-                # re-save encrypted for "transparent migration." The
-                # narrowing-cast tells mypy the loaded key is Ed25519
-                # (verified downstream by the caller); _save_key's
-                # signature is intentionally tight.
-                if pw:
-                    if not isinstance(priv, Ed25519PrivateKey):
-                        raise RuntimeError(
-                            "key file must hold an Ed25519 private key"
-                        )
-                    # 2026-05-21 audit T1-K: file-lock the migration
-                    # so two daemons starting at the same time don't
-                    # race ``_zero_overwrite_file → _save_key``. If
-                    # we lose the race (lock file already exists),
-                    # the other process wins — we just re-load.
-                    # Cross-platform via O_CREAT|O_EXCL.
-                    lock_path = p.with_suffix(p.suffix + ".migrate.lock")
-                    lock_fd = None
-                    try:
-                        try:
-                            lock_fd = os.open(
-                                str(lock_path),
-                                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                                0o600,
-                            )
-                        except FileExistsError:
-                            # Another process is migrating right now.
-                            # Re-read the file in a moment and trust
-                            # what they wrote. If their migration
-                            # crashes mid-way we'll need a lock-file
-                            # sweep, but a 5s-stale lock cleanup is
-                            # outside this fix's scope.
-                            pass
-                        else:
-                            # Build, fsync, decode, and key-compare the
-                            # encrypted replacement before the atomic
-                            # publish.  The old cleartext authority is never
-                            # modified on a save/fsync/ACL/rename failure.
-                            _migrate_key_encryption(p, priv, pw)
-                    finally:
-                        if lock_fd is not None:
-                            with contextlib.suppress(Exception):
-                                os.close(lock_fd)
-                            with contextlib.suppress(Exception):
-                                lock_path.unlink()
-            except (TypeError, ValueError):
-                pass
-        if priv is None:
-            # Encrypted but wrong/missing passphrase
+            priv, protection = decode_private_key_file(existing_bytes, pw)
+        except (TypeError, ValueError) as first_err:
+            # Encrypted, and the passphrase is wrong or missing.
             raise RuntimeError(
                 f"identity key at {p} is encrypted; set {PASSPHRASE_ENV} "
                 f"with the correct passphrase ({first_err})"
-            )
+            ) from first_err
         if not isinstance(priv, Ed25519PrivateKey):
             raise RuntimeError(f"unexpected key type at {p}: {type(priv).__name__}")
+        if pw and protection != PROTECTION_SEALED:
+            # The file is unencrypted, or encrypted under the old 2,048-round
+            # PBKDF2. A passphrase is available now, so re-save it sealed.
+            #
+            # 2026-05-21 audit T1-K: file-lock the migration so two daemons
+            # starting at the same time don't race each other. If the lock
+            # already exists another process is migrating right now; this one
+            # keeps the key it just loaded and leaves the file to the winner.
+            lock_path = p.with_suffix(p.suffix + ".migrate.lock")
+            lock_fd = None
+            try:
+                try:
+                    lock_fd = os.open(
+                        str(lock_path),
+                        os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                        0o600,
+                    )
+                except FileExistsError:
+                    pass
+                else:
+                    # Build, fsync, decode, and key-compare the sealed
+                    # replacement before the atomic publish. The old file is
+                    # never modified on a save/fsync/ACL/rename failure.
+                    _migrate_key_encryption(p, priv, pw)
+            finally:
+                if lock_fd is not None:
+                    with contextlib.suppress(Exception):
+                        os.close(lock_fd)
+                    with contextlib.suppress(Exception):
+                        lock_path.unlink()
     else:
         # v0.20.7 (master-seed integration): if a master seed has
         # been provisioned (either via "one-link backup init" or

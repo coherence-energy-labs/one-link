@@ -125,3 +125,37 @@ Source commits: 59beb1349f422e4913586978b878e4eb7bc5e31c and 78538b5987bdab9a405
 The before/negative-control reports deliberately reproduce failures; overlapping positive suites are not added together. Ruff passed for changed files; mypy checked all 243 source files without issues. The real two-daemon reconnect test passed on 59beb13; full exact-revision hosted gates still required.
 
 Remaining gaps: cross-delivery parked-consent supersession and grant retention after a new-delivery admission failure are not closed by the exact-contract guard. Durable cancellation across failed namespace operations, pre-existing active-cancel and finalization edge cases, full crash-point matrix, independent review, and physical/long-duration performance qualification remain distinct gates. This evidence does not supersede the original audit findings by assertion. The protected release and existing live installation remain unchanged.
+
+
+## Root-cause consolidation and hosted failure repair
+
+Integrated upstream remediation ae5c81b02aaad0ef7382c94494c21fe3893b6a45 into prior Phase Zero revision 097f88605554c885f05fcaeec10c1fbfe738eba8 without overwriting either branch's fixes. Implementation commit: 7734db5a6dc53ef14269490c4066f00f10459353.
+
+The inherited audit ledger contains 44 distinct findings. PHASE_ZERO_OVERHAUL_COVERAGE.json groups all 44 in 11 root-cause clusters and preserves the inherited statuses, residual requirements and global qualification requirements. A test refuses an omitted, duplicated or silently changed finding. This supplements rather than rewrites the historical ledger.
+
+Hosted run 45919589259 on the preceding Phase Zero revision failed two class-census assertions in each full suite and a Windows Chromium rendezvous case; all eight live daemon shards passed. The Linux full suite reported 10,881 passes, 2 failures, 51 skips; Windows 10,885 passes, 2 failures, 47 skips. These historical counts are not exact-final-revision acceptance.
+
+### Root mechanisms changed
+
+- Extract the complete owner consent lifecycle into held_offers behind a typed ConsentPort. Public daemon API remains stable. No architecture-ratchet exception or relaxation: Daemon 497 methods and 33,162 method lines, versus the failing 501-method combined state and upstream baseline 499 methods / 33,312 method lines. UIServer unchanged.
+- A rendezvous registration owns its refresh timer and single in-flight request. Pagehide suspends scheduling even while a request is outstanding; pageshow cannot multiply timers; obsolete queued callbacks and replaced registrations cannot act. Five deterministic lifecycle regressions execute the real authoring module. Regenerated peer HTML and both generated page checks passed. Windows Chromium assertion waits for a fresh network POST and newly committed success status, not an earlier success string.
+- Bound ACK storage to outstanding chunk IDs. Verify explicit blob, batch cardinality, unique IDs and negative verdicts; ignore unknown/stale IDs. Preserve the first local application-read timestamp for every batch member instead of later settlement times. This is bounded storage and improved timing semantics, not packet-arrival time or a claimed throughput multiplier. Legacy missing-blob/count compatibility is bound by outstanding request correlation.
+- Reject a revoked peer before liveness updates. If its first CAPS arrives after revocation, refuse without trying to send from the only task that can finish negotiation. A real socket regression reproduced the two-second timeout before correction and now verifies channel and slot release.
+- Preserve canonical LF bytes for the JavaScript ownership ledger in Windows checkouts through a narrow .gitattributes rule, not a weakened test. The locked dependency installation used the existing npm cache (offline, no install scripts). All 95 JS tests passed; ownership census remains exactly 336 cross-module writes with no cross-closure references.
+- Repository governance read-back confirms active master rule 20516627 with no bypass actors, active version tag rule 28202878, required independent release review and no administrator bypass for the release environment. The tag rule's documented repository-admin bypass is unchanged.
+
+### Executed local evidence
+
+| Report | Tests | Failures | Errors | Skipped | SHA-256 |
+|---|---:|---:|---:|---:|---|
+| combined.xml | 375 | 0 | 0 | 10 | 87a7ba77d6daab6816281f44642a0e14d1e0f3f81796049528da795589ac357a |
+| ack.xml | 213 | 0 | 0 | 1 | 79e284963c3cd78bb314f4fd8fe865529db1af26b40c5c09db21421250620c75 |
+| browser-v2.xml | 1 | 0 | 0 | 0 | d6c8f5d4836992332c1bcdb52b71a5d9329b3502277039bd1e59ddf801ed1c73 |
+| revocation-before.xml | 1 | 1 | 0 | 0 | 9a6f5005b701b01d31441d62d9426970388a30b5dcf01889aa7c9fd445ed25e0 |
+| revocation-after.xml | 85 | 0 | 0 | 0 | 054e4045235bc1b64a8e4db2a0306f782268fba28fc3500961215e835d693f64 |
+
+The suites overlap and cannot be summed as unique tests. The pre-fix revocation report is an expected failed witness. The Chromium test used the existing browser-enabled environment (native binary SHA-256 7dfc157c95d8e7c405eae7d272d9fe239b54577d3c739f7c5f3853e10b7cbf7c), not a fresh final artifact; the first invocation had no Playwright plugin and did not run. Ruff and whole-source mypy passed at the preceding code checkpoints; class census and full npm suite passed after the final root fixes. Seven audit-ledger and coverage tests passed. Governance read-back SHA-256: 87e6947bb56ae5a5669ee6cc43f8c0c5e6b33a9f4af4e5c175370fb6ca6565f0.
+
+### Remaining qualification
+
+Full current-revision hosted runs and independent review remain mandatory. Source or benchmark claims do not substitute for actual packaged release builds, independent artifact provenance, dedicated constant-time measurements, physical LAN/WAN and mobile tests, or the long-duration acceptance campaign. Cross-delivery parked-consent supersession and admission-failure grant retention remain open, as do further architectural decomposition, controlled scanner/QUIC optimization and older peer paths noted in the source ledger. No 10x network speedup or 100% closure is asserted. The running owner installation and protected master remain unchanged.

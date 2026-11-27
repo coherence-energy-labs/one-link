@@ -56,6 +56,17 @@ LIVE_INTEGRATION_ENV = "ONE_LINK_RUN_LIVE_INTEGRATION"
 _CONTROL_SECRETS: dict[int, tuple[str, Path]] = {}
 
 
+def daemon_boot_budget_s() -> float:
+    """How long a test waits for a daemon it started to become ready.
+
+    One budget for every test that starts a daemon. It has to be generous
+    enough that a slow but healthy start on a loaded runner is never called a
+    failure; a start that never happens is bounded by the per-test timeout.
+    Overridable for constrained hardware.
+    """
+    return float(os.environ.get("ONE_LINK_TEST_DAEMON_BOOT_S", "45"))
+
+
 def live_integration_enabled() -> bool:
     return os.environ.get(LIVE_INTEGRATION_ENV) == "1"
 
@@ -593,7 +604,7 @@ def _bring_up(
         # hang, so this only needs to be generous enough that a slow-but-
         # healthy boot is never called a failure. Overridable for operators
         # running on constrained hardware.
-        startup_budget = float(os.environ.get("ONE_LINK_TEST_DAEMON_BOOT_S", "45"))
+        startup_budget = daemon_boot_budget_s()
         http_deadline = time.time() + startup_budget
         ui_token_path = home / "data" / "ui.token"
         server_port_path = home / "data" / "server.port"

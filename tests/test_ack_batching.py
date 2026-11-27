@@ -463,6 +463,35 @@ def test_a_refusal_is_looked_for_in_every_queue_and_in_none_when_there_is_none()
     assert ack_batching.refusal_of_unanswered_chunk(refusal, []) is None
 
 
+def _yes() -> bool:
+    """The transfer the timer was armed for is still in progress."""
+    return True
+
+
+def test_a_timer_that_fires_for_a_transfer_that_has_ended_answers_nothing_and_drops_what_was_held():
+    async def scenario() -> None:
+        holder = SimpleNamespace(ack_batch_ids=["a", "b"], ack_batch_timer=None)
+        spawned: list[Any] = []
+        asked: list[bool] = []
+
+        async def flush() -> None:  # pragma: no cover - must not run
+            raise AssertionError("an answer was sent for a transfer that had ended")
+
+        def still_wanted() -> bool:
+            asked.append(True)
+            return False
+
+        assert ack_batching.arm_partial_flush(
+            holder, flush, spawn=spawned.append, still_wanted=still_wanted, delay_s=0.03,
+        )
+        assert asked == [], "the question is asked when the timer fires, not when it is armed"
+        await asyncio.sleep(0.1)
+        assert asked == [True] and spawned == []
+        assert holder.ack_batch_ids == [] and holder.ack_batch_timer is None
+
+    asyncio.run(scenario())
+
+
 def test_a_partial_batch_is_answered_after_the_delay_and_only_once():
     async def scenario() -> None:
         holder = SimpleNamespace(ack_batch_ids=["a"], ack_batch_timer=None)
@@ -478,11 +507,11 @@ def test_a_partial_batch_is_answered_after_the_delay_and_only_once():
             tasks.append(task)
             return task
 
-        assert ack_batching.arm_partial_flush(holder, flush, spawn=spawn, delay_s=0.2)
+        assert ack_batching.arm_partial_flush(holder, flush, spawn=spawn, still_wanted=_yes, delay_s=0.2)
         # A later chunk neither restarts the timer nor arms a second one.
         await asyncio.sleep(0.12)
         holder.ack_batch_ids.append("b")
-        assert not ack_batching.arm_partial_flush(holder, flush, spawn=spawn, delay_s=0.2)
+        assert not ack_batching.arm_partial_flush(holder, flush, spawn=spawn, still_wanted=_yes, delay_s=0.2)
         assert flushed == []
         # 0.27 s after arming: a timer restarted at 0.12 s would not have fired yet.
         await asyncio.sleep(0.15)
@@ -490,7 +519,7 @@ def test_a_partial_batch_is_answered_after_the_delay_and_only_once():
         assert flushed == [["a", "b"]], "the oldest chunk waited longer than the delay, or was answered twice"
         assert holder.ack_batch_timer is None
         # Nothing held: nothing to arm.
-        assert not ack_batching.arm_partial_flush(holder, flush, spawn=spawn, delay_s=0.2)
+        assert not ack_batching.arm_partial_flush(holder, flush, spawn=spawn, still_wanted=_yes, delay_s=0.2)
 
     asyncio.run(scenario())
 
@@ -503,7 +532,7 @@ def test_a_batch_that_fills_first_cancels_the_timer():
         async def flush() -> None:  # pragma: no cover - must not run
             raise AssertionError("the timer fired after it was cancelled")
 
-        assert ack_batching.arm_partial_flush(holder, flush, spawn=spawned.append, delay_s=0.03)
+        assert ack_batching.arm_partial_flush(holder, flush, spawn=spawned.append, still_wanted=_yes, delay_s=0.03)
         ack_batching.disarm_partial_flush(holder)
         assert holder.ack_batch_timer is None
         ack_batching.disarm_partial_flush(holder)  # twice is harmless
@@ -521,7 +550,7 @@ def test_a_timer_that_finds_nothing_held_sends_nothing():
         async def flush() -> None:  # pragma: no cover - must not run
             raise AssertionError("an empty batch was sent")
 
-        ack_batching.arm_partial_flush(holder, flush, spawn=spawned.append, delay_s=0.03)
+        ack_batching.arm_partial_flush(holder, flush, spawn=spawned.append, still_wanted=_yes, delay_s=0.03)
         holder.ack_batch_ids.clear()  # answered some other way, timer left armed
         await asyncio.sleep(0.1)
         assert spawned == [] and holder.ack_batch_timer is None
@@ -542,7 +571,7 @@ def test_a_late_answer_on_a_closed_connection_is_not_an_error():
             tasks.append(task)
             return task
 
-        ack_batching.arm_partial_flush(holder, flush, spawn=spawn, delay_s=0.01)
+        ack_batching.arm_partial_flush(holder, flush, spawn=spawn, still_wanted=_yes, delay_s=0.01)
         await asyncio.sleep(0.1)
         assert len(tasks) == 1
         assert await asyncio.gather(*tasks) == [None]
@@ -570,7 +599,15 @@ def _incoming_file() -> IncomingFile:
 def _bare_daemon() -> Daemon:
     daemon = Daemon.__new__(Daemon)
     daemon.me = SimpleNamespace(short_id="receiver")
+    daemon._incoming_files = {}
     return daemon
+
+
+def _receiving() -> tuple[Daemon, "_RecordingChannel", IncomingFile]:
+    """A daemon part-way through receiving one file, as the chunk handlers find it."""
+    daemon, incoming = _bare_daemon(), _incoming_file()
+    daemon._incoming_files[incoming.blob_hex] = incoming
+    return daemon, _RecordingChannel(), incoming
 
 
 def _acks(channel: _RecordingChannel) -> list[tuple[str, list[str]]]:
@@ -593,7 +630,7 @@ def test_the_daemon_answers_a_batch_the_sender_never_fills():
     """Two chunks promising a batch of eight, and then nothing: the old receiver waited for ever."""
 
     async def scenario() -> None:
-        daemon, channel, incoming = _bare_daemon(), _RecordingChannel(), _incoming_file()
+        daemon, channel, incoming = _receiving()
         await daemon._ack_file_chunk(channel, {"id": "c1", "ack_batch": 8}, incoming)
         await daemon._ack_file_chunk(channel, {"id": "c2", "ack_batch": 8}, incoming)
         assert _acks(channel) == [], "a partial batch is held, not answered at once"
@@ -608,7 +645,7 @@ def test_the_daemon_answers_a_batch_the_sender_never_fills():
 
 def test_the_daemon_answers_a_full_batch_at_once_and_drops_the_timer():
     async def scenario() -> None:
-        daemon, channel, incoming = _bare_daemon(), _RecordingChannel(), _incoming_file()
+        daemon, channel, incoming = _receiving()
         await daemon._ack_file_chunk(channel, {"id": "c1", "ack_batch": 2}, incoming)
         assert incoming.ack_batch_timer is not None
         await daemon._ack_file_chunk(channel, {"id": "c2", "ack_batch": 2}, incoming)
@@ -622,7 +659,7 @@ def test_the_daemon_answers_a_full_batch_at_once_and_drops_the_timer():
 
 def test_an_individual_answer_sends_what_was_held_first_so_answers_stay_in_order():
     async def scenario() -> None:
-        daemon, channel, incoming = _bare_daemon(), _RecordingChannel(), _incoming_file()
+        daemon, channel, incoming = _receiving()
         await daemon._ack_file_chunk(channel, {"id": "c1", "ack_batch": 4}, incoming)
         await daemon._ack_file_chunk(channel, {"id": "c2"}, incoming)  # no batch: answered by itself
         assert _acks(channel) == [("batch", ["c1"]), ("ack", ["c2"])]
@@ -632,6 +669,35 @@ def test_an_individual_answer_sends_what_was_held_first_so_answers_stay_in_order
         assert _acks(channel)[2:] == [("batch", ["c3"]), ("ack", ["c4"])]
         await asyncio.sleep(ack_batching.PARTIAL_BATCH_FLUSH_S * 2)
         assert len(_acks(channel)) == 4, "a timer left armed answered again"
+
+    asyncio.run(scenario())
+
+
+def test_the_daemon_does_not_answer_for_a_transfer_that_ended_some_other_way():
+    """Not every path that ends a transfer goes through the abort: a commit that
+    fails for a sender without commit receipts removes the file from the table
+    and reports the failure. A second review counted eight such sites. The
+    timer asks, when it fires, whether the file is still the one in progress."""
+
+    async def scenario() -> None:
+        daemon, channel, incoming = _receiving()
+        await daemon._ack_file_chunk(channel, {"id": "c1", "ack_batch": 4}, incoming)
+        assert incoming.ack_batch_timer is not None
+        daemon._incoming_files.pop(incoming.blob_hex)  # ended, without the abort
+        await asyncio.sleep(ack_batching.PARTIAL_BATCH_FLUSH_S * 3)
+        assert _acks(channel) == [], "an answer was sent for a transfer that had ended"
+        assert incoming.ack_batch_ids == [] and incoming.ack_batch_timer is None
+
+    asyncio.run(scenario())
+
+
+def test_the_daemon_does_not_answer_for_a_file_replaced_by_a_new_transfer_of_the_same_content():
+    async def scenario() -> None:
+        daemon, channel, incoming = _receiving()
+        await daemon._ack_file_chunk(channel, {"id": "c1", "ack_batch": 4}, incoming)
+        daemon._incoming_files[incoming.blob_hex] = _incoming_file()  # a fresh offer of the same blob
+        await asyncio.sleep(ack_batching.PARTIAL_BATCH_FLUSH_S * 3)
+        assert _acks(channel) == []
 
     asyncio.run(scenario())
 
@@ -697,6 +763,8 @@ def test_both_send_loops_are_the_loop_that_was_searched():
         "def _abort_incoming_file(self, blob: str, f: IncomingFile) -> None: "
         "ack_batching.disarm_partial_flush(f) f.ack_batch_ids.clear()"
     ) == 1
+    # The timer asks whether the file is still the one in progress.
+    assert flat.count("still_wanted=lambda: self._incoming_files.get(f.blob_hex) is f,") == 1
     # The reply wait hears a refusal of any chunk still in either loop's queue.
     assert flat.count("refusal = ack_batching.refusal_of_unanswered_chunk(m, unanswered_chunks)") == 1
     assert flat.count("unanswered_chunks.append(pending_cdc_sizes)") == 1

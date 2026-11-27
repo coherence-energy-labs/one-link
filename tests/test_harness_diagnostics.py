@@ -161,3 +161,36 @@ def test_pytest_prints_the_attached_logs_under_the_traceback(tmp_path: Path) -> 
         rendered = str(info.getrepr(style=style))
         assert "--- daemon B log tail ---" in rendered, style
         assert "still in step data-key acquisition" in rendered, style
+
+
+def test_every_wait_for_a_daemon_to_start_uses_one_budget(monkeypatch) -> None:
+    from tests.harness import daemon_boot_budget_s
+
+    monkeypatch.delenv("ONE_LINK_TEST_DAEMON_BOOT_S", raising=False)
+    assert daemon_boot_budget_s() == 45.0
+    monkeypatch.setenv("ONE_LINK_TEST_DAEMON_BOOT_S", "120")
+    assert daemon_boot_budget_s() == 120.0
+
+
+def test_the_lifecycle_tests_wait_for_start_up_as_long_as_the_harness_does(tmp_path: Path, monkeypatch) -> None:
+    """They waited a flat 12 s of their own. A hosted Windows runner once took longer
+    (schema initialisation alone took 8.1 s there), and a test about a token file failed
+    on the runner's load. The wait is the shared budget now; an explicit one is still honoured."""
+    import tests.test_lifecycle as lifecycle
+
+    home = tmp_path / "home"
+    (home / "data").mkdir(parents=True)
+
+    monkeypatch.setenv("ONE_LINK_TEST_DAEMON_BOOT_S", "0.4")
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="port file did not appear") as shared:
+        lifecycle._read_port(home, "server.port")
+    assert 0.3 <= time.monotonic() - started < 3.0
+    assert "of 0.40s" in str(shared.value)
+
+    monkeypatch.setenv("ONE_LINK_TEST_DAEMON_BOOT_S", "30")
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="port file did not appear") as explicit:
+        lifecycle._read_port(home, "server.port", timeout=0.2)
+    assert time.monotonic() - started < 3.0
+    assert "of 0.20s" in str(explicit.value)

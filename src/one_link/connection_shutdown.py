@@ -33,10 +33,19 @@ which is the one place that ends them, whichever way the stop arrives: the
 stopping event (``Daemon.request_shutdown``) or cancellation of the serving
 task (an interrupt).
 
+An independent review of this module found two things it had missed, both
+closed here. A connection that is *closing* is not yet closed: one closed with
+bytes still unsent to a client that has stopped reading (a tail subscriber
+evicted for being slow, say) is still counted by the server, and the stop used
+to skip it and could wait on it for ever. And before Python 3.12, where a
+closed server does not wait, serving had already ended by the time the stop
+looked, so it ended nothing; connections are now ended once in every case.
+
 Tests: ``tests/test_connection_shutdown.py`` (real asyncio servers, including
 the 3.12 behaviour this exists for) and
 ``tests/test_daemon_stops_with_open_connections.py`` (real daemons with a tail
-client, a quiet peer session and a held file offer).
+client, a quiet peer session, a held file offer and owner windows that no
+longer answer).
 """
 
 from __future__ import annotations
@@ -71,10 +80,14 @@ class AcceptedConnections:
             try:
                 await handler(reader, writer)
             finally:
-                # A handler that returns without closing its transport leaves a
-                # connection the server still counts. Keep it so the stop can
-                # close it; forget only what is already closing.
+                # Forget a connection only once its transport has let go of it.
+                # The server goes on counting one whose handler returned
+                # without closing it, and also one that was closed with bytes
+                # still unsent to a client that is not reading: closing is not
+                # closed. Both stay registered so that a stop can end them.
                 if writer.is_closing():
+                    with contextlib.suppress(Exception):
+                        await writer.wait_closed()
                     self._writers.discard(writer)
 
         return tracked
@@ -118,7 +131,9 @@ async def end_open_connections(
     if channels:
         await asyncio.gather(*(close_channel(channel) for channel in channels.values()))
     channel_writers = {id(getattr(channel, "writer", None)) for channel in channels.values()}
-    writers = [w for w in accepted.open_writers() if id(w) not in channel_writers and not w.is_closing()]
+    # Including the ones already closing: a transport that is still flushing
+    # to a client that does not read is still a connection the server waits for.
+    writers = [w for w in accepted.open_writers() if id(w) not in channel_writers]
     for writer in writers:
         with contextlib.suppress(Exception):
             writer.close()
@@ -165,9 +180,13 @@ async def serve_until_stopped(
         stop_wait.cancel()
         for server in servers:
             server.close()
+        # Once in every case: before Python 3.12 a closed server does not wait
+        # for its connections, so nothing below would run and they would be
+        # left for the process exit to cut.
+        await end_open_connections(live_channels, accepted, grace_s=grace_s)
         while still_serving := [task for task in serving if not task.done()]:
-            await end_open_connections(live_channels, accepted, grace_s=grace_s)
             await asyncio.wait(still_serving, timeout=sweep_s)
+            await end_open_connections(live_channels, accepted, grace_s=grace_s)
     for task in serving:
         if task.cancelled():
             continue  # how Server.serve_forever() reports that it was closed

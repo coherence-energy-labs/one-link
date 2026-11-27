@@ -11,6 +11,7 @@
     "tests/test_daemon_stops_with_open_connections.py::test_a_daemon_holding_a_file_offer_for_its_owner_stops",
     "tests/test_daemon_stops_with_open_connections.py::test_a_daemon_with_a_message_tail_attached_stops_and_the_tail_ends",
     "tests/test_daemon_stops_with_open_connections.py::test_a_daemon_with_a_quiet_peer_session_stops",
+    "tests/test_daemon_stops_with_open_connections.py::test_a_daemon_with_owner_windows_that_have_stopped_answering_stops",
     "tests/test_file_engine_perf_gate.py::test_perf_gate_receiver_rss_under_cap",
     "tests/test_file_engine_perf_gate.py::test_perf_gate_throughput_16mib_floor",
     "tests/test_file_offer_batch.py::test_file_offer_batch_receiver_processes_all_offers",

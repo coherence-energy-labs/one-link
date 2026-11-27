@@ -128,3 +128,54 @@ def test_a_daemon_holding_a_file_offer_for_its_owner_stops(monkeypatch):
         sender.join(timeout=60.0)
         assert not sender.is_alive(), "the sender was still waiting on a receiver that had stopped"
         assert not (outcome.get("reply") or {}).get("ok"), outcome
+
+
+@pytest.mark.live_daemon
+def test_a_daemon_with_owner_windows_that_have_stopped_answering_stops():
+    """The connection every running install has: the owner window's event socket.
+
+    The window's page may no longer be running (a suspended laptop, a frozen
+    tab), so nothing answers the daemon's close. A reviewer of the stop path
+    pointed out that nothing measured this; the web server allows a socket ten
+    seconds to answer a close and its handlers sixty to finish. Measured with
+    two such sockets attached: the daemon was gone 1.3 s after acknowledging
+    the stop. This keeps it that way.
+    """
+    import asyncio
+
+    import aiohttp
+
+    from one_link.server import OWNER_WS_PROTOCOL
+
+    with daemon_pair(pin_trust=True) as p:
+        token = (p.b.home / "data" / "ui.token").read_text().strip()
+        port = int((p.b.home / "data" / "server.port").read_text().strip())
+        attached, release, greetings = threading.Event(), threading.Event(), []
+
+        def windows() -> None:
+            async def main() -> None:
+                async with aiohttp.ClientSession() as session:
+                    sockets = []
+                    for _ in range(2):
+                        socket = await session.ws_connect(
+                            f"http://127.0.0.1:{port}/api/events",
+                            headers={"Authorization": f"Bearer {token}"},
+                            protocols=(OWNER_WS_PROTOCOL,), autoclose=False, autoping=False,
+                        )
+                        greetings.append((await socket.receive_json(timeout=10)).get("type"))
+                        sockets.append(socket)
+                    attached.set()
+                    while not release.is_set():  # never read again, never answer a close
+                        await asyncio.sleep(0.1)
+
+            asyncio.run(main())
+
+        thread = threading.Thread(target=windows, daemon=True)
+        thread.start()
+        try:
+            assert attached.wait(30.0), f"the event sockets did not attach: {greetings}"
+            assert greetings == ["hello", "hello"]
+            _stop_and_time(p.b)
+        finally:
+            release.set()
+            thread.join(timeout=10.0)

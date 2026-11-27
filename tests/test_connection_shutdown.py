@@ -54,10 +54,22 @@ async def _connect(port: int, count: int = 1) -> list[tuple[asyncio.StreamReader
     return clients
 
 
-async def _saw_the_end(client: tuple[asyncio.StreamReader, asyncio.StreamWriter]) -> bool:
+async def _saw_the_end(
+    client: tuple[asyncio.StreamReader, asyncio.StreamWriter], *, within: float = PROMPT_S,
+) -> bool:
+    """Whether the server ended this client's connection within the time allowed.
+
+    A timeout means it did not. ``asyncio.TimeoutError`` is the builtin
+    ``TimeoutError``, which is an ``OSError``: this helper used to catch it
+    together with the connection errors and so reported a client the server
+    had left connected as ended. An independent review found that; the test
+    after this one keeps it found.
+    """
     reader, writer = client
     try:
-        data = await asyncio.wait_for(reader.read(), timeout=PROMPT_S)
+        data = await asyncio.wait_for(reader.read(), timeout=within)
+    except TimeoutError:
+        return False
     except (ConnectionError, OSError):
         data = b""
     finally:
@@ -79,6 +91,25 @@ class _Channel:
             await asyncio.sleep(3600)
         self.writer.close()
         await self.writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_the_helper_can_tell_a_client_that_was_left_connected():
+    """Eight assertions below rest on ``_saw_the_end``. It has to be able to say no."""
+    accepted = AcceptedConnections()
+    server, port = await _serve(_until_the_connection_ends, accepted)
+    left_alone, ended = await _connect(port, 2)
+    try:
+        ended_writer = next(w for w in accepted.open_writers() if w.get_extra_info("peername")[1]
+                            == ended[1].get_extra_info("sockname")[1])
+        ended_writer.close()
+        assert await _saw_the_end(ended, within=2.0) is True
+        assert await _saw_the_end(left_alone, within=0.5) is False
+    finally:
+        server.close()
+        for writer in accepted.open_writers():
+            writer.close()
+        await asyncio.wait_for(server.wait_closed(), timeout=PROMPT_S)
 
 
 @pytest.mark.asyncio
@@ -276,6 +307,137 @@ def _daemon(tmp_path: Path, monkeypatch):
     fp = fingerprint_of(raw)
     return Daemon(Identity(private=sk, public=sk.public_key(), public_bytes=raw, fingerprint=fp,
                            short_id=fp[:8], hostname="stop-host"))
+
+
+class _Writer:
+    """A stream writer reduced to what the stop uses, whose close finishes only when the test says so."""
+
+    def __init__(self, *, close_finishes_by_itself: bool) -> None:
+        self._finishes = close_finishes_by_itself
+        self._closing = False
+        self._closed = asyncio.Event()
+        self.aborted = False
+        self.transport = self
+
+    def close(self) -> None:
+        self._closing = True
+        if self._finishes:
+            self._closed.set()
+
+    def is_closing(self) -> bool:
+        return self._closing
+
+    async def wait_closed(self) -> None:
+        await self._closed.wait()
+
+    def abort(self) -> None:
+        self.aborted = True
+        self._closing = True
+        self._closed.set()
+
+
+async def _closes_and_returns(_reader, writer) -> None:
+    """Like the daemon evicting a tail subscriber that has stopped reading: close, and move on."""
+    writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_connection_that_is_closing_but_not_closed_stays_registered():
+    """Closing is not closed. The server goes on counting a transport that still has
+    bytes to deliver to a client that is not reading, so the stop must still know of it."""
+    accepted = AcceptedConnections()
+    writer = _Writer(close_finishes_by_itself=False)
+    handler = asyncio.ensure_future(accepted.tracking(_closes_and_returns)(None, writer))
+    await asyncio.sleep(0.05)
+    assert accepted.open_writers() == (writer,), "a connection the server still counts was forgotten"
+    writer.abort()
+    await asyncio.wait_for(handler, timeout=1.0)
+    assert accepted.open_writers() == ()
+
+
+@pytest.mark.asyncio
+async def test_a_stop_aborts_a_connection_that_is_closing_and_never_finishes():
+    accepted = AcceptedConnections()
+    writer = _Writer(close_finishes_by_itself=False)
+    handler = asyncio.ensure_future(accepted.tracking(_closes_and_returns)(None, writer))
+    await asyncio.sleep(0.05)
+    started = time.monotonic()
+    assert await end_open_connections({}, accepted, grace_s=0.3) == 1
+    waited = time.monotonic() - started
+    assert writer.aborted, "a connection stuck in closing was left for the server to wait on for ever"
+    assert 0.2 <= waited < 2.0, f"it gets the grace first and no more ({waited:.2f}s)"
+    await asyncio.wait_for(handler, timeout=1.0)
+    assert accepted.open_writers() == ()
+
+
+@pytest.mark.asyncio
+async def test_a_stop_does_not_wait_for_bytes_a_client_will_never_read():
+    """The same with real sockets: a handler floods a client that does not read, closes, and returns."""
+    accepted = AcceptedConnections()
+    left_unsent: list[int] = []
+
+    async def floods_then_closes(_reader, writer) -> None:
+        writer.write(b"x" * (64 * 1024 * 1024))
+        left_unsent.append(writer.transport.get_write_buffer_size())
+        writer.close()
+
+    server, port = await _serve(floods_then_closes, accepted)
+    clients = await _connect(port)
+    await asyncio.sleep(0.2)
+    stopping = asyncio.Event()
+    serving = asyncio.create_task(serve_until_stopped((server,), stopping, {}, accepted, grace_s=0.5))
+    await asyncio.sleep(0.1)
+    produced = bool(left_unsent and left_unsent[0] > 0 and accepted.open_writers())
+    started = time.monotonic()
+    stopping.set()
+    try:
+        await asyncio.wait_for(serving, timeout=PROMPT_S)
+    finally:
+        for _reader, writer in clients:
+            writer.close()
+    assert time.monotonic() - started < PROMPT_S
+    assert accepted.open_writers() == ()
+    if not produced:
+        pytest.skip("this platform accepted every byte at once, so nothing was left closing; "
+                    "the two tests above cover the case with a scripted writer")
+
+
+async def _until_closed(_reader, writer) -> None:
+    await writer.wait_closed()
+
+
+class _ServerThatDoesNotWait:
+    """A closed asyncio server before Python 3.12: its serving ends at once, whatever is still connected."""
+
+    def __init__(self) -> None:
+        self._closed = asyncio.Event()
+
+    async def serve_forever(self) -> None:
+        await self._closed.wait()
+        raise asyncio.CancelledError()
+
+    def close(self) -> None:
+        self._closed.set()
+
+
+@pytest.mark.asyncio
+async def test_connections_are_ended_even_when_the_servers_had_already_stopped_serving():
+    """``Daemon.request_shutdown`` closes both servers and then sets the event. Before Python
+    3.12 serving has ended by the time the stop looks, and it used to conclude there was nothing to end."""
+    accepted = AcceptedConnections()
+    writer = _Writer(close_finishes_by_itself=True)
+    handler = asyncio.ensure_future(accepted.tracking(_until_closed)(None, writer))
+    server = _ServerThatDoesNotWait()
+    stopping = asyncio.Event()
+    serving = asyncio.create_task(serve_until_stopped((server,), stopping, {}, accepted))
+    await asyncio.sleep(0.05)
+    server.close()
+    await asyncio.sleep(0.05)
+    stopping.set()
+    await asyncio.wait_for(serving, timeout=2.0)
+    assert writer.is_closing(), "the connection was left for the process exit to cut"
+    await asyncio.wait_for(handler, timeout=1.0)
+    assert accepted.open_writers() == ()
 
 
 @pytest.mark.asyncio

@@ -92,10 +92,27 @@ cannot satisfy the second observation. Mixed-tree and concurrent profiles
 report per-file outcomes and calculate aggregate throughput only after all
 requested deliveries verify.
 
+Sender/receiver memory scenarios resolve the actual serving process through
+the authenticated test control channel, require that it belongs to the spawned
+private daemon tree and profile, and verify the same process identity after
+the transfer. The sampled RSS peak is a lower bound, not a lifetime or
+resettable OS high-water mark. Reports retain sampling duration, maximum
+sample gap and scope; collection is O(1) in the number of samples. A lost
+process, failed observation or changed daemon makes an otherwise successful
+transfer inconclusive as a memory measurement.
+
+Recovery tests terminate the authenticated serving daemon (not merely a
+launcher), verify both process exits, refuse a completion that raced the
+termination, and require a new daemon instance with the same peer identity.
+A cache checkpoint is not a byte-acknowledgement count.
+
 Transport labels come from an explicit request and actual payload accounting,
 never from peer trust or endpoint availability. A route which is disabled,
 unavailable, falls back or lacks a receipt makes that comparison inconclusive;
-no speedup is published. The historical `quic_vs_webrtc` scenario name remains
+no speedup is published. The receipt must have the correct accounting scope,
+unit and window; route labels, per-route counters, attempt totals and
+whole-transfer totals must agree. A missing fallback counter or prior attempt
+on another route cannot qualify a forced-route comparison. The historical `quic_vs_webrtc` scenario name remains
 as a CLI alias and must not be read as a claim that both file payload routes are
 currently supported. The shipped QUIC file gate remains intact until its own
 qualification is complete. A normal peer channel may use authenticated TCP.

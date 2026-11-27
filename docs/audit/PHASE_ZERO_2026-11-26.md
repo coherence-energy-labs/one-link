@@ -70,3 +70,58 @@ Raw logs and reports are retained in the private operator evidence directory; pa
 5. Protected merge, exact release builds, installer verification and public-download parity, clean-device install/update/rollback and safe owner-device rollout.
 
 Phase Zero remains open. Do not advance the larger architecture on a fabricated or partially measured baseline.
+
+## Diagnostic campaign follow-up (2026-11-26 local)
+
+All 16 planned stages actually executed. 15 passed and one was inconclusive.
+Source revision: c04496eec8313c93d08d857e04a4576d621249d5. Native revision: 86f0020cbbbd571485e6ece5ad4c83b1757b1370.
+Native artifact SHA-256: 77e39d9edc9c8a7338f8d660895049df3e8dfcce40200c360c48b65a3abd4d0f. The native source-input difference was documentation only.
+Same-host Windows diagnostic, not a controlled hardware or independent release qualification. CPU contention remained visible and source storage was OS-cache warm. No LAN/WAN, mobile, packet-capture, or competitive superiority claims follow.
+
+| Stage | Exit | Evidence result | Report SHA-256 |
+|---|---:|---|---|
+| wiring | 0 | None | 7aab9898869f56755b2d7004a6a2f475930b8d28d94ec25b6209c929ffcfcbdf |
+| perf-quick | 0 | None | 55272af7cf3767b208e94358e44c28547675d05c6ce9cdf846760fb88909e3fa |
+| field-snapshot | 0 | None | 585fd56adc82a7e80824647262b53797a449f218086de41b869cbae8c7e617b3 |
+| receiver-memory | 0 | passed | eeece616bb4d9b7842dd7c2f8455d11e04c513ba9d40e853e293339a226bb2e5 |
+| sender-memory | 0 | passed | 82f97a5e494b6f554f7cb737847a1b1ed0d47fd6c91b7ed8e2ac549ed0e9777b |
+| cold-unique | 0 | passed | 529826ed60c1735c5b98871bfe0cf9753e762eb054f093d819989754c3f02c68 |
+| warm | 0 | passed | 9e62401836db42298bee18a946a87e1515512dc0a9d4ea4b5035b3e564a0a828 |
+| related | 0 | passed | 40091955aa895148a89db1545efe5e965949194a0aafd64a4008bffb2a496173 |
+| many-small | 0 | passed | 2257775ba43c83b02554608c73dd5245e355aa604a1f8abf867f618a1f4dceeb |
+| mixed-tree | 0 | passed | 7d4fa414fa9013426ea3fbc36a1d1bf6dd6e06fff7bf75dfb53f3795e2eda0da |
+| concurrent | 0 | passed | 20dac58ba0836d159c8f8413b857ac18da917575c96027ca4751475ef50efbf8 |
+| sidecar | 0 | passed | a74c573f1bfcb717f2bd2c9cce9272b6042a4157d507aefb47a9e5bf30e9057a |
+| cache | 0 | passed | a1b346878c4c55bb52d991df700c7dae6fbd91f3cbef7e715e561dc394f8ee14 |
+| share-link | 0 | passed | 5333bbedb7323493bbc348cdf1083ea05f4b18f74390e7e73304b5908794702f |
+| route-control | 2 | inconclusive | e78eea8357fe5b2b6a90b4fccbc0befb5d198668acdbadb6c44fff557eabcd6a |
+| resume | 0 | passed | ab4c1f2b84ee3623fc438c8465ca7d38a5b75e9b7bbe6733adefbd42a8877910 |
+
+Campaign manifest SHA-256: 083de62b2a7a8089f2e1281e7fc19bdcf3206a70aa058b63be31bc161893a522.
+
+Selected measurements: 64 MiB sender/receiver RSS growth was 8,462,336 and 10,788,864 bytes, respectively (sampled serving-process RSS, not a guaranteed high-water bound). Cold random 16 MiB verified completion was approximately 0.669 s, one observation. Many-small and mixed-tree sends were 10/10 each, concurrent 4/4, and warm/related sends 2/2 each. The 16 MiB interruption/restart case completed with independently verified receiver content, fresh authenticated instance and abrupt serving-process termination observed; elapsed after restart was 16.975 s. The route comparison verified TCP and refused to qualify the unavailable QUIC arm. It did not pass overall. Coherence-field snapshot passed its absolute SLO checks.
+
+## Consent and recovery follow-up
+
+Source commits: 59beb1349f422e4913586978b878e4eb7bc5e31c and 78538b5987bdab9a4053fee1046d070090413b1c.
+
+- Six reproduced consent/reaper races fixed: revoke locally before awaiting a decline response; prevent stale or duplicate acceptance from mutating newer state; guard reply correlation and partial ownership; bind reaping to the actual delivery and peer.
+- Six parked-contract negative controls fixed for modern and legacy peers. A failed consent persistence no longer authorizes content requests or accept-all on that attempt. Exact private-sidecar name, size, destination and kind now participate in admission.
+- Two authenticated cancellation negative controls fixed: modern parked records are removed rather than stranded by peer-resume matching, and malformed fingerprints are rejected. A separate positive failure-injection test requires an explicit error if persisted sidecar removal fails.
+- Six archive fixture failures reproduced against the unchanged baseline on a low-headroom volume. Narrow test-only capacity snapshots isolate commit/publication tests; no production reserve weakened. A separate constrained-volume regression verifies refusal and preservation of the original archive.
+
+| Test evidence | Tests | Failures | Errors | Skipped | SHA-256 |
+|---|---:|---:|---:|---:|---|
+| before.xml | 6 | 6 | 0 | 0 | c4ea401cde65d44f2477a9fd8d84948b6a26e3de6165a896df8ed22f6785fd4a |
+| archive-baseline.xml | 6 | 6 | 0 | 0 | 0ffacd4bce5cce1901626c270a346a1031b1e5bfe9cf86c838a656eb57c0e93e |
+| final-broad.xml | 163 | 0 | 0 | 1 | 212b4f59599124a7f222adfeee4c773e38c079624d04b37e12e221ef0e861eb0 |
+| live-reconnect.xml | 1 | 0 | 0 | 0 | 372e381c6b9acbaa9fcfd623208da96511313423371efcacdcb7ba77dfa6aba2 |
+| parked-before.xml | 7 | 7 | 0 | 0 | a6a682be1dfbf12c1e3d04ea3aba64aae449eb3ec9fa25a9a777bccc494842ab |
+| parked-after.xml | 196 | 0 | 0 | 1 | 288209d7ae49b7a8de2bb198d19297477038f6747f3790dc72a8d82f67b1d49d |
+| cancel-before.xml | 2 | 2 | 0 | 0 | 9414936b30617575ccf9c6941181bea4c2a7f1181b591b0a287c7bdb46fcd4b0 |
+| recovery-final.xml | 230 | 0 | 0 | 1 | e6057027adc9aa2a1196180e310b17dfec109db75e1e6ae880919781fced0409 |
+| cancel-final.xml | 3 | 0 | 0 | 0 | 1280550cc47a15ce8a90a826157d6ecb8ee8c9eea051fd464f1fa5866c4f6b42 |
+
+The before/negative-control reports deliberately reproduce failures; overlapping positive suites are not added together. Ruff passed for changed files; mypy checked all 243 source files without issues. The real two-daemon reconnect test passed on 59beb13; full exact-revision hosted gates still required.
+
+Remaining gaps: cross-delivery parked-consent supersession and grant retention after a new-delivery admission failure are not closed by the exact-contract guard. Durable cancellation across failed namespace operations, pre-existing active-cancel and finalization edge cases, full crash-point matrix, independent review, and physical/long-duration performance qualification remain distinct gates. This evidence does not supersede the original audit findings by assertion. The protected release and existing live installation remain unchanged.

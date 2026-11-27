@@ -100,17 +100,28 @@ def _control_request(
 _STARTED: dict[Path, tuple[subprocess.Popen, Path]] = {}
 
 
-def _read_port(home: Path, name: str, timeout: float = 12.0) -> int:
+def _read_port(home: Path, name: str, timeout: float | None = None) -> int:
     """Wait for a port file; on failure say whether the daemon is alive and what it logged.
 
     A daemon that is slow to start logs which startup step it is in. A bare
-    "port file did not appear" throws that away, and this intermittent failure
-    on hosted Windows runners stays unexplained.
+    "port file did not appear" throws that away, and for a long time this
+    intermittent failure on hosted Windows runners stayed unexplained.
+
+    It is explained now, by that evidence. On 2026-11-27 a start took longer
+    than the flat 12 s this helper waited: every start-up step in the daemon's
+    log was slow, schema initialisation alone 8.1 s against 0.2 to 1.1 s on a
+    workstation. That is the runner's load, which none of these tests is
+    about, and the harness had already met and settled the same thing for its
+    own wait (see ``daemon_boot_budget_s``). The default here is now that one
+    budget. A daemon that never starts is still bounded, by it and by each
+    test's timeout.
     """
     from tests.harness import _read_port as read_port_with_evidence
+    from tests.harness import daemon_boot_budget_s
 
     proc, log = _STARTED.get(home, (None, None))
-    return read_port_with_evidence(home, name, timeout, proc=proc, log=log)
+    wait = daemon_boot_budget_s() if timeout is None else timeout
+    return read_port_with_evidence(home, name, wait, proc=proc, log=log)
 
 
 def _read_text(

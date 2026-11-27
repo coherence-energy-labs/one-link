@@ -763,6 +763,24 @@ CREATE INDEX IF NOT EXISTS idx_reactions_target ON message_reactions(target_msg_
 """
 
 
+def _sync_directory_entry(path: Path) -> None:
+    """Make a just-renamed file's name durable where the OS allows it.
+
+    Best effort: the file's contents are already synced, and a filesystem
+    that cannot sync a directory must not stop an upgrade. Windows exposes no
+    directory sync through Python.
+    """
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0))
+    with contextlib.suppress(OSError):
+        fd = os.open(str(path.parent), flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
 class StateSchemaTooNewError(RuntimeError):
     """The database was written by a newer release than this one."""
 
@@ -1645,9 +1663,12 @@ class State:
                 shutil.copyfile(db, partial)
             with contextlib.suppress(OSError):
                 os.chmod(partial, 0o600)
-            with open(partial, "rb") as fh:
+            # Windows flushes through FlushFileBuffers, which needs a handle
+            # opened for writing; a read-only handle fails with EBADF there.
+            with open(partial, "r+b") as fh:
                 os.fsync(fh.fileno())
             os.replace(partial, target)
+            _sync_directory_entry(target)
         except Exception as exc:
             with contextlib.suppress(OSError):
                 partial.unlink()

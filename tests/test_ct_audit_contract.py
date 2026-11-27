@@ -249,12 +249,12 @@ def tree(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def _classify(tree: Path, frames, kind="UninitCondition", external=None):
+def _classify(tree: Path, frames, kind="UninitCondition", external=None, case=None):
     reports, status = audit.parse_memcheck_xml(_xml(frames, kind))
     assert status == "FINISHED"
     index = audit.SourceIndex(tree / "native")
     for report in reports:
-        audit.classify(report, index, external)
+        audit.classify(report, index, external, case)
     return reports
 
 
@@ -312,17 +312,154 @@ def test_external_declassification_requires_exact_version_line_and_text(tree: Pa
     (dep / "lib.rs").write_text("x\n        if tag.ct_eq(expected).into() {\n", encoding="utf-8")
     entry = audit.ExternalDeclassification(
         package="dep", version="1.2.3", file="src/lib.rs", line=2,
-        source_text="if tag.ct_eq(expected).into() {", reason="verdict",
+        source_text="if tag.ct_eq(expected).into() {", reason="verdict", cases=("unseal",),
     )
     frame = [("verify", (dep / "lib.rs").as_posix(), 2)]
-    [ok] = _classify(tree, frame, external=[entry])
-    assert ok.classification == "declassified"
+    [ok] = _classify(tree, frame, external=[entry], case="unseal")
+    assert ok.classification == "declassified" and ok.external is entry
     stale_text = audit.ExternalDeclassification(**{**entry.__dict__, "source_text": "if other {"})
-    [stale] = _classify(tree, frame, external=[stale_text])
+    [stale] = _classify(tree, frame, external=[stale_text], case="unseal")
     assert stale.classification == "violation" and "no longer matches" in stale.reason
+    assert stale.external is None
     bumped = audit.ExternalDeclassification(**{**entry.__dict__, "version": "1.2.4"})
-    [other] = _classify(tree, frame, external=[bumped])
+    [other] = _classify(tree, frame, external=[bumped], case="unseal")
     assert other.classification == "violation"
+
+
+def _external_fixture(tree: Path):
+    dep = tree / "registry" / "dep-1.2.3" / "src"
+    dep.mkdir(parents=True)
+    (dep / "lib.rs").write_text("x\n        if tag.ct_eq(expected).into() {\n", encoding="utf-8")
+    entry = audit.ExternalDeclassification(
+        package="dep", version="1.2.3", file="src/lib.rs", line=2,
+        source_text="if tag.ct_eq(expected).into() {", reason="verdict", cases=("unseal",),
+    )
+    return entry, [("verify", (dep / "lib.rs").as_posix(), 2)]
+
+
+def test_external_declassification_applies_only_to_the_cases_it_names(tree: Path):
+    entry, frame = _external_fixture(tree)
+    # The same reviewed line reached from a case nobody reviewed it for is a
+    # violation: "this branch is the verdict" was argued for one caller.
+    [elsewhere] = _classify(tree, frame, external=[entry], case="other_case")
+    assert elsewhere.classification == "violation"
+    assert "not for case 'other_case'" in elsewhere.reason and "unseal" in elsewhere.reason
+    # No case at all (a caller that forgot to say) is not a wildcard.
+    [unnamed] = _classify(tree, frame, external=[entry])
+    assert unnamed.classification == "violation"
+    # An entry naming no case declassifies nothing.
+    caseless = audit.ExternalDeclassification(**{**entry.__dict__, "cases": ()})
+    [never] = _classify(tree, frame, external=[caseless], case="unseal")
+    assert never.classification == "violation"
+    # Two reviewed callers of one line: each case finds its own entry.
+    second = audit.ExternalDeclassification(**{**entry.__dict__, "cases": ("other_case",)})
+    [both] = _classify(tree, frame, external=[entry, second], case="other_case")
+    assert both.classification == "declassified" and both.external is second
+
+
+def _ran(name: str, reports=(), **overrides):
+    fields = dict(completed=True, under_valgrind=True, returncode=0)
+    fields.update(overrides)
+    return audit.CaseResult(name=name, expect="clean", covers=[], what="", reports=list(reports), **fields)
+
+
+def test_external_entry_that_declassifies_nothing_is_stale(tree: Path):
+    entry, frame = _external_fixture(tree)
+    [used] = _classify(tree, frame, external=[entry], case="unseal")
+    assert audit.stale_external([_ran("unseal", [used])], [entry]) == []
+
+    # The case ran cleanly and never reached the reviewed line: the compiler
+    # moved the branch, or the code path is gone. Either way the allowance
+    # now covers code nobody reviewed.
+    [stale] = audit.stale_external([_ran("unseal")], [entry])
+    assert "dep@1.2.3 src/lib.rs:2" in stale and "unseal" in stale
+
+    # A report declassified by a repository marker, or by a different entry,
+    # does not keep this entry alive.
+    marked = audit.Report(unique="1", kind="UninitCondition", what="", frames=[], classification="declassified")
+    assert audit.stale_external([_ran("unseal", [marked])], [entry])
+    twin = audit.ExternalDeclassification(**entry.__dict__)
+    [by_twin] = _classify(tree, frame, external=[twin], case="unseal")
+    assert audit.stale_external([_ran("unseal", [by_twin])], [entry])
+
+    # Not run in this invocation (--case), or already failing for its own
+    # reason: nothing can be concluded, and the run fails anyway in the
+    # second case.
+    assert audit.stale_external([_ran("something_else")], [entry]) == []
+    assert audit.stale_external([_ran("unseal", completed=False)], [entry]) == []
+    assert audit.stale_external([_ran("unseal", problems=["timed out after 900s"])], [entry]) == []
+
+
+def test_stale_or_misnamed_external_entry_fails_the_run(tmp_path, monkeypatch):
+    entry = audit.ExternalDeclassification(
+        package="dep", version="1.2.3", file="src/lib.rs", line=2,
+        source_text="if tag.ct_eq(expected).into() {", reason="verdict", cases=("unseal",),
+    )
+    control = audit.CaseResult(
+        name="control", expect="flagged", covers=[], what="", completed=True, under_valgrind=True,
+        returncode=0, reports=[audit.Report(unique="1", kind="UninitCondition", what="", frames=[])],
+    )
+    by_name = {"unseal": _ran("unseal"), "control": control}
+    cases = [{"name": name, "expect": r.expect} for name, r in by_name.items()]
+    monkeypatch.setattr(audit, "list_cases", lambda _binary: cases)
+    monkeypatch.setattr(audit, "run_case", lambda case, *_args: by_name[case["name"]])
+    monkeypatch.setattr(audit, "load_external", lambda _path: [entry])
+    report_path = tmp_path / "report.json"
+    argv = ["--binary", str(tmp_path / "bin"), "--source-root", str(tmp_path / "native"), "--report", str(report_path)]
+
+    # Every case passes on its own, and the run still fails.
+    assert audit.main(argv) == 1
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["passed"] == report["cases"] == 2
+    assert report["stale_external_declassifications"] == ["dep@1.2.3 src/lib.rs:2 declassifies nothing in unseal"]
+    assert any("stale external declassification" in item for item in report["failed"])
+
+    # Without the entry the same results pass, so the failure is the entry's.
+    monkeypatch.setattr(audit, "load_external", lambda _path: [])
+    assert audit.main(argv) == 0
+
+    # An entry for a case the binary does not have is refused before anything runs.
+    typo = audit.ExternalDeclassification(**{**entry.__dict__, "cases": ("unsael",)})
+    monkeypatch.setattr(audit, "load_external", lambda _path: [typo])
+    with pytest.raises(SystemExit, match="unknown cases"):
+        audit.main(argv)
+
+
+@pytest.mark.parametrize("cases", [None, [], [""], "confidential_unseal_tampered", [7]])
+def test_external_entry_file_must_name_its_cases(tmp_path, cases):
+    raw = {
+        "package": "dep", "version": "1.2.3", "file": "src/lib.rs", "line": 2,
+        "source_text": "if ok {", "reason": "verdict",
+    }
+    if cases is not None:
+        raw["cases"] = cases
+    path = tmp_path / "external.json"
+    path.write_text(
+        json.dumps({"schema": "one-link/ct-audit-external-declassifications/v1", "entries": [raw]}),
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit, match="must name the audit cases"):
+        audit.load_external(path)
+
+
+def test_shipped_external_declassifications_name_locked_versions_and_real_cases():
+    entries = audit.load_external(AUDIT_CRATE / "external_declassifications.json")
+    assert entries, "the shipped list parsed to nothing"
+    lock = (NATIVE / "Cargo.lock").read_text(encoding="utf-8")
+    locked = set(re.findall(r'name = "([^"]+)"\nversion = "([^"]+)"', lock))
+    known = audit_cases()
+    seen = set()
+    for entry in entries:
+        assert (entry.package, entry.version) in locked, f"{entry.label} is not the locked version"
+        for name in entry.cases:
+            assert name in known, f"{entry.label} names unknown audit case {name}"
+            assert known[name]["expect"] == "clean", (
+                f"{entry.label}: a uniform case allows no verdict branch and a control must stay flagged"
+            )
+            key = (entry.package, entry.version, entry.file, entry.line, name)
+            assert key not in seen, f"{entry.label} is listed twice for {name}"
+            seen.add(key)
+        assert entry.reason.strip() and entry.source_text.strip(), f"{entry.label} has no stated review"
 
 
 def test_case_verdicts_fail_closed():

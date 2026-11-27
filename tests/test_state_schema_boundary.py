@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import sqlite3
 import stat
@@ -120,6 +121,35 @@ def test_only_the_snapshot_of_the_latest_upgrade_is_retained(tmp_path: Path) -> 
     State(db_path=db).close()
 
     assert [p.name for p in _snapshots(db)] == [f"state.db.pre-migration-v{LATEST - 1}.bak"]
+
+
+def test_snapshot_is_synced_through_a_writable_handle(tmp_path: Path, monkeypatch) -> None:
+    """Windows refuses ``os.fsync`` on a handle opened for reading (EBADF).
+
+    POSIX accepts it, so a read-only handle passes every Linux and macOS run
+    and stops every schema upgrade on Windows. This holds the Windows rule on
+    the platforms that would otherwise not notice.
+    """
+    fcntl = pytest.importorskip("fcntl", reason="Windows enforces this itself")
+    real_fsync = os.fsync
+    synced_files: list[int] = []
+
+    def windows_like_fsync(fd: int) -> None:
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            if fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY:
+                raise OSError(errno.EBADF, "Bad file descriptor")
+            synced_files.append(fd)
+        real_fsync(fd)
+
+    db = _fresh(tmp_path)
+    _downgrade_stamp(db, LATEST - 1)
+    monkeypatch.setattr(state_module.os, "fsync", windows_like_fsync)
+    State(db_path=db).close()
+    monkeypatch.undo()
+
+    assert [p.name for p in _snapshots(db)] == [f"state.db.pre-migration-v{LATEST - 1}.bak"]
+    assert synced_files, "the snapshot was renamed into place without being synced"
+    assert _stamp(db) == LATEST
 
 
 def test_upgrade_does_not_proceed_when_the_snapshot_cannot_be_written(

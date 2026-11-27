@@ -7156,6 +7156,17 @@ class Daemon:
                     incoming = self._incoming_files.get(blob) if blob else None
                     if t.status == "paused" and incoming is None:
                         continue
+                    # The blob is content, not a delivery identity. A stale
+                    # ledger row for the same peer/blob must not park a newer
+                    # writer, including one currently awaiting owner consent.
+                    if incoming is not None and (
+                        (incoming.transfer_id or f"in:{blob}") != t.id
+                        or not self._inbound_file_owned_by(incoming, t.peer_fp)
+                    ):
+                        continue
+                    pending = self._pending_file_offers.get(t.id)
+                    if pending is not None and pending.get("accept_reply_in_flight"):
+                        continue
                     # Whole-file hash/fsync runs in a worker thread. Never
                     # close or park its handle merely because a very large
                     # finalization exceeded the ordinary progress deadline.
@@ -8609,6 +8620,34 @@ class Daemon:
             if _retry_tid in self._pending_file_offers:
                 _ctx = self._pending_file_offers[_retry_tid]
                 if _ctx.get("peer_fp") == peer_fp:
+                    _active_retry = self._pending_file_offer_owner(_retry_tid, _ctx)
+                    if (
+                        _active_retry is None
+                        or _active_retry.blob_hex != blob
+                        or _active_retry.size != size
+                        or not _incoming_delivery_contract_matches(
+                            _active_retry, peer_fp=peer_fp,
+                            delivery_id=delivery_id,
+                            delivery_name=delivery_name,
+                            delivery_rel_path=delivery_rel_path,
+                            delivery_kind=delivery_kind,
+                        )
+                    ):
+                        # Do not write a rejection over the original ledger row.
+                        await channel.send(encode_msg(make_msg(
+                            "ACK", self.me.short_id, of=msg["id"],
+                            rejected="delivery_contract_mismatch",
+                        )))
+                        return
+                    if _ctx.get("accept_reply_in_flight"):
+                        # The current reply owns its channel and correlation ID.
+                        # A concurrent retry must not mutate them underneath it.
+                        await channel.send(encode_msg(make_msg(
+                            "FILE_OFFER_HELD", self.me.short_id,
+                            of=msg["id"], blob=blob,
+                            reason="acceptance_reply_in_flight",
+                        )))
+                        return
                     # Use THIS retry's channel — the prior session is
                     # gone (the sender timed out + reconnected). Protocol
                     # replies must correlate to THIS retry's message id;
@@ -8616,32 +8655,24 @@ class Daemon:
                     _ctx["channel"] = channel
                     _ctx["msg_id"] = msg["id"]
                     _ctx["msg"] = msg
-                    _active_retry = self._incoming_files.get(blob)
-                    if _active_retry is not None:
-                        _active_retry.offer_id = str(msg["id"])
-                        if commit_receipt_required:
-                            self._register_file_commit_waiter(
-                                _active_retry,
-                                offer_id=str(msg["id"]),
-                                channel=channel,
-                            )
-                    if _ctx.get("accepted"):
-                        try:
-                            await self._reply_to_accepted_file_offer(_ctx)
-                        except Exception as e:
-                            log.info(
-                                "accepted file retry reply failed for %s: %s",
-                                blob[:8],
-                                e,
-                            )
-                            return
-                        self._pending_file_offers.pop(_retry_tid, None)
-                        self._mark_file_offer_accepted(_retry_tid)
-                        log.info(
-                            "file offer resumed after prior acceptance: %s from %s",
-                            _ctx.get("name") or name,
-                            peer_sid,
+                    _active_retry.offer_id = str(msg["id"])
+                    if commit_receipt_required:
+                        self._register_file_commit_waiter(
+                            _active_retry,
+                            offer_id=str(msg["id"]),
+                            channel=channel,
                         )
+                    if _ctx.get("accepted"):
+                        # Failed-reply inheritance must be disabled while this
+                        # newly correlated reply is in flight as well.
+                        _ctx["accept_reply_in_flight"] = True
+                        _ctx["accept_reply_failed"] = False
+                        try:
+                            await self._complete_pending_accept_reply(
+                                _retry_tid, _ctx, _active_retry,
+                            )
+                        finally:
+                            _ctx["accept_reply_in_flight"] = False
                         return
                     await channel.send(
                         encode_msg(
@@ -8676,6 +8707,14 @@ class Daemon:
                         "One Link blocked a file fingerprint already active for another sender."
                     ),
                 )
+                return
+            if existing_owner is not None and (
+                existing_owner.size != size or existing_owner.blob_hex != blob
+            ) and existing_owner.delivery_id == delivery_id:
+                await channel.send(encode_msg(make_msg(
+                    "ACK", self.me.short_id, of=msg["id"],
+                    rejected="delivery_contract_mismatch",
+                )))
                 return
             # Owner consent carried over from an accepted offer whose sender left.
             inherited_acceptance = False
@@ -20223,20 +20262,41 @@ class Daemon:
             metadata_root=self._resume_metadata_root,
         )
 
-    async def _reply_to_accepted_file_offer(self, ctx: dict) -> None:
-        """Send the accept response correlated to the latest retry offer."""
-        ch = ctx["channel"]
+    def _pending_file_offer_owner(self, transfer_id: str, ctx: dict) -> IncomingFile | None:
+        """Resolve the exact current writer; stale prompts confer no authority."""
+        if self._pending_file_offers.get(transfer_id) is not ctx:
+            return None
         f = self._incoming_files.get(ctx["blob"])
+        if (
+            f is None
+            or (f.transfer_id or f"in:{ctx['blob']}") != transfer_id
+            or f.peer_fp != ctx["peer_fp"]
+            or f.blob_hex != ctx["blob"]
+            or f.size != ctx["size"]
+        ):
+            return None
+        return f
+
+    async def _reply_to_accepted_file_offer(
+        self, transfer_id: str, ctx: dict, f: IncomingFile,
+    ) -> None:
+        """Send an acceptance only for the current, owned delivery."""
+
+        def require_current() -> None:
+            if self._pending_file_offer_owner(transfer_id, ctx) is not f:
+                raise RuntimeError("file offer no longer current")
+
+        require_current()
+        ch = ctx["channel"]
         missing = (
             sorted(f.cdc_missing or [])
-            if f is not None and f.cdc_chunks is not None
+            if f.cdc_chunks is not None
             else list(ctx.get("missing") or [])
         )
         ctx["missing"] = missing
         if ctx["mode"] == "cdc":
             use_bloom_only = self._bloom_only_for_peer(
-                ctx["peer_fp"],
-                ctx["blob"],
+                ctx["peer_fp"], ctx["blob"],
             )
             bloom_sent = False
             if use_bloom_only:
@@ -20246,40 +20306,63 @@ class Daemon:
                     blob=ctx["blob"],
                     peer_fp=ctx["peer_fp"],
                 )
+                require_current()
             if not bloom_sent:
                 await ch.send(
                     encode_msg(
                         make_msg(
-                            "FILE_WANTS",
-                            self.me.short_id,
-                            of=ctx["msg_id"],
-                            blob=ctx["blob"],
+                            "FILE_WANTS", self.me.short_id,
+                            of=ctx["msg_id"], blob=ctx["blob"],
                             wants=missing,
                         )
                     )
                 )
+                require_current()
                 await self._maybe_send_bloom_init_advisory(
                     ch, msg_id=ctx["msg_id"], blob=ctx["blob"],
                     peer_fp=ctx["peer_fp"],
                 )
+                require_current()
             if not missing:
                 self._schedule_finish_cdc_file(
-                    ctx["blob"],
-                    ctx["peer_fp"],
-                    ctx["peer_sid"],
-                    ctx["msg"],
+                    ctx["blob"], ctx["peer_fp"], ctx["peer_sid"], ctx["msg"],
                     channel=ch,
                 )
         else:
-            await ch.send(
-                encode_msg(
-                    make_msg(
-                        "ACK",
-                        self.me.short_id,
-                        of=ctx["msg_id"],
-                    )
-                )
+            await ch.send(encode_msg(make_msg(
+                "ACK", self.me.short_id, of=ctx["msg_id"],
+            )))
+
+    async def _complete_pending_accept_reply(
+        self, transfer_id: str, ctx: dict, f: IncomingFile,
+    ) -> dict:
+        """Complete one reply without allowing an obsolete task to change state."""
+        try:
+            await self._reply_to_accepted_file_offer(transfer_id, ctx, f)
+        except Exception as exc:
+            if self._pending_file_offer_owner(transfer_id, ctx) is not f:
+                return {"ok": False, "error": "file offer no longer current"}
+            log.info("accept_file_offer %s: send failed: %s", transfer_id, exc)
+            ctx["accept_reply_failed"] = True
+            self._update_transfer(
+                transfer_id, status="paused",
+                metadata=self._merge_transfer_metadata(transfer_id, {
+                    "needs_accept": False,
+                    "delivery_state": "waiting_for_sender",
+                    "transient": True,
+                    "user_message": (
+                        "The sender went offline before you accepted. "
+                        "It will resend automatically."
+                    ),
+                }),
             )
+            self._broadcast_file_offer_resolved(transfer_id)
+            return {"ok": False, "error": "sender offline; it will resend"}
+        if self._pending_file_offer_owner(transfer_id, ctx) is not f:
+            return {"ok": False, "error": "file offer no longer current"}
+        self._pending_file_offers.pop(transfer_id)
+        self._mark_file_offer_accepted(transfer_id)
+        return {"ok": True}
 
     def _broadcast_file_offer_resolved(self, transfer_id: str) -> None:
         if self.ui_server is not None:
@@ -20321,20 +20404,24 @@ class Daemon:
         ctx = self._pending_file_offers.get(transfer_id)
         if ctx is None:
             return {"ok": False, "error": "no pending offer for this transfer"}
-        # Record consent before touching the connection. If the sender's
-        # original channel already timed out, the next retry must inherit the
-        # user's decision instead of prompting again.
-        ctx["accepted"] = True
-        # Only a completed failed reply permits consent inheritance by a
-        # new delivery. In-flight async acceptance is not a failed reply.
+        f = self._pending_file_offer_owner(transfer_id, ctx)
+        if f is None:
+            return {"ok": False, "error": "file offer no longer current"}
+        if f.finalizing:
+            return {"ok": False, "error": "file already finalizing"}
+        if ctx.get("accept_reply_in_flight"):
+            return {"ok": False, "error": "file offer acceptance already in progress"}
+        # Claim the reply before the first await. A retry or duplicate owner
+        # action cannot change its correlation ID or send a competing reply.
+        ctx["accept_reply_in_flight"] = True
         ctx["accept_reply_failed"] = False
-        if accept_all:
-            self._file_accept_allow.add(ctx["peer_fp"])
-        f = self._incoming_files.get(ctx["blob"])
-        if f is not None:
-            f.acceptance_granted = True
+        ctx["accepted"] = True
+        f.acceptance_granted = True
+        try:
             with contextlib.suppress(Exception):
                 self._persist_incoming_acceptance(ctx["peer_fp"], f)
+            if accept_all:
+                self._file_accept_allow.add(ctx["peer_fp"])
             if f.cdc_chunks is not None and f.cdc_missing:
                 try:
                     remaining, swarm_assist = await self._swarm_assist_file_offer(
@@ -20345,47 +20432,28 @@ class Daemon:
                         cdc_chunks=f.cdc_chunks,
                         missing=set(f.cdc_missing),
                     )
+                    if self._pending_file_offer_owner(transfer_id, ctx) is not f:
+                        return {"ok": False, "error": "file offer no longer current"}
                     f.cdc_missing = remaining
                     ctx["missing"] = sorted(remaining)
                     self._update_transfer(
                         transfer_id,
                         metadata=self._merge_transfer_metadata(
-                            transfer_id,
-                            {"swarm_assist": swarm_assist},
+                            transfer_id, {"swarm_assist": swarm_assist},
                         ),
                     )
-                except Exception as e:
+                except Exception as exc:
                     log.debug(
                         "post-consent swarm assist skipped for %s: %s",
-                        f.blob_hex[:8],
-                        e,
+                        f.blob_hex[:8], exc,
                     )
-        try:
-            await self._reply_to_accepted_file_offer(ctx)
-        except Exception as e:
-            # Channel almost certainly closed (sender timed out + went
-            # away). Keep the partial; the sender retries + re-offers.
-            log.info("accept_file_offer %s: send failed: %s", transfer_id, e)
-            if self._pending_file_offers.get(transfer_id) is ctx:
-                ctx["accept_reply_failed"] = True
-            self._update_transfer(
-                transfer_id, status="paused",
-                metadata=self._merge_transfer_metadata(transfer_id, {
-                    "needs_accept": False,
-                    "delivery_state": "waiting_for_sender",
-                    "transient": True,
-                    "user_message": (
-                        "The sender went offline before you accepted. "
-                        "It will resend automatically."
-                    ),
-                },
-                ),
-            )
-            self._broadcast_file_offer_resolved(transfer_id)
-            return {"ok": False, "error": "sender offline; it will resend"}
-        if self._pending_file_offers.get(transfer_id) is ctx:
-            self._pending_file_offers.pop(transfer_id, None)
-        self._mark_file_offer_accepted(transfer_id)
+            if self._pending_file_offer_owner(transfer_id, ctx) is not f:
+                return {"ok": False, "error": "file offer no longer current"}
+            result = await self._complete_pending_accept_reply(transfer_id, ctx, f)
+        finally:
+            ctx["accept_reply_in_flight"] = False
+        if result.get("ok") is not True:
+            return result
         if accept_all:
             for tid in [
                 t for t, c in list(self._pending_file_offers.items())
@@ -20400,17 +20468,20 @@ class Daemon:
     ) -> dict:
         """User declined a HELD incoming file. Tell the sender, abort
         the partial, and mark the transfer declined."""
-        ctx = self._pending_file_offers.pop(transfer_id, None)
+        ctx = self._pending_file_offers.get(transfer_id)
         if ctx is None:
             return {"ok": False, "error": "no pending offer for this transfer"}
-        with contextlib.suppress(Exception):
-            await ctx["channel"].send(encode_msg(make_msg(
-                "FILE_DECLINED", self.me.short_id,
-                of=ctx["msg_id"], blob=ctx["blob"],
-            )))
-        f = self._incoming_files.get(ctx["blob"])
-        if f is not None:
-            self._abort_incoming_file(ctx["blob"], f)
+        f = self._pending_file_offer_owner(transfer_id, ctx)
+        if f is None:
+            return {"ok": False, "error": "file offer no longer current"}
+        if f.finalizing:
+            return {"ok": False, "error": "file already finalizing"}
+        # Revoke locally first. The peer's acknowledgement is not required
+        # for the owner to cancel, and an old async reply cannot resurrect
+        # this writer or update its now-terminal row.
+        self._pending_file_offers.pop(transfer_id)
+        f.acceptance_granted = False
+        self._abort_incoming_file(ctx["blob"], f)
         self._update_transfer(
             transfer_id, status="failed",
             metadata=self._merge_transfer_metadata(transfer_id, {
@@ -20418,8 +20489,7 @@ class Daemon:
                 "delivery_state": "declined",
                 "transient": False,
                 "user_message": "You declined this file.",
-            },
-            ),
+            }),
         )
         if self.ui_server is not None:
             with contextlib.suppress(Exception):
@@ -20427,6 +20497,11 @@ class Daemon:
                     "type": "file_offer_resolved",
                     "transfer_id": transfer_id, "action": "declined",
                 })
+        with contextlib.suppress(Exception):
+            await ctx["channel"].send(encode_msg(make_msg(
+                "FILE_DECLINED", self.me.short_id,
+                of=ctx["msg_id"], blob=ctx["blob"],
+            )))
         if decline_all:
             for tid in [
                 t for t, c in list(self._pending_file_offers.items())

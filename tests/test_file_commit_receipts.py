@@ -211,6 +211,26 @@ def _receiver(
     return daemon, state, peer
 
 
+
+def _archive_headroom_fixture(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate tiny commit-path fixtures from the host's disk occupancy.
+
+    This changes only the test inbox's capacity observation. Real archive
+    I/O, fsync, and publication remain active; capacity rejection tests
+    supply their own explicitly constrained snapshots.
+    """
+    real_disk_usage = daemon_module.shutil.disk_usage
+    target = inbox_dir().resolve()
+    gib = 1024**3
+
+    def disk_usage(path):
+        if Path(path).resolve() == target:
+            return SimpleNamespace(total=64 * gib, used=32 * gib, free=32 * gib)
+        return real_disk_usage(path)
+
+    monkeypatch.setattr(daemon_module.shutil, "disk_usage", disk_usage)
+
+
 def _install_incoming(
     daemon: Daemon,
     state: State,
@@ -1969,6 +1989,7 @@ async def test_folder_archive_commit_replay_survives_postprocessing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     daemon, state, peer = _receiver(tmp_path, monkeypatch)
+    _archive_headroom_fixture(monkeypatch)
     try:
         archive_buffer = io.BytesIO()
         with zipfile.ZipFile(archive_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -2234,6 +2255,7 @@ async def test_folder_archive_commit_runs_off_loop_with_bounded_progress(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     daemon, state, peer = _receiver(tmp_path, monkeypatch)
+    _archive_headroom_fixture(monkeypatch)
     ticker: asyncio.Task | None = None
     try:
         assert daemon_module.FOLDER_ARCHIVE_MAX_ENTRIES > 0
@@ -2418,11 +2440,41 @@ async def test_folder_archive_worker_deadline_cancels_cooperatively(
         state.close()
 
 
+def test_folder_archive_rejects_volume_below_production_reserve(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    daemon, state, _peer = _receiver(tmp_path, monkeypatch)
+    try:
+        magic = inbox_dir() / daemon._FOLDER_ARCHIVE_MAGIC
+        magic.mkdir(parents=True, exist_ok=True)
+        archive_path = magic / "low-space.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("new.txt", b"must-not-publish")
+        before = archive_path.read_bytes()
+        gib = 1024**3
+        monkeypatch.setattr(
+            daemon_module.shutil, "disk_usage",
+            lambda _path: SimpleNamespace(
+                total=2048 * gib, used=2047 * gib, free=gib,
+            ),
+        )
+        with pytest.raises(
+            FolderArchiveCommitError, match="insufficient_space_for_folder_archive",
+        ):
+            daemon._maybe_extract_folder_archive(archive_path)
+        assert archive_path.read_bytes() == before
+        assert not (inbox_dir() / "low-space").exists()
+    finally:
+        state.close()
+
+
 def test_folder_archive_publish_never_overwrites_existing_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     daemon, state, _peer = _receiver(tmp_path, monkeypatch)
+    _archive_headroom_fixture(monkeypatch)
     try:
         existing = inbox_dir() / "project"
         existing.mkdir(parents=True, exist_ok=True)
@@ -2451,6 +2503,7 @@ def test_folder_archive_publish_race_preserves_concurrent_destination(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     daemon, state, _peer = _receiver(tmp_path, monkeypatch)
+    _archive_headroom_fixture(monkeypatch)
     try:
         magic = inbox_dir() / daemon._FOLDER_ARCHIVE_MAGIC
         magic.mkdir(parents=True, exist_ok=True)
@@ -2504,6 +2557,7 @@ def test_folder_archive_path_swap_cannot_change_descriptor_bound_extraction(
     """
 
     daemon, state, _peer = _receiver(tmp_path, monkeypatch)
+    _archive_headroom_fixture(monkeypatch)
     try:
         magic = inbox_dir() / daemon._FOLDER_ARCHIVE_MAGIC
         magic.mkdir(parents=True, exist_ok=True)
@@ -2668,6 +2722,7 @@ def test_folder_archive_io_failure_leaves_no_partial_publish(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     daemon, state, _peer = _receiver(tmp_path, monkeypatch)
+    _archive_headroom_fixture(monkeypatch)
     try:
         magic = inbox_dir() / daemon._FOLDER_ARCHIVE_MAGIC
         magic.mkdir(parents=True, exist_ok=True)

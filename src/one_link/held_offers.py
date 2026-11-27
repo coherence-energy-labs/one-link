@@ -195,6 +195,7 @@ async def settle_offer_against_held_offer(
     # reply is still in flight. The original delivery owns that progress.
     if (
         ctx.get("accept_reply_failed") is not True
+        or ctx.get("accept_reply_in_flight")
         or not holder.acceptance_granted
         or holder.received
         or holder.next_seq

@@ -51,6 +51,19 @@ commit history.
 - The owner page may connect only to its own daemon.
 - Rendezvous: one source address may hold at most 16 connection slots.
 
+**Performance**
+
+- Finding content-defined chunk boundaries is about twice as fast, and a
+  whole chunk scan (boundaries plus BLAKE3 addresses) about one and a half
+  times as fast, measured on one x86-64 machine. The boundaries are
+  unchanged.
+- A file made of a repeated two-byte pattern no longer makes the chunk scan
+  allocate several times the file's size: 64 MiB of it took about 550 MiB of
+  working memory and 0.4 s, and now takes under 1 MiB and under 0.1 s.
+- Building the native library with `panic = "unwind"` costs paths that are
+  mostly call overhead a few percent: the chunk-store lookup benchmark
+  measured 3.4% and 3.6% slower in two CI runs.
+
 **Privacy**
 
 - `docs/NETWORK_CONTACTS.md` lists everything a default install contacts.

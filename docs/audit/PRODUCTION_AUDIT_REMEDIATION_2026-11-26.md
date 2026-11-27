@@ -134,8 +134,9 @@ These were not in the audit.
 
 ## Found by CI on the pull request
 
-Three defects in this branch's own work. Its first CI run failed five checks;
-two of the five are gates that only repeat another job's result.
+Three defects in this branch's own work and one cost of a change it made.
+Its first CI run failed five checks; two of the five are gates that only
+repeat another job's result. Its second failed the benchmark gate.
 
 - **The pre-upgrade snapshot stopped every schema upgrade on Windows.** It
   was synced through a handle opened for reading. Windows flushes with
@@ -173,6 +174,47 @@ two of the five are gates that only repeat another job's result.
   of every other pull request as well. The commit that introduced the
   literals was amended on this branch instead, so no commit in the
   repository matches and `.gitleaks.toml` needs no entry for it.
+- **The benchmark gate measured the chunk scan 17% slower on one runner.**
+  `native_cdc_scan_128MiB` compares this branch's native library, built
+  `unwind`, with the base branch's, built `abort`. The first CI run measured
+  +1.9% (interval 1.000 to 1.030). The second, with the same native code,
+  measured -16.7% (0.813 to 0.885; the limit is 5%). A local comparison of
+  the two builds over ten alternating pairs measured -0.4%. So the cost is
+  there on some hardware and not on other. That fits a loop whose speed
+  depends on how the compiler lays it out, but the run's artifacts, which
+  name the runner's processor, could not be downloaded from where this work
+  was done, so the hardware explanation is an inference.
+
+  Three quarters of the scan was one loop: a rolling hash in which every byte
+  waits for the one before, two cycles a byte on any core. The search now
+  advances four independent chains per full segment, in lanes of a fixed
+  length. The 64-byte memory of the hash, which already let segments be
+  hashed separately, lets a segment be split the same way; and where a
+  profile's two masks share enough bits, one test per byte replaces two. The
+  boundaries are identical. The positions found are compared with a single
+  chain across segment and lane edges, with candidates planted on both sides
+  of every lane edge, on input built to satisfy the masks as often as bytes
+  can, and by property tests; fourteen deliberately broken versions each
+  fail (`native/ol_chunk/src/pcdc.rs`).
+
+  Measured locally, boundary search alone: 2.0 to 2.2 times as fast, on one
+  thread and on two. The measurement through the real extension, new code
+  built `unwind` against old code built `abort`, is in the pull request.
+
+  **Found while doing this, and present on the base branch:** the lists of
+  candidate positions grew with the input's content, not its size. A
+  two-byte pattern repeated through a file satisfies a mask at every other
+  byte; 64 MiB of it made the scan hold about 550 MiB of positions and take
+  0.4 s where ordinary bytes take 0.03 s. The streaming scanner's 32 MiB
+  window bounded the input, not this. Each lane now records at most sixteen
+  times what unstructured bytes produce; past that the buffer is cut by
+  hashing every chunk directly, which is the definition the lists shortcut,
+  so the boundaries do not change. The same 64 MiB now takes under 1 MiB of
+  working memory and under 0.1 s.
+
+  What unwinding itself costs shows in the benchmarks that are mostly call
+  overhead: `native_chunk_store_locate` measured 3.4% and 3.6% slower in the
+  two CI runs, inside its 5% limit.
 
 ## Totals
 

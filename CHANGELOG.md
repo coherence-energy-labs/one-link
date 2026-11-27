@@ -11,6 +11,63 @@ where practical (`NATIVE_TRANSFER_V1`, `DOUBLE_RATCHET_V1`).
 
 ---
 
+## Unreleased — production-readiness hardening (2026-11-26)
+
+Changes an operator or a peer can observe. Internal refactors are in the
+commit history.
+
+**Compatibility**
+
+- Recovery shares are now version 2: the split secret carries a digest of
+  the seed and each share is signed by its creator. Version 1 shares still
+  combine, but `recovery restore` refuses them unless
+  `--allow-unverified-legacy-shares` is given, because a wrong result from
+  them cannot be detected. Re-issue shares to get checked ones. A release
+  older than this one cannot read version 2 shares.
+- A passphrase-protected identity key is re-sealed with scrypt the first
+  time it is loaded with the passphrase. A release older than this one
+  cannot read the re-sealed file.
+- `state.db` from a newer release is refused instead of opened. A schema
+  upgrade first saves `state.db.pre-migration-vN.bak` next to the database.
+- A peer that is not paired may send frames of at most 256 KiB and is
+  disconnected when its frame allowance is spent. Paired peers are
+  unaffected. Handshake frames are capped at 16 KiB.
+- The native library is built with `panic = "unwind"` and without aws-lc-rs.
+- `/dr_test` answers 404 unless `ONE_LINK_SERVE_DEV_PAGES=1`.
+
+**Security**
+
+- Unpaired peers: bounded frame size, frame volume, owner prompts and stored
+  records; `PAIR_REJECT` is honoured only inside a live pairing.
+- Handshake replay cache entries are written only after the signature
+  verifies.
+- The identity key is sealed with scrypt (N=2^17) instead of 2,048 rounds of
+  PBKDF2; `ONE_LINK_PASSPHRASE_FILE` supplies the passphrase from a file.
+- Share recovery detects too few shares, mixed setups and damaged shares.
+- ML-KEM encapsulation keys are range-checked (FIPS 203 section 7.2) and KEM
+  secrets are wiped after use.
+- Peer names resolve only when they name exactly one peer.
+- Received file names lose bidi-override characters.
+- The owner page may connect only to its own daemon.
+- Rendezvous: one source address may hold at most 16 connection slots.
+
+**Privacy**
+
+- `docs/NETWORK_CONTACTS.md` lists everything a default install contacts.
+- The Quiet preset announces only the short ID and public key on the LAN.
+
+**Tooling**
+
+- `THIRD_PARTY_NOTICES.md` and a license allow list, generated from the lock
+  files; `REUSE.toml` declares the license of every file.
+- Gates that only allow improvement: HTML sinks in the UI, broad exception
+  handlers, tests that match UI source text, and the size of `Daemon` and
+  `UIServer`.
+- The linter now also enforces flake8-bugbear, pylint errors and unreferenced
+  asyncio tasks.
+
+---
+
 ## [0.21.0-alpha] — 2026-05-11 — File engine v2
 
 **Headline**: implementation of the shipped scope in

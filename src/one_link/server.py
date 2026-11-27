@@ -56,7 +56,7 @@ install_windows_platform_fastpath()
 
 from aiohttp import WSMsgType, web
 
-from one_link import certified_surface, control_ipc
+from one_link import certified_surface, control_ipc, task_refs
 from one_link.build_identity import runtime_build_identity
 from one_link.call_routes import CallRouter
 from one_link.owner_auth_note import note_refused_owner_request
@@ -19333,7 +19333,7 @@ class UIServer:
                     "error": str(e),
                 })
 
-        loop.create_task(_bg_scan())
+        task_refs.spawn(_bg_scan())
 
         return web.json_response({
             "ok": True, "folder": f, "scan_status": "in_progress",
@@ -21284,7 +21284,7 @@ class UIServer:
                 })
             except Exception as e:
                 log.warning("relocate rescan for %s failed: %s", name, e)
-        loop.create_task(_bg_scan())
+        task_refs.spawn(_bg_scan())
         return web.json_response({"ok": True, "folder": row})
 
     async def api_folder_audit(self, request: web.Request) -> web.Response:
@@ -22562,8 +22562,6 @@ class UIServer:
         mat = self._materialize_group(bytes.fromhex(gid_hex))
         title = (mat.get("name") if mat else None) or f"Group {gid_hex[:8]}"
         # recent_group_messages already exists; pull a generous batch.
-        with contextlib.suppress(Exception):
-            self.daemon.state.recent_group_messages
         msgs = self.daemon.state.recent_group_messages(
             group_id=bytes.fromhex(gid_hex), limit=100_000,
         )
@@ -28332,7 +28330,7 @@ class UIServer:
             async def _shutdown_for_update() -> None:
                 await self.daemon.request_shutdown(delay_s=0.75)
 
-            asyncio.create_task(_shutdown_for_update())
+            task_refs.spawn(_shutdown_for_update())
             return web.json_response(
                 {
                     "status": "handoff_started",
@@ -28403,7 +28401,7 @@ class UIServer:
         async def _shutdown_soon():
             log.info("daemon shutdown: requesting clean shutdown")
             await self.daemon.request_shutdown(delay_s=0.5)
-        asyncio.create_task(_shutdown_soon())
+        task_refs.spawn(_shutdown_soon())
 
         return resp
 

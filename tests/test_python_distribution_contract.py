@@ -97,7 +97,9 @@ def test_stable_distribution_contract_exactly_matches_source_tree() -> None:
     # passphrase-file source, the decisions about peers without standing, and
     # the received-file-name sanitiser. The last two hold logic moved out of
     # Daemon.
-    assert len(build_identity.EXPECTED_STABLE_RUNTIME_MODULES) == 229
+    # 230: task_refs (imported by daemon, server and lan_discovery),
+    # 2026-11-26: holds fire-and-forget tasks so they cannot be collected.
+    assert len(build_identity.EXPECTED_STABLE_RUNTIME_MODULES) == 230
     assert build_identity.EXPECTED_STABLE_RUNTIME_MODULES == tuple(
         sorted(set(build_identity.EXPECTED_STABLE_RUNTIME_MODULES))
     )
@@ -178,10 +180,10 @@ def test_distribution_source_contract_hashes_every_packaged_python_file() -> Non
     # (241 / 264 before it.) connection_shutdown, 2026-11-26.
     # (242 / 265 before it.) ack_batching, 2026-11-26.
     # (243 / 266 before them.) passphrase_source, peer_admission,
-    # transfer_names, 2026-11-26.
-    assert len(source_python) == 246
+    # transfer_names, 2026-11-26. (246 / 269 before it.) task_refs, same day.
+    assert len(source_python) == 247
     assert packaged_python == source_python
-    assert len(contract.payload_hashes) == 269
+    assert len(contract.payload_hashes) == 270
 
 
 def test_developer_only_modules_are_not_stable_distribution_requirements() -> None:

@@ -158,15 +158,15 @@ def test_k_minus_1_shares_do_not_reconstruct_seed(seed, kn):
             my_ed_priv_seed=guardians[i].private_bytes_raw(),
         )
         unwrapped.append((idx, share_bytes))
-    # combine_shares MAY succeed (it doesn't know the threshold)
-    # but the result MUST NOT equal the original seed.
+    # Shamir itself does not know the threshold and would return unrelated
+    # bytes. The split secret carries a digest of the seed, so the wrong
+    # reconstruction must be refused, not handed back.
     try:
-        reconstructed = social_recovery.combine_shares(unwrapped)
-    except Exception:
-        return  # raised; safe path
-    assert reconstructed != seed, (
-        f"k-1={k-1} shares reconstructed the original seed "
-        f"(k={k}, n={n}); threshold is effectively k-1 not k"
+        social_recovery.combine_shares(unwrapped)
+    except ValueError:
+        return
+    raise AssertionError(
+        f"k-1={k-1} shares produced a result instead of an error (k={k}, n={n})"
     )
 
 

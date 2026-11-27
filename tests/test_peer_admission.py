@@ -682,6 +682,9 @@ async def test_pair_requests_from_many_strangers_share_one_allowance(tmp_path: P
     daemon, _me = _daemon_with_state(tmp_path)
     prompts: list[dict] = []
     daemon.ui_server = SimpleNamespace(broadcast=prompts.append)
+    # A frozen clock: the allowance must not refill while the test creates
+    # its identities, however long that takes on a slow machine.
+    daemon.admission._prompts = PromptBudget(clock=lambda: 0.0)
     try:
         refused = 0
         for i in range(peer_admission.PROMPT_BURST + 20):
@@ -925,3 +928,52 @@ def test_each_daemon_gets_its_own_admission_controller(tmp_path: Path) -> None:
     bare = Daemon.__new__(Daemon)
     assert isinstance(bare.admission, peer_admission.PeerAdmission)
     assert isinstance(Daemon.admission, peer_admission.PerDaemon)
+
+
+# ─── key-change alerts stay proportionate ───────────────────────────
+
+
+def _alerts(state: State) -> list[tuple[str, str, str]]:
+    rows = state._conn.execute(
+        "SELECT severity, old_fingerprint, new_fingerprint FROM key_change_events ORDER BY id"
+    ).fetchall()
+    return [(r[0], r[1], r[2]) for r in rows]
+
+
+def test_a_hostname_cycling_through_keys_cannot_log_quadratic_alerts(tmp_path: Path) -> None:
+    state = State(db_path=tmp_path / "s.db")
+    try:
+        count = 30
+        for i in range(count):
+            fp = f"{i + 1:064x}"
+            state.upsert_peer(
+                fingerprint=fp, short_id=fp[-8:], pubkey=bytes([i + 1]) * 32, hostname="kiosk"
+            )
+        cap = State._MAX_UNPINNED_KEY_CHANGE_ALERTS
+        # The i-th key compares against at most `cap` earlier unpinned keys,
+        # where it used to compare against all i of them (435 rows for 30).
+        expected = sum(min(i, cap) for i in range(count))
+        assert len(_alerts(state)) == expected
+    finally:
+        state.close()
+
+
+def test_a_change_away_from_a_pinned_key_is_always_recorded(tmp_path: Path) -> None:
+    state = State(db_path=tmp_path / "s.db")
+    try:
+        friend = "aa" * 32
+        state.upsert_peer(fingerprint=friend, short_id="aaaaaaaa", pubkey=b"\xaa" * 32,
+                          hostname="laptop")
+        state.set_peer_trust(friend, "pinned")
+        # Bury the pinned key under more throwaway keys than the cap.
+        for i in range(State._MAX_UNPINNED_KEY_CHANGE_ALERTS + 6):
+            fp = f"{i + 1:064x}"
+            state.upsert_peer(
+                fingerprint=fp, short_id=fp[-8:], pubkey=bytes([i + 1]) * 32, hostname="laptop"
+            )
+        imposter = "ee" * 32
+        state.upsert_peer(fingerprint=imposter, short_id="eeeeeeee", pubkey=b"\xee" * 32,
+                          hostname="laptop")
+        assert ("high", friend, imposter) in _alerts(state)
+    finally:
+        state.close()

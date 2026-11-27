@@ -294,6 +294,7 @@ from one_link import (
     connection_shutdown,
     held_offers,
     peer_admission,
+    task_refs,
     transfer_names,
 )
 from one_link.wire import decode_msg, encode_msg, make_msg
@@ -17713,8 +17714,8 @@ class Daemon:
         # Live re-config so we register with the inherited rendezvous
         # immediately; no daemon restart.
         try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self.update_rendezvous_urls(urls))
+            asyncio.get_running_loop()
+            self._track(self.update_rendezvous_urls(urls))
         except RuntimeError:
             pass
         if self.ui_server is not None:
@@ -17886,8 +17887,8 @@ class Daemon:
         # the inbound peer-message handler — and so we don't try to
         # `await` from this sync helper.
         try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self.update_rendezvous_urls(sorted(clean)))
+            asyncio.get_running_loop()
+            self._track(self.update_rendezvous_urls(sorted(clean)))
         except RuntimeError:
             # Not in an event loop (shouldn't happen here, but be safe).
             pass
@@ -26465,8 +26466,8 @@ class Daemon:
             )
             return
         try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self._send_batched_endpoint(peer_fp, outer))
+            asyncio.get_running_loop()
+            self._track(self._send_batched_endpoint(peer_fp, outer))
         except RuntimeError:
             # No running loop (test environment) — skip.
             pass
@@ -33345,7 +33346,7 @@ class Daemon:
                     )
             elif cmd == "shutdown":
                 await self._reply(writer, {"ok": True, "stopping": True})
-                asyncio.create_task(self._control_shutdown())
+                task_refs.spawn(self._control_shutdown())
             elif cmd == "peers":
                 peer_rows = [
                     {

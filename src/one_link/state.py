@@ -2916,11 +2916,11 @@ class State:
     # Rows about a peer in these tables are route and hostname caches. They
     # are dropped together with a pruned pending peer. Every other table that
     # names a peer is history, and a peer with history is never pruned.
-    _PENDING_PRUNE_CACHE_TABLES = (
-        ("route_memory", "peer_fp"),
-        ("route_candidates", "peer_fp"),
-        ("hostname_keys", "fingerprint"),
-    )
+    _PENDING_PRUNE_CACHE_DELETES = {
+        "route_memory": "DELETE FROM route_memory WHERE peer_fp = ?",
+        "route_candidates": "DELETE FROM route_candidates WHERE peer_fp = ?",
+        "hostname_keys": "DELETE FROM hostname_keys WHERE fingerprint = ?",
+    }
 
     def _peer_history_tables_locked(self, c: sqlite3.Cursor) -> list[tuple[str, str]]:
         """Every ``(table, column)`` that ties stored history to a peer.
@@ -2929,7 +2929,7 @@ class State:
         added later protects its peers from pruning without anyone having to
         remember this function exists.
         """
-        cache_tables = {name for name, _col in self._PENDING_PRUNE_CACHE_TABLES}
+        cache_tables = set(self._PENDING_PRUNE_CACHE_DELETES)
         out: list[tuple[str, str]] = []
         names = [
             row[0]
@@ -2988,9 +2988,11 @@ class State:
                     fp = row[0]
                     if fp in protected:
                         continue
+                    # Table and column names come from this database's own
+                    # schema (sqlite_master), quoted; the value is bound.
                     if any(
                         c.execute(
-                            f'SELECT 1 FROM "{table}" WHERE "{column}" = ? LIMIT 1',
+                            f'SELECT 1 FROM "{table}" WHERE "{column}" = ? LIMIT 1',  # nosec B608
                             (fp,),
                         ).fetchone()
                         for table, column in history
@@ -3004,12 +3006,9 @@ class State:
                 c.execute("BEGIN IMMEDIATE")
                 try:
                     for fp in victims:
-                        for table, column in self._PENDING_PRUNE_CACHE_TABLES:
+                        for delete_cached in self._PENDING_PRUNE_CACHE_DELETES.values():
                             with contextlib.suppress(*DB_OPERATIONAL_ERRORS):
-                                c.execute(
-                                    f'DELETE FROM "{table}" WHERE "{column}" = ?',
-                                    (fp,),
-                                )
+                                c.execute(delete_cached, (fp,))
                         # A key-change alert that involved a pinned peer is
                         # 'high' and stays. The rest only ever compared two
                         # unpinned keys, one of which is now forgotten.
@@ -3935,6 +3934,8 @@ class State:
 
     # ─── key-change tracking (v0.7.8) ─────────────────────────────────
 
+    _MAX_UNPINNED_KEY_CHANGE_ALERTS = 4
+
     def _record_hostname_key_seen_locked(
         self,
         *,
@@ -3985,6 +3986,7 @@ class State:
         if not prior_rows:
             return None
         new_event_id: Optional[int] = None
+        unpinned_alerts = 0
         for old in prior_rows:
             old_fp = old["fingerprint"]
             old_pub_hex = old["ed_pub_hex"]
@@ -4015,6 +4017,15 @@ class State:
                 severity = "medium"
             else:
                 severity = "low"
+            if severity != "high":
+                # A hostname is whatever a device on the LAN says it is. One
+                # that cycles through keys would otherwise log an alert
+                # against every key it ever used, each time: quadratic rows
+                # that say nothing new. A change away from a PINNED key is
+                # always recorded; of the rest, only the most recent few.
+                unpinned_alerts += 1
+                if unpinned_alerts > self._MAX_UNPINNED_KEY_CHANGE_ALERTS:
+                    continue
             cur = c.execute(
                 """
                 INSERT INTO key_change_events(

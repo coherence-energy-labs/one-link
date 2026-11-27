@@ -322,13 +322,36 @@ target-version = "py311"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E9", "F"]
+# 2026-11-26: widened beyond pyflakes. Every rule added here was at zero
+# violations when it was added, so the gate stayed green and each rule now
+# stops a class of defect from coming back:
+#   PLE      pylint errors (bad string formats, misplaced await/yield, ...)
+#   W6       deprecated or invalid syntax
+#   B        flake8-bugbear: mutable default arguments, return in finally,
+#            duplicate except clauses, useless expressions, assert on tuples
+#   RUF006   a task started and thrown away can be garbage-collected mid-run
+#            (use Daemon._track or task_refs.spawn)
+#   PLW1510  subprocess.run without an explicit check=
+#   TRY002   raising bare Exception
+#   EXE      shebang and executable-bit mismatches
+select = ["E9", "F", "PLE", "W6", "B", "RUF006", "PLW1510", "TRY002", "EXE"]
 # F841 (assigned-but-unused LOCAL): the noisiest pyflakes rule and the
 # most often intentional (debug leftovers, tuple-unpack throwaways,
 # read-for-effect). The ~20 current instances were reviewed and are all
 # benign (no forgotten-result bugs). Not gated, to keep the gate
 # signal-rich; clean up opportunistically.
-ignore = ["F841"]
+ignore = [
+  "F841",
+  # Bugbear rules with existing violations, counted in src/ on 2026-11-26.
+  # They are debt, not policy: clear a rule's violations and delete its line.
+  "B904",  # 37  raise inside except without `from`
+  "B023",  # 36  closure captures a loop variable
+  "B009",  # 17  getattr with a constant name
+  "B905",  # 13  zip() without strict=
+  "B010",  # 12  setattr with a constant name
+  "B007",  #  5  unused loop variable
+  "B008",  #  4  function call in a default argument
+]
 
 [tool.mypy]
 mypy_path = "native:stubs:src"

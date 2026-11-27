@@ -265,7 +265,11 @@ def test_identity_key_can_be_sealed_from_a_passphrase_file(tmp_path: Path, monke
     secret = tmp_path / "pw"
     secret.write_text("file-secret")
     secret.chmod(0o600)
-    monkeypatch.delenv(PASSPHRASE_ENV, raising=False)
+    # Adopting the file writes ONE_LINK_PASSPHRASE into the process
+    # environment. Touch the variable through monkeypatch first, so the
+    # state it restores afterwards is the one from before this test.
+    monkeypatch.setenv(PASSPHRASE_ENV, "placeholder")
+    monkeypatch.delenv(PASSPHRASE_ENV)
     monkeypatch.setenv(FILE_ENV_VAR, str(secret))
     key = tmp_path / "id.key"
     created = load_or_create(key)
@@ -344,3 +348,15 @@ def test_security_report_describes_identity_key_protection(tmp_path: Path, monke
     )
     (legacy,) = hardening_checks.check_identity_key_protection(key)
     assert legacy.severity == "warn" and "PBKDF2" in legacy.message
+
+
+def test_passphrase_tests_leave_the_environment_as_they_found_it():
+    """Runs after the tests above: none of them may leak the passphrase.
+
+    A leaked passphrase silently changes every later test that starts a
+    daemon or creates an identity.
+    """
+    import os
+
+    assert PASSPHRASE_ENV not in os.environ
+    assert FILE_ENV_VAR not in os.environ

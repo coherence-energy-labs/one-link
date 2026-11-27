@@ -547,6 +547,7 @@ EXPECTED_STABLE_RUNTIME_MODULES: tuple[str, ...] = (
     "one_link.storage_lifecycle",
     "one_link.supervisor",
     "one_link.swarm_plan",
+    "one_link.task_refs",
     "one_link.threshold",
     "one_link.threshold_recovery_native",
     "one_link.traffic_shaper",

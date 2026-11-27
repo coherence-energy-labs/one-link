@@ -53,7 +53,7 @@
       "self_attributes_assigned": 192
     },
     "UIServer": {
-      "class_lines": 25839,
+      "class_lines": 25837,
       "domains": {
         "call": {
           "lines": 537,
@@ -72,7 +72,7 @@
           "methods": 51
         },
         "group": {
-          "lines": 619,
+          "lines": 617,
           "methods": 19
         },
         "mesh": {
@@ -100,7 +100,7 @@
           "methods": 26
         }
       },
-      "method_lines": 25029,
+      "method_lines": 25027,
       "methods": 445,
       "self_attributes_assigned": 52
     }
@@ -334,6 +334,19 @@
         },
         "UIServer": {
           "method_lines": 25029,
+          "methods": 445
+        }
+      }
+    },
+    {
+      "label": "Hold fire-and-forget tasks through task_refs; drop a no-op expression",
+      "totals": {
+        "Daemon": {
+          "method_lines": 33107,
+          "methods": 497
+        },
+        "UIServer": {
+          "method_lines": 25027,
           "methods": 445
         }
       }

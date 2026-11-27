@@ -8826,6 +8826,10 @@ class Daemon:
                 peer_fp,
                 blob,
                 delivery_id=delivery_id,
+                size=size,
+                delivery_name=delivery_name,
+                delivery_rel_path=delivery_rel_path,
+                delivery_kind=delivery_kind,
             ):
                 await self._reject_file_offer(
                     channel,
@@ -20413,13 +20417,25 @@ class Daemon:
             return {"ok": False, "error": "file offer acceptance already in progress"}
         # Claim the reply before the first await. A retry or duplicate owner
         # action cannot change its correlation ID or send a competing reply.
+        prior_accepted = bool(ctx.get("accepted"))
+        prior_reply_failed = bool(ctx.get("accept_reply_failed"))
+        prior_grant = f.acceptance_granted
         ctx["accept_reply_in_flight"] = True
         ctx["accept_reply_failed"] = False
         ctx["accepted"] = True
         f.acceptance_granted = True
         try:
-            with contextlib.suppress(Exception):
+            try:
                 self._persist_incoming_acceptance(ctx["peer_fp"], f)
+            except Exception as exc:
+                # No request for content, swarm access or accept-all grant
+                # may follow a failed durable-consent boundary. Keep the
+                # same prompt and writer for a later explicit retry.
+                ctx["accepted"] = prior_accepted
+                ctx["accept_reply_failed"] = prior_reply_failed
+                f.acceptance_granted = prior_grant
+                log.warning("could not persist file acceptance %s: %s", transfer_id, exc)
+                return {"ok": False, "error": "could not persist file acceptance"}
             if accept_all:
                 self._file_accept_allow.add(ctx["peer_fp"])
             if f.cdc_chunks is not None and f.cdc_missing:
@@ -34336,7 +34352,7 @@ class Daemon:
                 # whose sender will never come back without waiting
                 # 30 days for the TTL prune.
                 blob = str(req.get("blob") or "").strip().lower()
-                if not blob or len(blob) != 64:
+                if not self._valid_blob_hex(blob):
                     await self._reply(writer, {
                         "ok": False,
                         "error": "blob must be a 64-character hex string",
@@ -34361,22 +34377,25 @@ class Daemon:
                     #    Pop it (so a later FILE_OFFER doesn't
                     #    auto-resume), then delete the partial and
                     #    the sidecar.
-                    keys_to_remove = [
-                        (pfp, bb) for (pfp, bb) in list(self._resume_registry.keys())
-                        if bb == blob
-                    ]
-                    for pfp, bb in keys_to_remove:
-                        sc = self._resume_registry.pop_match(pfp, bb)
-                        if sc is not None:
-                            try:
-                                Path(sc.out_path).unlink()
-                                cancelled_partial = True
-                            except OSError:
-                                pass
-                    _delete_resume_sidecar(inbox_dir(), blob,
-                        metadata_root=self._resume_metadata_root,
+                    for sc in self._resume_registry.discard_blob(blob):
+                        try:
+                            Path(sc.out_path).unlink()
+                            cancelled_partial = True
+                        except OSError:
+                            pass
+                    cancelled_sidecar = _delete_resume_sidecar(
+                        inbox_dir(), blob, metadata_root=self._resume_metadata_root,
                     )
-                    cancelled_sidecar = True
+                    if not cancelled_sidecar:
+                        await self._reply(writer, {
+                            "ok": False,
+                            "error": "could not remove persisted resume state",
+                            "blob": blob,
+                            "cancelled_in_session": False,
+                            "cancelled_partial": cancelled_partial,
+                            "cancelled_sidecar": False,
+                        })
+                        return
                 await self._reply(writer, {
                     "ok": True,
                     "blob": blob,

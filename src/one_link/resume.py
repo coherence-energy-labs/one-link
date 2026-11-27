@@ -407,16 +407,20 @@ def delete_sidecar(
     blob_hex: str,
     *,
     metadata_root: Path | None = None,
-) -> None:
-    """Remove the sidecar for ``blob_hex``. Idempotent; missing
-    files are silently ignored so the abort + finish paths can call
-    this without checking."""
+) -> bool:
+    """Remove a sidecar, reporting whether it is absent after the attempt.
+
+    Missing files are an idempotent success. Existing best-effort cleanup
+    callers may ignore the result; explicit owner cancellation must not.
+    """
     try:
         sidecar_path(inbox_root, blob_hex, metadata_root=metadata_root).unlink()
     except FileNotFoundError:
-        pass
+        return True
     except OSError as e:
         log.warning("could not delete resume sidecar for %s: %s", blob_hex[:8], e)
+        return False
+    return True
 
 
 def load_sidecar(
@@ -698,12 +702,36 @@ class ResumeRegistry:
         peer_fp: str,
         blob_hex: str,
         *,
-        delivery_id: str = "",
+        delivery_id: str,
+        size: int,
+        delivery_name: str,
+        delivery_rel_path: str,
+        delivery_kind: str,
     ) -> bool:
-        """Return whether a persisted partial belongs to another intent."""
+        """Refuse to consume a parked partial under a changed delivery contract.
 
+        This is an independent guard even when the durable transfer ledger
+        row is absent. A content hash and delivery nonce alone cannot convey
+        consent for a different declared size or destination.
+        """
         candidate = self._by_key.get((peer_fp, blob_hex))
-        return candidate is not None and candidate.delivery_id != delivery_id
+        return candidate is not None and (
+            candidate.delivery_id != delivery_id
+            or candidate.size != size
+            or (candidate.delivery_name or candidate.name) != delivery_name
+            or candidate.delivery_rel_path != delivery_rel_path
+            or candidate.delivery_kind != delivery_kind
+        )
+
+    def discard_blob(self, blob_hex: str) -> list[ResumeSidecar]:
+        """Remove all parked records for an explicit local owner cancellation.
+
+        Unlike pop_match, this is not a peer-offer adoption operation, so a
+        modern delivery nonce must not prevent removal. Only the authenticated
+        local cancel command may use this blob-scoped operation.
+        """
+        keys = [key for key in self._by_key if key[1] == blob_hex]
+        return [self._by_key.pop(key) for key in keys]
 
     def register(self, sidecar: ResumeSidecar) -> None:
         """Add (or replace) an entry. Called by the FILE_OFFER

@@ -1280,6 +1280,62 @@ async def test_restart_partial_is_never_claimed_or_deleted_by_new_delivery(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("modern", [True, False])
+@pytest.mark.parametrize("changed", ["size", "name", "destination"])
+async def test_parked_consent_is_bound_to_full_delivery_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, modern: bool, changed: str,
+) -> None:
+    daemon, state, peer = _receiver(tmp_path, monkeypatch)
+    try:
+        content = b"parked owner-authorized content"
+        blob = blake3.blake3(content).hexdigest()
+        delivery = "81" * 16 if modern else ""
+        partial = inbox_dir() / daemon_module.INCOMING_STAGING_DIR / "parked.part"
+        partial.parent.mkdir(parents=True, exist_ok=True)
+        partial.write_bytes(content[:4])
+        sidecar = ResumeSidecar(
+            blob_hex=blob, peer_fp=peer.fingerprint, name="original.bin",
+            size=len(content), out_path=str(partial),
+            cdc_chunks=[{
+                "index": 0, "start": 0, "end": len(content),
+                "size": len(content), "hash": blob,
+            }],
+            acceptance_granted=True,
+            delivery_id=delivery, delivery_name="original.bin",
+            delivery_rel_path="", delivery_kind="file",
+            final_path=str(inbox_dir() / "original.bin"),
+        )
+        # A valid private sidecar may survive without an admitted ledger row.
+        # It must independently enforce the original acceptance contract.
+        daemon._resume_registry.register(sidecar)
+        daemon._incoming_files_require_accept = True
+        channel = _RecordingChannel(peer, commit_capable=modern)
+        offer = {
+            "name": "original.bin", "size": len(content),
+            "blob": blob, "mode": "stream",
+        }
+        if modern:
+            offer["delivery_id"] = delivery
+        if changed == "size":
+            offer["size"] += 1
+        elif changed == "name":
+            offer["name"] = "renamed.bin"
+        else:
+            offer["rel_path"] = "subfolder/original.bin"
+        await daemon._on_peer_message(
+            channel, make_msg("FILE_OFFER", peer.short_id, id="crossed-parked", **offer),
+        )
+        assert channel.sent[-1].get("rejected") == "admission_resume_owned_by_another_delivery"
+        assert partial.read_bytes() == content[:4]
+        assert daemon._resume_registry.pop_match(
+            peer.fingerprint, blob, delivery_id=delivery,
+        ) is sidecar
+        assert blob not in daemon._incoming_files
+    finally:
+        state.close()
+
+
+@pytest.mark.asyncio
 async def test_385_mib_resume_from_81_mib_keeps_one_logical_offer_and_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

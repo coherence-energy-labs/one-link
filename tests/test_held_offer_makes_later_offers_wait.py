@@ -649,3 +649,27 @@ def test_reaper_cannot_park_new_writer_using_a_stale_delivery_row(daemon, tmp_pa
     assert not holder.handle.closed
     assert HOLDER_ID in daemon._pending_file_offers
     assert _reservations(daemon) == [f"res:{HOLDER_ID}"]
+
+@pytest.mark.asyncio
+async def test_acceptance_persistence_failure_requests_no_bytes_and_keeps_prompt(
+    daemon, tmp_path, monkeypatch,
+):
+    holder = _hold(daemon, tmp_path)
+    ctx = daemon._pending_file_offers[HOLDER_ID]
+    channel = ctx["channel"]
+
+    def fail_persist(*args, **kwargs):
+        raise OSError("injected durable consent failure")
+
+    monkeypatch.setattr(daemon, "_persist_incoming_acceptance", fail_persist)
+    result = await daemon.accept_file_offer(HOLDER_ID, accept_all=True)
+    assert result["ok"] is False
+    assert "persist" in result["error"]
+    assert daemon._pending_file_offers[HOLDER_ID] is ctx
+    assert not holder.acceptance_granted
+    assert not ctx.get("accepted")
+    assert not ctx.get("accept_reply_in_flight")
+    assert PEER not in daemon._file_accept_allow
+    assert channel.sent == []
+    assert not holder.handle.closed
+    assert _reservations(daemon) == [f"res:{HOLDER_ID}"]

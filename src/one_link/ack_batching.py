@@ -38,10 +38,13 @@ Both rules assume every chunk is answered. One that the receiver refuses is
 answered at once, out of turn, and the transfer is over; an independent review
 of the first version of this module found that case outside what it had
 claimed. A sender now takes a refusal of any chunk it has outstanding as the
-refusal it is (``refusal_of_unanswered_chunk``), and a receiver that abandons
-a transfer drops the answers it was holding for it instead of sending them
-later. A sender that predates this still waits out its deadline in that case,
-whatever the receiver runs.
+refusal it is (``refusal_of_unanswered_chunk``). A receiver that abandons a
+transfer drops the answers it was holding for it, and its timer answers only
+for a transfer that is still in progress when it fires (a second review found
+ways a transfer ends that the first of those two did not cover). A refusal
+that does not end the transfer leaves the earlier answers to be sent, as they
+should be. A sender that predates this still waits out its deadline when a
+chunk is refused behind a held answer, whatever the receiver runs.
 
 Tests: ``tests/test_ack_batching.py`` searches every reachable state of the
 sender's send loop against the receiver's rule, driven by the real window
@@ -142,6 +145,7 @@ def arm_partial_flush(
     flush: Callable[[], Awaitable[None]],
     *,
     spawn: Callable[[Awaitable[None]], Any],
+    still_wanted: Callable[[], bool],
     delay_s: float = PARTIAL_BATCH_FLUSH_S,
 ) -> bool:
     """Answer ``holder``'s unfilled batch after ``delay_s`` unless it fills first.
@@ -150,15 +154,21 @@ def arm_partial_flush(
     ``ack_batch_timer``. The timer is not restarted by later chunks, so the
     oldest unanswered chunk waits at most ``delay_s``. ``flush`` sends whatever
     is held at that moment; ``spawn`` runs it as a task the caller tracks.
-    Returns whether a timer was armed by this call.
+    ``still_wanted`` is asked when the timer fires: a transfer that has ended
+    by then, by whatever path, is owed no answer, and what was held for it is
+    dropped. Returns whether a timer was armed by this call.
     """
     if getattr(holder, "ack_batch_timer", None) is not None or not holder.ack_batch_ids:
         return False
 
     def fire() -> None:
         holder.ack_batch_timer = None
-        if holder.ack_batch_ids:
-            spawn(_flush_quietly(flush))
+        if not holder.ack_batch_ids:
+            return
+        if not still_wanted():
+            holder.ack_batch_ids.clear()
+            return
+        spawn(_flush_quietly(flush))
 
     holder.ack_batch_timer = asyncio.get_running_loop().call_later(delay_s, fire)
     return True

@@ -7608,6 +7608,7 @@ class Daemon:
             channel.note_caps_sent()
             channel.maybe_activate_ratchet()
             caps_validated = False
+            owed_certs: asyncio.Task | None = None
             while True:
                 try:
                     # v0.20.7 (security audit H4): bounded read deadline.
@@ -7642,7 +7643,17 @@ class Daemon:
                         raise RuntimeError("peer sent application data before required CAPS")
                     await self._on_peer_message(channel, msg)
                     caps_validated = True
+                    if channel.waits_for_peer_before_sending():
+                        # Started now, sent once the next read has opened
+                        # this side's send chain, and finished before the
+                        # frame that read returns is answered.
+                        owed_certs = self._track(
+                            self._drain_pending_rotation_certs_to(channel, peer_fp)
+                        )
                     continue
+                if owed_certs is not None:
+                    await owed_certs
+                    owed_certs = None
                 await self._on_peer_message(channel, msg)
         except Exception as e:
             log.warning("peer loop error (%s): %s", channel.peer_short_id, e)
@@ -7832,15 +7843,12 @@ class Daemon:
             # ROTATION_CERT frames will be processed by the peer's
             # dispatcher. Safe to call every CAPS - already-acked
             # certs are skipped.
-            # On the side that accepted the connection this handler runs in
-            # the task that reads it, and that side cannot send before it has
-            # read the caller's first ratcheted frame: deliver from a task,
-            # and let it take its place in the send queue ahead of replies.
-            with contextlib.suppress(Exception):
-                if channel.waits_for_peer_before_sending():
-                    self._track(self._drain_pending_rotation_certs_to(channel, peer_fp))
-                    await asyncio.sleep(0)
-                else:
+            # Not from here on the side that accepted the connection: it
+            # cannot send before it has read the caller's first ratcheted
+            # frame, and this handler runs in the task that reads. The read
+            # loop in _handle_peer delivers for that side.
+            if not channel.waits_for_peer_before_sending():
+                with contextlib.suppress(Exception):
                     await self._drain_pending_rotation_certs_to(channel, peer_fp)
             # A newly negotiated async-capsule capability may unblock durable
             # outbox rows retained while this peer was offline.
@@ -21858,6 +21866,7 @@ class Daemon:
         else:  # a batch the sender never fills is answered anyway
             ack_batching.arm_partial_flush(
                 f, lambda: self._flush_file_ack_batch(channel, f), spawn=self._track,
+                still_wanted=lambda: self._incoming_files.get(f.blob_hex) is f,
             )
 
     def _inbound_is_rejected(self, peer_fp: str) -> bool:

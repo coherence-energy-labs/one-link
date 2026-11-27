@@ -1,7 +1,7 @@
 {
   "classes": {
     "Daemon": {
-      "class_lines": 33980,
+      "class_lines": 33989,
       "domains": {
         "call": {
           "lines": 660,
@@ -32,7 +32,7 @@
           "methods": 206
         },
         "peer": {
-          "lines": 4470,
+          "lines": 4478,
           "methods": 35
         },
         "recovery": {
@@ -44,11 +44,11 @@
           "methods": 13
         },
         "transfer": {
-          "lines": 9878,
+          "lines": 9879,
           "methods": 124
         }
       },
-      "method_lines": 33303,
+      "method_lines": 33312,
       "methods": 499,
       "self_attributes_assigned": 192
     },
@@ -264,6 +264,20 @@
       "totals": {
         "Daemon": {
           "method_lines": 33303,
+          "methods": 499
+        },
+        "UIServer": {
+          "method_lines": 25034,
+          "methods": 445
+        }
+      }
+    },
+    {
+      "growth_reason": "Daemon +9 lines, no method and no attribute added: the accepting side's read loop starts the delivery of owed rotation certificates after CAPS and finishes it before answering the next frame (the CAPS handler loses the task and the yield it used), and the short-batch timer is told how to ask whether its file is still the one in progress.",
+      "label": "rotation and file transfer: corrections from a second independent review",
+      "totals": {
+        "Daemon": {
+          "method_lines": 33312,
           "methods": 499
         },
         "UIServer": {

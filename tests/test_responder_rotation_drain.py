@@ -47,18 +47,25 @@ def _identity(hostname: str) -> Identity:
     )
 
 
-async def _call(tmp_path: Path, *, owes_a_certificate: bool, caller_speaks: bool = True) -> dict[str, Any]:
-    """Call a daemon, exchange CAPS and (unless silent) PING it. Report what the caller saw and what the daemon kept."""
+async def _call(tmp_path: Path, *, owed: int, caller_speaks: bool = True) -> dict[str, Any]:
+    """Call a daemon that owes the caller ``owed`` certificates, exchange CAPS and (unless silent) PING it.
+
+    Reports what the caller saw and what the daemon kept.
+    """
     receiver, caller = _identity("receiver"), _identity("caller")
     daemon = Daemon(receiver)
     state = State(db_path=tmp_path / "state.db")
     daemon.state = state
-    if owes_a_certificate:
+    # One row per rotation the caller has not acknowledged: a daemon that
+    # rotated twice before this peer called owes two. The store keeps one row
+    # per (peer, new fingerprint), so each needs its own.
+    for step in range(owed):
         state.queue_rotation_announcement(
-            peer_fp=caller.fingerprint, old_fp="0" * 64, new_fp=receiver.fingerprint,
+            peer_fp=caller.fingerprint, old_fp=f"{step:064x}",
+            new_fp=receiver.fingerprint if step == owed - 1 else f"{step + 1:064x}",
             cert_json="{}", sig_hex="00",
         )
-        assert len(state.list_pending_rotation_announcements(peer_fp=caller.fingerprint, unacked_only=True)) == 1
+    assert len(state.list_pending_rotation_announcements(peer_fp=caller.fingerprint, unacked_only=True)) == owed
     server = await asyncio.start_server(daemon._handle_peer, host="127.0.0.1", port=0)
     port = int(server.sockets[0].getsockname()[1])
     client = None
@@ -127,19 +134,24 @@ _CLEAN = {"handler_ended": True, "slots_still_held": 0, "connections_still_count
 
 @pytest.mark.asyncio
 async def test_a_daemon_that_owes_nothing_answers_the_ping(tmp_path: Path) -> None:
-    assert await _call(tmp_path, owes_a_certificate=False) == {"frames": ["PONG"], "answered": True, **_CLEAN}
+    assert await _call(tmp_path, owed=0) == {"frames": ["PONG"], "answered": True, **_CLEAN}
 
 
 @pytest.mark.asyncio
-async def test_a_daemon_that_owes_the_caller_a_certificate_sends_it_first_and_still_answers(tmp_path: Path) -> None:
-    assert await _call(tmp_path, owes_a_certificate=True) == {
-        "frames": ["ROTATION_CERT", "PONG"], "answered": True, **_CLEAN,
+@pytest.mark.parametrize("owed", [1, 2, 3])
+async def test_a_daemon_sends_every_certificate_it_owes_before_it_answers(tmp_path: Path, owed: int) -> None:
+    """All of them, not only the first. A reviewer of the first version of this
+    change showed that with two owed, the second went out after the answer:
+    the delivery took the send lock once per certificate and the answer got in
+    between. The read loop now finishes the delivery before it answers."""
+    assert await _call(tmp_path, owed=owed) == {
+        "frames": ["ROTATION_CERT"] * owed + ["PONG"], "answered": True, **_CLEAN,
     }
 
 
 @pytest.mark.asyncio
 async def test_a_caller_that_hangs_up_before_the_certificate_can_be_sent_leaves_nothing_behind(tmp_path: Path) -> None:
     """The delivery waits for the caller's first ratcheted frame. If none comes, it ends with the connection."""
-    assert await _call(tmp_path, owes_a_certificate=True, caller_speaks=False) == {
+    assert await _call(tmp_path, owed=2, caller_speaks=False) == {
         "frames": [], "answered": False, **_CLEAN,
     }

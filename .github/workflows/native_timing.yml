@@ -4,6 +4,8 @@ name: native timing diagnostics
 # This job has a separate conclusion; a failure/timeout is not converted green.
 on:
   workflow_dispatch:
+  push:
+    branches: [qualification/controlled-timing-8435e0e37646]
 
 permissions:
   contents: read
@@ -21,6 +23,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: 8435e0e376466668a9ff78c8b657c25e33ecda05
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"

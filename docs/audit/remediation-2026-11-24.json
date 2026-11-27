@@ -5242,6 +5242,11 @@
         "revision": "4a0dffe",
         "summary": "59 checks passed, none failed, 2 skipped, with no re-run.",
         "reading": "The first hosted run that contains FLD-05, FLD-06, the corrections to the stop path and the two instruments. It does not contain the corrections from the second independent review."
+      },
+      {
+        "revision": "39efc27",
+        "summary": "56 checks passed, 3 failed, 2 skipped. Failed: one live test on hosted Windows (a daemon given a corrupt token file), with its two roll-ups.",
+        "reading": "Not a failure of the product, and the first hosted live failure that could be read from its own log: the daemon was still starting when the test's wait ran out. Every start-up step in its log was slow on that runner (schema initialisation alone 8.1 s, against 0.2 to 1.1 s on a workstation), and the lifecycle tests waited a flat 12 s of their own where the shared harness waits 45. The daemon never reached the code changed in this revision. The lifecycle tests now use the shared budget."
       }
     ]
   },

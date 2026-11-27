@@ -570,6 +570,27 @@ def test_tagged_release_separates_signing_from_release_mutation():
     )
 
 
+@pytest.mark.parametrize(("workflow_name", "job_name"), [
+    ("auto_build.yml", "build"),
+    ("auto_build_macos_intel.yml", "build-intel"),
+])
+def test_continuous_desktop_builds_keep_tray_dependencies_and_check_the_frozen_app(
+    workflow_name, job_name,
+):
+    job = dict(_workflow_documents())[_WORKFLOWS / workflow_name]["jobs"][job_name]
+    steps = job["steps"]
+    commands = [step.get("run", "") for step in steps]
+    install = next(i for i, command in enumerate(commands) if "uv sync" in command)
+    build = next(i for i, command in enumerate(commands) if "scripts/build_binary.py --gui" in command)
+    assert "--extra tray" in commands[install] and "--extra release" in commands[install]
+    assert "uv run --no-sync python scripts/build_binary.py --gui" in commands[build]
+    check = next(i for i, command in enumerate(commands) if "scripts/validate_packaged_artifact.py" in command)
+    upload = next(i for i, step in enumerate(steps) if step.get("uses", "").startswith("actions/upload-artifact@"))
+    assert install < build < check < upload
+    assert "--artifact" in commands[check] and "--skip-runtime-inventory" not in commands[check]
+    assert not steps[check].get("continue-on-error")
+
+
 def test_continuous_builds_are_ephemeral_and_have_no_release_authority():
     workflows = dict(_workflow_documents())
     for name in ("auto_build.yml", "auto_build_macos_intel.yml"):
@@ -696,8 +717,8 @@ def test_continuous_zip_step_preserves_stamps_and_framework_links(tmp_path, runn
     shims = tmp_path / "tools"
     shims.mkdir()
     (shims / "uv").write_text(
-        '#!/bin/sh\nset -eu\n[ "$1 $2 $3 $4 $5" = "run --frozen --extra release python" ]\n'
-        'shift 5\nexec "$ONE_LINK_TEST_PYTHON" "$@"\n'
+        '#!/bin/sh\nset -eu\n[ "$1 $2 $3" = "run --no-sync python" ]\n'
+        'shift 3\nexec "$ONE_LINK_TEST_PYTHON" "$@"\n'
     )
     (shims / "git").write_text(
         '#!/bin/sh\nset -eu\n[ "$*" = "show -s --format=%ct HEAD" ]\n'

@@ -55,19 +55,25 @@ jobs:
 
       - name: install build tooling
         shell: bash
-        run: uv sync --frozen --python python --extra release
+        run: uv sync --frozen --python python --extra release --extra tray
 
       - name: build native crate from source
         shell: bash
         working-directory: native
-        run: uv run --project .. --frozen --extra release maturin develop --release --locked
+        run: uv run --project .. --no-sync maturin develop --release --locked
 
       - name: build the standalone binary
         shell: bash
         env:
           PYTHONIOENCODING: utf-8
         run: |
-          uv run --frozen --extra release python scripts/build_binary.py --gui
+          uv run --no-sync python scripts/build_binary.py --gui
+
+      - name: validate the packaged desktop runtime
+        shell: bash
+        run: |
+          uv run --no-sync python scripts/validate_packaged_artifact.py \
+            --artifact dist/one-link.app --spec build/one-link.spec
 
       - name: verify the binary is x86_64
         shell: bash

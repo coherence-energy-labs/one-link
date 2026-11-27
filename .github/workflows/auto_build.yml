@@ -249,7 +249,7 @@ jobs:
         # The universal lock covers PyInstaller, maturin, the project, and all
         # transitive dependencies. On win_arm64 this may compile cryptography,
         # so Rust + OpenSSL must already be present.
-        run: uv sync --frozen --python python --extra release
+        run: uv sync --frozen --python python --extra release --extra tray
 
       - name: cache cargo registry + target
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -279,7 +279,7 @@ jobs:
         #
         # Native transfer acceleration is a release invariant. Never publish a
         # silently degraded binary when the Rust build fails.
-        run: uv run --project .. --frozen --extra release maturin develop --release --locked
+        run: uv run --project .. --no-sync maturin develop --release --locked
 
       - name: build the standalone binary
         shell: bash
@@ -298,7 +298,15 @@ jobs:
           # cannot link (MSVC-target clang with no developer environment)
           # can no longer mask a working gcc beside it and block every
           # download.
-          uv run --frozen --extra release python scripts/build_binary.py --gui
+          uv run --no-sync python scripts/build_binary.py --gui
+
+      - name: validate the packaged desktop runtime
+        shell: bash
+        env:
+          BUNDLE_PATH: ${{ matrix.bundle-path }}
+        run: |
+          uv run --no-sync python scripts/validate_packaged_artifact.py \
+            --artifact "${BUNDLE_PATH}" --spec build/one-link.spec
 
       - name: stamp build metadata
         shell: bash
@@ -353,7 +361,7 @@ jobs:
           test -s "${helper}"
           test ! -L "${helper}"
           SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
-          uv run --frozen --extra release python scripts/package_standalone_bundle.py \
+          uv run --no-sync python scripts/package_standalone_bundle.py \
             --bundle "${BUNDLE_PATH}" \
             --output "dist/${ARTIFACT_NAME}.zip" \
             --executable "${EXE_NAME}" \
@@ -361,7 +369,7 @@ jobs:
           # Only now write the on-disk manifest used by other CI installers.
           # The canonical packager refuses a pre-existing reserved manifest.
           ONE_LINK_BUNDLE_EXECUTABLE="${EXE_NAME}" \
-            uv run --frozen --extra release python scripts/write_bundle_manifest.py \
+            uv run --no-sync python scripts/write_bundle_manifest.py \
               --bundle "${BUNDLE_PATH}" \
               --root-name "${BUNDLE_ROOT}" \
               --verify

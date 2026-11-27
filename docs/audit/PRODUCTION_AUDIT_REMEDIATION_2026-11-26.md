@@ -42,7 +42,7 @@ was fixed at its root where that was possible.
 | SC-2 a pushed tag is the whole update trust decision | Open (owner) | Needs a tag ruleset and signing policy in the repository settings. | Not applicable |
 | NET-1 16 MiB frames before pairing stall the daemon | Fixed | Handshake frames capped at 16 KiB, unpaired peers at 256 KiB, refused from the length prefix. Depth check rewritten to run at C speed; frames with over a million containers refused. | `tests/test_peer_admission.py`; property tests compare the depth check with `json.loads` and with the old scan. A 16 MiB frame: about 1.2 s before, about 15 ms after |
 | NET-2 unpaired identities leave unbounded state | Fixed | Pending peer rows pruned beyond a cap; per-peer maps bounded; per-connection frame allowance; shared prompt allowance; `PAIR_REJECT` only inside a live pairing; key-change alerts capped. | `tests/test_peer_admission.py`, including a real connection that is closed when its allowance is spent |
-| NET-3 `panic = "abort"` in the native library | Fixed | Release profile is `panic = "unwind"`. **Remaining:** the constant-time timing evidence in `docs/audit/evidence/` was measured with `abort` and has to be regenerated on the release runners. | `tests/test_native_build_contract.py`; `cargo test -p ol_pqkem -p ol_quic` |
+| NET-3 `panic = "abort"` in the native library | Fixed | Release profile is `panic = "unwind"`. The deterministic constant-time audit was re-run on that code generation (see "Found by CI on the pull request"). **Remaining:** the constant-time timing evidence in `docs/audit/evidence/` was measured with `abort` and has to be regenerated on the release runners. | `tests/test_native_build_contract.py`; `cargo test -p ol_pqkem -p ol_quic`; `scripts/run_ct_audit.py`, 27 of 27 cases |
 | NET-6 rendezvous capped at 64 sockets, two addresses fill it | Partly | One source address (IPv4, or IPv6 /64) may hold 16 slots. **Remaining:** the total is a memory bound; enough distinct addresses still fill one server. More capacity or more servers is an operating decision. | `tests/test_rendezvous_fair_admission.py` |
 | CR-1 identity key protected by 2,048 PBKDF2 rounds | Fixed | Sealed with scrypt (N=2^17) and ChaCha20-Poly1305; parameters authenticated and bounded; old files re-sealed on load. | `tests/test_identity_encrypted.py`; property test for wrong passphrase and any flipped byte |
 | ID-1 share recovery cannot detect a wrong result | Fixed | Split secret is `seed || digest(seed)`; a wrong reconstruction raises and stages nothing; legacy shares refused unless explicitly allowed. | `tests/test_recovery_share_verification.py`, `tests/test_social_recovery_v0207.py`, `tests/properties/test_shamir_roundtrip.py` |
@@ -61,7 +61,7 @@ was fixed at its root where that was possible.
 | NET-7 no default rendezvous, third-party STUN | Partly | Disclosed in `docs/NETWORK_CONTACTS.md`. **Remaining:** operating a project rendezvous or STUN service. | `tests/test_network_contacts_disclosure.py` |
 | UI-1 remote text written to `innerHTML` | Fixed | Built with DOM nodes and `textContent`. | `tests/test_html_sink_gate.py` |
 | UI-2 HTML sinks ungated | Partly | A gate that only allows the number of dynamic sinks to go down; three removed. **Remaining:** 50 dynamic sinks are grandfathered, and Trusted Types is not enforced; that needs a browser to verify. | `tests/test_html_sink_gate.py` |
-| ST-1 no schema guard or snapshot | Fixed | A database from a newer release is refused untouched; an upgrade first writes `state.db.pre-migration-vN.bak`. | `tests/test_state_schema_boundary.py` |
+| ST-1 no schema guard or snapshot | Fixed | A database from a newer release is refused untouched; an upgrade first writes `state.db.pre-migration-vN.bak`. | `tests/test_state_schema_boundary.py`; `tests/test_fsync_needs_writable_handle.py` |
 | CQ-1 authorization by convention in the dispatcher | Fixed | `MESSAGE_GATES` declares each type's gate; a test parses the dispatcher and fails on an undeclared type or a gated type with no trust check. The dispatcher itself was not split. | `tests/test_peer_admission.py` |
 | CQ-2 broad exception handlers | Partly | A ratchet: 1,234 counted, the number per file may not grow. **Remaining:** none were narrowed. | `tests/test_debt_ratchet.py` |
 | TST-1 tests that match UI source text | Partly | A ratchet: 104 files counted, no new one may be added. **Remaining:** none were converted. | `tests/test_debt_ratchet.py` |
@@ -131,6 +131,48 @@ These were not in the audit.
 - Clipboard HTML was parsed inside the live document.
 - A fixed-size text window in one test stopped seeing the code it asserted on
   when the handler grew.
+
+## Found by CI on the pull request
+
+Three defects in this branch's own work. Its first CI run failed five checks;
+two of the five are gates that only repeat another job's result.
+
+- **The pre-upgrade snapshot stopped every schema upgrade on Windows.** It
+  was synced through a handle opened for reading. Windows flushes with
+  `FlushFileBuffers`, which needs write access and fails with EBADF; POSIX
+  accepts the call, so Linux and macOS passed. Fixed by opening the snapshot
+  read-write. `tests/test_state_schema_boundary.py` now holds the Windows
+  rule on POSIX, and `tests/test_fsync_needs_writable_handle.py` scans
+  `src/one_link` and `scripts` for the same mistake. The snapshot's directory
+  entry is now synced too, where the platform allows it.
+- **The constant-time audit failed on the `unwind` build.** The compiler
+  attributes the Poly1305 tag verdict of `confidential_unseal_tampered` to
+  `chacha20poly1305` 0.10.1 `src/cipher.rs:87` (`if
+  self.mac.verify(tag).is_ok()`), where the `abort` build attributed the same
+  four branches to `universal-hash` 0.5.1 `src/lib.rs:154`. Both lines test
+  the one accept/reject result of a `subtle::ConstantTimeEq` comparison. The
+  audit was right to stop: the reviewed line was no longer the reported one.
+  The new line was read and the entry in
+  `native/ol_ct_audit/external_declassifications.json` replaced. Two gaps in
+  the audit driver were closed at the same time: an entry's `cases` list was
+  written down and never enforced, and an entry that matched nothing stayed
+  in the list without complaint. An entry now applies only to the cases it
+  names, and one that declassifies nothing in such a case fails the run
+  (`tests/test_ct_audit_contract.py`).
+- **The secret scan read the sealed-key armor as private keys.** The marker
+  lines were written out as literals, in `identity.py` and in a test, close
+  enough together to match the scanner's private-key rule. No key was
+  involved. The markers are now assembled from their parts, so nothing in the
+  working tree is exempt from that rule, and
+  `tests/test_no_private_key_shaped_literals.py` reads the tree for the same
+  shape before a commit is made. A test also pins the exact bytes written to
+  disk, which the old tests took from the constants they were checking.
+
+  The scan reads every commit on every branch, so deleting the lines in a
+  later commit would not have cleared it, and it would have failed the scan
+  of every other pull request as well. The commit that introduced the
+  literals was amended on this branch instead, so no commit in the
+  repository matches and `.gitleaks.toml` needs no entry for it.
 
 ## Totals
 

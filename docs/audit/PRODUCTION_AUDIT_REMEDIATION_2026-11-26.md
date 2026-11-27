@@ -134,9 +134,9 @@ These were not in the audit.
 
 ## Found by CI on the pull request
 
-Three defects in this branch's own work and one cost of a change it made.
+Three defects in this branch's own work and two costs of a change it made.
 Its first CI run failed five checks; two of the five are gates that only
-repeat another job's result. Its second failed the benchmark gate.
+repeat another job's result. Its second and third failed the benchmark gate.
 
 - **The pre-upgrade snapshot stopped every schema upgrade on Windows.** It
   was synced through a handle opened for reading. Windows flushes with
@@ -212,9 +212,31 @@ repeat another job's result. Its second failed the benchmark gate.
   so the boundaries do not change. The same 64 MiB now takes under 1 MiB of
   working memory and under 0.1 s.
 
-  What unwinding itself costs shows in the benchmarks that are mostly call
-  overhead: `native_chunk_store_locate` measured 3.4% and 3.6% slower in the
-  two CI runs, inside its 5% limit.
+- **The same gate then measured chunk lookups 5.6% slower.**
+  `native_chunk_store_locate`, a million lookups, had measured 3.4%, 3.6%
+  and 3.4% slower in the three earlier studies, inside its 5% limit, and
+  5.6% in the fourth. Unlike the scan this reproduced locally: the same
+  source built both ways took 118 ns a call with `abort` and 135 ns with
+  `unwind`. An instruction-level profile showed 43 more instructions a call,
+  3%, for 14% more time. Once the 32-byte id check carried a cleanup path
+  for its error, the optimizer stopped folding it into each method, so every
+  call wrote the id to memory in one function and read it straight back in
+  the next. The checks are inlined again with their error built out of
+  line, in the store and the encryption bindings, and a lookup no longer
+  allocates a string for the stripe's role on every call. Messages and
+  return values are unchanged, compared side by side with the old build.
+
+  Measured locally against the old code built `abort`: a lookup alone 10%
+  faster, the benchmark as it is timed 6% faster over 14 pairs, encryption
+  within 1% either way.
+
+  Two other studies came back inconclusive on metrics that sync to disk
+  (`native_wal_group_commit` 4 KiB once, `native_chunk_store_write` twice):
+  medians within 1% of the base branch, intervals wider than the limit.
+  Nothing in this branch touches those paths beyond the panic strategy, and
+  the same metrics passed in the other studies. They are runner noise as far
+  as these measurements can tell, and a reason the gate may need more than
+  one attempt.
 
 ## Totals
 

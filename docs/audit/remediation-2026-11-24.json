@@ -2552,6 +2552,13 @@
       "subject": "fix(daemon): a stop no longer skips a connection that is closing but not closed",
       "url": "https://github.com/coherence-energy-labs/one-link/commit/8a486e726f494a2e5ad0f123119f53ce4425b740",
       "integrated_in_review_basis": false
+    },
+    {
+      "id": "4bacadb",
+      "revision": "4bacadb9dc84285f60d082a60dab184aa9b1afbe",
+      "subject": "fix(rotation, transfer): what a second independent review found in 312c5a3 and 3634ec6",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/4bacadb9dc84285f60d082a60dab184aa9b1afbe",
+      "integrated_in_review_basis": false
     }
   ],
   "findings": [
@@ -4906,6 +4913,17 @@
             "src/one_link/daemon.py",
             "tests/test_ack_batching.py"
           ]
+        },
+        {
+          "summary": "After a second independent review: the receiver's short-batch timer asks, when it fires, whether its file is still the one in progress, and drops what it held if not. Not every path that ends a transfer goes through the abort that the previous change taught to drop held answers; the reviewer counted eight refusal sites without it.",
+          "commits": [
+            "4bacadb"
+          ],
+          "files": [
+            "src/one_link/ack_batching.py",
+            "src/one_link/daemon.py",
+            "tests/test_ack_batching.py"
+          ]
         }
       ],
       "validation": [
@@ -4927,13 +4945,20 @@
           "summary": "Independent review of the first change (a reviewer that did not write it): refuted for a refused chunk, with a runnable two-chunk witness against the real receive handlers and the real reply wait; addressed as above. It confirmed by reading that the last chunk always announces a batch of one in both loops. It did not examine the ordering of the timer's frame against the handler's on one channel, the bound on sending past a full window, or the soundness of the search's pruning.",
           "tests": [],
           "evidence_ids": []
+        },
+        {
+          "summary": "Second independent review, of the refused-chunk change: the sender's side confirmed by reading (the two send loops are alternatives, nothing recovers from the raise inside either, and a refusal of a pending chunk was already fatal before, by timeout; the offer and commit waits cannot be affected). The receiver's claim could not be decided and had static evidence against it, addressed as above. Its mutation runs showed that unwiring the refusal check, or the queues it reads, is caught only by the test that reads the source text: no test drives the daemon's reply wait with a refusal out of turn. 35 planted defects in this finding's rules are each caught.",
+          "tests": [
+            "tests/test_ack_batching.py"
+          ],
+          "evidence_ids": []
         }
       ],
       "remaining": [
         "Hosted CI on these revisions.",
         "No test with real daemons fails deterministically without the first change: the stall needs a slow acknowledgement at one point in the transfer, and nothing in the product lets a test place it. The evidence with real daemons is the before-and-after count.",
         "A sender that predates the second change still waits out its deadline when a chunk behind a held answer is refused, whatever the receiver runs. Answering what is held before every refusal would fix that for old senders and means touching about forty refusal sites; not done.",
-        "The second change has not been read independently, and the reply wait's part of it is tested through the function it calls and a check of the source text, not by driving the daemon's send path.",
+        "The reply wait's handling of a refusal is tested through the function it calls and a check of the source text, not by driving the daemon's send path; an independent review confirmed it by reading.",
         "The window controller is told an acknowledgement's age when the send loop next needs room, not when the acknowledgement arrived, so chunks answered together look progressively slower and the window shrinks more often than the link warrants. Recorded, not changed: it affects speed, not completion.",
         "The disabled QUIC chunk path derives its transfer session from the most recent inbound connection from the peer, which can be a route-verification probe. Read in the source, not tested; the path is off."
       ]
@@ -4956,6 +4981,16 @@
             "src/one_link/daemon.py",
             "tests/test_responder_rotation_drain.py"
           ]
+        },
+        {
+          "summary": "After an independent review: with two or more certificates owed, only the first went out before the handler's first answer, because the delivery took the send lock once per certificate and the answer got in between. The accepting side's read loop now starts the delivery after CAPS and finishes it before it answers the next frame.",
+          "commits": [
+            "4bacadb"
+          ],
+          "files": [
+            "src/one_link/daemon.py",
+            "tests/test_responder_rotation_drain.py"
+          ]
         }
       ],
       "validation": [
@@ -4965,12 +5000,20 @@
             "tests/test_responder_rotation_drain.py"
           ],
           "evidence_ids": []
+        },
+        {
+          "summary": "Independent review (a reviewer that did not write it), with the real handler over real channels: no freeze, and no task, slot, counted connection or handler left behind with zero to three certificates owed; the certificate is sent only after the transcript-binding check; a caller without the ratchet or without the cutover capability is served correctly; the test fails with either half of the change removed. It refuted the ordering for two or more certificates, 5 runs of 5, addressed as above; the test now owes one, two and three. Five planted defects are each caught. Read but not run by the reviewer: the calling side, the idle-timeout path, relay-backed channels.",
+          "tests": [
+            "tests/test_responder_rotation_drain.py"
+          ],
+          "evidence_ids": []
         }
       ],
       "remaining": [
-        "Hosted CI on the fix revision, and an independent read.",
+        "Hosted CI on these revisions.",
         "Found by reading and confirmed with the handler in isolation. It has not been exercised between two real daemons, where it needs one that has rotated and a peer that calls before the certificate is acknowledged.",
-        "It was found while looking for the cause of one hosted failure of the key-rotation live test and is not that cause: there the rotated daemon had made the call."
+        "It was found while looking for the cause of one hosted failure of the key-rotation live test and is not that cause: there the rotated daemon had made the call.",
+        "One more place has the same shape and was named by the reviewer without being run: a peer that becomes rejected between the accept-time check and its first frame is answered from the read task before CAPS has been received, and nothing wakes that send. It needs the owner to reject the peer in that instant, or the state store to be unavailable."
       ]
     }
   ],
@@ -5194,6 +5237,11 @@
         "revision": "c679803",
         "summary": "56 checks passed, 3 failed, 2 skipped; after re-running the failed live shard, 59 passed, none failed. Failed first: a 64 MiB file send between two daemons on hosted Linux, with its roll-ups.",
         "reading": "A defect in the product, recorded as FLD-05. The same stall was then reproduced on a workstation and traced with both daemons' whole logs. It is not related to the stop path. The key-rotation live test that failed once on hosted Windows at 1c7ae92 is still not explained: it passed 19 times of 19 on a workstation, 15 of them under load. A failing live test now carries 60,000 characters of each daemon's log instead of 4,000, and a session probe that fails logs why."
+      },
+      {
+        "revision": "4a0dffe",
+        "summary": "59 checks passed, none failed, 2 skipped, with no re-run.",
+        "reading": "The first hosted run that contains FLD-05, FLD-06, the corrections to the stop path and the two instruments. It does not contain the corrections from the second independent review."
       }
     ]
   },
@@ -5208,7 +5256,7 @@
       "FLD-05",
       "FLD-06"
     ],
-    "fix_revision": "8a486e7",
+    "fix_revision": "4bacadb",
     "hosted_ci": {
       "revision": "6eb2af7",
       "summary": "59 checks passed, none failed, 2 skipped.",

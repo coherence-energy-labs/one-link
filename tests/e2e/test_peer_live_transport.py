@@ -664,10 +664,21 @@ def test_rendezvous_refresh_retries_once_and_survives_bfcache_events(
                 }""",
             )
             assert persisted is True
+        previous_status = page.locator("#rdz-status").inner_text()
         page.clock.run_for(999)
         assert scripted["post_count"] == 3
         page.clock.run_for(1)
-        _wait_for_locator_text(page, "#rdz-status", "Signed presence refreshed")
+        # The prior successful refresh already left identical success text.
+        # Pump Playwright events while requiring this exact new POST and its
+        # newly committed success status (the fake clock is 91 seconds later).
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            status = page.locator("#rdz-status").inner_text(timeout=1_000)
+            if scripted["post_count"] == 4 and status != previous_status and "Signed presence refreshed" in status:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail(f"new refresh not observed: posts={scripted['post_count']}, status={status!r}")
         assert scripted["post_count"] == 4
         assert scripted["seen_modes"] == [
             "valid",

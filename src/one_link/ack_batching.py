@@ -127,6 +127,56 @@ def refusal_of_unanswered_chunk(
     return str(message.get("rejected") or message.get("error") or "peer rejected file-transfer request")
 
 
+class AckReceiptWindow:
+    """Cache only ACKs for currently outstanding chunk requests.
+
+    Every member of a batch receives the same local observation time. The
+    sender can settle queued receipts later without charging local accounting
+    work to the network latency. No remotely supplied timestamp is trusted.
+    """
+
+    def __init__(self) -> None:
+        self._observed: dict[str, float] = {}
+
+    def __len__(self) -> int:
+        return len(self._observed)
+
+    def consume(self, request_id: str) -> float | None:
+        return self._observed.pop(request_id, None)
+
+    def record_batch(
+        self, message: Mapping[str, Any],
+        pending_queues: Iterable[Iterable[Sequence[Any]]],
+        *, blob: str, observed_at: float, max_count: int,
+    ) -> None:
+        # Older peers omitted blob/count; their unique outstanding request IDs
+        # still bind the receipt to this serialized transfer. An explicitly
+        # supplied contradictory binding must never qualify.
+        if "blob" in message and message["blob"] != blob:
+            raise ValueError("crossed file acknowledgement batch")
+        ids = message.get("ofs", message.get("acks"))
+        if (
+            not isinstance(ids, list) or not 1 <= len(ids) <= max_count
+            or any(not isinstance(value, str) or not 1 <= len(value) <= 128 for value in ids)
+            or len(set(ids)) != len(ids)
+        ):
+            raise ValueError("invalid file acknowledgement batch IDs")
+        if "count" in message and (
+            type(message["count"]) is not int or message["count"] != len(ids)
+        ):
+            raise ValueError("invalid file acknowledgement batch count")
+        if message.get("rejected") or message.get("ok") is False:
+            raise ValueError("negative file acknowledgement batch")
+        outstanding = {entry[0] for queue in pending_queues for entry in queue}
+        # Prune any obsolete entries and never cache unknown or future IDs.
+        for key in list(self._observed):
+            if key not in outstanding:
+                del self._observed[key]
+        for value in ids:
+            if value in outstanding:
+                self._observed.setdefault(value, observed_at)
+
+
 def batch_is_due(held: int, batch_size: int) -> bool:
     """Whether a receiver holding ``held`` unanswered chunks answers now."""
     return int(held) >= int(batch_size)

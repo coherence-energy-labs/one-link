@@ -19,7 +19,7 @@
   },
   "status_counts": {
     "implemented_and_verified": 28,
-    "implemented_pending_qualification": 10,
+    "implemented_pending_qualification": 12,
     "partially_remediated": 3,
     "prepared_not_applied": 1
   },
@@ -2510,6 +2510,48 @@
       "subject": "fix(bench): per-record scan memory is measured with the chunk count held fixed, not fitted",
       "url": "https://github.com/coherence-energy-labs/one-link/commit/50fd4ee8cdc9a0b370d74c28c80a403cddf3c15b",
       "integrated_in_review_basis": false
+    },
+    {
+      "id": "1577cb1",
+      "revision": "1577cb1ffefd2dbe6b2bf10ca3bb37a32238a9a8",
+      "subject": "fix(transfer): a file sender and its receiver can no longer wait on each other",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/1577cb1ffefd2dbe6b2bf10ca3bb37a32238a9a8",
+      "integrated_in_review_basis": false
+    },
+    {
+      "id": "d13a67c",
+      "revision": "d13a67c61b272d02df324cb614327bfa604d862b",
+      "subject": "test(live): a failing live test carries enough of each daemon's log to read",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/d13a67c61b272d02df324cb614327bfa604d862b",
+      "integrated_in_review_basis": false
+    },
+    {
+      "id": "312c5a3",
+      "revision": "312c5a3870b4e8c702d345c671e0bba682eba9f7",
+      "subject": "fix(rotation): a daemon that owes its caller a rotation certificate no longer freezes that connection",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/312c5a3870b4e8c702d345c671e0bba682eba9f7",
+      "integrated_in_review_basis": false
+    },
+    {
+      "id": "f3b3d1e",
+      "revision": "f3b3d1e063e1316911dd65845337c73cbd5d65a1",
+      "subject": "fix(sessions): a session probe that fails says why",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/f3b3d1e063e1316911dd65845337c73cbd5d65a1",
+      "integrated_in_review_basis": false
+    },
+    {
+      "id": "3634ec6",
+      "revision": "3634ec6ac26bca2dfa689920ca48fae122418b27",
+      "subject": "fix(transfer): a refused chunk ends the send with its reason, not with a timeout",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/3634ec6ac26bca2dfa689920ca48fae122418b27",
+      "integrated_in_review_basis": false
+    },
+    {
+      "id": "8a486e7",
+      "revision": "8a486e726f494a2e5ad0f123119f53ce4425b740",
+      "subject": "fix(daemon): a stop no longer skips a connection that is closing but not closed",
+      "url": "https://github.com/coherence-energy-labs/one-link/commit/8a486e726f494a2e5ad0f123119f53ce4425b740",
+      "integrated_in_review_basis": false
     }
   ],
   "findings": [
@@ -4782,6 +4824,17 @@
             "tests/test_connection_shutdown.py",
             "tests/test_daemon_stops_with_open_connections.py"
           ]
+        },
+        {
+          "summary": "After an independent review: a connection that is closing is not yet closed. One closed with bytes still unsent to a client that has stopped reading stays registered until its transport lets go, and the stop gives it the grace period and aborts it like any other; before, the stop skipped it and could wait on it for ever. Connections are also ended once in every case, which before Python 3.12 they were not when the servers had been closed before the stop looked.",
+          "commits": [
+            "8a486e7"
+          ],
+          "files": [
+            "src/one_link/connection_shutdown.py",
+            "tests/test_connection_shutdown.py",
+            "tests/test_daemon_stops_with_open_connections.py"
+          ]
         }
       ],
       "validation": [
@@ -4805,13 +4858,119 @@
           "summary": "On the install (2026-11-26): the daemon running the old code, asked to stop with a message tail attached, was still running ten seconds later and exited within 0.2 s of the tail ending. The next start reported no unclean shutdown. The new daemon's own stop has not been exercised there.",
           "tests": [],
           "evidence_ids": []
+        },
+        {
+          "summary": "Independent review (a reviewer that did not write it), by reading and three small experiments; it reached its limit before running either test file, a planted defect or a real daemon. It found no way to make the stop fail. It found a test helper that could not fail: a timeout was caught with the connection errors and counted as an ended connection, under eight assertions. Corrected, the eight still pass, and a test shows the helper saying no. It named the closing-connection case without being able to produce it on Windows; that is now tested with a scripted writer on every platform and with real sockets where bytes are left unsent. It asked what unanswering browser windows do to a stop: measured with two such event sockets on a real daemon, 1.3 s, now a real-daemon test. Six planted defects in the module and its helper are each caught.",
+          "tests": [
+            "tests/test_connection_shutdown.py",
+            "tests/test_daemon_stops_with_open_connections.py"
+          ],
+          "evidence_ids": []
         }
       ],
       "remaining": [
         "An explicit stop now interrupts a transfer or a control command in progress instead of waiting for it, which is what it did before Python 3.12. The updater's own drain still refuses to begin while transfers are active.",
         "The interrupt path (Ctrl-C, Ctrl-Break) is covered against real asyncio servers but not by a real-daemon test.",
         "On Python 3.11 a closed server does not wait, so only the 3.12 lanes can fail these tests.",
-        "No independent read of this change."
+        "Not examined, by the author or the reviewer: what a stop does to a handler caught in the middle of a durable change. The stores are closed one loop turn after the connections are ended, as before.",
+        "The real-socket test of a closing connection skips on Windows, where the platform accepted all 64 MiB at once; the scripted-writer tests run everywhere.",
+        "Hosted CI on the revision with these corrections."
+      ]
+    },
+    {
+      "id": "FLD-05",
+      "priority": "High",
+      "title": "A file sender and its receiver could each wait for the other until the send was reported as paused",
+      "owner": "daemon",
+      "acceptance": "A file send never stops to wait for an acknowledgement the receiver is not going to send, with a receiver of this version or an earlier one; a receiver answers a sender of an earlier version that stops early; and a chunk the receiver refuses ends the send with the receiver's reason.",
+      "status": "implemented_pending_qualification",
+      "changes": [
+        {
+          "summary": "A sender tells the receiver how many chunks to acknowledge together, taken from its send window, and stopped whenever the window was full. A slow acknowledgement halves the window. Read between sending a chunk and deciding to stop, it left the sender waiting with fewer chunks outstanding than that chunk had announced, and the receiver holding all of them until more arrived. Neither had a timer shorter than the sender's 30-second limit. The sender now stops only when it has at least as many chunks outstanding as its last chunk announced, and otherwise sends one more; the receiver now answers a batch that has stayed short for a tenth of a second. Either change is sufficient alone, so a pair of mixed versions is covered in both directions. The defect dates from 2026-05-12 and is on the default branch.",
+          "commits": [
+            "1577cb1"
+          ],
+          "files": [
+            "src/one_link/ack_batching.py",
+            "src/one_link/daemon.py",
+            "tests/test_ack_batching.py"
+          ]
+        },
+        {
+          "summary": "An independent review refuted the first claim in one case: a receiver that refuses a chunk says so at once while it may hold the answers to the chunks before it, and the sender's reply wait dropped an answer to any chunk but the one it awaited before checking whether it was a refusal. The sender then waited out its deadline and reported a silent peer; with the new timer the held answers were also sent after the transfer had been abandoned. The sender now takes a refusal of any chunk it has outstanding as the refusal of the transfer, and a receiver that abandons a transfer drops what it held. The stall predates the first change; the late answer did not.",
+          "commits": [
+            "3634ec6"
+          ],
+          "files": [
+            "src/one_link/ack_batching.py",
+            "src/one_link/daemon.py",
+            "tests/test_ack_batching.py"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "A search of every reachable state of the send loop against the receive rule, driven by the real window controller, over 288 configurations and transfers of up to 12 chunks: with the rule that shipped, 252 configurations can stall, the smallest after three chunks; with the sender's new rule alone, none; with the receiver's new rule alone, none. A first version of the sender's rule, which only booked batched acknowledgements earlier, was refuted by the same search (238 configurations still stalled) and discarded. With the receiver refusing each chunk in turn, every history ends with the sender told of the refusal, against a receiver of either version. 31 planted defects are each caught; the seven that remove a call from the daemon's send path are caught only by a check of the source text.",
+          "tests": [
+            "tests/test_ack_batching.py"
+          ],
+          "evidence_ids": []
+        },
+        {
+          "summary": "Measured between two freshly paired daemons on a workstation, a 64 MiB file each time: before, 4 of 134 sends stalled for 30 seconds and were reported as paused; after, 189 of 189 completed (126 on the committed code, 63 on an earlier arrangement of the same rule), with the median send time unchanged at 1.9 s. In one of 63 instrumented sends the sender's new rule was needed, six times; without it each was a stall.",
+          "tests": [
+            "tests/test_file_engine_perf_gate.py"
+          ],
+          "evidence_ids": []
+        },
+        {
+          "summary": "Independent review of the first change (a reviewer that did not write it): refuted for a refused chunk, with a runnable two-chunk witness against the real receive handlers and the real reply wait; addressed as above. It confirmed by reading that the last chunk always announces a batch of one in both loops. It did not examine the ordering of the timer's frame against the handler's on one channel, the bound on sending past a full window, or the soundness of the search's pruning.",
+          "tests": [],
+          "evidence_ids": []
+        }
+      ],
+      "remaining": [
+        "Hosted CI on these revisions.",
+        "No test with real daemons fails deterministically without the first change: the stall needs a slow acknowledgement at one point in the transfer, and nothing in the product lets a test place it. The evidence with real daemons is the before-and-after count.",
+        "A sender that predates the second change still waits out its deadline when a chunk behind a held answer is refused, whatever the receiver runs. Answering what is held before every refusal would fix that for old senders and means touching about forty refusal sites; not done.",
+        "The second change has not been read independently, and the reply wait's part of it is tested through the function it calls and a check of the source text, not by driving the daemon's send path.",
+        "The window controller is told an acknowledgement's age when the send loop next needs room, not when the acknowledgement arrived, so chunks answered together look progressively slower and the window shrinks more often than the link warrants. Recorded, not changed: it affects speed, not completion.",
+        "The disabled QUIC chunk path derives its transfer session from the most recent inbound connection from the peer, which can be a route-verification probe. Read in the source, not tested; the path is off."
+      ]
+    },
+    {
+      "id": "FLD-06",
+      "priority": "High",
+      "title": "A daemon that had rotated its identity froze the connection of a peer that called it",
+      "owner": "daemon",
+      "acceptance": "A daemon that owes a caller a rotation certificate delivers it and goes on answering that caller, and nothing outlives the connection.",
+      "status": "implemented_pending_qualification",
+      "changes": [
+        {
+          "summary": "After the CAPS exchange each daemon sends the other any rotation certificate it still owes, from inside its CAPS handler. On a ratcheted channel the side that accepted the connection cannot send until it has read the caller's first ratcheted frame, and on that side the CAPS handler runs in the task that reads the connection: the send waited on a read that task could no longer make. The caller was never answered and the handler never ended, even after the caller hung up, keeping one of that peer's inbound slots for the life of the daemon. The accepting side now hands the delivery to a tracked task, queued ahead of its own replies, and keeps reading. The calling side is unchanged.",
+          "commits": [
+            "312c5a3"
+          ],
+          "files": [
+            "src/one_link/channel.py",
+            "src/one_link/daemon.py",
+            "tests/test_responder_rotation_drain.py"
+          ]
+        }
+      ],
+      "validation": [
+        {
+          "summary": "Three tests with the real handler, a real channel and a real state store. Against the code before the change, a caller that is owed a certificate gets no answer, the handler is still running after the caller has gone and one inbound slot stays held. After it the caller receives the certificate and then its answer, and nothing is left. The existing 114 rotation and capability tests pass.",
+          "tests": [
+            "tests/test_responder_rotation_drain.py"
+          ],
+          "evidence_ids": []
+        }
+      ],
+      "remaining": [
+        "Hosted CI on the fix revision, and an independent read.",
+        "Found by reading and confirmed with the handler in isolation. It has not been exercised between two real daemons, where it needs one that has rotated and a peer that calls before the certificate is acknowledged.",
+        "It was found while looking for the cause of one hosted failure of the key-rotation live test and is not that cause: there the rotated daemon had made the call."
       ]
     }
   ],
@@ -5030,6 +5189,11 @@
         "revision": "e3548b7",
         "summary": "57 checks passed, 2 failed, 2 skipped, on a documents-only commit. Failed: the browser test of a window left open across a daemon restart, on hosted Linux, with its roll-up.",
         "reading": "A defect in that test, not in the product: it required three recovery probes inside a fixed nine seconds, and the probes back off, so the count depended on where the page's poll timers stood when the daemon died. It now waits for the fourth probe counted from the injected 401."
+      },
+      {
+        "revision": "c679803",
+        "summary": "56 checks passed, 3 failed, 2 skipped; after re-running the failed live shard, 59 passed, none failed. Failed first: a 64 MiB file send between two daemons on hosted Linux, with its roll-ups.",
+        "reading": "A defect in the product, recorded as FLD-05. The same stall was then reproduced on a workstation and traced with both daemons' whole logs. It is not related to the stop path. The key-rotation live test that failed once on hosted Windows at 1c7ae92 is still not explained: it passed 19 times of 19 on a workstation, 15 of them under load. A failing live test now carries 60,000 characters of each daemon's log instead of 4,000, and a session probe that fails logs why."
       }
     ]
   },
@@ -5040,9 +5204,11 @@
       "FLD-01",
       "FLD-02",
       "FLD-03",
-      "FLD-04"
+      "FLD-04",
+      "FLD-05",
+      "FLD-06"
     ],
-    "fix_revision": "4e73895",
+    "fix_revision": "8a486e7",
     "hosted_ci": {
       "revision": "6eb2af7",
       "summary": "59 checks passed, none failed, 2 skipped.",

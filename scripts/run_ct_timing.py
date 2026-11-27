@@ -64,6 +64,26 @@ PASS, LEAK, INCONCLUSIVE = "PASS", "LEAK", "INCONCLUSIVE-POWER"
 # Relative tolerance between the binary's statistics and this recomputation.
 RECOMPUTE_RTOL = 1e-9
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+def ct_profile_description() -> str:
+    """Describe the code generation the audited binary was built with.
+
+    Read from the workspace manifest, so the evidence records the profile
+    that was actually used rather than a sentence that can go stale when the
+    release profile changes.
+    """
+    import tomllib
+
+    manifest = tomllib.loads((ROOT / "native" / "Cargo.toml").read_text(encoding="utf-8"))
+    release = manifest["profile"]["release"]
+    return (
+        "ct-audit (inherits release: "
+        f"opt-level {release['opt-level']}, "
+        f"lto={release['lto']}, "
+        f"codegen-units={release['codegen-units']}, "
+        f"panic={release['panic']})"
+    )
 # A target's process may run this much longer than its measurement budget
 # (setup of key pools, JSON emission) before it is killed.
 SETUP_MARGIN_S = 120
@@ -572,7 +592,7 @@ def source_info(args: argparse.Namespace, binary: pathlib.Path) -> dict:
         "binary": display_path(binary),
         "binary_sha256": sha256(binary),
         "binary_bytes": binary.stat().st_size,
-        "profile": "ct-audit (inherits release: opt-level 3, fat LTO, 1 codegen unit, panic=abort)",
+        "profile": ct_profile_description(),
     }
 
 

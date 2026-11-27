@@ -11,12 +11,17 @@ name = "ol_pqkem"
 crate-type = ["lib"]
 
 [dependencies]
-blake3        = { workspace = true }
-ml-kem        = "0.2"
+# `zeroize` lets the combiner wipe its hasher, whose block buffer holds
+# shared-secret bytes after the last update.
+blake3        = { workspace = true, features = ["zeroize"] }
+# `zeroize` makes ml-kem wipe its decapsulation key (the secret vector and
+# the implicit-rejection seed) when the key is dropped.
+ml-kem        = { version = "0.2", features = ["zeroize"] }
 # Match the hybrid-array version ml-kem 0.2 uses. Required because we
 # need to construct `Array<u8, N>` instances directly to call ml-kem's
 # `KeyEncode::from_bytes` (which takes a typed Array, not a slice).
-hybrid-array  = "0.2"
+# `zeroize` lets the typed arrays that carry secrets be wiped after use.
+hybrid-array  = { version = "0.2", features = ["zeroize"] }
 x25519-dalek  = { version = "2.0", features = ["static_secrets"] }
 rand_core     = { workspace = true }
 zeroize       = { workspace = true }

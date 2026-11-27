@@ -11,6 +11,20 @@ publish = false
 [package.metadata]
 cargo-fuzz = true
 
+# The same verified ml-kem backport the native workspace selects (see
+# native/Cargo.toml and ../patches/ml-kem-0.2.3.json). This graph links
+# ol_onion and ol_pqkem, so the fuzzers must exercise the reviewed bytes, not
+# the registry's. Cargo honours [patch] only at a workspace root, and this is
+# its own workspace, so it declares the patch itself. One record and one
+# vendored tree serve both workspaces; scripts/verify_vendor_patches.py checks
+# that this path and the record's path resolve to the same directory, and
+# that no lockfile in the repository resolves ml-kem 0.2.3 from the registry.
+[package.metadata.one-link.vendored-patches]
+ml-kem = "../patches/ml-kem-0.2.3.json"
+
+[patch.crates-io]
+ml-kem = { path = "../vendor/ml-kem-0.2.3" }
+
 [dependencies]
 libfuzzer-sys = "0.4"
 zeroize       = { version = "1.8", features = ["derive"] }

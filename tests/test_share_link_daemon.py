@@ -19,6 +19,7 @@ from tests.harness import _bring_up, daemon_pair, inbox_files, request
 pytestmark = [pytest.mark.timeout(120), pytest.mark.soak]
 
 
+@pytest.mark.live_daemon
 def test_create_share_link_returns_sas_and_token(tmp_path: Path) -> None:
     """Minting via the control API returns both the human-
     readable SAS phrase and the raw token. Sender shares the SAS
@@ -39,6 +40,7 @@ def test_create_share_link_returns_sas_and_token(tmp_path: Path) -> None:
         assert res["expires_at_ms"] > int(time.time() * 1000)
 
 
+@pytest.mark.live_daemon
 def test_redeem_consumes_share_link(tmp_path: Path) -> None:
     """Recipient hands the token back through redeem_share_link;
     the registry marks consumed; second redeem with the same
@@ -66,6 +68,7 @@ def test_redeem_consumes_share_link(tmp_path: Path) -> None:
         assert redeem2.get("error") == "already_redeemed"
 
 
+@pytest.mark.live_daemon
 def test_redeem_unknown_token(tmp_path: Path) -> None:
     """A token the daemon never minted must report not_found —
     not crash, not return success."""
@@ -78,6 +81,7 @@ def test_redeem_unknown_token(tmp_path: Path) -> None:
         assert res.get("error") == "not_found"
 
 
+@pytest.mark.live_daemon
 def test_redeem_rejects_malformed_token() -> None:
     """token_hex must be exactly 64 hex chars; anything else is
     rejected at the boundary."""
@@ -90,6 +94,7 @@ def test_redeem_rejects_malformed_token() -> None:
         assert "64 hex" in res.get("error", "")
 
 
+@pytest.mark.live_daemon
 def test_list_share_links_omits_token(tmp_path: Path) -> None:
     """Listing surfaces user-facing fields (SAS phrase, size,
     expiry) but never the raw token. Tokens are bearer secrets;
@@ -114,6 +119,7 @@ def test_list_share_links_omits_token(tmp_path: Path) -> None:
         assert found["consumed"] is False
 
 
+@pytest.mark.live_daemon
 def test_revoke_share_link_removes(tmp_path: Path) -> None:
     """Sender can revoke a still-active share-link before the
     recipient redeems."""
@@ -137,6 +143,7 @@ def test_revoke_share_link_removes(tmp_path: Path) -> None:
         assert redeem.get("error") == "not_found"
 
 
+@pytest.mark.live_daemon
 def test_claim_share_link_from_peer_end_to_end(tmp_path: Path) -> None:
     """Recipient-side public API: ``claim_share_link_from_peer``
     constructs + sends SHARE_LINK_REDEEM behind the scenes. UI
@@ -179,6 +186,7 @@ def test_claim_share_link_from_peer_end_to_end(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.live_daemon
 def test_share_link_redeem_wire_frame_triggers_file_offer(tmp_path: Path) -> None:
     """A peer that presents a valid token via SHARE_LINK_REDEEM
     wire frame must trigger the sender to fire a FILE_OFFER for
@@ -238,6 +246,7 @@ def test_share_link_redeem_wire_frame_triggers_file_offer(tmp_path: Path) -> Non
         assert redeem_again.get("error") == "already_redeemed"
 
 
+@pytest.mark.live_daemon
 def test_share_link_redeem_wire_rejects_bad_token() -> None:
     """A SHARE_LINK_REDEEM with a token that was never minted
     must be rejected — no file offer fires, no spurious transfer
@@ -269,6 +278,7 @@ def test_share_link_redeem_wire_rejects_bad_token() -> None:
         )
 
 
+@pytest.mark.live_daemon
 def test_share_link_redeem_wire_rejects_malformed_token() -> None:
     """A SHARE_LINK_REDEEM with a non-64-char token gets the
     rejected=bad_share_link_token ACK and produces no transfer."""
@@ -291,6 +301,7 @@ def test_share_link_redeem_wire_rejects_malformed_token() -> None:
         assert not in_files
 
 
+@pytest.mark.live_daemon
 def test_share_link_survives_daemon_restart(tmp_path: Path) -> None:
     """Minted tokens persist to disk and the registry reloads on
     daemon restart so recipients can redeem hours later."""

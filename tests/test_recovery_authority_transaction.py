@@ -144,14 +144,20 @@ def test_blank_boot_phrase_destroy_restore_recovers_live_identity_and_data_root(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("passphrase_mode", [False, True])
 async def test_real_daemon_run_establishes_seed_before_constructing_daemon(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    passphrase_mode: bool,
 ) -> None:
     from one_link import daemon as daemon_module
 
     home = tmp_path / "daemon-blank"
     monkeypatch.setenv("ONE_LINK_HOME", str(home))
+    if passphrase_mode:
+        monkeypatch.setenv(lockbox.PASSPHRASE_ENV, "audit first boot and restart")
+    else:
+        monkeypatch.delenv(lockbox.PASSPHRASE_ENV, raising=False)
     observations: dict[str, object] = {}
 
     async def no_socket_start(self) -> None:
@@ -166,6 +172,12 @@ async def test_real_daemon_run_establishes_seed_before_constructing_daemon(
             paths.data_dir()
         )
         observations["derived_drk"] = master_seed.derive_drk(seed)
+        assert master_seed.inspect_derived_authority(
+            paths.data_dir(), identity_path=paths.key_path(), seed=seed,
+        ) == {"identity": True, "data_root": True}
+        assert lockbox.recovery_envelope_matches_seed(paths.data_dir(), seed) is (
+            True if passphrase_mode else None
+        )
 
     async def no_socket_serve(_self) -> None:
         return None
@@ -184,6 +196,13 @@ async def test_real_daemon_run_establishes_seed_before_constructing_daemon(
     assert observations["public"] == observations["derived_public"]
     assert observations["drk"] == observations["derived_drk"]
     assert master_seed.has_seed(paths.data_dir()) is True
+
+    # A second boot must converge using exactly the persisted authority.
+    first_seed = master_seed.load_seed(paths.data_dir())
+    first_identity = paths.key_path().read_bytes()
+    await daemon_module.run()
+    assert master_seed.load_seed(paths.data_dir()) == first_seed
+    assert paths.key_path().read_bytes() == first_identity
 
 
 @pytest.mark.asyncio

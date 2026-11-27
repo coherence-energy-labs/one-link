@@ -81,6 +81,7 @@ def test_build_caps_app_version_is_present_with_optional_fields():
 
 # ─── 2. /api/me exposes our app_version ────────────────────────────────
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_api_me_exposes_app_version():
     from one_link import __version__
@@ -101,6 +102,7 @@ async def test_api_me_exposes_app_version():
 
 # ─── 3. /api/peers carries each peer's app_version after CAPS ─────────
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_api_peers_exposes_peer_app_version_after_caps():
     """The peer's CAPS frame is exchanged on first encrypted send.
@@ -234,6 +236,7 @@ def test_translate_unknown_falls_back_with_detail():
 
 # ─── 5. End-to-end: a real /api/send hitting a translated error ────────
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_api_send_returns_translated_error_for_rejected_peer():
     """The structured error reaches the client. We use peer-rejected

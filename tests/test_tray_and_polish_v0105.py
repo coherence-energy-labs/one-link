@@ -114,7 +114,7 @@ def test_tray_optional_deps_in_pyproject():
     data = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     tray = data["project"]["optional-dependencies"]["tray"]
     assert "pystray>=0.19" in tray
-    assert "pillow>=12.2.0" in tray
+    assert "pillow>=13.0.0,<14" in tray
 
 
 def test_cli_daemon_respects_no_tray_flag():

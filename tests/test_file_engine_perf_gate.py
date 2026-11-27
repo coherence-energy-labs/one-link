@@ -65,6 +65,7 @@ def _wait_for_payload(home: Path, payload: bytes, timeout: float) -> Path | None
 # Memory regression gate (stream-to-disk must not regress)
 # ──────────────────────────────────────────────────────────────────
 
+@pytest.mark.live_daemon
 def test_perf_gate_receiver_rss_under_cap(tmp_path: Path) -> None:
     """The receiver's RSS during a 64 MiB transfer must stay under
     a generous cap. Pre-Wave-1d the receiver would have held all
@@ -123,6 +124,7 @@ def test_perf_gate_receiver_rss_under_cap(tmp_path: Path) -> None:
 # Throughput regression gate
 # ──────────────────────────────────────────────────────────────────
 
+@pytest.mark.live_daemon
 def test_perf_gate_throughput_16mib_floor(tmp_path: Path) -> None:
     """A 16 MiB loopback transfer must complete inside a floor with
     real headroom for the machine class it runs on.

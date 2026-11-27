@@ -44,6 +44,7 @@ def _stream_offer(name: str, payload: bytes) -> dict:
     }
 
 
+@pytest.mark.live_daemon
 def test_file_offer_batch_receiver_processes_all_offers() -> None:
     """A FILE_OFFER_BATCH carrying 3 distinct offers must produce
     3 IncomingFile entries on the receiver — same effect as 3
@@ -99,6 +100,7 @@ def test_file_offer_batch_receiver_processes_all_offers() -> None:
         )
 
 
+@pytest.mark.live_daemon
 def test_file_offer_batch_rejects_empty() -> None:
     """A FILE_OFFER_BATCH with no offers must be rejected with a
     clean ``rejected=bad_file_offer_batch_empty`` ACK, not
@@ -137,6 +139,7 @@ def test_file_offer_batch_rejects_empty() -> None:
         )
 
 
+@pytest.mark.live_daemon
 def test_file_offer_batch_rejects_oversize() -> None:
     """A batch with > 256 offers must be rejected so a hostile
     peer can't make us allocate unbounded inner state. Each

@@ -24,7 +24,7 @@ rand_chacha   = "0.3"
 # raw r||s signatures over the curve, but peers on macOS / Linux
 # need to verify them. Verify-only is cheap; signing on the TPM
 # stays on Windows.
-p256          = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+p256          = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 # Row 1: PQ-hybrid signing primitive — attestation docs and sealed
 # signing both bind to the master's hybrid key.
 ol_pqsig      = { path = "../ol_pqsig" }

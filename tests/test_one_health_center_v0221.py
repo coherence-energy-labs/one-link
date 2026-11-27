@@ -155,7 +155,9 @@ def test_one_health_refreshes_on_startup_poll_and_mesh_events() -> None:
     init = html[init_idx:init_idx + 5000]
     assert '["health", refreshOneHealth()]' in init
     assert "await Promise.allSettled" in init
-    assert "setInterval(refreshOneHealth, 15000)" in init
+    assert "pollingCluster.start(_mainPollTasks())" in init
+    tasks_idx = html.find("function _mainPollTasks()")
+    assert "[refreshOneHealth, 15000]" in html[tasks_idx:tasks_idx + 400]
     ws_idx = html.find('m.type === "self_mesh_changed"')
     ws = html[ws_idx:ws_idx + 300]
     assert "refreshOneHealth()" in ws

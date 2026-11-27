@@ -56,6 +56,17 @@ LIVE_INTEGRATION_ENV = "ONE_LINK_RUN_LIVE_INTEGRATION"
 _CONTROL_SECRETS: dict[int, tuple[str, Path]] = {}
 
 
+def daemon_boot_budget_s() -> float:
+    """How long a test waits for a daemon it started to become ready.
+
+    One budget for every test that starts a daemon. It has to be generous
+    enough that a slow but healthy start on a loaded runner is never called a
+    failure; a start that never happens is bounded by the per-test timeout.
+    Overridable for constrained hardware.
+    """
+    return float(os.environ.get("ONE_LINK_TEST_DAEMON_BOOT_S", "45"))
+
+
 def live_integration_enabled() -> bool:
     return os.environ.get(LIVE_INTEGRATION_ENV) == "1"
 
@@ -63,6 +74,18 @@ def live_integration_enabled() -> bool:
 def require_live_daemon() -> None:
     """Skip the calling test unless the live-daemon lane is enabled.
     Call this from any code path that spawns a real daemon subprocess."""
+    current = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
+    if current:
+        import pytest
+
+        nodeid = current.split("[", 1)[0].replace("\\", "/")
+        manifest = Path(__file__).with_name("live_daemon_manifest.json")
+        registered = json.loads(manifest.read_text(encoding="utf-8"))["nodeids"]
+        if nodeid not in registered:
+            pytest.fail(
+                "unregistered live-daemon test: add @pytest.mark.live_daemon and "
+                "regenerate scripts/live_suite.py --write-manifest before spawning"
+            )
     if not live_integration_enabled():
         import pytest
 
@@ -235,7 +258,13 @@ def request(control_port: int, *, timeout: float = 30.0, **req) -> dict:
     raise RuntimeError("control request returned no response")
 
 
-def _spawn(home: Path, log: Path, mdns_type: str | None = None) -> tuple[subprocess.Popen, BinaryIO]:
+def _spawn(
+    home: Path,
+    log: Path,
+    mdns_type: str | None = None,
+    *,
+    periodic_folder_sync: bool = True,
+) -> tuple[subprocess.Popen, BinaryIO]:
     """Returns (proc, log_fh). Caller stores the log_fh on the handle
     and closes it after the proc exits — keeps Python's GC from
     emitting ResourceWarning at random later moments."""
@@ -274,8 +303,11 @@ def _spawn(home: Path, log: Path, mdns_type: str | None = None) -> tuple[subproc
     env.setdefault("ONE_LINK_REQUIRE_FILE_ACCEPT", "0")
     log.parent.mkdir(parents=True, exist_ok=True)
     f = open(log, "wb")
+    daemon_module = (
+        "one_link.cli" if periodic_folder_sync else "tests.manual_folder_sync_daemon"
+    )
     proc = subprocess.Popen(
-        [sys.executable, "-m", "one_link.cli", "daemon", "-v"],
+        [sys.executable, "-m", daemon_module, "daemon", "-v"],
         env=env,
         stdout=f,
         stderr=subprocess.STDOUT,
@@ -427,7 +459,9 @@ def _stop(
                     lowered = [str(arg).strip().lower() for arg in argv]
                     is_daemon = (
                         "-m" in lowered
-                        and "one_link.cli" in lowered
+                        and any(module in lowered for module in (
+                            "one_link.cli", "tests.manual_folder_sync_daemon",
+                        ))
                         and "daemon" in lowered
                     )
                     candidate_home = candidate.environ().get("ONE_LINK_HOME")
@@ -520,8 +554,17 @@ def _read_log(p: Path, n: int = 4000) -> str:
         return "<no log>"
 
 
-def _bring_up(home: Path, log: Path, label: str, mdns_type: str | None = None) -> DaemonHandle:
-    proc, log_fh = _spawn(home, log, mdns_type=mdns_type)
+def _bring_up(
+    home: Path,
+    log: Path,
+    label: str,
+    mdns_type: str | None = None,
+    *,
+    periodic_folder_sync: bool = True,
+) -> DaemonHandle:
+    proc, log_fh = _spawn(
+        home, log, mdns_type=mdns_type, periodic_folder_sync=periodic_folder_sync,
+    )
     try:
         # 15 s was too tight for a loaded Windows hosted runner: three
         # unrelated live tests failed on one run purely because the daemon had
@@ -561,7 +604,7 @@ def _bring_up(home: Path, log: Path, label: str, mdns_type: str | None = None) -
         # hang, so this only needs to be generous enough that a slow-but-
         # healthy boot is never called a failure. Overridable for operators
         # running on constrained hardware.
-        startup_budget = float(os.environ.get("ONE_LINK_TEST_DAEMON_BOOT_S", "45"))
+        startup_budget = daemon_boot_budget_s()
         http_deadline = time.time() + startup_budget
         ui_token_path = home / "data" / "ui.token"
         server_port_path = home / "data" / "server.port"
@@ -644,13 +687,45 @@ def _pin_test_peer(source: DaemonHandle, peer: DaemonHandle) -> None:
         )
 
 
+# How much of each daemon's log a failing live test carries. It was 4000
+# characters, and two hosted failures arrived unreadable: one "peer caps" line
+# is about 700 characters, so the tail began some twenty lines before the end,
+# after the events that mattered. A whole short test's log is 20 to 60 thousand.
+FAILED_TEST_LOG_TAIL = 60_000
+
+
+def _attach_daemon_logs(exc: BaseException, logs: dict[str, Path]) -> None:
+    """Add each daemon's log tail to a failing live test's exception.
+
+    pytest prints exception notes under the traceback, so the evidence reaches
+    the hosted job log with no artifact to fetch. Reading the logs must never
+    replace the original failure, and a generator being closed or an interrupt
+    is not a test failure.
+    """
+    if isinstance(exc, (GeneratorExit, KeyboardInterrupt)):
+        return
+    for label, path in logs.items():
+        try:
+            tail = _read_log(path, FAILED_TEST_LOG_TAIL)
+        except Exception as read_error:
+            tail = f"<log unreadable: {type(read_error).__name__}: {read_error}>"
+        exc.add_note(f"--- daemon {label} log tail ---\n{tail}")
+
+
 @contextmanager
-def daemon_pair(*, pin_trust: bool = False) -> Iterator[DaemonPair]:
+def daemon_pair(
+    *, pin_trust: bool = False, periodic_folder_sync: bool = True,
+) -> Iterator[DaemonPair]:
     """Spin up two daemons, converge mDNS, and optionally pin both peers.
 
     ``pin_trust=False`` preserves the pending-peer surface needed by pairing
     and authorization tests. Live transport tests pass ``pin_trust=True`` so
     capability checks run with the same post-pairing authority as production.
+
+    ``periodic_folder_sync=False`` uses a test-only CLI entry point that omits
+    the scheduled folder pushes. Manual sync, watchers, authenticated transport,
+    and receipt verification still run normally, so a single-sync test cannot
+    accidentally prove convergence caused by an earlier background cycle.
     """
     # Gate: spawning real daemon subprocesses is the live-integration
     # lane. Skip the calling test in the default (hermetic) gate.
@@ -668,8 +743,14 @@ def daemon_pair(*, pin_trust: bool = False) -> Iterator[DaemonPair]:
     a: DaemonHandle | None = None
     b: DaemonHandle | None = None
     try:
-        a = _bring_up(a_home, a_log, "A", mdns_type=mdns_type)
-        b = _bring_up(b_home, b_log, "B", mdns_type=mdns_type)
+        a = _bring_up(
+            a_home, a_log, "A", mdns_type=mdns_type,
+            periodic_folder_sync=periodic_folder_sync,
+        )
+        b = _bring_up(
+            b_home, b_log, "B", mdns_type=mdns_type,
+            periodic_folder_sync=periodic_folder_sync,
+        )
         # Wait for cross-discovery
         deadline = time.time() + 20.0
         while time.time() < deadline:
@@ -690,7 +771,14 @@ def daemon_pair(*, pin_trust: bool = False) -> Iterator[DaemonPair]:
         if pin_trust:
             _pin_test_peer(a, b)
             _pin_test_peer(b, a)
-        yield DaemonPair(a=a, b=b, tmp=tmp)
+        try:
+            yield DaemonPair(a=a, b=b, tmp=tmp)
+        except BaseException as exc:
+            # A live test that fails on a hosted runner leaves only its
+            # assertion ("a.txt didn't land on B within 30s") unless the
+            # daemons' own account travels with it.
+            _attach_daemon_logs(exc, {"A": a_log, "B": b_log})
+            raise
     finally:
         if a is not None:
             _stop(

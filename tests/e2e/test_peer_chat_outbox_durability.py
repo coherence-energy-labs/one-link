@@ -90,7 +90,7 @@ async () => {
             remote_signal_signer_pubkey_b64u: remote.public_key_b64u,
         },
     };
-    api.state.rec = local;
+    api._identityTestUseRecord(local);
     api.state.pairing = pairing;
     window.__chatOutboxProof = { local, remote, pairing, sent };
     return { local: local.fingerprint, remote: remote.fingerprint };
@@ -236,7 +236,7 @@ def test_direct_chat_outbox_rejects_wrong_owner_and_quarantines_poison(
                         },
                     },
                 };
-                api.state.rec = intruder;
+                api._identityTestUseRecord(intruder);
                 api.state.pairing = wrongOwnerPairing;
                 const wrongOwnerDrain = await api.drainChatOutbox(
                     wrongOwnerPairing
@@ -254,7 +254,7 @@ def test_direct_chat_outbox_rejects_wrong_owner_and_quarantines_poison(
                         },
                     },
                 };
-                api.state.rec = proof.local;
+                api._identityTestUseRecord(proof.local);
                 api.state.pairing = ownerReconnect;
                 const ownerDrain = await api.drainChatOutbox(ownerReconnect);
                 const quarantine = await api.listChatOutboxQuarantine();

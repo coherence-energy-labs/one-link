@@ -63,6 +63,392 @@ from typing import Any, Iterable, Mapping, Optional
 from one_link.paths import data_dir
 
 DB_FILE = "state.db"
+
+
+# ─── key-protected State fields: the one registry ────────────────────────────
+#
+# Every State column (or JSON member of a column) whose stored bytes depend on
+# a key the install can rotate is listed here, with the key family it depends
+# on.  Writers seal and readers open these values only through
+# ``State._seal_field`` / ``State._open_field``, and identity rotation /
+# recovery re-keys exactly this set (``State.rekey_protected_fields``) inside
+# the same crash-replayable transaction that carries the whole-file LockBox
+# envelopes.  ``tests/test_rotation_state_field_carry.py`` holds the registry
+# complete: a static census of every seal/open primitive call in this module
+# and a dynamic census of every cell the real writers leave in the database.
+
+# The install's application data key (a LockBox): the silent DRK, which is
+# derive_drk(seed) and so changes with the seed, or a passphrase envelope's
+# stable DEK, which does not.
+FIELD_FAMILY_DATA_KEY = "data_key"
+# Deterministic AES-SIV under derive_path_pii_key(seed) (audit M30): changes
+# with every seed change, in both LockBox modes.
+FIELD_FAMILY_PATH_PII = "path_pii"
+
+
+@dataclass(frozen=True)
+class KeyProtectedField:
+    name: str
+    table: str
+    column: str
+    family: str
+    label: str
+    # Literal statements keep identifier selection in this reviewed registry.
+    # Row cursors, replacement values and row IDs are always bound parameters.
+    rekey_select_sql: str
+    rekey_update_sql: str
+    json_key: str = ""
+    aad: bytes = b""
+    plaintext_len: int = 32
+
+    def __post_init__(self) -> None:
+        # `table` and `column` name the cells the literal statements above
+        # act on; the schema-presence check and the registry tests use them
+        # as identifiers. They are restricted, at construction, to plain
+        # lowercase ASCII identifiers, so no quoting, whitespace, punctuation
+        # or statement text can ride in on one, whoever adds a field later.
+        for role, identifier in (("table", self.table), ("column", self.column)):
+            if not (
+                identifier.isascii()
+                and identifier.isidentifier()
+                and identifier == identifier.lower()
+            ):
+                raise ValueError(
+                    f"key-protected field {self.name!r}: {role} {identifier!r} is not a plain SQL identifier"
+                )
+        if self.family not in (FIELD_FAMILY_DATA_KEY, FIELD_FAMILY_PATH_PII):
+            raise ValueError(f"key-protected field {self.name!r}: unknown key family {self.family!r}")
+
+
+GROUP_SENDER_CHAIN_KEY = KeyProtectedField(
+    "group_sender_chains.chain_key", "group_sender_chains", "chain_key",
+    FIELD_FAMILY_DATA_KEY, label="chain_key",
+    rekey_select_sql=(
+        "SELECT rowid, chain_key FROM group_sender_chains "
+        "WHERE rowid > ? AND chain_key IS NOT NULL ORDER BY rowid LIMIT 512"
+    ),
+    rekey_update_sql="UPDATE OR REPLACE group_sender_chains SET chain_key = ? WHERE rowid = ?",
+)
+SELF_MESH_ROOT_SEED = KeyProtectedField(
+    "self_mesh_roots.root_seed", "self_mesh_roots", "root_seed",
+    FIELD_FAMILY_DATA_KEY, label="self-mesh root seed",
+    rekey_select_sql=(
+        "SELECT rowid, root_seed FROM self_mesh_roots "
+        "WHERE rowid > ? AND root_seed IS NOT NULL ORDER BY rowid LIMIT 512"
+    ),
+    rekey_update_sql="UPDATE OR REPLACE self_mesh_roots SET root_seed = ? WHERE rowid = ?",
+)
+TRANSFER_SOURCE_PATH = KeyProtectedField(
+    "transfers.metadata_json.path", "transfers", "metadata_json",
+    FIELD_FAMILY_PATH_PII, label="transfer source path",
+    rekey_select_sql=(
+        "SELECT rowid, metadata_json FROM transfers "
+        "WHERE rowid > ? AND metadata_json IS NOT NULL ORDER BY rowid LIMIT 512"
+    ),
+    rekey_update_sql="UPDATE OR REPLACE transfers SET metadata_json = ? WHERE rowid = ?",
+    json_key="path", aad=b"OL/state/transfers/path|v1",
+)
+CHUNK_SOURCE_PATH = KeyProtectedField(
+    "chunk_sources.path", "chunk_sources", "path",
+    FIELD_FAMILY_PATH_PII, label="chunk source path",
+    rekey_select_sql=(
+        "SELECT rowid, path FROM chunk_sources "
+        "WHERE rowid > ? AND path IS NOT NULL ORDER BY rowid LIMIT 512"
+    ),
+    rekey_update_sql="UPDATE OR REPLACE chunk_sources SET path = ? WHERE rowid = ?",
+    aad=b"OL/state/chunk_sources/path|v1",
+)
+FILE_INDEX_PATH = KeyProtectedField(
+    "file_index_cache.path", "file_index_cache", "path",
+    FIELD_FAMILY_PATH_PII, label="file index path",
+    rekey_select_sql=(
+        "SELECT rowid, path FROM file_index_cache "
+        "WHERE rowid > ? AND path IS NOT NULL ORDER BY rowid LIMIT 512"
+    ),
+    rekey_update_sql="UPDATE OR REPLACE file_index_cache SET path = ? WHERE rowid = ?",
+    aad=b"OL/state/file_index_cache/path|v1",
+)
+KEY_PROTECTED_FIELDS: tuple[KeyProtectedField, ...] = (
+    GROUP_SENDER_CHAIN_KEY,
+    SELF_MESH_ROOT_SEED,
+    TRANSFER_SOURCE_PATH,
+    CHUNK_SOURCE_PATH,
+    FILE_INDEX_PATH,
+)
+
+
+def carry_key_protected_fields(
+    data_dir: Path,
+    *,
+    previous_data_key: Optional[bytes],
+    target_data_key: bytes,
+    previous_seed: Optional[bytes],
+    target_seed: bytes,
+) -> dict[str, dict[str, int]]:
+    """Re-key every registered field of ``data_dir``'s state.db, if needed.
+
+    Called by a confirmed seed/authority replacement before either key is
+    published.  Opens State only when a key actually changes and the
+    database exists; the daemon opens it the same way moments later.
+    """
+    if not isinstance(target_seed, (bytes, bytearray)) or len(target_seed) != 32:
+        raise ValueError("target_seed must be 32 bytes")
+    db_path = Path(data_dir) / DB_FILE
+    data_key_changes = previous_data_key is not None and not secrets.compare_digest(
+        bytes(previous_data_key), bytes(target_data_key)
+    )
+    path_key_changes = previous_seed is not None and not secrets.compare_digest(
+        bytes(previous_seed), bytes(target_seed)
+    )
+    if not (data_key_changes or path_key_changes) or not db_path.exists():
+        return {}
+    try:
+        state = State(db_path=db_path)
+    except Exception as exc:
+        # Publishing the new key without re-keying would orphan every sealed
+        # value the moment this database becomes readable again (a locked
+        # keychain at boot, for example).  The transaction stays pending and
+        # replays at the next boot instead.
+        from one_link.key_material import KeyMaterialProtectionError
+
+        raise KeyMaterialProtectionError(
+            "state.db cannot be opened to re-key its protected fields, so the "
+            "key replacement stays pending until it can: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    try:
+        return state.rekey_protected_fields(
+            previous_data_key=previous_data_key if data_key_changes else None,
+            target_data_key=bytes(target_data_key),
+            previous_seed=previous_seed if path_key_changes else None,
+            target_seed=bytes(target_seed),
+        )
+    finally:
+        state.close()
+
+
+def rekey_field_rows(
+    conn: Any,
+    *,
+    previous_data_key: Optional[bytes],
+    target_data_key: bytes,
+    previous_seed: Optional[bytes],
+    target_seed: bytes,
+    dry_run: bool = False,
+) -> dict[str, dict[str, int]]:
+    """Classify and re-key every ``KEY_PROTECTED_FIELDS`` value on ``conn``.
+
+    The caller owns the transaction (``State.rekey_protected_fields`` uses
+    its durable write transaction; the offline data-key migration opens its
+    own).  Semantics are documented on ``State.rekey_protected_fields``.
+    ``dry_run`` classifies without writing: ``rekeyed`` then counts the
+    values that WOULD be re-sealed.  Verifying that every value opens under
+    one key K is a dry run with previous == target == K: anything that is
+    not ``current`` is ``unopenable``.
+    """
+    from one_link.lockbox import LockBox, LockBoxError, MIN_WRAPPED_LEN
+    from one_link.path_pii import PATH_PII_MARKER, PathPIIEncryptor
+
+    target_box = LockBox(bytes(target_data_key))
+    previous_box = (
+        LockBox(bytes(previous_data_key)) if previous_data_key is not None else None
+    )
+    target_paths = PathPIIEncryptor(bytes(target_seed))
+    previous_paths = (
+        PathPIIEncryptor(bytes(previous_seed)) if previous_seed is not None else None
+    )
+
+    def _opens(box, blob: bytes) -> bool:
+        try:
+            box.unwrap(blob)
+        except LockBoxError:
+            return False
+        return True
+
+    tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    report: dict[str, dict[str, int]] = {}
+    for field in KEY_PROTECTED_FIELDS:
+        counts = {"rekeyed": 0, "current": 0, "unopenable": 0}
+        report[field.name] = counts
+        # Path-PII ciphertext is deterministic: every chunk row of one
+        # file stores the same value, so classify each distinct value
+        # once: stored value -> ("current" | "unopenable", None) or
+        # ("rekey", resealed value).
+        path_verdicts: dict[str, tuple[str, Optional[str]]] = {}
+        if field.table not in tables:
+            continue  # an older schema without this table holds no such value
+        if field.family == FIELD_FAMILY_DATA_KEY and previous_box is None:
+            continue
+        if field.family == FIELD_FAMILY_PATH_PII and previous_paths is None:
+            continue
+        # Exactly one previous key applies to this field's family and
+        # the guards above guarantee it is present. Bind it once, as a
+        # non-optional name, so a missing key can never be mistaken for
+        # an undecryptable row further down.
+        field_previous_box = previous_box if field.family == FIELD_FAMILY_DATA_KEY else None
+        field_previous_paths = previous_paths if field.family != FIELD_FAMILY_DATA_KEY else None
+        # The statements are literals of the reviewed registry entry, never
+        # composed here; cursor, replacement value and row id are bound.
+        select_page = field.rekey_select_sql
+        update_row = field.rekey_update_sql
+        last_rowid = 0
+        while True:
+            rows = conn.execute(select_page, (last_rowid,)).fetchall()
+            if not rows:
+                break
+            for rowid, stored in rows:
+                last_rowid = int(rowid)
+                if field.family == FIELD_FAMILY_DATA_KEY:
+                    blob = bytes(stored)
+                    if len(blob) != field.plaintext_len + MIN_WRAPPED_LEN:
+                        continue  # legacy cleartext: keyless
+                    if _opens(target_box, blob):
+                        counts["current"] += 1
+                        continue
+                    if field_previous_box is None:
+                        raise RuntimeError(
+                            f"re-key of {field.name} reached without its previous data key"
+                        )
+                    try:
+                        plaintext = field_previous_box.unwrap(blob)
+                    except LockBoxError:
+                        counts["unopenable"] += 1
+                        continue
+                    sealed: Any = target_box.wrap(plaintext)
+                else:
+                    document: Any = None
+                    if field.json_key:
+                        try:
+                            document = json.loads(stored)
+                        except (TypeError, ValueError):
+                            continue
+                        if not isinstance(document, dict):
+                            continue
+                        value = document.get(field.json_key)
+                    else:
+                        value = stored
+                    if not isinstance(value, str) or not value.startswith(
+                        PATH_PII_MARKER
+                    ):
+                        continue  # legacy cleartext: keyless
+                    verdict = path_verdicts.get(value)
+                    if verdict is None:
+                        if target_paths.unwrap(value, aad=field.aad) is not None:
+                            verdict = ("current", None)
+                        else:
+                            if field_previous_paths is None:
+                                raise RuntimeError(
+                                    f"re-key of {field.name} reached without its previous path key"
+                                )
+                            plaintext_path = field_previous_paths.unwrap(
+                                value, aad=field.aad,
+                            )
+                            verdict = (
+                                ("unopenable", None)
+                                if plaintext_path is None
+                                else (
+                                    "rekey",
+                                    target_paths.wrap(plaintext_path, aad=field.aad),
+                                )
+                            )
+                        path_verdicts[value] = verdict
+                    if verdict[0] != "rekey":
+                        counts[verdict[0]] += 1
+                        continue
+                    resealed = verdict[1]
+                    if document is not None:
+                        document[field.json_key] = resealed
+                        sealed = json.dumps(
+                            document, separators=(",", ":"), sort_keys=True,
+                        )
+                    else:
+                        sealed = resealed
+                # OR REPLACE: a deterministic path ciphertext can be a
+                # key column (chunk_sources, file_index_cache); if the
+                # same plaintext path already has a current-key row,
+                # the two rows describe one path and one survives.
+                if not dry_run:
+                    conn.execute(update_row, (sealed, rowid))
+                counts["rekeyed"] += 1
+    return report
+
+
+def open_offline_state_connection(
+    db_path: Path, database_keys: Iterable[Optional[str]],
+) -> tuple[Any, Optional[str]]:
+    """Open an OFFLINE state.db with the first database key that authenticates.
+
+    Returns ``(connection, key)``; ``key`` is ``None`` for a plaintext file.
+    Never State(): that picks its SQLCipher key from the environment and may
+    encrypt a plaintext file as a side effect.  The caller holds the daemon
+    instance lock, so no other connection is open.
+    """
+    from one_link import state_encryption
+    from one_link.key_material import KeyMaterialProtectionError
+
+    kind = state_encryption.detect_db_state(Path(db_path))
+    if kind == "plaintext":
+        return sqlite3.connect(str(db_path), isolation_level=None), None
+    if kind != "encrypted":
+        raise KeyMaterialProtectionError(f"state.db is {kind}; nothing can be re-keyed in it")
+    for key in database_keys:
+        if not key:
+            continue
+        try:
+            return state_encryption.open_encrypted_connection(Path(db_path), key), key
+        except Exception:  # nosec B112 - wrong key: authentication is the classifier
+            continue
+    raise KeyMaterialProtectionError(
+        "state.db opens with none of the database keys this migration holds"
+    )
+
+
+def rekey_offline_state_fields(
+    db_path: Path,
+    *,
+    database_keys: Iterable[Optional[str]],
+    previous_data_key: bytes,
+    target_data_key: bytes,
+    seed: bytes,
+    dry_run: bool = False,
+) -> dict[str, dict[str, int]]:
+    """Re-key (or, with ``dry_run``, classify) an offline state.db's data-key fields.
+
+    One FULL-synchronous transaction: all of it or none of it.  Path-PII
+    fields are keyed by the seed, which a data-key migration does not change,
+    so they are not touched.  A missing state.db holds no field.
+    """
+    if not Path(db_path).exists():
+        return {}
+    conn, _key = open_offline_state_connection(Path(db_path), database_keys)
+    try:
+        kwargs: dict[str, Any] = dict(
+            previous_data_key=previous_data_key,
+            target_data_key=target_data_key,
+            previous_seed=None,
+            target_seed=seed,
+        )
+        if dry_run:
+            return rekey_field_rows(conn, dry_run=True, **kwargs)
+        conn.execute("PRAGMA synchronous = FULL")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            report = rekey_field_rows(conn, **kwargs)
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        return report
+    finally:
+        conn.close()
+
+
 MAX_REMOTE_INSTRUCTION_SEEN_ROWS = 65_536
 MAX_REMOTE_INSTRUCTION_REPLAY_RETENTION_MS = 16 * 60 * 1000
 _LOWER_HEX_CHARS = frozenset("0123456789abcdef")
@@ -574,7 +960,11 @@ class State:
         # honestly.
         self.is_encrypted = False
         self._encryption_backup_path: Optional[Path] = None
-        conn = self._open_connection_with_encryption_if_available()
+        # Boot passes through here; a stall is logged while it lasts.
+        from one_link.lockbox import audible_step
+
+        with audible_step("state.db open", logger=log):
+            conn = self._open_connection_with_encryption_if_available()
         self._conn = conn
         # Row factory must come from the connection's OWN module —
         # sqlite3.Row only accepts sqlite3.Cursor, sqlcipher3.Row only
@@ -652,9 +1042,10 @@ class State:
         with contextlib.suppress(Exception):
             self._clean_marker.unlink()
         try:
-            self._init_pragmas()
-            self._migrate()
-            self._cleanup_verified_plaintext_backup()
+            with audible_step("state.db schema initialisation", logger=log):
+                self._init_pragmas()
+                self._migrate()
+                self._cleanup_verified_plaintext_backup()
         except BaseException:
             # A half-constructed State must not retain a native SQLite handle.
             # Windows otherwise refuses recovery's atomic state.db replace;
@@ -755,14 +1146,85 @@ class State:
     # AAD strings: distinct per column so a path that exists in both
     # tables encrypts to different ciphertext, ensuring a leak of one
     # column doesn't help an attacker pivot via the other.
-    _PATH_PII_AAD_CHUNK_SOURCES = b"OL/state/chunk_sources/path|v1"
-    _PATH_PII_AAD_FILE_INDEX = b"OL/state/file_index_cache/path|v1"
+    # The AADs live in KEY_PROTECTED_FIELDS; these names remain for readers
+    # outside this module (storage_lifecycle reads transfer paths).
+    _PATH_PII_AAD_CHUNK_SOURCES = CHUNK_SOURCE_PATH.aad
+    _PATH_PII_AAD_FILE_INDEX = FILE_INDEX_PATH.aad
     # 2026-05-22 audit T3-J: wrap the per-transfer source ``path``
     # so the ledger row + on-disk DB don't carry the user's
     # filesystem layout in plaintext. Distinct AAD per column so
     # leaked chunk_sources / file_index_cache rows can't help
     # decrypt this column even though many paths are the same.
-    _PATH_PII_AAD_TRANSFER = b"OL/state/transfers/path|v1"
+    _PATH_PII_AAD_TRANSFER = TRANSFER_SOURCE_PATH.aad
+
+    def _seal_field(self, field: KeyProtectedField, value: Any) -> Any:
+        """Seal one registered field for storage under its key family.
+
+        The only producer of key-protected State ciphertext: a value that
+        bypasses this cannot be found by ``rekey_protected_fields``.
+        """
+        if field.family == FIELD_FAMILY_DATA_KEY:
+            from one_link.lockbox import maybe_wrap
+
+            return maybe_wrap(bytes(value), self._lockbox)
+        return self._wrap_path(value, aad=field.aad)
+
+    def _open_field(self, field: KeyProtectedField, stored: Any) -> Any:
+        """Open one registered field read from storage.
+
+        Data-key fields are fixed width: exactly ``plaintext_len`` bytes is
+        legacy cleartext and ``plaintext_len + 29`` is a LockBox envelope.
+        Length, not the one-byte marker, discriminates, because a random
+        32-byte secret begins with the marker byte once in 256 values.
+        """
+        if field.family == FIELD_FAMILY_DATA_KEY:
+            from one_link.lockbox import MIN_WRAPPED_LEN
+
+            raw = bytes(stored)
+            if len(raw) == field.plaintext_len:
+                return raw
+            if len(raw) != field.plaintext_len + MIN_WRAPPED_LEN:
+                raise ValueError(
+                    f"invalid stored {field.label} length: {len(raw)}"
+                )
+            if self._lockbox is None:
+                raise RuntimeError(
+                    f"found a non-cleartext {field.label} but no lockbox is "
+                    "configured (was ONE_LINK_PASSPHRASE removed?)"
+                )
+            return self._lockbox.unwrap(raw)
+        return self._unwrap_path(stored, aad=field.aad)
+
+    def rekey_protected_fields(
+        self,
+        *,
+        previous_data_key: Optional[bytes],
+        target_data_key: bytes,
+        previous_seed: Optional[bytes],
+        target_seed: bytes,
+    ) -> dict[str, dict[str, int]]:
+        """Re-key every ``KEY_PROTECTED_FIELDS`` value in ONE durable transaction.
+
+        A family whose previous key is ``None`` is unchanged and skipped.
+        Each stored value is classified by authentication, never guessed:
+
+        * opens under the target key: already current (a replay after the
+          transaction committed converges here);
+        * opens under the previous key: re-sealed under the target key;
+        * opens under neither: counted as ``unopenable`` and left exactly as
+          stored (it was sealed by a key this transaction does not hold).
+
+        SQLite commits all of it or none of it, so an interruption leaves
+        every row under the previous key and the replay re-runs it.
+        """
+        with self.durable_write_transaction():
+            return rekey_field_rows(
+                self._conn,
+                previous_data_key=previous_data_key,
+                target_data_key=target_data_key,
+                previous_seed=previous_seed,
+                target_seed=target_seed,
+            )
 
     def _wrap_path(self, value: str, *, aad: bytes) -> str:
         if self._path_pii is None or not value:
@@ -840,7 +1302,17 @@ class State:
         from one_link import keychain as _kc
         from one_link import state_encryption as _se
 
+        from one_link import lockbox as _lockbox
+
         _kc.adopt_recovery_passphrase_for_database(Path(self.db_path))
+        # A passphrase-protected database started without its passphrase:
+        # refuse before the keychain mints a database key that opens nothing.
+        # KeyMaterialError: Daemon.start refuses instead of running stateless.
+        refusal = _lockbox.passphrase_startup_refusal(
+            Path(self.db_path).parent, probe_database=False,
+        )
+        if refusal is not None:
+            raise refusal
         passphrase = _kc.ensure_passphrase()
         # Stash for run_deferred_integrity_check(), which opens its OWN
         # read connection (so the multi-second check never blocks the
@@ -903,6 +1375,11 @@ class State:
             # silently swapping the file for a plaintext one would
             # corrupt the user's data.
             if state == "encrypted":
+                refusal = _lockbox.passphrase_startup_refusal(
+                    Path(self.db_path).parent, probe_database=True,
+                )
+                if refusal is not None:
+                    raise refusal from e
                 raise RuntimeError(
                     f"state.db is encrypted but the current passphrase "
                     f"can't decrypt it. The most likely cause: the "
@@ -1080,9 +1557,34 @@ class State:
                         target_version=target_version,
                         current_version=current,
                         apply=apply_fn,
+                        exactly_once=target_version in self._EXACTLY_ONCE_MIGRATIONS,
                     )
             finally:
                 c.close()
+
+    # Migrations that transform stored values one way. The runner re-applies
+    # every other step on every boot (they are idempotent backfills); these
+    # may run only on the boot that first crosses their version.
+    #
+    #   28  replaces each stored browser-session bearer with its SHA-256
+    #       record key. A record key has the same shape as a bearer (64
+    #       lowercase hex), so applying the step to an already-migrated row
+    #       hashes the key again and the browser's bearer no longer matches
+    #       anything. From 2026-07-25 until this set existed, that happened
+    #       on EVERY daemon start: each restart signed every open window out,
+    #       and "stay signed in across daemon restarts" could not work.
+    #
+    # tests/test_state_migrations_rerun.py re-opens a populated database and
+    # fails on any row a re-run changes in the tables it populates, so a new
+    # one-way step on those tables that is not listed here is caught.
+    #
+    # Not covered (independent review, 2026-11-25): a binary older than v28
+    # opening a database already stamped >= 28 stores a raw bearer, and this
+    # step will not convert it later. That row cannot authenticate here
+    # (lookups hash what is presented), so the browser signs in once more.
+    # Making the step idempotent would need a stored form that tells a record
+    # key from a bearer; the two are indistinguishable today.
+    _EXACTLY_ONCE_MIGRATIONS = frozenset({28})
 
     def _run_atomic_migration(
         self,
@@ -1091,24 +1593,32 @@ class State:
         target_version: int,
         apply,
         current_version: Optional[int] = None,
+        exactly_once: bool = False,
     ) -> None:
         """Apply ``apply(cursor)`` and (if first-time-crossing) stamp
         ``target_version`` in one transaction.
 
-        Each migration step is idempotent — most use ``CREATE ... IF
+        Most migration steps are idempotent — they use ``CREATE ... IF
         NOT EXISTS`` and PRAGMA-introspected ``ALTER TABLE``, and a few
         also serve as boot-time backfills (e.g. v2's root_id sweep).
-        We therefore always run ``apply`` so backfills keep healing
-        any drifted rows, but only INSERT the version stamp the first
-        time we cross the boundary. The whole thing is wrapped in a
-        single ``BEGIN IMMEDIATE`` so a crash mid-step rolls back
-        cleanly — no half-applied DDL with a stale version stamp.
+        Those are always run, so backfills keep healing any drifted
+        rows, and only the version stamp is first-crossing-only. The
+        whole thing is wrapped in a single ``BEGIN IMMEDIATE`` so a
+        crash mid-step rolls back cleanly — no half-applied DDL with a
+        stale version stamp.
+
+        A step that is NOT idempotent passes ``exactly_once=True`` and is
+        skipped once the database has reached its version. The stamp is
+        written in the same transaction as the step, so "reached its
+        version" and "the step was applied" are one fact.
         """
         if current_version is None:
             row = c.execute("SELECT MAX(version) FROM schema_version").fetchone()
             current_version = (
                 row[0] if row and row[0] is not None else 0
             )
+        if exactly_once and current_version >= target_version:
+            return
         c.execute("BEGIN IMMEDIATE")
         try:
             apply(c)
@@ -1598,9 +2108,12 @@ class State:
         database disclosure could therefore be replayed directly against a
         running daemon. Tokens are 256-bit random values, so a domain-separated
         SHA-256 record key is sufficient: lookup remains O(1), while the value
-        at rest is no longer a bearer credential. The schema version makes the
-        transformation exactly-once; hashing a record key a second time would
-        invalidate every outstanding browser session.
+        at rest is no longer a bearer credential. Hashing a record key a second
+        time would invalidate every outstanding browser session, so this step
+        is listed in ``_EXACTLY_ONCE_MIGRATIONS``: the runner applies it only
+        on the boot that first crosses v28. (The schema version alone did not
+        make it exactly-once: the runner re-applies ordinary steps on every
+        boot, and until that set existed it re-applied this one too.)
         """
         rows = c.execute(
             "SELECT id, session_uuid FROM ui_sessions"
@@ -4117,8 +4630,7 @@ class State:
         # disk attacker without the passphrase sees AEAD ciphertext.
         # When no lockbox is configured this is a no-op passthrough
         # (cleartext on disk — same as before this fix).
-        from one_link.lockbox import maybe_wrap as _lb_wrap
-        chain_key_at_rest = _lb_wrap(chain_key, self._lockbox)
+        chain_key_at_rest = self._seal_field(GROUP_SENDER_CHAIN_KEY, chain_key)
         with self._write_lock:
             self._conn.execute(
                 """
@@ -4170,19 +4682,7 @@ class State:
         # (marker + nonce + ct + tag). This avoids the 1/256 false
         # positive that a generic is_wrapped check would have on
         # the small-marker-byte collision class.
-        chain_key = bytes(row["chain_key"])
-        if len(chain_key) not in (32, 61):
-            raise ValueError(
-                f"invalid stored chain_key length: {len(chain_key)}"
-            )
-        if len(chain_key) == 61:
-            from one_link.lockbox import LockBox  # noqa: F401
-            if self._lockbox is None:
-                raise RuntimeError(
-                    "found a non-cleartext chain_key but no lockbox is "
-                    "configured (was ONE_LINK_PASSPHRASE removed?)"
-                )
-            chain_key = self._lockbox.unwrap(chain_key)
+        chain_key = self._open_field(GROUP_SENDER_CHAIN_KEY, row["chain_key"])
         return {
             "epoch": row["epoch"],
             "chain_key": chain_key,
@@ -5735,9 +6235,7 @@ class State:
         meta_to_store = dict(metadata or {})
         raw_path = meta_to_store.get("path")
         if isinstance(raw_path, str) and raw_path:
-            meta_to_store["path"] = self._wrap_path(
-                raw_path, aad=self._PATH_PII_AAD_TRANSFER,
-            )
+            meta_to_store["path"] = self._seal_field(TRANSFER_SOURCE_PATH, raw_path)
         with self._write_lock:
             self._conn.execute(
                 """
@@ -6647,11 +7145,9 @@ class State:
                 root_seed=bytes(root_seed),
                 root_pub=bytes(root_pub),
             )
-        from one_link.lockbox import maybe_wrap as _lb_wrap
-
         now = _now_ms()
         seed_at_rest = (
-            _lb_wrap(bytes(root_seed), self._lockbox)
+            self._seal_field(SELF_MESH_ROOT_SEED, bytes(root_seed))
             if root_seed is not None else None
         )
         meta_json = json.dumps(metadata or {}, separators=(",", ":"), sort_keys=True)
@@ -7672,22 +8168,7 @@ class State:
             # one-byte marker check has a 1/256 false-positive rate for random
             # 32-byte seeds, which previously made enrollment minting fail
             # intermittently whenever a valid seed happened to begin 0x01.
-            stored_seed = bytes(row["root_seed"])
-            if len(stored_seed) == 32:
-                root_seed = stored_seed
-            elif len(stored_seed) == 61:
-                if self._lockbox is None:
-                    raise RuntimeError(
-                        "found a non-cleartext self-mesh root seed but no "
-                        "lockbox is configured (was ONE_LINK_PASSPHRASE "
-                        "removed?)"
-                    )
-                root_seed = self._lockbox.unwrap(stored_seed)
-            else:
-                raise ValueError(
-                    "invalid stored self-mesh root seed length: "
-                    f"{len(stored_seed)}"
-                )
+            root_seed = self._open_field(SELF_MESH_ROOT_SEED, row["root_seed"])
             self._validate_self_mesh_root_seed(
                 root_seed=root_seed,
                 root_pub=bytes(row["root_pub"]),
@@ -7835,9 +8316,7 @@ class State:
         # values, so legacy rows / unwrapped paths pass through.
         raw_path = metadata.get("path") if isinstance(metadata, dict) else None
         if isinstance(raw_path, str) and raw_path:
-            metadata["path"] = self._unwrap_path(
-                raw_path, aad=self._PATH_PII_AAD_TRANSFER,
-            )
+            metadata["path"] = self._open_field(TRANSFER_SOURCE_PATH, raw_path)
         return TransferRecord(
             id=row["id"],
             direction=row["direction"],
@@ -9442,9 +9921,7 @@ class State:
     ) -> None:
         now = _now_ms()
         # v0.20.7 (M30): wrap path before persisting.
-        wrapped_path = self._wrap_path(
-            str(path), aad=self._PATH_PII_AAD_CHUNK_SOURCES,
-        )
+        wrapped_path = self._seal_field(CHUNK_SOURCE_PATH, str(path))
         with self._write_lock:
             self._conn.execute(
                 """
@@ -9497,16 +9974,17 @@ class State:
         # v0.20.7 (M30): wrap path once for the whole batch — same
         # plaintext path → same ciphertext (AES-SIV deterministic),
         # so the existing PRIMARY KEY de-duplication still works.
-        wrapped_path = self._wrap_path(
-            str(path), aad=self._PATH_PII_AAD_CHUNK_SOURCES,
-        )
+        wrapped_path = self._seal_field(CHUNK_SOURCE_PATH, str(path))
         clean: list[tuple[str, str, int, int, int, int, str, int]] = []
         avail: list[tuple[str, int, str, int]] = []
         for index, c in enumerate(chunks):
             try:
                 chunk_hash = str(c["hash"])
                 start = int(c["start"])
-                size = int(c.get("size", int(c["end"]) - start))
+                # A dict.get default is evaluated eagerly: writing this as
+                # c.get("size", int(c["end"]) - start) raised KeyError for a
+                # chunk that carries only `size`, and the chunk was skipped.
+                size = int(c["size"]) if "size" in c else int(c["end"]) - start
             except (AttributeError, KeyError, TypeError, ValueError) as exc:
                 log.warning(
                     "record_chunk_sources_for_file: skipping malformed "
@@ -9577,9 +10055,7 @@ class State:
                 "chunk_hash": r["chunk_hash"],
                 # v0.20.7 (M30): unwrap on read; legacy cleartext rows
                 # pass through untouched via PathPIIEncryptor.unwrap.
-                "path": self._unwrap_path(
-                    r["path"], aad=self._PATH_PII_AAD_CHUNK_SOURCES,
-                ),
+                "path": self._open_field(CHUNK_SOURCE_PATH, r["path"]),
                 "start": int(r["start"]),
                 "size": int(r["size"]),
                 "mtime_ms": int(r["mtime_ms"]),
@@ -9604,9 +10080,7 @@ class State:
         row no longer identifies the promised chunk so future availability
         checks do not repeatedly reopen the same invalid source.
         """
-        wrapped_path = self._wrap_path(
-            str(path), aad=self._PATH_PII_AAD_CHUNK_SOURCES,
-        )
+        wrapped_path = self._seal_field(CHUNK_SOURCE_PATH, str(path))
         with self._write_lock:
             self._conn.execute(
                 "DELETE FROM chunk_sources "
@@ -9715,9 +10189,7 @@ class State:
         # Survivor wins. Unwrap and return.
         wrapped, (_w, file_size, mtime_ms) = next(iter(candidates.items()))
         try:
-            unwrapped = self._unwrap_path(
-                wrapped, aad=self._PATH_PII_AAD_CHUNK_SOURCES,
-            )
+            unwrapped = self._open_field(CHUNK_SOURCE_PATH, wrapped)
         except Exception:
             return None
         return {
@@ -9790,9 +10262,7 @@ class State:
                 "hash": str(c["hash"]),
             })
         # v0.20.7 (M30): wrap path before persisting.
-        wrapped_path = self._wrap_path(
-            str(path), aad=self._PATH_PII_AAD_FILE_INDEX,
-        )
+        wrapped_path = self._seal_field(FILE_INDEX_PATH, str(path))
         with self._write_lock:
             self._conn.execute(
                 """
@@ -9984,9 +10454,7 @@ class State:
         # deterministic-encrypted row written in record_file_index_cache.
         # Same plaintext + AAD → same ciphertext (AES-SIV), so the
         # index lookup still works.
-        wrapped_path = self._wrap_path(
-            str(path), aad=self._PATH_PII_AAD_FILE_INDEX,
-        )
+        wrapped_path = self._seal_field(FILE_INDEX_PATH, str(path))
         row = self._conn.execute(
             """
             SELECT path, size, mtime_ns, ctime_ns, blob_hash, index_kind,
@@ -10041,9 +10509,7 @@ class State:
         if not isinstance(chunks, list):
             chunks = []
         return {
-            "path": self._unwrap_path(
-                row["path"], aad=self._PATH_PII_AAD_FILE_INDEX,
-            ),
+            "path": self._open_field(FILE_INDEX_PATH, row["path"]),
             "size": int(row["size"]),
             "mtime_ns": int(row["mtime_ns"]),
             "ctime_ns": int(row["ctime_ns"]),

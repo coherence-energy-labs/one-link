@@ -28,10 +28,10 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections import deque
+from collections.abc import Callable, Mapping
 import contextlib
-from functools import wraps
+from functools import partial, wraps
 import hashlib
-import heapq
 import hmac
 import ipaddress
 import json
@@ -58,6 +58,18 @@ from aiohttp import WSMsgType, web
 
 from one_link import certified_surface, control_ipc
 from one_link.build_identity import runtime_build_identity
+from one_link.call_routes import CallRouter
+from one_link.owner_auth_note import note_refused_owner_request
+from one_link.courier_files import (
+    COURIER_FILE_MAX_BYTES, CourierDirectoryMonitor, CourierFileCatalog, CourierFileInfo,
+)
+from one_link.courier_ledger import (
+    COURIER_LEDGER_FILE, COURIER_LEDGER_MAX_EVENTS, CourierReplayLedger,
+    CourierLedgerUnavailable,  # noqa: F401 - compatibility import for embedders
+)
+from one_link.courier_service import (
+    CourierFailure, CourierIdentity, CourierOperationError, CourierService,
+)
 from one_link.device_relogin import (
     DeviceReloginChallengeCapacityError,
     DeviceReloginChallengeError,
@@ -68,6 +80,7 @@ from one_link.device_relogin import (
     encode_b64u,
 )
 from one_link.fault_observability import report_best_effort_failure
+from one_link.off_loop_import import OFF_LOOP_IMPORTS
 from one_link.local_stun import LocalStunService
 from one_link.paths import data_dir, inbox_dir
 from one_link._coerce import to_int
@@ -108,16 +121,9 @@ log = logging.getLogger("one_link.server")
 WEB_DIR = Path(__file__).resolve().parent / "web"
 TOKEN_FILE = "ui.token"
 SERVER_PORT_FILE = "server.port"
-COURIER_LEDGER_FILE = "courier_ledger.json"
-COURIER_LEDGER_MAX_EVENTS = 512
-COURIER_FILE_MAX_BYTES = 768 * 1024 * 1024
 HIDDEN_INBOX_FILES_SETTING = "hidden_inbox_files_json"
 WIPE_LOCAL_TRACES_CONFIRM = "wipe local traces"
 DISPLAY_NAME_MAX_LENGTH = 128
-
-
-class CourierLedgerUnavailable(RuntimeError):
-    """The durable courier replay authority cannot be trusted."""
 
 
 class _SettingsUpdateRejected(ValueError):
@@ -1387,6 +1393,11 @@ COOKIE_NAME = "ol_ui"
 # it; just "yes a session cookie exists") so the access-denied page
 # can decide to auto-reload silently instead of dead-ending.
 SESSION_COOKIE_NAME = "ol_session"
+# One line, at most once a minute per client, saying what a refused owner
+# request presented (never the credential). See one_link.owner_auth_note.
+_note_refused_owner_request = partial(
+    note_refused_owner_request, log=log, cookie_names=(SESSION_COOKIE_NAME, COOKIE_NAME),
+)
 SESSION_PRESENT_MARKER_COOKIE = "ol_session_present"
 SESSION_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 30  # 30 days
 SESSION_ABSOLUTE_MAX_AGE_SECONDS = SESSION_COOKIE_MAX_AGE_SECONDS
@@ -1442,6 +1453,49 @@ class _RecoveryBundleTooLarge(ValueError):
 # random port only as a last resort.
 PREFERRED_UI_PORT = 7117
 UI_PORT_FALLBACK_RANGE = 16
+
+#: Operator/test override for the UI listener port.
+#:   unset  -> preferred port, then the fallback range, then OS-assigned;
+#:   ``0``  -> skip the preferred range and bind an OS-assigned port;
+#:   ``N``  -> bind exactly N (1..65535) or fail startup, never falling back.
+UI_PORT_ENV = "ONE_LINK_UI_PORT"
+
+
+class UiPortStartupError(RuntimeError):
+    """The configured UI port cannot be honored; daemon startup must fail.
+
+    ``fatal_startup`` tells the daemon not to downgrade this into a headless
+    start: an explicit port request is an instruction, not a preference.
+    """
+
+    fatal_startup = True
+
+
+def ui_port_override(environ: Mapping[str, str] | None = None) -> int | None:
+    """Parse :data:`UI_PORT_ENV`; ``None`` when unset. Raises on invalid text."""
+
+    env = os.environ if environ is None else environ
+    if UI_PORT_ENV not in env:
+        return None
+    raw = env[UI_PORT_ENV]
+    text = raw.strip() if isinstance(raw, str) else ""
+    if not text or not text.isascii() or not text.isdigit() or int(text) > 65535:
+        raise UiPortStartupError(
+            f"{UI_PORT_ENV}={raw!r} is invalid: expected 0 (OS-assigned) "
+            "or a TCP port 1..65535"
+        )
+    return int(text)
+
+
+async def _preload_qr_renderer() -> None:
+    """Import the SVG QR renderer off the event loop (first import ~0.2 s).
+
+    Failures are left to the handler's own ``import`` statement, which keeps
+    each endpoint's existing error contract.
+    """
+
+    with contextlib.suppress(Exception):
+        await OFF_LOOP_IMPORTS.load("qrcode.image.svg")
 
 
 # 2026-05-22 UX — phone-friendly onboarding landing page.
@@ -2812,10 +2866,13 @@ class UIServer:
         # LAUNCH NONCES -- see `mint_launch_nonce`. Kept beside the invite store
         # because they are the same species: short-lived, single-use, capacity-bounded.
         self._launch_nonces: dict[str, float] = {}
-        self._courier_seen_bundle_ids: set[str] = set()
-        self._courier_events: list[dict] = []
-        self._courier_ledger_error: str | None = None
-        self._load_courier_ledger()
+        self._courier_ledger = CourierReplayLedger(
+            data_dir() / COURIER_LEDGER_FILE, max_events=COURIER_LEDGER_MAX_EVENTS,
+        )
+        self._courier_files = CourierFileCatalog(
+            data_dir() / "courier", max_file_bytes=COURIER_FILE_MAX_BYTES,
+        )
+        self._courier_directory_monitor = CourierDirectoryMonitor(self._courier_files)
         self._courier_monitor_task: asyncio.Task | None = None
         self._ui_delivery_tasks: set[asyncio.Task] = set()
         self._peer_dc_tasks: set[asyncio.Task] = set()
@@ -2823,10 +2880,6 @@ class UIServer:
         self._phone_upload_sweeper_task: asyncio.Task | None = None
         self._closing = False
         self._courier_monitor_interval_s = 2.0
-        self._courier_drop_signature: tuple[str, ...] = ()
-        self._courier_outbox_signature: tuple[str, ...] = ()
-        self._courier_monitor_last_ms = 0
-        self._courier_monitor_events = 0
         self._setup_device_invites: dict[str, dict[str, Any]] = {}
         self._setup_device_invites_lock = asyncio.Lock()
         self._device_relogin_challenges = DeviceReloginChallengeStore()
@@ -3387,6 +3440,90 @@ class UIServer:
                 s.close()
             return None
 
+    async def _bind_ui_listener(self, bind_host: str, requested_port: int | None) -> None:
+        """Bind the UI listener under the ``ONE_LINK_UI_PORT`` policy.
+
+        ``requested_port`` is :func:`ui_port_override`'s result. ``None``
+        keeps the historical policy; an explicit port (``0``: OS-assigned) is
+        bound exactly or raises :class:`UiPortStartupError`, never falling
+        back. Sets ``self.site`` and ``self.port``.
+        """
+        # Try the well-known port first so browser tabs survive restarts.
+        # Fall through 7118..7132 if taken, then OS-assigned random as
+        # last resort.
+        #
+        # v0.20.5 — the previous "ownership probe" raced with TIME_WAIT
+        # entries from a just-killed daemon: bind() would succeed (so
+        # we own the port) but the probe's connect would briefly hit
+        # the kernel's TIME_WAIT-routing layer, fail to read a 200,
+        # and we'd fall through to a higher port. Result: every
+        # restart claimed a different port number, breaking every
+        # bookmark + previously-minted pair URL. On Windows + Linux,
+        # bind() succeeding ≠ "TIME_WAIT clear" but DOES mean "we
+        # own this listener now" — connections will route to us, not
+        # to the dead 5-tuples in TIME_WAIT. Probe removed.
+        if self.runner is None:
+            raise RuntimeError("the UI listener is bound after the app runner is set up, not before")
+        if requested_port is None:
+            candidates: range | tuple[int, ...] = range(
+                PREFERRED_UI_PORT, PREFERRED_UI_PORT + UI_PORT_FALLBACK_RANGE
+            )
+        else:
+            candidates = (requested_port,)
+        bound = False
+        for candidate in candidates:
+            # v0.21.x: on Windows, pre-bind with SO_EXCLUSIVEADDRUSE
+            # so a hostile local process that sets SO_REUSEADDR can't
+            # steal our port. On other platforms the option doesn't
+            # exist and the default semantics already prevent stealing.
+            ex_sock = self._bind_exclusive_socket(bind_host, candidate)
+            if ex_sock is not None:
+                site: web.BaseSite = web.SockSite(self.runner, ex_sock)
+                try:
+                    await site.start()
+                except OSError:
+                    with contextlib.suppress(OSError):
+                        ex_sock.close()
+                    continue
+                self.site = site
+                # getsockname, not ``candidate``: an explicit 0 is OS-assigned.
+                self.port = int(ex_sock.getsockname()[1])
+                bound = True
+                break
+            if os.name == "nt":
+                # The exclusive bind failed (port truly in use).
+                # Skip to next candidate; don't fall through to a
+                # non-exclusive TCPSite that could shadow another
+                # daemon via the REUSEADDR loophole.
+                continue
+            try:
+                site = web.TCPSite(self.runner, host=bind_host, port=candidate)
+                await site.start()
+                self.site = site
+                sockets = getattr(getattr(site, "_server", None), "sockets", None) or ()
+                self.port = int(sockets[0].getsockname()[1]) if sockets else candidate
+                bound = True
+                break
+            except OSError:
+                # Port in use by ANOTHER LISTENER — try the next.
+                # TIME_WAIT entries don't cause this on Windows or
+                # modern Linux; only an actively-listening rival
+                # process does.
+                continue
+        if bound:
+            return
+        if requested_port is not None:
+            raise UiPortStartupError(
+                f"{UI_PORT_ENV}={requested_port}: {bind_host}:{requested_port} "
+                "could not be bound (already in use?); refusing to fall back "
+                "to another port"
+            )
+        site = web.TCPSite(self.runner, host=bind_host, port=0)
+        await site.start()
+        sock = site._server.sockets[0]  # type: ignore[union-attr]
+        self.site = site
+        self.port = sock.getsockname()[1]
+
     async def _probe_owned_http_port(self, bind_host: str, port: int) -> bool:
         """Return True only if the HTTP listener reached on this port is us.
 
@@ -3520,135 +3657,52 @@ class UIServer:
         del daemon
         return secrets.token_urlsafe(32)
 
+    def _courier_service(self) -> CourierService:
+        """Adapt live daemon capabilities into a courier-only use-case boundary."""
+        return CourierService(
+            ledger=self._courier_ledger,
+            files=self._courier_files,
+            identity=CourierIdentity(self.daemon.me.fingerprint, self.daemon.me.private),
+            index=self.daemon.state,
+            read_chunk=self.daemon._read_chunk_cache,
+            store_chunk=self.daemon._store_chunk_cache,
+            valid_hash=self.daemon._valid_blob_hex,
+            safe_name=self.daemon._safe_transfer_name,
+            inbox_path=self.daemon._unique_inbox_path,
+        )
+
+    @property
+    def _courier_seen_bundle_ids(self) -> set[str]:
+        return self._courier_ledger.seen_bundle_ids
+
+    @property
+    def _courier_events(self) -> list[dict]:
+        return self._courier_ledger.events
+
+    @property
+    def _courier_ledger_error(self) -> str | None:
+        return self._courier_ledger.error
+
+    @property
+    def _courier_monitor_last_ms(self) -> int:
+        return self._courier_directory_monitor.last_scan_ms
+
+    @property
+    def _courier_monitor_events(self) -> int:
+        return self._courier_directory_monitor.events
+
     def _courier_ledger_path(self) -> Path:
-        return data_dir() / COURIER_LEDGER_FILE
+        return self._courier_ledger.path
 
     @staticmethod
     def _valid_courier_bundle_id(value: object) -> bool:
-        text = str(value or "").strip().lower()
-        if len(text) != 32:
-            return False
-        try:
-            int(text, 16)
-            return True
-        except ValueError:
-            return False
+        return CourierReplayLedger.valid_bundle_id(value)
 
     def _load_courier_ledger(self) -> None:
-        path = self._courier_ledger_path()
-        try:
-            info = path.lstat()
-        except FileNotFoundError:
-            self._courier_seen_bundle_ids = set()
-            self._courier_events = []
-            self._courier_ledger_error = None
-            return
-        except OSError as exc:
-            self._courier_seen_bundle_ids = set()
-            self._courier_events = []
-            self._courier_ledger_error = "unreadable"
-            log.error("courier replay ledger metadata is unreadable: %s", exc)
-            return
-
-        try:
-            if not stat.S_ISREG(info.st_mode) or info.st_size > 8 * 1024 * 1024:
-                raise CourierLedgerUnavailable("ledger is not a bounded regular file")
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(raw, dict) or set(raw) != {
-                "version",
-                "seen_bundle_ids",
-                "events",
-            }:
-                raise CourierLedgerUnavailable("ledger schema is invalid")
-            if raw.get("version") != 1:
-                raise CourierLedgerUnavailable("ledger version is unsupported")
-            seen = raw.get("seen_bundle_ids")
-            events = raw.get("events")
-            if not isinstance(seen, list) or not isinstance(events, list):
-                raise CourierLedgerUnavailable("ledger collections are invalid")
-            if len(events) > COURIER_LEDGER_MAX_EVENTS:
-                raise CourierLedgerUnavailable("ledger event count exceeds its bound")
-            if any(not self._valid_courier_bundle_id(value) for value in seen):
-                raise CourierLedgerUnavailable("ledger contains an invalid replay id")
-            if any(
-                not isinstance(event, dict)
-                or not self._valid_courier_bundle_id(event.get("bundle_id"))
-                for event in events
-            ):
-                raise CourierLedgerUnavailable("ledger contains an invalid event")
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError,
-            CourierLedgerUnavailable,
-        ) as exc:
-            self._courier_seen_bundle_ids = set()
-            self._courier_events = []
-            self._courier_ledger_error = "invalid_or_unreadable"
-            log.error("courier replay ledger cannot be trusted: %s", exc)
-            return
-
-        self._courier_seen_bundle_ids = {
-            str(value).strip().lower()
-            for value in seen}
-        self._courier_events = list(events)
-        self._courier_ledger_error = None
+        self._courier_ledger.load()
 
     def _save_courier_ledger(self) -> None:
-        if self._courier_ledger_error is not None:
-            raise CourierLedgerUnavailable(
-                "refusing to overwrite an unreadable courier replay ledger"
-            )
-        path = self._courier_ledger_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "version": 1,
-            "seen_bundle_ids": sorted(self._courier_seen_bundle_ids),
-            "events": self._courier_events[-COURIER_LEDGER_MAX_EVENTS:],
-        }
-        encoded = json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_BINARY"):
-            flags |= os.O_BINARY
-        descriptor: int | None = None
-        try:
-            descriptor = os.open(tmp, flags, 0o600)
-            view = memoryview(encoded)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:
-                    raise OSError("short write while persisting courier ledger")
-                view = view[written:]
-            os.fsync(descriptor)
-            os.close(descriptor)
-            descriptor = None
-            if os.name == "nt":
-                from one_link.identity import _restrict_windows_acl
-
-                _restrict_windows_acl(tmp)
-            else:
-                os.chmod(tmp, 0o600)
-            if tmp.read_bytes() != encoded:
-                raise OSError("courier ledger read-back mismatch")
-            from one_link.namespace_durability import replace_path
-
-            replace_path(tmp, path)
-            if os.name != "nt":
-                directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-            if path.read_bytes() != encoded:
-                raise OSError("published courier ledger read-back mismatch")
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
-            with contextlib.suppress(FileNotFoundError):
-                tmp.unlink()
+        self._courier_ledger.save()
 
     def _record_courier_event(
         self,
@@ -3658,97 +3712,58 @@ class UIServer:
         bundle_bytes: int | None = None,
         stored_chunks: int | None = None,
     ) -> None:
-        bundle_id = str(manifest.get("bundle_id") or "").strip().lower()
-        if not self._valid_courier_bundle_id(bundle_id):
-            return
-        event = {
-            "kind": kind,
-            "bundle_id": bundle_id,
-            "ts_ms": int(time.time() * 1000),
-            "sender_fp": manifest.get("sender_fp"),
-            "recipient_fp": manifest.get("recipient_fp"),
-            "chunk_count": manifest.get("chunk_count"),
-            "total_bytes": manifest.get("total_bytes"),
-            "expires_ms": manifest.get("expires_ms"),
-        }
-        if bundle_bytes is not None:
-            event["bundle_bytes"] = int(bundle_bytes)
-        if stored_chunks is not None:
-            event["stored_chunks"] = int(stored_chunks)
-        self._courier_events.append(event)
-        self._courier_events = self._courier_events[-COURIER_LEDGER_MAX_EVENTS:]
-        self._save_courier_ledger()
+        self._courier_ledger.record_event(
+            kind,
+            manifest,
+            bundle_bytes=bundle_bytes,
+            stored_chunks=stored_chunks,
+        )
 
     def _mark_courier_imported(self, manifest: dict) -> None:
-        bundle_id = str(manifest.get("bundle_id") or "").strip().lower()
-        if not self._valid_courier_bundle_id(bundle_id):
-            raise ValueError("invalid courier bundle id")
-        self._courier_seen_bundle_ids.add(bundle_id)
-        self._save_courier_ledger()
+        self._courier_ledger.mark_imported(manifest)
 
     def _courier_dir(self) -> Path:
-        path = data_dir() / "courier"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        return self._courier_files.directory()
 
     def _courier_drop_dir(self) -> Path:
-        path = self._courier_dir() / "drop"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        return self._courier_files.drop_directory()
 
     def _courier_outbox_dir(self) -> Path:
-        path = self._courier_dir() / "outbox"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        return self._courier_files.outbox_directory()
 
     def _courier_file_id(self, path: Path) -> str:
-        st = path.stat()
-        return self._courier_file_id_from_stat(path.name, int(st.st_size), int(st.st_mtime_ns))
+        return self._courier_files.file_id(path)
 
     @staticmethod
     def _courier_file_id_from_stat(name: str, size: int, mtime_ns: int) -> str:
-        seed = f"{name}\0{int(size)}\0{int(mtime_ns)}".encode("utf-8", "surrogatepass")
-        return hashlib.sha256(seed).hexdigest()[:24]
+        return CourierFileCatalog.file_id_from_stat(name, size, mtime_ns)
 
-    def _scan_courier_files(self) -> list[dict]:
-        return self._scan_courier_dir(self._courier_drop_dir())
+    def _scan_courier_files(self) -> list[CourierFileInfo]:
+        return self._courier_files.scan_drop()
 
-    def _scan_courier_outbox(self) -> list[dict]:
-        return self._scan_courier_dir(self._courier_outbox_dir())
+    def _scan_courier_outbox(self) -> list[CourierFileInfo]:
+        return self._courier_files.scan_outbox()
 
     @staticmethod
-    def _courier_signature(files: list[dict]) -> tuple[str, ...]:
-        return tuple(
-            f"{f.get('id')}:{f.get('bytes')}:{f.get('mtime_ms')}"
-            for f in files
-        )
+    def _courier_signature(files: list[CourierFileInfo]) -> tuple[str, ...]:
+        return CourierDirectoryMonitor.signature(files)
 
     def _courier_monitor_tick(self, *, broadcast: bool = True) -> dict:
-        drop_files = self._scan_courier_files()
-        outbox_files = self._scan_courier_outbox()
-        drop_sig = self._courier_signature(drop_files)
-        outbox_sig = self._courier_signature(outbox_files)
-        changed = (
-            drop_sig != self._courier_drop_signature
-            or outbox_sig != self._courier_outbox_signature
-        )
-        self._courier_drop_signature = drop_sig
-        self._courier_outbox_signature = outbox_sig
-        self._courier_monitor_last_ms = int(time.time() * 1000)
-        if changed:
-            self._courier_monitor_events += 1
-            if broadcast:
-                self.broadcast({
+        snapshot = self._courier_directory_monitor.poll()
+        if snapshot.changed and broadcast:
+            self.broadcast(
+                {
                     "type": "courier_files",
-                    "drop_files": len(drop_files),
-                    "outbox_files": len(outbox_files),
+                    "drop_files": len(snapshot.drop_files),
+                    "outbox_files": len(snapshot.outbox_files),
                     "drop_dir": str(self._courier_drop_dir()),
                     "outbox_dir": str(self._courier_outbox_dir()),
-                })
+                }
+            )
         return {
-            "changed": changed,
-            "drop_files": drop_files,
-            "outbox_files": outbox_files,
+            "changed": snapshot.changed,
+            "drop_files": snapshot.drop_files,
+            "outbox_files": snapshot.outbox_files,
         }
 
     def _removable_monitor_tick(self, *, broadcast: bool = True) -> dict:
@@ -3783,115 +3798,27 @@ class UIServer:
         except Exception:
             log.exception("courier monitor stopped unexpectedly")
 
-    def _scan_courier_dir(self, directory: Path) -> list[dict]:
-        root = directory.resolve()
-        if not root.is_dir():
-            return []
-        newest: list[tuple[int, Path, os.stat_result]] = []
-        try:
-            iterator = root.iterdir()
-        except OSError:
-            return []
-        for path in iterator:
-            try:
-                if path.is_symlink():
-                    continue
-                resolved = path.resolve()
-                if not resolved.is_file() or resolved.parent != root:
-                    continue
-                if resolved.suffix.lower() not in {".json", ".olcb",
-                } and not resolved.name.lower().endswith(".olcb.json"):
-                    continue
-                st = resolved.stat()
-                if st.st_size <= 0 or st.st_size > COURIER_FILE_MAX_BYTES:
-                    continue
-                item = (int(st.st_mtime_ns), resolved, st)
-                if len(newest) < 64:
-                    heapq.heappush(newest, item)
-                elif item[0] > newest[0][0]:
-                    heapq.heapreplace(newest, item)
-            except OSError:
-                continue
-        out: list[dict] = []
-        for _mtime_ns, resolved, st in sorted(newest, key=lambda item: item[0], reverse=True):
-            try:
-                out.append({
-                    "id": self._courier_file_id_from_stat(
-                        resolved.name,
-                        int(st.st_size),
-                        int(st.st_mtime_ns),
-                    ),
-                    "name": resolved.name,
-                    "bytes": int(st.st_size),
-                    "mtime_ms": int(st.st_mtime * 1000),
-                })
-            except OSError:
-                continue
-        return out
+    def _scan_courier_dir(self, directory: Path) -> list[CourierFileInfo]:
+        return self._courier_files.scan(directory)
 
     def _resolve_courier_file_id(self, file_id: str) -> Path | None:
-        want = str(file_id or "").strip().lower()
-        if len(want) != 24:
-            return None
-        for item in self._scan_courier_files():
-            if item.get("id") == want:
-                path = (self._courier_drop_dir() / str(item["name"])).resolve()
-                root = self._courier_drop_dir().resolve()
-                if path.parent == root and path.is_file():
-                    return path
-        return None
+        return self._courier_files.resolve_drop(file_id)
 
     def _resolve_courier_outbox_file_id(self, file_id: str) -> Path | None:
-        want = str(file_id or "").strip().lower()
-        if len(want) != 24:
-            return None
-        root = self._courier_outbox_dir().resolve()
-        for item in self._scan_courier_outbox():
-            if item.get("id") == want:
-                path = (root / str(item["name"])).resolve()
-                if path.parent == root and path.is_file():
-                    return path
-        return None
+        return self._courier_files.resolve_outbox(file_id)
 
     def _removable_courier_dir(self, target_path: Path) -> Path:
-        return (target_path / "One Link Courier").resolve()
+        return self._courier_files.removable_directory(target_path)
 
-    def _scan_removable_courier_files(self, target_path: Path) -> list[dict]:
-        root = self._removable_courier_dir(target_path)
-        target_root = target_path.resolve()
-        if target_root not in {root, *root.parents} or not root.is_dir():
-            return []
-        return self._scan_courier_dir(root)
+    def _scan_removable_courier_files(self, target_path: Path) -> list[CourierFileInfo]:
+        return self._courier_files.scan_removable(target_path)
 
     def _resolve_removable_courier_file_id(self, target_path: Path, file_id: str) -> Path | None:
-        want = str(file_id or "").strip().lower()
-        if len(want) != 24:
-            return None
-        root = self._removable_courier_dir(target_path)
-        target_root = target_path.resolve()
-        if target_root not in {root, *root.parents}:
-            return None
-        for item in self._scan_removable_courier_files(target_path):
-            if item.get("id") == want:
-                path = (root / str(item["name"])).resolve()
-                if path.parent == root and path.is_file():
-                    return path
-        return None
+        return self._courier_files.resolve_removable(target_path, file_id)
 
     @staticmethod
     def _extract_courier_bundle_text(text: str) -> str:
-        stripped = text.strip()
-        if not stripped:
-            raise ValueError("courier file is empty")
-        try:
-            parsed = json.loads(stripped)
-            if isinstance(parsed, dict):
-                bundle = parsed.get("bundle_b64") or parsed.get("bundle")
-                if bundle:
-                    return str(bundle).strip()
-        except json.JSONDecodeError:
-            pass
-        return stripped
+        return CourierFileCatalog.extract_bundle_text(text)
 
     # ─── routes ───────────────────────────────────────────────────────
     def _setup_routes(self) -> None:
@@ -4232,13 +4159,15 @@ class UIServer:
         # / tray / supervisor handles that if present).
         r.add_post("/api/v1/daemon/shutdown", self._guarded(self.api_daemon_shutdown))
         r.add_get("/api/status", self._guarded(self.api_status))
+        r.add_get("/api/runtime-identity", self._guarded(self.api_runtime_identity))
         # ── Living Presence Tier α-pre — Call API ────────────────
         # Browser hits these to drive the per-call state machines.
         # POST /api/v1/calls dispatches an action (initiate / accept /
         # decline / hangup / resume / recording start-approve-decline-
         # stop). GET /api/v1/calls lists active calls; GET .../{id}
         # returns one call's snapshot. See call_api.py for action
-        # vocabulary + response shape.
+        # vocabulary + response shape. Handlers live in call_routes.py
+        # (CallRouter); capsule upload handlers stay on the server.
         r.add_post("/api/v1/calls", self._guarded(self.api_call_action))
         r.add_get("/api/v1/calls", self._guarded(self.api_calls_list))
         r.add_get("/api/v1/calls/{call_id}/trace", self._guarded(self.api_call_trace))
@@ -4889,6 +4818,7 @@ class UIServer:
     def _guarded(self, handler):
         async def wrap(request: web.Request) -> web.StreamResponse:
             if not self._check_token(request):
+                _note_refused_owner_request(self, request)
                 if self._rate_limited(
                     "auth_fail",
                     self._client_rate_key(request),
@@ -4921,6 +4851,7 @@ class UIServer:
     def _guarded_ws(self, handler):
         async def wrap(request: web.Request) -> web.StreamResponse:
             if not self._check_token(request):
+                _note_refused_owner_request(self, request)
                 if self._rate_limited(
                     "auth_fail",
                     self._client_rate_key(request),
@@ -5686,7 +5617,7 @@ class UIServer:
         it deliberately omits the owner token and directs callers to mint a
         short-lived device invite through ``/api/setup/device-invite``.
         """
-        return web.json_response(self._connect_info())
+        return web.json_response(self._connect_info(), headers={"Cache-Control": "no-store"})
 
     async def api_connect_info_qr(self, request: web.Request) -> web.Response:
         """Return only safe legacy QR data; never encode an owner LAN bearer."""
@@ -5705,6 +5636,7 @@ class UIServer:
                     ),
                 },
                 status=409,
+                headers={"Cache-Control": "no-store"},
             )
         if info["requires_short_lived_invite"]:
             return web.json_response(
@@ -5718,6 +5650,7 @@ class UIServer:
                 status=409,
                 headers={"Cache-Control": "no-store"},
             )
+        await _preload_qr_renderer()
         try:
             import qrcode  # types-qrcode stub package supplies the type info
             import qrcode.image.svg
@@ -6946,6 +6879,7 @@ class UIServer:
             "127.0.0.1",
         )
         landing = f"http://{lan_ip}:{self.port}/install?code={code}"
+        await _preload_qr_renderer()
         try:
             import qrcode
             import qrcode.image.svg
@@ -7257,6 +7191,7 @@ class UIServer:
                 {"error": "url_too_long", "hint": "max 2048 chars"},
                 status=413,
             )
+        await _preload_qr_renderer()
         try:
             import qrcode  # types-qrcode stub package supplies the type info
             import qrcode.image.svg
@@ -7297,17 +7232,17 @@ class UIServer:
         currently trusted roster row. A bearer never creates authority;
         unknown, revoked, ambiguous, or uncertified keys close with 4030.
         """
-        # aiortc imports are lazy so this module loads even on
-        # daemons without aiortc. If we get here, we need it.
-        try:
-            from aiortc import (
-                RTCConfiguration,
-                RTCIceServer,
-                RTCPeerConnection,
-                RTCSessionDescription,
-            )
-        except ImportError:
+        # aiortc is optional, and its first import loads PyAV and native
+        # codecs (measured at seconds on a cold cache). It is imported once
+        # per process on a worker thread so this handler never stalls the
+        # event loop; an absent package still answers 501.
+        aiortc = await OFF_LOOP_IMPORTS.load_optional("aiortc")
+        if aiortc is None:
             return web.Response(status=501, text="aiortc not installed")
+        RTCConfiguration = aiortc.RTCConfiguration
+        RTCIceServer = aiortc.RTCIceServer
+        RTCPeerConnection = aiortc.RTCPeerConnection
+        RTCSessionDescription = aiortc.RTCSessionDescription
 
         from one_link.peer_rtc import (
             BrowserPeer,
@@ -10322,146 +10257,22 @@ class UIServer:
             setattr(self.daemon, "_call_reliability", rel)
         return rel
 
+    def _call_router(self) -> CallRouter:
+        """The /api/v1/calls route group (``call_routes.py``), built lazily."""
+        router = self.__dict__.get("_call_routes")
+        if router is None:
+            router = CallRouter(_ServerCallRouteHost(self), logger=log)
+            self._call_routes = router
+        return router
+
     async def api_call_action(self, request: web.Request) -> web.Response:
-        """POST /api/v1/calls — dispatch one action.
+        """POST /api/v1/calls — dispatch one action (see ``CallRouter.action``).
 
-        Body shape: ``{"action": "initiate", "peer_master_vk_hex": ...,
-        "negotiated_capabilities": [...]}`` or ``{"action": "hangup",
-        "call_id": "..."}``. Returns the structured CallAPI response.
-
-        Also handles the SDP / ICE actions that bypass CallManager:
-          - ``send_sdp_offer`` / ``send_sdp_answer``: forward the
-            browser's SDP to the peer via a ``CALL_SDP_OFFER`` /
-            ``CALL_SDP_ANSWER`` wire message.
-          - ``send_ice_candidate``: forward a trickled ICE candidate
-            via ``CALL_ICE``.
-        These don't touch CallManager — they sit on the media-layer
-        rail next to the lifecycle FSM.
+        Lifecycle actions go through CallAPI and are flushed to the wire;
+        SDP/ICE relay, frame attestation, RTC metrics, predictive continuity
+        and handoff actions are delegated to their tier handlers.
         """
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response(
-                {
-                    "ok": False,
-                    "user_message": "Request shape was unexpected.",
-                },
-                status=400,
-            )
-        if not isinstance(body, dict):
-            return web.json_response(
-                {"ok": False, "user_message": "Request shape was unexpected."},
-                status=400,
-            )
-
-        raw_action = body.get("action")
-        action_name = raw_action.strip().lower() if isinstance(raw_action, str) else ""
-
-        # Media-layer actions — bypass CallManager.
-        if action_name in {
-            "send_sdp_offer", "send_sdp_answer", "send_ice_candidate",
-        }:
-            return await self._handle_media_layer_action(action_name, body)
-
-        # Tier β — per-window provenance attestation from the browser.
-        if action_name == "attest_frame":
-            return await self._handle_attest_frame_action(body)
-
-        # Tier γ — browser pushes per-window WebRTC stats.
-        if action_name == "report_metrics":
-            return self._handle_report_metrics_action(body)
-        if action_name == "report_call_event":
-            return self._handle_report_call_event_action(body)
-
-        # Browser/app restart recovery: restore the live media engine
-        # against an existing backend-owned call instead of opening a
-        # duplicate call or letting each side guess.
-        if action_name == "rejoin":
-            return self._handle_rejoin_call_action(body)
-
-        # Tier η — browser-driven Predictive Continuity API.
-        if action_name == "observe_frame":
-            return self._handle_observe_frame_action(body)
-        if action_name == "predict_frame":
-            return self._handle_predict_frame_action(body)
-
-        # Tier ε — browser/Body confirms handoff secondary is ready.
-        if action_name == "mark_handoff_prewarmed":
-            return self._handle_mark_handoff_prewarmed_action(body)
-
-        if action_name == "initiate":
-            from one_link.call_manager import normalize_call_kind
-
-            try:
-                call_kind = normalize_call_kind(body.get("kind"))
-            except ValueError:
-                return web.json_response(
-                    {
-                        "ok": False,
-                        "user_message": "Choose a voice or video call.",
-                    },
-                    status=400,
-                )
-            peer_fp = body.get("peer_master_vk_hex")
-            if not isinstance(peer_fp, str) or not self.daemon._call_capability_allowed(
-                peer_fp, call_kind
-            ):
-                return web.json_response(
-                    {
-                        "ok": False,
-                        "call_kind": call_kind,
-                        "user_message": ("That contact is not allowed to use this call type."),
-                    },
-                    status=403,
-                )
-            body = dict(body)
-            body["kind"] = call_kind
-
-        api = self._call_api()
-        result = api.handle_json(body)
-        # Flush the response so outbound wire messages actually reach
-        # the peer + tail events broadcast to the WebSocket UIs.
-        delivered: tuple[str, ...] = ()
-        try:
-            delivered = tuple(await self.daemon.flush_call_api_response(result))
-        except Exception as exc:
-            log.warning("flush_call_api_response failed: %s", exc)
-        if action_name == "initiate" and result.ok and result.outbound and not delivered:
-            peer_label = str(body.get("peer_label") or "That device").strip()
-            return web.json_response({
-                "ok": False,
-                "call_id": result.call_id,
-                    "call_kind": result.call_kind,
-                    "phase": result.phase,
-                "consent_phase": result.consent_phase,
-                "user_message": (
-                    f"{peer_label} is not reachable right now. "
-                    "Open One Link on that device, then try again."
-                ),
-                "call_complete": result.call_complete,
-                "outbound": [
-                    {"type": m.type, "peer": m.peer_master_vk_hex}
-                    for m in result.outbound
-                ],
-                "delivered": [],
-            })
-        # Translate the result back to JSON. We omit the binary-ish
-        # tail-events (those flow via the WebSocket separately) so
-        # this response is small + UI-friendly.
-        return web.json_response({
-            "ok": result.ok,
-            "call_id": result.call_id,
-                "call_kind": result.call_kind,
-                "phase": result.phase,
-            "consent_phase": result.consent_phase,
-            "user_message": result.user_message,
-            "call_complete": result.call_complete,
-            "outbound": [
-                {"type": m.type, "peer": m.peer_master_vk_hex}
-                for m in result.outbound
-            ],
-            "delivered": list(delivered),
-        })
+        return await self._call_router().action(request)
 
     def _capsule_ingest_states(self) -> dict[str, dict[str, Any]]:
         """Return the bounded per-server capsule retry registry.
@@ -11059,7 +10870,7 @@ class UIServer:
         enriched_body.setdefault("best_relay_health", route_policy.get("best_relay_health"))
         enriched_body.setdefault("best_relay_score", route_policy.get("best_relay_score"))
         recommendation = reliability.record_metrics(enriched_body)
-        self._append_call_media_audit(enriched_body)
+        self._call_router().media_audit.append_metrics(enriched_body)
         return web.json_response({
             "ok": True,
             "call_id": call_id,
@@ -11068,435 +10879,6 @@ class UIServer:
             "recovery_intent": reliability.recovery_intent_for(call_id),
             "routePolicy": route_policy,
         })
-
-    def _handle_report_call_event_action(self, body: dict) -> web.Response:
-        """Browser posts privacy-safe WebRTC state-machine breadcrumbs."""
-        call_id = body.get("call_id")
-        if not isinstance(call_id, str) or not call_id:
-            return web.json_response(
-                {"ok": False, "user_message": "Call is no longer active."},
-            )
-        reliability = self._call_reliability()
-        reliability.record_event(body)
-        self._append_call_media_event_audit(body)
-        return web.json_response({
-            "ok": True,
-            "call_id": call_id,
-            "session_authority": reliability.session_for(call_id),
-            "recovery_intent": reliability.recovery_intent_for(call_id),
-        })
-
-    def _call_peer_label(self, peer_fp: str) -> str:
-        peer_label = peer_fp[:8]
-        try:
-            rec = self.daemon.state.get_peer(peer_fp) if self.daemon.state is not None else None
-            if rec is not None:
-                peer_label = (
-                    getattr(rec, "local_alias", None)
-                    or getattr(rec, "display_name", None)
-                    or getattr(rec, "hostname", None)
-                    or peer_label
-                )
-        except Exception as peer_exc:
-            report_best_effort_failure(
-                log,
-                "call_peer_label",
-                peer_exc,
-                level=logging.DEBUG,
-            )
-        return peer_label
-
-    def _call_media_backfill(self, call_id: str) -> tuple[dict, list]:
-        sdp_backfill = {}
-        ice_backfill = []
-        try:
-            sdp_backfill = dict(
-                getattr(self.daemon, "_call_sdp_backfill", {}).get(call_id, {})
-            )
-        except Exception:
-            sdp_backfill = {}
-        try:
-            ice_backfill = list(
-                getattr(self.daemon, "_call_ice_backfill", {}).get(call_id, [])
-            )
-        except Exception:
-            ice_backfill = []
-        return sdp_backfill, ice_backfill
-
-    def _call_snapshot(self, call_id: str, mgr) -> dict:
-        s = mgr.session_snapshot()
-        rec_value = s.recording_state.value if s.recording_state.value is not None else 0
-        peer_fp = mgr.state.peer_master_vk_hex
-        local_role = mgr.state.local_role
-        sdp_backfill, ice_backfill = self._call_media_backfill(call_id)
-        return {
-            "ok": True,
-            "call_id": call_id,
-            "peer_master_vk_hex": peer_fp,
-            "peer_label": self._call_peer_label(peer_fp),
-            "local_role": local_role,
-            "call_kind": getattr(mgr.state, "call_kind", "voice"),
-            "is_incoming": local_role == "recipient",
-            "pending_sdp_offer": sdp_backfill.get("sdp_offer"),
-            "pending_sdp_answer": sdp_backfill.get("sdp_answer"),
-            "pending_ice_candidates": ice_backfill,
-            "phase": mgr.phase.name.lower(),
-            "consent_phase": mgr.consent_phase.name.lower(),
-            "intensity": s.current_intensity.name.lower(),
-            "current_rung": s.current_rung_value.name.lower(),
-            "recording_state": int(rec_value),
-            "is_active": mgr.is_active,
-            "is_capturing": mgr.is_capturing,
-            "is_resumable": mgr.is_resumable,
-            "is_complete": mgr.is_complete,
-            "backend_authority": self._call_authority_snapshot(mgr),
-            "path_recommendation": self._call_reliability().recommendation_for(call_id),
-            "media_session_authority": self._call_reliability().session_for(call_id),
-            "media_recovery_intent": self._call_reliability().recovery_intent_for(call_id),
-            "rejoin": {
-                "allowed": bool(mgr.is_active or mgr.phase.name.lower() in {"inviting", "ringing"}),
-                "same_call_id": True,
-                "requires_media_restart": bool(mgr.is_active),
-            },
-        }
-
-    def _handle_rejoin_call_action(self, body: dict) -> web.Response:
-        call_id = body.get("call_id")
-        if not isinstance(call_id, str) or not call_id:
-            return web.json_response(
-                {"ok": False, "user_message": "This call is no longer active."},
-                status=404,
-            )
-        mgr = self.daemon._call_registry.get(call_id)
-        if mgr is None or mgr.is_complete:
-            return web.json_response(
-                {"ok": False, "user_message": "This call is no longer active."},
-                status=404,
-            )
-        reliability = self._call_reliability()
-        reliability.record_event({
-            "call_id": call_id,
-            "event": "client_rejoin_requested",
-            "reason": str(body.get("reason") or "browser_rejoin"),
-        })
-        snap = self._call_snapshot(call_id, mgr)
-        snap["session_authority"] = reliability.session_for(call_id)
-        snap["recovery_intent"] = reliability.recovery_intent_for(call_id)
-        return web.json_response(snap)
-
-    def _append_call_media_event_audit(self, body: dict) -> None:
-        """Append a sanitized call-media event row.
-
-        Events are fixed slugs from the browser media driver. They do not
-        include SDP, ICE candidates, IP addresses, device names, file names,
-        peer labels, or message contents.
-        """
-        try:
-            call_id = str(body.get("call_id") or "")
-            event = str(body.get("event") or "").strip().lower()
-            allowed_events = {
-                "local_media_ready",
-                "negotiation_starting",
-                "offer_preparing",
-                "offer_sent",
-                "offer_send_failed",
-                "answer_preparing",
-                "answer_sent",
-                "answer_send_failed",
-                "answer_resend",
-                "answer_resent",
-                "answer_resend_failed",
-                "offer_resend",
-                "offer_resent",
-                "offer_resend_failed",
-                "accept_resend",
-                "waiting_for_media_offer",
-                "remote_offer_received",
-                "remote_answer_received",
-                "remote_track_connected",
-                "remote_track_muted",
-                "remote_track_unmuted",
-                "remote_track_ended",
-                "remote_video_metadata",
-                "remote_video_resize",
-                "remote_video_playing",
-                "remote_video_waiting",
-                "remote_video_stalled",
-                "remote_video_error",
-                "remote_video_no_frames",
-                "remote_surface_synced",
-                "media_path_repair",
-                "media_path_repair_failed",
-                "ice_restart_requested",
-                "remote_playback_revive",
-                "pc_rebuild_start",
-                "pc_rebuild_offer_sent",
-                "attest_recorder_start_failed",
-                "microphone_changed",
-                "microphone_change_failed",
-                "camera_changed",
-                "camera_change_failed",
-                "audio_output_changed",
-                "audio_output_change_failed",
-                "media_device_changed",
-                "video_fit_changed",
-                "screen_share_started",
-                "screen_share_stopped",
-                "screen_share_failed",
-                "screen_share_unavailable",
-                "pip_started",
-                "pip_failed",
-                "pip_unavailable",
-                "background_blur_changed",
-                "voicemail_capsule_requested",
-                "capsule_capture_started",
-                "capsule_chunk_upload_failed",
-                "capsule_capture_finalized",
-                "capsule_capture_finalize_failed",
-                "group_call_requested",
-                "call_hold_started",
-                "call_hold_ended",
-                "layout_changed",
-                "captions_started",
-                "captions_stopped",
-                "captions_failed",
-                "captions_unavailable",
-                "voice_processing_changed",
-                "call_debug_copied",
-                "call_debug_copy_failed",
-                "tau_media_adapted",
-                "tau_capture_adapted",
-                "tau_capture_adapt_failed",
-                "ice_host_only_mode",
-                "ice_relay_ready",
-                "relay_escape_requested",
-                "remote_media_frozen",
-                "network_resume_repair",
-                "network_offline",
-                "duplicate_remote_offer_ignored",
-                "sas_words_shown",
-                "sas_words_missing",
-                "offer_collision",
-                "offer_collision_recovery_start",
-                "offer_collision_rollback",
-                "offer_collision_rebuild",
-                "offer_collision_recovered",
-                "offer_collision_recovery_failed",
-                "ice_state_changed",
-                "backend_recommendation_received",
-                "backend_recommendation_applied",
-                "backend_recommendation_failed",
-                "session_authority_seen",
-                "recovery_intent_seen",
-                "recovery_intent_applied",
-                "recovery_intent_failed",
-                "call_trace_exported",
-                "call_trace_export_failed",
-                "relay_probe_completed",
-                "relay_probe_failed",
-                "turn_credentials_refreshed",
-                "turn_credentials_refresh_failed",
-                "client_rejoin_requested",
-                "client_rejoin_media_ready",
-                "client_rejoin_failed",
-                "auto_call_trace_captured",
-                "auto_call_trace_failed",
-            }
-            if not call_id or event not in allowed_events:
-                return
-
-            def _clean_token(name: str, allowed: set[str]) -> str | None:
-                raw = body.get(name)
-                if not isinstance(raw, str):
-                    return None
-                clean = raw.strip().lower()
-                return clean if clean in allowed else None
-
-            def _clean_small_int(name: str, lo: int, hi: int) -> int | None:
-                if name not in body:
-                    return None
-                try:
-                    value = int(body.get(name) or 0)
-                except (TypeError, ValueError):
-                    return None
-                return max(lo, min(hi, value))
-
-            row = {
-                "ts_ms": int(time.time() * 1000),
-                "row_type": "event",
-                "call_id": call_id,
-                "event": event,
-                "reason": _clean_token(
-                    "reason", {
-                        "start", "accept", "active", "watchdog", "metrics",
-                        "duplicate_offer", "offer_collision", "offer_echo",
-                        "ringing_backfill", "answered", "no_answer",
-                        "stalled_media", "media_path_repair", "contain", "cover",
-                        "repair", "renderer_detached", "playback_revive",
-                        "ice_state_changed", "connection_state_changed",
-                        "remote_audio_ended", "remote_video_ended",
-                        "focus", "split", "compact",
-                        "observe", "hold", "watch", "backend_recommendation",
-                        "revive_playback", "renegotiate", "audio_first_repair",
-                        "ice_restart", "downshift", "rebuild_peer_connection",
-                        "backend_ice_restart", "backend_renegotiate",
-                        "backend_audio_first_repair",
-                        "negotiating", "connected", "degraded",
-                        "reconnecting", "recovered", "failed",
-                        "restart_ice", "force_relay",
-                        "recovery_intent", "revive_playback",
-                        "relay_probe", "credential_refresh",
-                        "credential_expiring",
-                        "browser_rejoin", "backfill_active",
-                        "media_rejoin", "daemon_restart",
-                        "auto_trace", "sustained_media_freeze",
-                        "watchdog_no_media_movement",
-                    },
-                ),
-                "media_kind": _clean_token("media_kind", {"audio", "video"}),
-                "state": _clean_token(
-                    "state",
-                    {
-                        "new", "checking", "connected", "completed",
-                        "failed", "disconnected", "closed", "connecting",
-                        "enabled", "disabled", "full", "steady", "survival",
-                        "auto", "direct", "relay", "same",
-                        "negotiating", "degraded", "recovered",
-                        "survival", "audio_first",
-                        "healthy", "poor", "unknown",
-                    },
-                ),
-                "ok": bool(body.get("ok")) if "ok" in body else None,
-                "repair_stage": _clean_small_int("repair_stage", 0, 3),
-            }
-            log_dir = data_dir() / "logs"
-            log_dir.mkdir(parents=True, exist_ok=True)
-            with (log_dir / "call_media_audit.jsonl").open(
-                "a", encoding="utf-8",
-            ) as f:
-                f.write(json.dumps(row, sort_keys=True) + "\n")
-        except Exception as exc:
-            log.debug("call media event audit append failed: %s", exc)
-
-    def _append_call_media_audit(self, body: dict) -> None:
-        """Append a privacy-safe WebRTC media diagnostic row.
-
-        The row intentionally excludes SDP bodies, ICE candidate strings,
-        IP addresses, device names, and message contents. It captures only
-        state-machine and aggregate media counters so a failed call can be
-        diagnosed after the fact.
-        """
-        try:
-            call_id = str(body.get("call_id") or "")
-            if not call_id:
-                return
-            allowed_states = {
-                "new", "checking", "connected", "completed", "failed",
-                "disconnected", "closed", "connecting", "stable",
-                "have-local-offer", "have-remote-offer",
-                "have-local-pranswer", "have-remote-pranswer",
-                "gathering", "complete",
-            }
-
-            def _state(name: str) -> str | None:
-                raw = body.get(name)
-                if not isinstance(raw, str):
-                    return None
-                clean = raw.strip().lower()
-                return clean if clean in allowed_states else None
-
-            def _int(name: str) -> int | None:
-                raw = body.get(name)
-                if raw is None:
-                    return None
-                try:
-                    value = int(raw)
-                except (TypeError, ValueError):
-                    return None
-                return max(0, min(value, 32))
-
-            def _counter(name: str) -> int | None:
-                raw = body.get(name)
-                if raw is None:
-                    return None
-                try:
-                    value = int(raw)
-                except (TypeError, ValueError):
-                    return None
-                return max(0, min(value, 10_000_000_000))
-
-            def _float(name: str) -> float | None:
-                raw = body.get(name)
-                if raw is None:
-                    return None
-                try:
-                    value = float(raw)
-                except (TypeError, ValueError):
-                    return None
-                if value != value:
-                    return None
-                return value
-
-            row = {
-                "ts_ms": int(time.time() * 1000),
-                "row_type": "metrics",
-                "call_id": call_id,
-                "ice_connection_state": _state("ice_connection_state"),
-                "connection_state": _state("connection_state"),
-                "ice_gathering_state": _state("ice_gathering_state"),
-                "signaling_state": _state("signaling_state"),
-                "has_local_description": bool(body.get("has_local_description")),
-                "has_remote_description": bool(body.get("has_remote_description")),
-                "local_audio_tracks": _int("local_audio_tracks"),
-                "local_video_tracks": _int("local_video_tracks"),
-                "local_live_audio_tracks": _int("local_live_audio_tracks"),
-                "local_live_video_tracks": _int("local_live_video_tracks"),
-                "remote_audio_tracks": _int("remote_audio_tracks"),
-                "remote_video_tracks": _int("remote_video_tracks"),
-                "remote_live_audio_tracks": _int("remote_live_audio_tracks"),
-                "remote_live_video_tracks": _int("remote_live_video_tracks"),
-                "remote_muted_audio_tracks": _int("remote_muted_audio_tracks"),
-                "remote_muted_video_tracks": _int("remote_muted_video_tracks"),
-                "inbound_audio_bytes": _counter("inbound_audio_bytes"),
-                "inbound_audio_packets": _counter("inbound_audio_packets"),
-                "inbound_video_bytes": _counter("inbound_video_bytes"),
-                "inbound_video_packets": _counter("inbound_video_packets"),
-                "inbound_video_frames_decoded": _counter("inbound_video_frames_decoded"),
-                "inbound_video_frames_dropped": _counter("inbound_video_frames_dropped"),
-                "remote_video_width": _counter("remote_video_width"),
-                "remote_video_height": _counter("remote_video_height"),
-                "remote_video_ready_state": _counter("remote_video_ready_state"),
-                "remote_video_paused": bool(body.get("remote_video_paused")),
-                "rtt_ms": _float("rtt_ms"),
-                "jitter_ms": _float("jitter_ms"),
-                "loss_rate": _float("loss_rate"),
-                "bandwidth_estimate_kbps": _float("bandwidth_estimate_kbps"),
-                "media_health_state": (
-                    str(body.get("media_health_state")).strip().lower()
-                    if isinstance(body.get("media_health_state"), str)
-                    else None
-                ),
-                "media_health_severity": _int("media_health_severity"),
-                "remote_video_src_attached": bool(body.get("remote_video_src_attached")),
-                "remote_audio_src_attached": bool(body.get("remote_audio_src_attached")),
-                "ice_relay_ready": bool(body.get("ice_relay_ready")),
-                "relay_escape_active": bool(body.get("relay_escape_active")),
-                "best_relay_health": (
-                    str(body.get("best_relay_health")).strip().lower()
-                    if str(body.get("best_relay_health") or "").strip().lower()
-                    in {"healthy", "degraded", "poor", "unknown"}
-                    else None
-                ),
-                "best_relay_score": _float("best_relay_score"),
-            }
-            log_dir = data_dir() / "logs"
-            log_dir.mkdir(parents=True, exist_ok=True)
-            with (log_dir / "call_media_audit.jsonl").open(
-                "a", encoding="utf-8",
-            ) as f:
-                f.write(json.dumps(row, sort_keys=True) + "\n")
-        except Exception as exc:
-            log.debug("call media audit append failed: %s", exc)
 
     def _handle_observe_frame_action(self, body: dict) -> web.Response:
         """Tier η — browser reports an arriving real audio/video frame.
@@ -11689,179 +11071,15 @@ class UIServer:
 
     async def api_calls_list(self, request: web.Request) -> web.Response:
         """GET /api/v1/calls — list active call snapshots."""
-        registry = self.daemon._call_registry
-        out = []
-        for cid in registry.active_call_ids():
-            mgr = registry.get(cid)
-            if mgr is None:
-                continue
-            peer_fp = mgr.state.peer_master_vk_hex
-            peer_label = peer_fp[:8]
-            try:
-                rec = self.daemon.state.get_peer(peer_fp) if self.daemon.state is not None else None
-                if rec is not None:
-                    peer_label = (
-                        getattr(rec, "local_alias", None)
-                        or getattr(rec, "display_name", None)
-                        or getattr(rec, "hostname", None)
-                        or peer_label
-                    )
-            except Exception as peer_exc:
-                report_best_effort_failure(
-                    log,
-                    "call_list_peer_label",
-                    peer_exc,
-                    level=logging.DEBUG,
-                )
-            local_role = mgr.state.local_role
-            sdp_backfill = {}
-            try:
-                sdp_backfill = dict(
-                    getattr(self.daemon, "_call_sdp_backfill", {}).get(cid, {})
-                )
-            except Exception:
-                sdp_backfill = {}
-            try:
-                ice_backfill = list(
-                    getattr(self.daemon, "_call_ice_backfill", {}).get(cid, [])
-                )
-            except Exception:
-                ice_backfill = []
-            out.append({
-                "call_id": cid,
-                "peer_master_vk_hex": peer_fp,
-                "peer_label": peer_label,
-                "local_role": local_role,
-                    "call_kind": getattr(mgr.state, "call_kind", "voice"),
-                    "is_incoming": local_role == "recipient",
-                "pending_sdp_offer": sdp_backfill.get("sdp_offer"),
-                "pending_sdp_answer": sdp_backfill.get("sdp_answer"),
-                "pending_ice_candidates": ice_backfill,
-                "phase": mgr.phase.name.lower(),
-                "consent_phase": mgr.consent_phase.name.lower(),
-                "is_active": mgr.is_active,
-                "is_capturing": mgr.is_capturing,
-                "is_resumable": mgr.is_resumable,
-                "is_complete": mgr.is_complete,
-                "backend_authority": self._call_authority_snapshot(mgr),
-                "path_recommendation": self._call_reliability().recommendation_for(cid),
-                "media_session_authority": self._call_reliability().session_for(cid),
-                "media_recovery_intent": self._call_reliability().recovery_intent_for(cid),
-            })
-        return web.json_response({"calls": out})
+        return await self._call_router().list_calls(request)
 
     async def api_call_state(self, request: web.Request) -> web.Response:
         """GET /api/v1/calls/{call_id} — one call's snapshot."""
-        call_id = request.match_info.get("call_id", "")
-        mgr = self.daemon._call_registry.get(call_id)
-        if mgr is None:
-            # Doctrine §3.2.f: no "not found" error code. Plain
-            # language instead.
-            return web.json_response(
-                {
-                    "ok": False,
-                    "user_message": "This call is no longer active.",
-                },
-                status=404,
-            )
-        s = mgr.session_snapshot()
-        rec_value = s.recording_state.value if s.recording_state.value is not None else 0
-        peer_fp = mgr.state.peer_master_vk_hex
-        peer_label = peer_fp[:8]
-        try:
-            rec = self.daemon.state.get_peer(peer_fp) if self.daemon.state is not None else None
-            if rec is not None:
-                peer_label = (
-                    getattr(rec, "local_alias", None)
-                    or getattr(rec, "display_name", None)
-                    or getattr(rec, "hostname", None)
-                    or peer_label
-                )
-        except Exception as peer_exc:
-            report_best_effort_failure(
-                log,
-                "call_detail_peer_label",
-                peer_exc,
-                level=logging.DEBUG,
-            )
-        local_role = mgr.state.local_role
-        sdp_backfill = {}
-        try:
-            sdp_backfill = dict(
-                getattr(self.daemon, "_call_sdp_backfill", {}).get(call_id, {})
-            )
-        except Exception:
-            sdp_backfill = {}
-        try:
-            ice_backfill = list(
-                getattr(self.daemon, "_call_ice_backfill", {}).get(call_id, [])
-            )
-        except Exception:
-            ice_backfill = []
-        return web.json_response({
-            "ok": True,
-            "call_id": call_id,
-            "peer_master_vk_hex": peer_fp,
-            "peer_label": peer_label,
-            "local_role": local_role,
-                "call_kind": getattr(mgr.state, "call_kind", "voice"),
-                "is_incoming": local_role == "recipient",
-            "pending_sdp_offer": sdp_backfill.get("sdp_offer"),
-            "pending_sdp_answer": sdp_backfill.get("sdp_answer"),
-            "pending_ice_candidates": ice_backfill,
-            "phase": mgr.phase.name.lower(),
-            "consent_phase": mgr.consent_phase.name.lower(),
-            "intensity": s.current_intensity.name.lower(),
-            "current_rung": s.current_rung_value.name.lower(),
-            "recording_state": int(rec_value),
-            "is_active": mgr.is_active,
-            "is_capturing": mgr.is_capturing,
-            "is_resumable": mgr.is_resumable,
-            "is_complete": mgr.is_complete,
-            "backend_authority": self._call_authority_snapshot(mgr),
-            "path_recommendation": self._call_reliability().recommendation_for(call_id),
-            "media_session_authority": self._call_reliability().session_for(call_id),
-            "media_recovery_intent": self._call_reliability().recovery_intent_for(call_id),
-        })
+        return await self._call_router().call_state(request)
 
     async def api_call_trace(self, request: web.Request) -> web.Response:
         """GET /api/v1/calls/{call_id}/trace — privacy-safe flight recorder."""
-        call_id = request.match_info.get("call_id", "")
-        mgr = self.daemon._call_registry.get(call_id)
-        if mgr is None:
-            return web.json_response(
-                {"ok": False, "user_message": "This call is no longer active."},
-                status=404,
-            )
-        trace = self._call_reliability().trace_for(call_id)
-        trace["backend_authority"] = self._call_authority_snapshot(mgr)
-        trace["routePolicy"] = self._resolved_webrtc_route_policy(call_id=call_id)
-        return web.json_response(trace)
-
-    @staticmethod
-    def _call_authority_snapshot(mgr) -> dict:
-        phase = mgr.phase.name.lower()
-        if mgr.is_complete:
-            authority_state = "ended"
-        elif mgr.is_resumable:
-            authority_state = "recovered"
-        elif mgr.is_capturing:
-            authority_state = "degraded"
-        elif mgr.is_active:
-            authority_state = "connected"
-        elif phase == "ringing":
-            authority_state = "ringing"
-        elif phase == "inviting":
-            authority_state = "negotiating"
-        else:
-            authority_state = phase
-        return {
-            "state": authority_state,
-            "phase": phase,
-            "is_active": bool(mgr.is_active),
-            "is_resumable": bool(mgr.is_resumable),
-            "is_complete": bool(mgr.is_complete),
-        }
+        return await self._call_router().call_trace(request)
 
     async def api_list_ui_sessions(
         self, request: web.Request,
@@ -16197,6 +15415,7 @@ class UIServer:
             self._sweep_setup_device_invites()
             if token not in self._setup_device_invites:
                 raise ValueError("invite expired or not found")
+            await _preload_qr_renderer()
             import io
             import qrcode
             import qrcode.image.svg
@@ -17894,6 +17113,7 @@ class UIServer:
         token = str(request.query.get("token") or "")
         try:
             parsed = parse_enrollment_invite(token)
+            await _preload_qr_renderer()
             import io
             import qrcode
             import qrcode.image.svg
@@ -18128,603 +17348,157 @@ class UIServer:
         })
 
     async def api_courier_export(self, request: web.Request) -> web.Response:
-        """Export cached CDC chunks into an encrypted offline courier bundle."""
-
-        from one_link.courier_bundle import (
-            CourierBundleError,
-            encode_bundle_b64,
-            export_courier_bundle,
+        return await self._courier_json_operation(
+            request,
+            lambda data: self._courier_service().export(data),
+            json_message="Expected JSON with a chunks array.",
+            object_message="Courier export expects a JSON object.",
         )
-
-        try:
-            data = await request.json()
-        except Exception:
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Expected JSON with a chunks array.",
-            }, status=400,
-            )
-        if not isinstance(data, dict):
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Courier export expects a JSON object.",
-            }, status=400,
-            )
-        raw_chunks = data.get("chunks")
-        export_blob_hash = str(data.get("blob_hash") or "").strip().lower()
-        export_name = str(data.get("name") or "").strip() or None
-        if (not isinstance(raw_chunks, list) or not raw_chunks) and self.daemon.state is not None:
-            blob_hash = export_blob_hash
-            transfer_id = str(data.get("transfer_id") or "").strip()
-            if transfer_id:
-                rec = self.daemon.state.get_transfer(transfer_id)
-                if rec is not None:
-                    blob_hash = str(rec.blob_hash or "").strip().lower()
-                    export_name = rec.name or export_name
-            if blob_hash and getattr(self.daemon, "_valid_blob_hex")(blob_hash):
-                export_blob_hash = blob_hash
-                raw_chunks = [
-                    str(c.get("chunk_hash") or "")
-                    for c in self.daemon.state.list_chunks_for_blob(blob_hash)
-                ]
-        if not isinstance(raw_chunks, list) or not raw_chunks:
-            return web.json_response({
-                "ok": False,
-                "error": "missing_chunks",
-                "message": "Choose a cached transfer or at least one cached chunk to courier.",
-            }, status=400,
-            )
-        chunks: list[tuple[str, bytes]] = []
-        missing: list[str] = []
-        for raw_hash in raw_chunks:
-            h = str(raw_hash or "").strip().lower()
-            if not getattr(self.daemon, "_valid_blob_hex")(h):
-                return web.json_response({
-                    "ok": False,
-                    "error": "invalid_chunk_hash",
-                    "message": "Courier export received a malformed chunk hash.",
-                }, status=400,
-                )
-            data_bytes = self.daemon._read_chunk_cache(h)
-            if data_bytes is None:
-                missing.append(h)
-            else:
-                chunks.append((h, data_bytes))
-        if missing:
-            return web.json_response({
-                "ok": False,
-                "error": "missing_cached_chunks",
-                "message": "One Link has not cached every requested chunk yet.",
-                "missing": missing[:64],
-                "missing_count": len(missing),
-            }, status=409,
-            )
-        try:
-            ttl_s = int(data.get("ttl_s") or 24 * 60 * 60)
-        except (TypeError, ValueError, OverflowError):
-            ttl_s = 24 * 60 * 60
-        try:
-            export = export_courier_bundle(
-                chunks,
-                sender_fp=self.daemon.me.fingerprint,
-                recipient_fp=data.get("recipient_fp") or None,
-                blob_hash=export_blob_hash if export_blob_hash else None,
-                name=export_name,
-                ttl_s=ttl_s,
-                signing_key=self.daemon.me.private,
-            )
-        except CourierBundleError as exc:
-            return web.json_response({
-                "ok": False,
-                "error": "courier_export_rejected",
-                "message": str(exc),
-            }, status=400,
-            )
-        except Exception as exc:
-            return web.json_response({
-                "ok": False,
-                "error": "courier_export_failed",
-                "message": str(exc),
-            }, status=500,
-            )
-        with contextlib.suppress(Exception):
-            self._record_courier_event(
-                "export",
-                dict(export.manifest),
-                bundle_bytes=len(export.bundle),
-            )
-        return web.json_response({
-            "ok": True,
-            "bundle_b64": encode_bundle_b64(export.bundle),
-            "key_token": export.key_token,
-            "manifest": export.manifest,
-            "bundle_bytes": len(export.bundle),
-            "chunk_count": export.manifest.get("chunk_count"),
-            "total_bytes": export.manifest.get("total_bytes"),
-        })
 
     async def api_courier_export_file(self, request: web.Request) -> web.Response:
-        """Stage an encrypted courier bundle into the local courier outbox."""
-
-        try:
-            data = await request.json()
-        except Exception:
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Expected JSON with export options.",
-            }, status=400,
-            )
-        if not isinstance(data, dict):
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Courier export-file expects a JSON object.",
-            }, status=400,
-            )
-        class _MemoryRequest:
-            async def json(self_nonlocal):
-                return data
-        response = await self.api_courier_export(_MemoryRequest())  # type: ignore[arg-type]
-        if response.status != 200:
-            return response
-        try:
-            payload = json.loads(response.text or "{}")
-            bundle_b64 = str(payload["bundle_b64"])
-            manifest = payload.get("manifest") if isinstance(payload.get("manifest"), dict) else {}
-        except Exception as exc:
-            return web.json_response({
-                "ok": False,
-                "error": "courier_export_file_failed",
-                "message": str(exc),
-            }, status=500,
-            )
-        bundle_id = str(manifest.get("bundle_id") or secrets.token_hex(16))
-        name = self.daemon._safe_transfer_name(manifest.get("name") or f"{bundle_id}.olcb.json")
-        if not name.lower().endswith(".olcb.json"):
-            name = f"{Path(name).stem or bundle_id}.olcb.json"
-        out_dir = self._courier_outbox_dir()
-        out_path = (out_dir / name).resolve()
-        if out_path.parent != out_dir.resolve():
-            out_path = out_dir / f"{bundle_id}.olcb.json"
-        if out_path.exists():
-            out_path = out_dir / f"{Path(out_path.name).stem}.{bundle_id[:8]}.olcb.json"
-        body = json.dumps({
-            "type": "one-link-courier-bundle",
-            "version": 1,
-            "bundle_b64": bundle_b64,
-            "manifest": manifest,
-        }, ensure_ascii=False, indent=2,
+        return await self._courier_json_operation(
+            request,
+            lambda data: self._courier_service().export_file(data),
+            json_message="Expected JSON with export options.",
+            object_message="Courier export-file expects a JSON object.",
         )
-        tmp = out_path.with_name(f".{out_path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
-        tmp.write_text(body, encoding="utf-8")
-        os.replace(tmp, out_path)
-        return web.json_response({
-            "ok": True,
-            "path": str(out_path),
-            "name": out_path.name,
-            "outbox_dir": str(out_dir),
-            "key_token": payload.get("key_token"),
-            "manifest": manifest,
-            "bundle_bytes": payload.get("bundle_bytes"),
-        })
 
     async def api_courier_copy_to_removable(self, request: web.Request) -> web.Response:
-        """Copy a staged courier outbox file to a selected removable target."""
-
-        import shutil
         from one_link.removable_media import find_removable_target
 
-        try:
-            data = await request.json()
-        except Exception:
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Expected JSON with file_id and target_id.",
-            }, status=400,
-            )
-        if not isinstance(data, dict):
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Courier removable copy expects a JSON object.",
-            }, status=400,
-            )
-        src = self._resolve_courier_outbox_file_id(str(data.get("file_id") or ""))
-        if src is None:
-            return web.json_response({
-                "ok": False,
-                "error": "courier_outbox_file_not_found",
-                "message": "That staged courier file is not in the outbox anymore.",
-            }, status=404,
-            )
-        target = find_removable_target(str(data.get("target_id") or ""))
-        if target is None:
-            return web.json_response({
-                "ok": False,
-                "error": "removable_target_not_found",
-                "message": "That removable target is not available.",
-            }, status=404,
-            )
-        try:
-            dest_root = (target.path / "One Link Courier").resolve()
-            target_root = target.path.resolve()
-            if target_root not in {dest_root, *dest_root.parents}:
-                return web.json_response({
-                    "ok": False,
-                    "error": "removable_target_rejected",
-                    "message": "Courier target resolved outside the removable drive.",
-                }, status=400,
+        def copy(data: dict) -> dict:
+            source = self._courier_files.resolve_outbox(str(data.get("file_id") or ""))
+            if source is None:
+                raise CourierOperationError(
+                    CourierFailure.MISSING,
+                    "courier_outbox_file_not_found",
+                    "That staged courier file is not in the outbox anymore.",
                 )
-            dest_root.mkdir(parents=True, exist_ok=True)
-            dest = (dest_root / src.name).resolve()
-            if dest.parent != dest_root:
-                raise ValueError("destination escaped courier folder")
-            if dest.exists():
-                dest = dest_root / f"{src.stem}.{secrets.token_hex(4)}{src.suffix}"
-            tmp = dest.with_name(f".{dest.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
-            shutil.copyfile(src, tmp)
-            os.replace(tmp, dest)
-        except Exception as exc:
-            return web.json_response({
-                "ok": False,
-                "error": "courier_removable_copy_failed",
-                "message": str(exc),
-            }, status=500,
-            )
-        return web.json_response({
-            "ok": True,
-            "path": str(dest),
-            "name": dest.name,
-            "target_id": target.id,
-            "target_label": target.label,
-            "bytes": int(dest.stat().st_size),
-        })
+            target = find_removable_target(str(data.get("target_id") or ""))
+            if target is None:
+                raise CourierOperationError(
+                    CourierFailure.MISSING,
+                    "removable_target_not_found",
+                    "That removable target is not available.",
+                )
+            dest = self._courier_service().copy_to_removable(source, target.path)
+            return {
+                "path": str(dest),
+                "name": dest.name,
+                "target_id": target.id,
+                "target_label": target.label,
+                "bytes": int(dest.stat().st_size),
+            }
 
-    async def api_courier_copy_from_removable(self, request: web.Request) -> web.Response:
-        """Copy a courier bundle from removable media into the local drop folder."""
-
-        import shutil
-        from one_link.removable_media import find_removable_target
-
-        try:
-            data = await request.json()
-        except Exception:
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Expected JSON with target_id and file_id.",
-            }, status=400,
-            )
-        if not isinstance(data, dict):
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Courier removable copy expects a JSON object.",
-            }, status=400,
-            )
-        target = find_removable_target(str(data.get("target_id") or ""))
-        if target is None:
-            return web.json_response({
-                "ok": False,
-                "error": "removable_target_not_found",
-                "message": "That removable target is not available.",
-            }, status=404,
-            )
-        src = self._resolve_removable_courier_file_id(target.path, str(data.get("file_id") or ""))
-        if src is None:
-            return web.json_response({
-                "ok": False,
-                "error": "removable_courier_file_not_found",
-                "message": "That courier file is not available on the removable target.",
-            }, status=404,
-            )
-        try:
-            drop = self._courier_drop_dir().resolve()
-            dest = (drop / src.name).resolve()
-            if dest.parent != drop:
-                raise ValueError("destination escaped courier drop folder")
-            if dest.exists():
-                dest = drop / f"{src.stem}.{secrets.token_hex(4)}{src.suffix}"
-            tmp = dest.with_name(f".{dest.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
-            shutil.copyfile(src, tmp)
-            os.replace(tmp, dest)
-            self._courier_monitor_tick(broadcast=True)
-        except Exception as exc:
-            return web.json_response({
-                "ok": False,
-                "error": "courier_removable_copy_failed",
-                "message": str(exc),
-            }, status=500,
-            )
-        return web.json_response({
-            "ok": True,
-            "path": str(dest),
-            "name": dest.name,
-            "target_id": target.id,
-            "target_label": target.label,
-            "bytes": int(dest.stat().st_size),
-        })
-
-    async def api_courier_import(self, request: web.Request) -> web.Response:
-        """Import an encrypted offline courier bundle into the chunk cache."""
-
-        try:
-            data = await request.json()
-        except Exception:
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Expected JSON with bundle_b64 and key_token.",
-            }, status=400,
-            )
-        if not isinstance(data, dict):
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Courier import expects a JSON object.",
-            }, status=400,
-            )
-        return self._import_courier_payload(data)
-
-    def _import_courier_payload(self, data: dict) -> web.Response:
-        from one_link.courier_bundle import (
-            CourierBundleError,
-            decode_bundle_b64,
-            import_courier_bundle,
+        return await self._courier_json_operation(
+            request,
+            copy,
+            json_message="Expected JSON with file_id and target_id.",
+            object_message="Courier removable copy expects a JSON object.",
         )
 
-        if self._courier_ledger_error is not None:
+    async def api_courier_copy_from_removable(self, request: web.Request) -> web.Response:
+        from one_link.removable_media import find_removable_target
+
+        def copy(data: dict) -> dict:
+            target = find_removable_target(str(data.get("target_id") or ""))
+            if target is None:
+                raise CourierOperationError(
+                    CourierFailure.MISSING,
+                    "removable_target_not_found",
+                    "That removable target is not available.",
+                )
+            dest = self._courier_service().copy_from_removable(
+                str(data.get("file_id") or ""),
+                target.path,
+            )
+            try:
+                self._courier_monitor_tick(broadcast=True)
+            except Exception as exc:
+                raise CourierOperationError(
+                    CourierFailure.FAILED,
+                    "courier_removable_copy_failed",
+                    str(exc),
+                ) from exc
+            return {
+                "path": str(dest),
+                "name": dest.name,
+                "target_id": target.id,
+                "target_label": target.label,
+                "bytes": int(dest.stat().st_size),
+            }
+
+        return await self._courier_json_operation(
+            request,
+            copy,
+            json_message="Expected JSON with target_id and file_id.",
+            object_message="Courier removable copy expects a JSON object.",
+        )
+
+    async def api_courier_import(self, request: web.Request) -> web.Response:
+        return await self._courier_json_operation(
+            request,
+            lambda data: self._courier_service().import_payload(data),
+            json_message="Expected JSON with bundle_b64 and key_token.",
+            object_message="Courier import expects a JSON object.",
+        )
+
+    def _courier_operation(self, operation: Callable[[], Mapping[str, object]]) -> web.Response:
+        try:
+            return web.json_response({"ok": True, **operation()})
+        except CourierOperationError as exc:
+            status = {
+                CourierFailure.INVALID: 400,
+                CourierFailure.MISSING: 404,
+                CourierFailure.CONFLICT: 409,
+                CourierFailure.UNAVAILABLE: 503,
+                CourierFailure.FAILED: 500,
+            }[exc.kind]
             return web.json_response(
-                {
-                    "ok": False,
-                    "error": "courier_replay_ledger_unavailable",
-                    "message": (
-                        "Courier import is blocked because its durable replay "
-                        "ledger is unreadable or invalid. Preserve the ledger "
-                        "and restore it from a trusted backup before importing."
-                    ),
-                },
-                status=503,
+                {"ok": False, "error": exc.code, "message": str(exc), **exc.details},
+                status=status,
             )
 
-        bundle_text = data.get("bundle_b64") or data.get("bundle")
-        key_token = str(data.get("key_token") or "").strip()
-        if not bundle_text or not key_token:
-            return web.json_response({
-                "ok": False,
-                "error": "missing_courier_fields",
-                "message": "Courier import needs both the encrypted bundle and its unlock token.",
-            }, status=400,
-            )
-        expected_recipient = data.get("expected_recipient_fp")
-        if expected_recipient is None and data.get("enforce_recipient", True):
-            expected_recipient = self.daemon.me.fingerprint
+    async def _courier_json_operation(
+        self,
+        request: web.Request,
+        operation: Callable[[dict], Mapping[str, object]],
+        *,
+        json_message: str,
+        object_message: str,
+    ) -> web.Response:
         try:
-            bundle = decode_bundle_b64(str(bundle_text))
-            imported = import_courier_bundle(
-                bundle,
-                key_token,
-                expected_recipient_fp=expected_recipient,
-                expected_sender_fp=data.get("expected_sender_fp") or None,
-                require_sender_signature=bool(data.get("require_sender_signature", False)),
+            data = await request.json()
+        except Exception:
+            return web.json_response(
+                {"ok": False, "error": "bad_json", "message": json_message},
+                status=400,
             )
-            bundle_id = str(imported.manifest.get("bundle_id") or "").strip().lower()
-            if bundle_id in self._courier_seen_bundle_ids:
-                raise CourierBundleError("courier bundle was already imported")
-            # Persist replay admission before any chunk-cache side effect. If
-            # durability fails, the import fails with zero admitted chunks;
-            # a crash can never apply payload bytes without first recording
-            # the bundle id in the durable replay authority.
-            self._mark_courier_imported(dict(imported.manifest))
-            stored = 0
-            import_blob_hash = imported.manifest.get("blob_hash")
-            for chunk_hash, chunk_data in imported.chunks:
-                self.daemon._store_chunk_cache(
-                    chunk_hash,
-                    chunk_data,
-                    blob_hash=import_blob_hash if isinstance(import_blob_hash, str) else None,
-                    chunk_index=stored if isinstance(import_blob_hash, str) else None,
-                )
-                stored += 1
-            self._record_courier_event(
-                "import",
-                dict(imported.manifest),
-                bundle_bytes=len(bundle),
-                stored_chunks=stored,
+        if not isinstance(data, dict):
+            return web.json_response(
+                {"ok": False, "error": "bad_json", "message": object_message},
+                status=400,
             )
-        except CourierBundleError as exc:
-            return web.json_response({
-                "ok": False,
-                "error": "courier_import_rejected",
-                "message": str(exc),
-            }, status=400,
-            )
-        except Exception as exc:
-            return web.json_response({
-                "ok": False,
-                "error": "courier_import_failed",
-                "message": str(exc),
-            }, status=500,
-            )
-        return web.json_response({
-            "ok": True,
-            "manifest": imported.manifest,
-            "stored_chunks": stored,
-            "chunk_count": imported.manifest.get("chunk_count"),
-            "total_bytes": imported.manifest.get("total_bytes"),
-        })
+        return self._courier_operation(lambda: operation(data))
+
+    def _import_courier_payload(self, data: dict) -> web.Response:
+        return self._courier_operation(lambda: self._courier_service().import_payload(data))
 
     async def api_courier_import_file(self, request: web.Request) -> web.Response:
-        """Import a courier bundle from the local courier drop directory."""
-
-        try:
-            data = await request.json()
-        except Exception:
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Expected JSON with file_id and key_token.",
-            }, status=400,
-            )
-        if not isinstance(data, dict):
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Courier file import expects a JSON object.",
-            }, status=400,
-            )
-        path = self._resolve_courier_file_id(str(data.get("file_id") or ""))
-        if path is None:
-            return web.json_response({
-                "ok": False,
-                "error": "courier_file_not_found",
-                "message": "That courier file is not in the drop folder anymore.",
-            }, status=404,
-            )
-        try:
-            if path.stat().st_size > COURIER_FILE_MAX_BYTES:
-                raise ValueError("courier file exceeds the size limit")
-            bundle_b64 = self._extract_courier_bundle_text(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, ValueError) as exc:
-            return web.json_response({
-                "ok": False,
-                "error": "courier_file_unreadable",
-                "message": str(exc),
-            }, status=400,
-            )
-        return self._import_courier_payload({
-            "bundle_b64": bundle_b64,
-            "key_token": data.get("key_token"),
-            "expected_recipient_fp": data.get("expected_recipient_fp"),
-            "enforce_recipient": data.get("enforce_recipient", True),
-        })
+        return await self._courier_json_operation(
+            request,
+            lambda data: self._courier_service().import_file(data),
+            json_message="Expected JSON with file_id and key_token.",
+            object_message="Courier file import expects a JSON object.",
+        )
 
     async def api_courier_assemble(self, request: web.Request) -> web.Response:
-        """Assemble a fully cached courier-imported blob into the inbox."""
-
-        try:
-            from one_link.courier_bundle import (
-                CourierBundleError,
-                assemble_courier_chunks,
-            )
-
-            data = await request.json()
-        except Exception:
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Expected JSON with a blob_hash field.",
-            }, status=400,
-            )
-        if not isinstance(data, dict):
-            return web.json_response({
-                "ok": False,
-                "error": "bad_json",
-                "message": "Courier assemble expects a JSON object.",
-            }, status=400,
-            )
-        blob_hash = str(data.get("blob_hash") or "").strip().lower()
-        if not getattr(self.daemon, "_valid_blob_hex")(blob_hash):
-            return web.json_response({
-                "ok": False,
-                "error": "invalid_blob_hash",
-                "message": "Courier assemble received a malformed blob hash.",
-            }, status=400,
-            )
-        state = getattr(self.daemon, "state", None)
-        if state is None:
-            return web.json_response({
-                "ok": False,
-                "error": "state_unavailable",
-                "message": "Chunk index is not available yet.",
-            }, status=503,
-            )
-        rows = state.list_chunks_for_blob(blob_hash)
-        if not rows:
-            return web.json_response({
-                "ok": False,
-                "error": "missing_chunk_index",
-                "message": "No chunk index is known for this courier blob.",
-            }, status=404,
-            )
-        name = self.daemon._safe_transfer_name(data.get("name") or f"{blob_hash[:12]}.bin")
-        out_path = self.daemon._unique_inbox_path(blob_hash, name)
-
-        def cached_chunks():
-            for row in rows:
-                chunk_hash = str(row.get("chunk_hash") or "").strip().lower()
-                if not getattr(self.daemon, "_valid_blob_hex")(chunk_hash):
-                    raise CourierBundleError("courier chunk index contains an invalid hash")
-                chunk_data = self.daemon._read_chunk_cache(chunk_hash)
-                if chunk_data is None:
-                    raise KeyError(chunk_hash)
-                yield chunk_hash, chunk_data
-
-        written = 0
-        try:
-            with open(out_path, "xb") as fh:
-                written = assemble_courier_chunks(
-                    cached_chunks(),
-                    fh,
-                    expected_blob_hash=blob_hash,
-                )
-                fh.flush()
-                os.fsync(fh.fileno())
-        except KeyError as exc:
-            with contextlib.suppress(OSError):
-                out_path.unlink()
-            missing_hash = str(exc.args[0]) if exc.args else ""
-            return web.json_response(
-                {
-                    "ok": False,
-                    "error": "missing_cached_chunks",
-                    "message": "Courier import has not received every chunk for this file yet.",
-                    "missing_count": 1,
-                    "missing": [missing_hash] if missing_hash else [],
-                },
-                status=409,
-            )
-        except CourierBundleError as exc:
-            with contextlib.suppress(OSError):
-                out_path.unlink()
-            return web.json_response(
-                {
-                    "ok": False,
-                    "error": "courier_assemble_rejected",
-                    "message": str(exc),
-                },
-                status=409,
-            )
-        except OSError as exc:
-            with contextlib.suppress(OSError):
-                out_path.unlink()
-            return web.json_response(
-                {
-                    "ok": False,
-                    "error": "courier_assemble_failed",
-                    "message": str(exc),
-                },
-                status=500,
-            )
-        if os.name != "nt":
-            with contextlib.suppress(OSError):
-                dir_fd = os.open(out_path.parent, os.O_RDONLY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
-        return web.json_response({
-            "ok": True,
-            "path": str(out_path),
-            "name": out_path.name,
-            "blob_hash": blob_hash,
-            "bytes": written,
-            "chunks": len(rows),
-        })
+        return await self._courier_json_operation(
+            request,
+            lambda data: self._courier_service().assemble(data),
+            json_message="Expected JSON with a blob_hash field.",
+            object_message="Courier assemble expects a JSON object.",
+        )
 
     async def api_route_bootstrap(self, request: web.Request) -> web.Response:
         """Mint a signed route-bootstrap token for QR/audio/BLE paths.
@@ -18817,6 +17591,7 @@ class UIServer:
             ttl_s = int(request.query.get("ttl_s") or 180)
         except ValueError:
             ttl_s = 180
+        await _preload_qr_renderer()
         try:
             import qrcode
             import qrcode.image.svg
@@ -18977,6 +17752,27 @@ class UIServer:
             return web.json_response({"ok": True})
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+    async def api_runtime_identity(self, request: web.Request) -> web.Response:
+        """Authenticate a launcher without collecting dashboard diagnostics.
+
+        The owner bearer uses the same guard as /api/status. Return the identity
+        checked against authenticated control status after the launcher has
+        proven this HTTP connection's instance. Keep this path
+        independent of state queries, cache enumeration and hardware probes.
+        """
+
+        return web.json_response(
+            {
+                "ok": True,
+                "app_version": __import__("one_link").__version__,
+                **runtime_build_identity(),
+                "daemon_instance_id": getattr(self.daemon, "_control_instance_id", None),
+                "pid": os.getpid(),
+                "me": {"fingerprint": self.daemon.me.fingerprint},
+            },
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def api_status(self, request: web.Request) -> web.Response:
         state = self.daemon.state
@@ -27487,6 +26283,29 @@ class UIServer:
                 {"error": f"source file no longer exists: {path}"},
                 status=410,
             )
+        # The retry re-issues the original request, including any explicit
+        # transport selection; the daemon owns that reconstruction so this
+        # path and durable resume cannot drift apart.
+        from one_link.daemon import Daemon as _Daemon
+
+        try:
+            retry_kwargs = _Daemon.retry_send_kwargs(
+                metadata, fallback_display_name=rec.name,
+            )
+        except ValueError as exc:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": str(exc),
+                    "code": "unsupported_file_transport",
+                    "transfer_id": rec.id,
+                    "hint": (
+                        "This delivery recorded a transport that is not a "
+                        "qualified file route; send the file again to choose one."
+                    ),
+                },
+                status=409,
+            )
         # Resolve peer fresh — don't trust the cached endpoint that
         # might have caused the original failure.
         try:
@@ -27502,9 +26321,7 @@ class UIServer:
             return web.json_response({"error": "peer offline"}, status=404)
         try:
             result = await self.daemon.send_file(peer, path, transfer_id=rec.id,
-                display_name=metadata.get("display_name") or rec.name,
-                chat_inline=bool(metadata.get("chat_inline")),
-                rel_path=metadata.get("rel_path"),
+                **retry_kwargs,
             )
             return web.json_response({"ok": True, "result": result})
         except Exception as e:
@@ -27813,7 +26630,7 @@ class UIServer:
                 "kind": "lan_peer_quic",
                 "destination": "paired peer address and negotiated UDP port",
                 "protocol": "QUIC/TLS 1.3 native transfer path",
-                "activation": "native module + mutual capability + reachable route",
+                "activation": "experimental native primitive; desktop file payload lane is disabled",
             },
             {"kind": "mdns_multicast",
              "destination": "224.0.0.251:5353",
@@ -27871,9 +26688,21 @@ class UIServer:
                     "websocket_subprotocol_bound": OWNER_WS_PROTOCOL,
                 },
             "peer_protocol": {
-                "transport": "authenticated peer TCP plus negotiated native QUIC file lanes",
+                "transport": "authenticated encrypted peer stream over direct TCP or configured relay",
                 "auth": "Ed25519 mutual signature in handshake",
-                "encryption": "X25519 ECDH + HKDF + ChaCha20-Poly1305 (64-bit nonce counter)",
+                "encryption": (
+                    "default X25519 + ML-KEM-768 hybrid key agreement, HKDF, "
+                    "ChaCha20-Poly1305; negotiated Double Ratchet after capability exchange"
+                ),
+                "handshake_policy": __import__(
+                    "one_link.channel", fromlist=["configured_handshake_policy"]
+                ).configured_handshake_policy(),
+                "file_payload_routes": {
+                    "supported_requests": ["auto", "tcp", "relay"],
+                    "quic": "unsupported by desktop send_file; native primitive only",
+                    "webrtc": "separate browser DataChannel path; not desktop send_file",
+                    "receipt_scope": "acknowledged application payload; excludes wire overhead",
+                },
                 "message_types": peer_msg_types,
                     "message_type_inventory": (
                         "declared daemon vocabulary; capability negotiation selects "
@@ -29567,6 +28396,9 @@ class UIServer:
         )
 
     async def start(self) -> int:
+        # An explicit port request is validated before anything is touched,
+        # so a typo cannot leave half-published runtime state behind.
+        requested_port = ui_port_override()
         self._closing = False
         # ``ui.token`` and ``server.port`` are process-lifetime publications.
         # Invalidate prior values before the first await so a stale file cannot
@@ -29593,67 +28425,12 @@ class UIServer:
         # bearer/session authentication and only public short-lived pairing
         # flows remain available without TLS.
         bind_host = os.environ.get("ONE_LINK_BIND_HOST") or "127.0.0.1"
-        # Try the well-known port first so browser tabs survive restarts.
-        # Fall through 7118..7132 if taken, then OS-assigned random as
-        # last resort.
-        #
-        # v0.20.5 — the previous "ownership probe" raced with TIME_WAIT
-        # entries from a just-killed daemon: bind() would succeed (so
-        # we own the port) but the probe's connect would briefly hit
-        # the kernel's TIME_WAIT-routing layer, fail to read a 200,
-        # and we'd fall through to a higher port. Result: every
-        # restart claimed a different port number, breaking every
-        # bookmark + previously-minted pair URL. On Windows + Linux,
-        # bind() succeeding ≠ "TIME_WAIT clear" but DOES mean "we
-        # own this listener now" — connections will route to us, not
-        # to the dead 5-tuples in TIME_WAIT. Probe removed.
-        bound = False
-        for candidate in range(
-            PREFERRED_UI_PORT, PREFERRED_UI_PORT + UI_PORT_FALLBACK_RANGE
-        ):
-            # v0.21.x: on Windows, pre-bind with SO_EXCLUSIVEADDRUSE
-            # so a hostile local process that sets SO_REUSEADDR can't
-            # steal our port. On other platforms the option doesn't
-            # exist and the default semantics already prevent stealing.
-            ex_sock = self._bind_exclusive_socket(bind_host, candidate)
-            if ex_sock is not None:
-                site: web.BaseSite = web.SockSite(self.runner, ex_sock)
-                try:
-                    await site.start()
-                except OSError:
-                    with contextlib.suppress(OSError):
-                        ex_sock.close()
-                    continue
-                self.site = site
-                self.port = candidate
-                bound = True
-                break
-            if os.name == "nt":
-                # The exclusive bind failed (port truly in use).
-                # Skip to next candidate; don't fall through to a
-                # non-exclusive TCPSite that could shadow another
-                # daemon via the REUSEADDR loophole.
-                continue
-            try:
-                site = web.TCPSite(self.runner, host=bind_host, port=candidate)
-                await site.start()
-                self.site = site
-                self.port = candidate
-                bound = True
-                break
-            except OSError:
-                # Port in use by ANOTHER LISTENER — try the next.
-                # TIME_WAIT entries don't cause this on Windows or
-                # modern Linux; only an actively-listening rival
-                # process does.
-                continue
-        if not bound:
-            site = web.TCPSite(self.runner, host=bind_host, port=0)
-            await site.start()
-            sock = site._server.sockets[0]  # type: ignore[union-attr]
-            self.site = site
-            self.port = sock.getsockname()[1]
+        await self._bind_ui_listener(bind_host, requested_port)
         self.bind_host = bind_host
+        # Heavy optional imports (aiortc/PyAV for browser-peer WebRTC, the
+        # SVG QR renderer) start now on a worker thread, so the first pairing
+        # request does not wait for them and never imports them on the loop.
+        OFF_LOOP_IMPORTS.warm(("aiortc", "qrcode.image.svg"))
         await self._start_local_stun(bind_host)
         # v0.20.7 (security audit M29): wrap the UI token with the
         # daemon's lockbox WHEN explicit passphrase mode is active.
@@ -29889,6 +28666,71 @@ class UIServer:
         delivery_store = getattr(self, "_ui_delivery_idempotency", None)
         if delivery_store is not None:
             delivery_store.close()
+
+
+class _ServerCallRouteHost:
+    """``CallRouteHost`` over a live :class:`UIServer`; reads at call time."""
+
+    __slots__ = ("_server",)
+
+    _MEDIA_LAYER_ACTIONS = frozenset({"send_sdp_offer", "send_sdp_answer", "send_ice_candidate"})
+
+    def __init__(self, server: "UIServer") -> None:
+        self._server = server
+
+    def call_registry(self) -> Any:
+        return self._server.daemon._call_registry
+
+    def call_api(self) -> Any:
+        return self._server._call_api()
+
+    def call_reliability(self) -> Any:
+        return self._server._call_reliability()
+
+    def call_capability_allowed(self, peer_fp: str, call_kind: str) -> bool:
+        return self._server.daemon._call_capability_allowed(peer_fp, call_kind)
+
+    async def flush_call_api_response(self, response: Any) -> Any:
+        return await self._server.daemon.flush_call_api_response(response)
+
+    def peer_record(self, peer_fp: str) -> Any | None:
+        state = self._server.daemon.state
+        return state.get_peer(peer_fp) if state is not None else None
+
+    def call_media_backfill(self, call_id: str) -> tuple[dict, list]:
+        daemon = self._server.daemon
+        try:
+            sdp = dict(getattr(daemon, "_call_sdp_backfill", {}).get(call_id, {}))
+        except Exception:
+            sdp = {}
+        try:
+            ice = list(getattr(daemon, "_call_ice_backfill", {}).get(call_id, []))
+        except Exception:
+            ice = []
+        return sdp, ice
+
+    def webrtc_route_policy(self, call_id: str) -> dict:
+        return self._server._resolved_webrtc_route_policy(call_id=call_id)
+
+    def call_media_audit_path(self) -> Path:
+        return data_dir() / "logs" / "call_media_audit.jsonl"
+
+    async def dispatch_extension_action(self, action: str, body: dict) -> Any:
+        """Tier actions that ride POST /api/v1/calls but belong to other planes."""
+        server = self._server
+        if action in self._MEDIA_LAYER_ACTIONS:
+            return await server._handle_media_layer_action(action, body)
+        if action == "attest_frame":  # Tier β provenance
+            return await server._handle_attest_frame_action(body)
+        if action == "report_metrics":  # Tier γ RTC stats
+            return server._handle_report_metrics_action(body)
+        if action == "observe_frame":  # Tier η predictive continuity
+            return server._handle_observe_frame_action(body)
+        if action == "predict_frame":
+            return server._handle_predict_frame_action(body)
+        if action == "mark_handoff_prewarmed":  # Tier ε handoff
+            return server._handle_mark_handoff_prewarmed_action(body)
+        return None
 
 
 def read_server_port() -> int:

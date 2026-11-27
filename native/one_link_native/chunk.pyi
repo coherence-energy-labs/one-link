@@ -7,6 +7,13 @@ from typing_extensions import Buffer
 CDC_MIN_SIZE: int
 CDC_AVG_SIZE: int
 CDC_MAX_SIZE: int
+CDC_FILE_WINDOW_BYTES: int
+FORMAT_AWARE_IN_MEMORY_LIMIT: int
+FORMAT_AWARE_CHUNKING_VERSION: int
+"""Version of the format-aware boundary definition (2 = content-defined candidate selection).
+
+Record it next to a manifest: boundaries are comparable only under the same value and sizes.
+"""
 AEAD_FRAME_PLAINTEXT_LEN: int
 AEAD_TAG_LEN: int
 
@@ -46,15 +53,50 @@ class BoundaryIterator(Iterator[Boundary]):
 
 def cdc_iter(obj: Buffer) -> BoundaryIterator: ...
 def cdc_iter_params(obj: Buffer, min_size: int, avg_size: int, max_size: int) -> BoundaryIterator: ...
-def cdc_file(path: str) -> list[Boundary]: ...
-def cdc_file_params(path: str, min_size: int, avg_size: int, max_size: int) -> list[Boundary]: ...
+def cdc_file(path: str) -> list[Boundary]:
+    """Scan immutable bytes with a 32 MiB payload window plus kernel/output metadata.
+
+    OSError reports I/O failures or a detected length change. Returned objects
+    require O(chunks) memory; same-length rewrites need caller snapshot protection.
+    """
+    ...
+def cdc_file_params(path: str, min_size: int, avg_size: int, max_size: int) -> list[Boundary]:
+    """Use a payload window of max(CDC_FILE_WINDOW_BYTES, 4 * max_size).
+
+    Parameters are checked before opening the file; invalid values raise ValueError.
+    """
+    ...
 def format_aware_boundaries(obj: Buffer, format_name: str) -> list[FormatBoundary]: ...
 def format_aware_boundaries_params(
     obj: Buffer, format_name: str, min_size: int, avg_size: int, max_size: int
 ) -> list[FormatBoundary]: ...
-def format_aware_file(path: str, format_name: str) -> list[FormatBoundary]: ...
+def format_aware_file(path: str, format_name: str) -> list[FormatBoundary]:
+    """Scan immutable bytes with online MCAP/MP4/WAV header coalescing.
+
+    Boundary/hash output is O(chunks). ZIP/H264 read the whole file up to
+    FORMAT_AWARE_IN_MEMORY_LIMIT and raise ValueError above it; there is no
+    silent fallback. OSError reports I/O errors or detected length changes.
+    """
+    ...
 def format_aware_file_params(
     path: str, format_name: str, min_size: int, avg_size: int, max_size: int
+) -> list[FormatBoundary]: ...
+def cdc_fd(handle: int, size: int) -> list[Boundary]:
+    """cdc_file of an already-open, identity-verified file; never reopens a path.
+
+    handle is the descriptor (POSIX, f.fileno()) or the OS handle (Windows,
+    msvcrt.get_osfhandle(f.fileno())); size is the verified length. A file
+    shorter or longer than size raises OSError. The handle is duplicated, so
+    the scan reads the verified file even if its pathname is replaced; its
+    shared file position is unspecified afterwards.
+    """
+    ...
+def cdc_fd_params(handle: int, size: int, min_size: int, avg_size: int, max_size: int) -> list[Boundary]: ...
+def format_aware_fd(handle: int, size: int, format_name: str) -> list[FormatBoundary]:
+    """format_aware_file of an already-open file; same handle/size contract as cdc_fd."""
+    ...
+def format_aware_fd_params(
+    handle: int, size: int, format_name: str, min_size: int, avg_size: int, max_size: int
 ) -> list[FormatBoundary]: ...
 def chunk_address_raw(obj: Buffer) -> bytes: ...
 def chunk_address_convergent(obj: Buffer) -> bytes: ...

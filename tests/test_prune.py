@@ -103,6 +103,7 @@ async def test_prune_keeps_reachable_peer():
         await server.wait_closed()
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_api_prune_endpoint():
     """The /api/peers/prune endpoint actually prunes the daemon's registry."""

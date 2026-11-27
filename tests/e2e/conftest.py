@@ -14,15 +14,15 @@ from __future__ import annotations
 
 import contextlib
 import os
-import socket
 import subprocess
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
 import pytest
+
+from tests.daemon_readiness import wait_for_owner_http
 
 
 # v0.21.x: gate the browser E2E suite behind an explicit opt-in.
@@ -92,23 +92,6 @@ class LiveDaemon:
         return f"{self.base_url}/?t={self.token}"
 
 
-def _find_free_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
-def _wait_for_file(path: Path, timeout: float = 30.0) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if path.is_file() and path.stat().st_size > 0:
-            return True
-        time.sleep(0.1)
-    return False
-
-
 @pytest.fixture
 def live_daemon(tmp_path: Path) -> Iterator[LiveDaemon]:
     """Spawn a real daemon for E2E. Each test gets its own clean
@@ -130,11 +113,12 @@ def live_daemon(tmp_path: Path) -> Iterator[LiveDaemon]:
     # before any owner request is accepted; this is identity possession, not a
     # claim of browser hardware/platform attestation.
     env["ONE_LINK_REQUIRE_BROWSER_IDENTITY_POSSESSION"] = "required"
-    # The daemon auto-discovers a free port starting at 7117 and
-    # falls through to 7118..7132 if taken, then OS-assigned. Since
-    # ONE_LINK_HOME is fresh + isolated, we read the chosen port
-    # back from data/server.port once it's up - no env override
-    # needed.
+    # An OS-assigned UI port, read back from data/server.port once the daemon
+    # is up. Left to itself the daemon auto-discovers from the product's
+    # well-known 7117, so a test daemon could occupy a port a real daemon on
+    # this machine expects (observed 2026-11-25). Set explicitly here as well
+    # as in tests/conftest.py, so this fixture is safe however it is invoked.
+    env["ONE_LINK_UI_PORT"] = "0"
 
     log_fh = open(log_path, "ab", buffering=0)
     proc = subprocess.Popen(
@@ -146,20 +130,17 @@ def live_daemon(tmp_path: Path) -> Iterator[LiveDaemon]:
     )
 
     try:
-        port_file = home / "data" / "server.port"
-        token_file = home / "data" / "ui.token"
-        if not _wait_for_file(port_file, timeout=30.0):
+        # Use the same configured boot budget as tests/harness.py, but one
+        # monotonic deadline covers BOTH files and authenticated HTTP. The
+        # old 30s + 10s + 30s stages could reject a healthy, loaded first boot
+        # at the first boundary while allowing 70s in total. Never retry the
+        # test itself or treat the fixture budget as a performance result.
+        startup_budget = float(os.environ.get("ONE_LINK_TEST_DAEMON_BOOT_S", "45"))
+        try:
+            port, token, _elapsed = wait_for_owner_http(home, proc, timeout=startup_budget)
+        except RuntimeError as exc:
             log_text = log_path.read_text(encoding="utf-8", errors="replace")[-3000:]
-            raise RuntimeError(
-                f"daemon never wrote server.port within 30s\n--- log ---\n{log_text}"
-            )
-        if not _wait_for_file(token_file, timeout=10.0):
-            log_text = log_path.read_text(encoding="utf-8", errors="replace")[-3000:]
-            raise RuntimeError(
-                f"daemon never wrote ui.token within 10s\n--- log ---\n{log_text}"
-            )
-        port = int(port_file.read_text().strip())
-        token = token_file.read_text().strip()
+            raise RuntimeError(f"{exc}\n--- log ---\n{log_text}") from exc
         yield LiveDaemon(
             home=home, port=port, token=token, proc=proc, log=log_path,
         )
@@ -239,6 +220,57 @@ def ui_page(live_daemon, page):
         except Exception:
             pass
     return page
+
+
+# Session browsers (by id) whose startup cache has been checked.
+_STARTUP_CACHE_SETTLED: set[int] = set()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def firefox_startup_cache_disabled_by_default():
+    """Every Firefox this session launches gets a startup cache that cannot be written (RUN-01).
+
+    A Firefox writes its startup cache about 2-10 s and again about 120 s
+    after launch. While a write runs, its parent stops servicing navigation,
+    createOffer() and Playwright's own commands, for as long as the write
+    takes: up to minutes on a loaded host. Relocating the cache into a
+    directory that does not exist makes those writes fail at once (see
+    tests/e2e/browser_readiness.py).
+
+    This is set in the test process environment before Playwright starts its
+    driver, so a Firefox launched without an explicit ``env`` inherits it:
+    the session ``browser`` and any ``browser_type.launch()`` in a test. Only
+    Mozilla programs read the variable; other browsers ignore it.
+    """
+    from tests.e2e.browser_readiness import STARTUP_CACHE_ENV, startup_cache_disabled_env
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv(STARTUP_CACHE_ENV, startup_cache_disabled_env({})[STARTUP_CACHE_ENV])
+        yield
+
+
+@pytest.fixture(autouse=True)
+def firefox_past_startup_cache_write(request):
+    """Check, before its first test, that the session's Firefox cannot write its startup cache.
+
+    It checks every Firefox running under this test process, so it is also
+    the proof that the session default above took effect. A test that
+    launches its own browsers should use ``browser_readiness.launch_settled``
+    (or ``launch_settled_many``), which checks the new processes too and keeps
+    the relocation when the test passes its own ``env``. This is a no-op for
+    tests without ``browser`` and for other browsers. A Firefox whose cache is
+    still writable fails the test with BrowserNotReady naming the stage, never
+    a pass or a skip.
+    """
+    if "browser" not in request.fixturenames:
+        return
+    browser = request.getfixturevalue("browser")
+    if id(browser) in _STARTUP_CACHE_SETTLED:
+        return
+    from tests.e2e.browser_readiness import wait_for_startup_cache_write
+
+    wait_for_startup_cache_write(browser)
+    _STARTUP_CACHE_SETTLED.add(id(browser))
 
 
 @pytest.fixture(scope="session")

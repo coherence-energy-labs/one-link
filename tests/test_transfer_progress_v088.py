@@ -37,7 +37,7 @@ def test_format_helpers_present(index_html: str):
 
 
 def test_state_has_transfer_rates_map(index_html: str):
-    assert "transferRates: new Map()" in index_html
+    assert "transferRates: transferStore.rates" in index_html
 
 
 # ───────── EWMA semantics ────────────────────────────────────────────
@@ -61,7 +61,7 @@ def test_rate_tracker_resets_on_terminal_status(index_html: str):
     snippet = index_html[start:start + 1800]
     assert 'status === "complete"' in snippet
     assert 'status === "failed"' in snippet
-    assert "state.transferRates.delete(" in snippet
+    assert "transferStore.forgetRate(" in snippet
 
 
 def test_rate_decays_after_inactivity(index_html: str):

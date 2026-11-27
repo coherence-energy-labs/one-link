@@ -220,6 +220,7 @@ async def _pair(p) -> tuple[str, str]:
         pytest.fail("pair did not settle to mutual pinned within 8s")
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 @pytest.mark.timeout(180)
 async def test_folder_send_via_manifest_real_wire():

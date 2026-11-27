@@ -24,6 +24,7 @@ pytestmark = pytest.mark.timeout(120)
 
 # ─────────────────────────── Happy path ────────────────────────────
 
+@pytest.mark.live_daemon
 def test_text_round_trip():
     with daemon_pair(pin_trust=True) as p:
         res = request(p.a.control_port, cmd="send", peer=p.b.short_id, body="hello")
@@ -34,6 +35,7 @@ def test_text_round_trip():
         assert text_in and text_in[-1]["body"] == "hello"
 
 
+@pytest.mark.live_daemon
 def test_text_with_unicode():
     body = "résumé 日本 🌍 مرحبا"
     with daemon_pair(pin_trust=True) as p:
@@ -44,6 +46,7 @@ def test_text_with_unicode():
         assert text_in[-1]["body"] == body
 
 
+@pytest.mark.live_daemon
 def test_send_by_hostname():
     with daemon_pair(pin_trust=True) as p:
         peers = request(p.a.control_port, cmd="peers")
@@ -57,12 +60,14 @@ def test_send_by_hostname():
         assert res["ok"], res
 
 
+@pytest.mark.live_daemon
 def test_send_by_short_id_prefix():
     with daemon_pair(pin_trust=True) as p:
         res = request(p.a.control_port, cmd="send", peer=p.b.short_id[:4], body="hi")
         assert res["ok"], res
 
 
+@pytest.mark.live_daemon
 def test_peer_capabilities_persist_after_contact():
     with daemon_pair(pin_trust=True) as p:
         res = request(p.a.control_port, cmd="send", peer=p.b.short_id, body="caps")
@@ -83,6 +88,7 @@ def test_peer_capabilities_persist_after_contact():
         assert "folder_sync" in caps
 
 
+@pytest.mark.live_daemon
 def test_chat_reuses_long_lived_session_and_capability_policy():
     with daemon_pair(pin_trust=True) as p:
         from one_link.state import State
@@ -140,6 +146,7 @@ def test_chat_reuses_long_lived_session_and_capability_policy():
 
 # ─────────────────────────── File sizes ────────────────────────────
 
+@pytest.mark.live_daemon
 @pytest.mark.parametrize(
     "size",
     [
@@ -177,6 +184,7 @@ def test_file_send_various_sizes(size: int):
         assert got.read_bytes() == src.read_bytes()
 
 
+@pytest.mark.live_daemon
 def test_file_send_cdc_skips_chunks_receiver_already_has():
     with daemon_pair(pin_trust=True) as p:
         base = p.tmp / "base.bin"
@@ -212,6 +220,7 @@ def test_file_send_cdc_skips_chunks_receiver_already_has():
         assert match_path.read_bytes() == derived_bytes
 
 
+@pytest.mark.live_daemon
 def test_file_send_compresses_easy_payloads():
     with daemon_pair(pin_trust=True) as p:
         src = p.tmp / "compressible.bin"
@@ -235,6 +244,7 @@ def test_file_send_compresses_easy_payloads():
 
 # ─────────────────────── Filename safety ───────────────────────────
 
+@pytest.mark.live_daemon
 def test_unicode_filename():
     with daemon_pair(pin_trust=True) as p:
         src = p.tmp / "résumé_日本.txt"
@@ -248,6 +258,7 @@ def test_unicode_filename():
         assert any("résumé_日本.txt" in f.name for f in files), files
 
 
+@pytest.mark.live_daemon
 def test_filename_with_unusual_chars_lands_in_inbox():
     """Files with unusual but legal names round-trip and stay in inbox/."""
     with daemon_pair(pin_trust=True) as p:
@@ -267,6 +278,7 @@ def test_filename_with_unusual_chars_lands_in_inbox():
 
 # ───────────────────── Failure / error paths ──────────────────────
 
+@pytest.mark.live_daemon
 def test_send_to_unknown_peer_returns_error():
     with daemon_pair(pin_trust=True) as p:
         res = request(p.a.control_port, cmd="send", peer="zzzzzzzz", body="x")
@@ -274,6 +286,7 @@ def test_send_to_unknown_peer_returns_error():
         assert "no peer" in res.get("error", "").lower()
 
 
+@pytest.mark.live_daemon
 def test_send_file_for_missing_path_returns_error():
     with daemon_pair(pin_trust=True) as p:
         res = request(
@@ -286,12 +299,14 @@ def test_send_file_for_missing_path_returns_error():
         assert "no file" in res.get("error", "").lower()
 
 
+@pytest.mark.live_daemon
 def test_unknown_command_returns_error():
     with daemon_pair(pin_trust=True) as p:
         res = request(p.a.control_port, cmd="frobnicate")
         assert not res["ok"]
 
 
+@pytest.mark.live_daemon
 def test_malformed_control_request_returns_error():
     with daemon_pair(pin_trust=True) as p:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -314,6 +329,7 @@ def test_malformed_control_request_returns_error():
 
 # ───────────────────── Logging / tail ──────────────────────────────
 
+@pytest.mark.live_daemon
 def test_message_log_records_both_directions():
     with daemon_pair(pin_trust=True) as p:
         request(p.a.control_port, cmd="send", peer=p.b.short_id, body="from-A")
@@ -331,6 +347,7 @@ def test_message_log_records_both_directions():
 
 # ───────────────────── Concurrency ──────────────────────────────
 
+@pytest.mark.live_daemon
 def test_serial_text_sends_all_received():
     """Five sends in a row, all should land. Same as 'concurrent' but without
     the threading complications — exercises the message log too."""
@@ -349,6 +366,7 @@ def test_serial_text_sends_all_received():
         assert bodies[-5:] == [f"msg-{i}" for i in range(5)]
 
 
+@pytest.mark.live_daemon
 def test_concurrent_sends_via_threads():
     """Multiple CLI clients hitting the same daemon at once must all complete
     without corrupting state. Each control connection is independent, but the

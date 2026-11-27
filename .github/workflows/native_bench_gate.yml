@@ -1,99 +1,22 @@
-# File engine v2 — per-PR benchmark gate.
+# Relative component regression gate. Both native revisions are built separately
+# and measured in alternating order under the candidate's common harness.
+# Limits: 5% by default, 12% for the explicitly listed crypto/layout-sensitive
+# classes. Missing, incompatible or uncertain measurements fail closed with
+# INCONCLUSIVE; they are never described as passing. See bench_baselines/README.md.
 #
-# Per FILE_ENGINE_V2_PLAN.md "Verification (end-to-end)" #2:
-# "PR rejected if cycles/byte regresses or throughput drops by >5% on any
-# standardized corpus."
-#
-# A throughput number only means something next to a number from the SAME
-# machine. This gate did not honour that and was measuring hardware:
-#
-#   bench_baselines/native_chunk.json records
-#     host: Windows-11-10.0.26200-SP0, python 3.14.3, cpu_count 24
-#
-# a 24-core Windows workstation, committed 2026-05-10 -- while the gate runs on
-# ubuntu-latest, a 2-4 core Linux VM. So every PR touching native/** was judged
-# against a desktop. On the lz4_flex bump that produced, in one run, ChaCha
-# "regressing" 12% and chunk_store_locate 41% while AES "improved" 293% and
-# quic_round_trip 184%. That bimodal split is AES-NI and core count, not code,
-# and it made the gate fail PRs for reasons unrelated to their changes.
-#
-# So the comparison is now PAIRED. Both jobs below compare like against like:
-#
-#   bench_gate   (pull_request): builds and benchmarks the PR head AND its
-#                merge base on the same runner, in the same job, and fails if
-#                the head regresses > 5%. Hardware is held constant by
-#                construction, so a difference is attributable to the change.
-#
-#   drift_watch  (push to master): the coverage the paired check cannot give.
-#                Twenty merged PRs each taking 4% all pass against their own
-#                base while throughput halves. It builds and benchmarks the
-#                commit named in bench_baselines/DRIFT_ANCHOR alongside master,
-#                here, for the same reason.
-#
-# Neither compares against a stored number. That was tried twice and failed
-# twice -- against a workstation recording, then against a same-runner-class
-# recording, which still reported AES-256KiB down 37% on an unchanged tree.
-#
-# Each side is benchmarked FIVE times and every observation is kept.
-#
-# Five, not three, and the reason is arithmetic rather than taste. With n=3 a
-# side, complete separation between two samples of pure noise happens with
-# probability 2/C(6,3) = 10% PER METRIC. Across 28 tracked metrics that is
-# roughly three spurious separations every run, and one duly appeared:
-# native_quic_parallel_8x4_256KiB "regressed" 9.94% with all three head runs
-# below all three base runs, on byte-identical code. At n=5 the same
-# probability is 2/C(10,5) = 0.79%, and it has to coincide with a >5% effect
-# before anything fails.
-#
-# Pairing alone was not enough. On BYTE-IDENTICAL native code, three runs in a
-# row each put a different metric over whatever line was drawn:
-#
-#   single run       AES-256KiB  -9.03%   AES-16KiB  -5.62%
-#   best of 3        QUIC-1MiB   -7.75%
-#   best of 3        AES-16KiB   -6.20%   QUIC-16KiB -25.37%
-#
-# All of that is noise. Tuning the threshold a fourth time would have been
-# fitting noise, so the criterion changed instead of the constant. A metric
-# fails only when BOTH hold:
-#
-#   effect size  the head's best run is more than 5% below the base's best
-#   separation   the head's best run is slower than the base's WORST run
-#
-# Separation asks the data rather than a constant. A real regression is
-# present in every repetition, so the two sample sets stop overlapping. Noise
-# does not separate: on the run above, the head's best AES-16KiB (3559 MB/s)
-# still sat above the base's worst (3525 MB/s), and the same for QUIC-16KiB
-# (420 vs 393). Both are now correctly reported as noisy and not separable,
-# with the numbers printed -- silently passing a measured drop is how a real
-# one would hide.
-#
-# Verified against the real artifacts of the run that failed: with this
-# criterion it passes, and an injected 30% regression on the same data still
-# fails on all 28 metrics. That also removed the need for the per-class QUIC
-# tolerance this file carried briefly -- with separation doing the work, every
-# metric is back under one strict 5%.
-#
-# bench_gate.py is passed --require-comparable-host in both, so it REFUSES to
-# compare across machines rather than reporting a meaningless delta.
-
+# Applicability: every changed path is applicable unless a reviewed inert rule
+# proves no job here reads it. A pull request is judged by
+# scripts/native_ci_scope.py as it exists at its BASE revision; see
+# docs/RELEASE_PROTECTION.md. Pushes to master always run the drift watch.
+# There is no `paths:` filter: GitHub's push filter sees at most 300 files and
+# cannot express "applicable unless proven inert".
 name: file-engine v2 bench gate
 
 on:
   pull_request:
-    paths:
-      - "native/**"
-      - "src/one_link/chunk_native.py"
-      - "src/one_link/perf_lab_native.py"
-      - "bench_baselines/**"
-      - ".github/workflows/native_bench_gate.yml"
   push:
     branches: [master]
-    paths:
-      - "native/**"
-      - "src/one_link/chunk_native.py"
-      - "src/one_link/perf_lab_native.py"
-      - "bench_baselines/**"
-      - ".github/workflows/native_bench_gate.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -103,252 +26,231 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  bench_gate:
-    name: native file-engine benchmark gate
-    if: github.event_name == 'pull_request'
+  applicability:
+    name: native performance applicability
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      applicable: ${{ steps.scope.outputs.applicable }}
+      checkout_sha: ${{ steps.scope.outputs.checkout_sha }}
+      base_sha: ${{ steps.scope.outputs.base_sha }}
+      head_sha: ${{ steps.scope.outputs.head_sha }}
+      comparison_base_sha: ${{ steps.scope.outputs.comparison_base_sha }}
+      proof: ${{ steps.scope.outputs.proof }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # The merge base has to be checked out and built in this same job,
-          # so its history must be present.
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Verify source identities and classify the complete diff
+        id: scope
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # Pull requests are judged by the policy at their BASE revision, never
+          # by their own tree. A base that predates the policy falls back to the
+          # candidate's copy, which can skip nothing because its own file is in
+          # the diff. Every other event uses the tested checkout's copy. The
+          # policy re-derives this choice and verifies its own bytes.
+          policy_rev="$GITHUB_SHA"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            listing="$(git ls-tree --full-tree --name-only "$PR_BASE_SHA" -- scripts/native_ci_scope.py)"
+            if [ -n "$listing" ]; then
+              policy_rev="$PR_BASE_SHA"
+            fi
+          fi
+          policy="$RUNNER_TEMP/native-ci-policy.py"
+          git show "$policy_rev:scripts/native_ci_scope.py" > "$policy"
+          sha256sum "$policy"
+          python "$policy" scope --kind performance --policy-revision "$policy_rev" --report native-scope.json
+      - name: Preserve applicability evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-performance-scope-${{ github.run_id }}-${{ github.run_attempt }}
+          path: native-scope.json
+          if-no-files-found: warn
 
+  bench_gate:
+    name: native file-engine benchmark gate
+    needs: applicability
+    if: needs.applicability.outputs.applicable == 'true' && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.applicability.outputs.checkout_sha }}
+          fetch-depth: 0
+          persist-credentials: false
       - name: Install Rust
         run: |
           rustup toolchain install 1.96.0 --profile minimal --no-self-update
           rustup default 1.96.0
-
-      - name: Install Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-
-      - name: setup uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.31"
+          version: "0.13.10"
           enable-cache: true
-
-      - name: Cache cargo target
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: native
-
-      - name: Install deps
-        run: uv sync --frozen --python python --extra release
-
-      - name: Build native (release) -- PR head
-        working-directory: native
-        run: uv run --project .. --frozen --extra release maturin develop --release --locked
-
-      - name: Benchmark PR head
-        run: |
-          for i in 1 2 3 4 5; do
-            uv run --frozen --extra release python -m one_link.perf_lab_native --json --no-legacy --size-mib 128 > head-$i.json
-          done
-
-      # Everything from here to the gate exists to measure the MERGE BASE on
-      # this same runner. bench_gate.py keeps the JSON files (untracked), so
-      # they survive the checkout.
-      - name: Check out the merge base
+      - name: Prepare merge-base source without replacing candidate checkout
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: git checkout --force "$BASE_SHA"
-
-      - name: Sync deps for the merge base
-        run: uv sync --frozen --python python --extra release
-
-      - name: Build native (release) -- merge base
-        working-directory: native
-        run: uv run --project .. --frozen --extra release maturin develop --release --locked
-
-      - name: Benchmark the merge base
+          BASE_SHA: ${{ needs.applicability.outputs.base_sha }}
+          COMPARISON_BASE: ${{ needs.applicability.outputs.comparison_base_sha }}
+          BASE_ROOT: ${{ runner.temp }}/one-link-bench-base
         run: |
-          for i in 1 2 3 4 5; do
-            uv run --frozen --extra release python -m one_link.perf_lab_native --json --no-legacy --size-mib 128 > base-$i.json
-          done
-
-      - name: Restore the PR head
+          comparison_base="$(git merge-base HEAD "$BASE_SHA")"
+          test "$comparison_base" = "$COMPARISON_BASE"
+          git worktree add --detach "$BASE_ROOT" "$comparison_base"
+      - name: Install and build candidate artifact
+        run: |
+          uv sync --frozen --python python --extra release
+          cd native
+          uv run --project .. --frozen --extra release maturin develop --release --locked
+      - name: Install and build baseline artifact separately
         env:
-          HEAD_SHA: ${{ github.sha }}
-        run: git checkout --force "$HEAD_SHA"
-
-      - name: Sync deps for the PR head
-        run: uv sync --frozen --python python --extra release
-
-      - name: Gate the PR against its own merge base, measured on this runner
+          BASE_ROOT: ${{ runner.temp }}/one-link-bench-base
         run: |
-          # WHY THIS CLASS OF METRIC CARRIES A WIDER LIMIT.
-          # Pure in-memory crypto/hash microbenchmarks are dominated by CODE LAYOUT, which
-          # unrelated changes elsewhere in the binary shift around. They are NOT the I/O-bound
-          # metrics (quic_*, chunk_store_*, wal_*, cdc_scan_*), which keep the strict 5%.
-          #
-          # Measured 2026-08-08, four times, always on source that could not have caused it:
-          #   aes_decrypt_16KiB      -6.53%  (PR touching only its own isolated workspace)
-          #   aes_decrypt_16KiB      -6.31%  (master, native/ol_aead/ UNCHANGED since anchor)
-          #   aes_decrypt_16KiB      -6.75%  (the PR that added this very limit)
-          #   blake3_addr_convergent -7.87%  (a curve25519 bump, which cannot touch BLAKE3)
-          #
-          # A 5% line on a quantity that moves +/-8% for non-code reasons does not detect
-          # regressions, it teaches people to ignore the gate. Every drop is still PRINTED as
-          # TOLERATED, so a real one is visible rather than swallowed; only the failure
-          # threshold moves, and only for this class.
+          uv sync --project "$BASE_ROOT" --frozen --python python --extra release
+          cd "$BASE_ROOT/native"
+          uv run --project .. --frozen --extra release maturin develop --release --locked
+      - name: Alternate matched native artifacts on this runner
+        env:
+          BASE_ROOT: ${{ runner.temp }}/one-link-bench-base
+        run: |
+          uv run --frozen --extra release python scripts/bench_paired_native.py \
+            --candidate-python "$GITHUB_WORKSPACE/.venv/bin/python" \
+            --baseline-python "$BASE_ROOT/.venv/bin/python" \
+            --candidate-source "$GITHUB_WORKSPACE" --baseline-source "$BASE_ROOT" \
+            --output bench-results --profile ci --repeats 20 --size-mib 128
+      - name: Evaluate complete paired observations
+        run: |
           uv run --frozen --extra release python scripts/bench_gate.py \
-            --results head-1.json head-2.json head-3.json head-4.json head-5.json \
-            --baseline base-1.json base-2.json base-3.json base-4.json base-5.json \
-            --require-comparable-host \
+            --results bench-results/candidate-{1..20}.json \
+            --baseline bench-results/baseline-{1..20}.json \
+            --require-comparable-host --require-paired-runs --min-samples 20 \
             --max-regression-percent 5 \
             --metric-limit 'native_aead_*=12' \
             --metric-limit 'native_blake3_*=12' \
-            --metric-limit 'native_derive_*=12'
-
-      - name: Keep both measurements
+            --metric-limit 'native_derive_*=12' \
+            --json bench-results/gate.json
+      - name: Preserve all observations and failures
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: bench-paired-${{ github.run_id }}
-          path: |
-            head-*.json
-            base-*.json
+          name: bench-paired-${{ github.run_id }}-${{ github.run_attempt }}
+          path: bench-results/
           if-no-files-found: warn
 
   drift_watch:
-    # The paired gate above answers "did THIS pr regress throughput". It cannot
-    # answer "have twenty merged PRs each taken 4% and nobody noticed", because
-    # every one of them compared green against its own base.
-    #
-    # That drift check is what the committed baseline was supposed to be, and
-    # it never worked: it was recorded on a 24-core Windows workstation while
-    # the gate ran on ubuntu-latest, so it measured the machine.
-    #
-    # Recording a baseline on the RIGHT runner class does not fix it either,
-    # and this job proved that on its first real run: comparing an unchanged
-    # tree against a baseline captured on the same class one commit earlier
-    # reported native_aead_aes_encrypt_256KiB down 37% (3574 -> 2251 MB/s).
-    # Same class is not the same machine -- shared CI has noisy neighbours, and
-    # that variance swamps any 5% threshold. A committed number can therefore
-    # only ever be flaky or meaningless.
-    #
-    # So drift is measured the way the PR gate measures a change: build and
-    # benchmark BOTH the anchor commit and master here, in one job, on one
-    # machine. The hardware and its neighbours are common to both sides and
-    # cancel. bench_baselines/DRIFT_ANCHOR names the commit and is moved
-    # deliberately, never to silence a red gate.
     name: native throughput drift on master
-    if: github.event_name == 'push'
+    needs: applicability
+    if: needs.applicability.outputs.applicable == 'true' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # The anchor commit is built here too, so its history must be present.
+          ref: ${{ needs.applicability.outputs.checkout_sha }}
           fetch-depth: 0
           persist-credentials: false
-
       - name: Install Rust
         run: |
           rustup toolchain install 1.96.0 --profile minimal --no-self-update
           rustup default 1.96.0
-
-      - name: Install Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-
-      - name: setup uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.31"
+          version: "0.13.10"
           enable-cache: true
-
-      - name: Cache cargo target
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: native
-
-      - name: Install deps
-        run: uv sync --frozen --python python --extra release
-
-      - name: Read the drift anchor
-        id: anchor
-        run: |
-          anchor="$(grep -vE '^\s*(#|$)' bench_baselines/DRIFT_ANCHOR | head -n 1 | tr -d '[:space:]')"
-          if [ -z "$anchor" ]; then
-            echo "::error::bench_baselines/DRIFT_ANCHOR names no commit"
-            exit 1
-          fi
-          echo "sha=$anchor" >> "$GITHUB_OUTPUT"
-          echo "drift anchor: $anchor"
-
-      - name: Build native (release) -- master
-        working-directory: native
-        run: uv run --project .. --frozen --extra release maturin develop --release --locked
-
-      - name: Benchmark master
-        run: |
-          for i in 1 2 3 4 5; do
-            uv run --frozen --extra release python -m one_link.perf_lab_native --json --no-legacy --size-mib 128 > master-$i.json
-          done
-
-      - name: Check out the drift anchor
+      - name: Prepare drift-anchor source without replacing candidate checkout
         env:
-          ANCHOR: ${{ steps.anchor.outputs.sha }}
-        run: git checkout --force "$ANCHOR"
-
-      - name: Sync deps for the anchor
-        run: uv sync --frozen --python python --extra release
-
-      - name: Build native (release) -- anchor
-        working-directory: native
-        run: uv run --project .. --frozen --extra release maturin develop --release --locked
-
-      - name: Benchmark the anchor
+          BASE_ROOT: ${{ runner.temp }}/one-link-bench-base
         run: |
-          for i in 1 2 3 4 5; do
-            uv run --frozen --extra release python -m one_link.perf_lab_native --json --no-legacy --size-mib 128 > anchor-$i.json
-          done
-
-      - name: Restore master
+          anchor="$(python -c 'from pathlib import Path; xs=[x.strip() for x in Path("bench_baselines/DRIFT_ANCHOR").read_text().splitlines() if x.strip() and not x.lstrip().startswith("#")]; assert len(xs)==1 and len(xs[0])==40; print(xs[0])')"
+          git worktree add --detach "$BASE_ROOT" "$anchor"
+      - name: Install and build candidate artifact
+        run: |
+          uv sync --frozen --python python --extra release
+          cd native
+          uv run --project .. --frozen --extra release maturin develop --release --locked
+      - name: Install and build baseline artifact separately
         env:
-          HEAD_SHA: ${{ github.sha }}
-        run: git checkout --force "$HEAD_SHA"
-
-      - name: Sync deps for master
-        run: uv sync --frozen --python python --extra release
-
-      - name: Gate master against the anchor, measured on this runner
+          BASE_ROOT: ${{ runner.temp }}/one-link-bench-base
         run: |
-          # WHY THIS CLASS OF METRIC CARRIES A WIDER LIMIT.
-          # Pure in-memory crypto/hash microbenchmarks are dominated by CODE LAYOUT, which
-          # unrelated changes elsewhere in the binary shift around. They are NOT the I/O-bound
-          # metrics (quic_*, chunk_store_*, wal_*, cdc_scan_*), which keep the strict 5%.
-          #
-          # Measured 2026-08-08, four times, always on source that could not have caused it:
-          #   aes_decrypt_16KiB      -6.53%  (PR touching only its own isolated workspace)
-          #   aes_decrypt_16KiB      -6.31%  (master, native/ol_aead/ UNCHANGED since anchor)
-          #   aes_decrypt_16KiB      -6.75%  (the PR that added this very limit)
-          #   blake3_addr_convergent -7.87%  (a curve25519 bump, which cannot touch BLAKE3)
-          #
-          # A 5% line on a quantity that moves +/-8% for non-code reasons does not detect
-          # regressions, it teaches people to ignore the gate. Every drop is still PRINTED as
-          # TOLERATED, so a real one is visible rather than swallowed; only the failure
-          # threshold moves, and only for this class.
+          uv sync --project "$BASE_ROOT" --frozen --python python --extra release
+          cd "$BASE_ROOT/native"
+          uv run --project .. --frozen --extra release maturin develop --release --locked
+      - name: Alternate matched native artifacts on this runner
+        env:
+          BASE_ROOT: ${{ runner.temp }}/one-link-bench-base
+        run: |
+          uv run --frozen --extra release python scripts/bench_paired_native.py \
+            --candidate-python "$GITHUB_WORKSPACE/.venv/bin/python" \
+            --baseline-python "$BASE_ROOT/.venv/bin/python" \
+            --candidate-source "$GITHUB_WORKSPACE" --baseline-source "$BASE_ROOT" \
+            --output bench-results --profile ci --repeats 20 --size-mib 128
+      - name: Evaluate complete paired observations
+        run: |
           uv run --frozen --extra release python scripts/bench_gate.py \
-            --results master-1.json master-2.json master-3.json master-4.json master-5.json \
-            --baseline anchor-1.json anchor-2.json anchor-3.json anchor-4.json anchor-5.json \
-            --require-comparable-host \
+            --results bench-results/candidate-{1..20}.json \
+            --baseline bench-results/baseline-{1..20}.json \
+            --require-comparable-host --require-paired-runs --min-samples 20 \
             --max-regression-percent 5 \
             --metric-limit 'native_aead_*=12' \
             --metric-limit 'native_blake3_*=12' \
-            --metric-limit 'native_derive_*=12'
-
-      - name: Publish both measurements
+            --metric-limit 'native_derive_*=12' \
+            --json bench-results/gate.json
+      - name: Preserve all observations and failures
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: bench-drift-${{ github.run_id }}
-          path: |
-            master-*.json
-            anchor-*.json
+          name: bench-drift-${{ github.run_id }}-${{ github.run_attempt }}
+          path: bench-results/
           if-no-files-found: warn
+
+  aggregate:
+    name: native performance gate
+    if: always()
+    needs: [applicability, bench_gate, drift_watch]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require applicable work or a verified not-applicable diff
+        env:
+          NATIVE_CI_NEEDS: ${{ toJSON(needs) }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # Pull requests are judged by the policy at their BASE revision, never
+          # by their own tree. A base that predates the policy falls back to the
+          # candidate's copy, which can skip nothing because its own file is in
+          # the diff. Every other event uses the tested checkout's copy. The
+          # policy re-derives this choice and verifies its own bytes.
+          policy_rev="$GITHUB_SHA"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            listing="$(git ls-tree --full-tree --name-only "$PR_BASE_SHA" -- scripts/native_ci_scope.py)"
+            if [ -n "$listing" ]; then
+              policy_rev="$PR_BASE_SHA"
+            fi
+          fi
+          policy="$RUNNER_TEMP/native-ci-policy.py"
+          git show "$policy_rev:scripts/native_ci_scope.py" > "$policy"
+          sha256sum "$policy"
+          python "$policy" gate --kind performance --policy-revision "$policy_rev"

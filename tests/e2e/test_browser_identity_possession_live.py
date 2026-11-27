@@ -21,6 +21,8 @@ from playwright.sync_api import (
     TimeoutError as PlaywrightTimeoutError,
 )
 
+from tests.e2e.browser_readiness import wait_for_browser_ready
+
 
 _IDENTITY_PASSPHRASE = "channel-bound browser authority 2026"
 
@@ -126,6 +128,12 @@ def test_required_mode_live_pair_owner_request_and_immediate_revoke(
 
         peer = context.new_page()
         _open_ready_peer(peer, origin)
+        # RUN-01: the pairing token TTL and the flow's 90 s deadline start
+        # below. Before that, the browser must prove it is past its one-time
+        # startup-cache write and that its parent process answers; otherwise
+        # a browser/host stall would be reported as a pairing failure. The
+        # pairing assertions and budgets that follow are unchanged.
+        wait_for_browser_ready(peer, browser)
         identity = peer.evaluate(
             """() => ({
                 pub: window.__oneLinkPeer.state.rec.public_key_b64u,
@@ -145,7 +153,7 @@ def test_required_mode_live_pair_owner_request_and_immediate_revoke(
                 "token": invite["token"],
                 "device_pub_b64": identity["pub"],
                 "device_kind": "browser-peer",
-                "label": "Chromium authority",
+                "label": f"{browser.browser_type.name} authority",
             },
         )
         assert claim["pending"] is True
@@ -172,22 +180,31 @@ def test_required_mode_live_pair_owner_request_and_immediate_revoke(
 
         peer.evaluate(
             """(handoff) => {
+                window.__olIdentityPairError = null;
                 window.__olIdentityPairFlow =
                   window.__oneLinkPeer._runAutoPairFlow({
                     pair_token: handoff.pair_token,
                     daemon_fingerprint: handoff.daemon_fingerprint,
                     ws_url: handoff.ws_signaling_url,
                   });
+                void window.__olIdentityPairFlow.catch((error) => {
+                    window.__olIdentityPairError = String(error?.message || error);
+                  });
             }""",
             handoff,
         )
         try:
             peer.wait_for_function(
-                """() => Boolean(
+                """() => Boolean(window.__olIdentityPairError) || Boolean(
                     window.__oneLinkPeer.state.daemon_identity_ready?.verified &&
                     window.__oneLinkPeer.state.daemon_dc?.readyState === 'open'
                 )""",
                 timeout=90_000,
+            )
+            pair_error = peer.evaluate("() => window.__olIdentityPairError")
+            assert pair_error is None, (
+                f"browser pairing rejected: {pair_error}; stages="
+                + repr(peer.evaluate("() => window.__oneLinkPeer.state.autopair_diagnostics"))
             )
         except PlaywrightTimeoutError as exc:
             browser_state = peer.evaluate(
@@ -201,7 +218,7 @@ def test_required_mode_live_pair_owner_request_and_immediate_revoke(
                             verified: window.__oneLinkPeer.state.daemon_identity_ready.verified,
                           }
                         : null,
-                    identityContext: window.__oneLinkPeer.state.daemon_identity_context,
+                    pairingStages: window.__oneLinkPeer.state.autopair_diagnostics || null,
                 })"""
             )
             log_tail = live_daemon.log.read_text(

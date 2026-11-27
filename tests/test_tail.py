@@ -59,6 +59,7 @@ def _open_tail(control_port: int) -> tuple[socket.socket, list[dict]]:
     return s, events
 
 
+@pytest.mark.live_daemon
 def test_tail_receives_incoming_messages():
     with daemon_pair(pin_trust=True) as p:
         sock, events = _open_tail(p.b.control_port)
@@ -80,6 +81,7 @@ def test_tail_receives_incoming_messages():
             sock.close()
 
 
+@pytest.mark.live_daemon
 def test_multiple_tail_subscribers_all_receive():
     with daemon_pair(pin_trust=True) as p:
         s1, ev1 = _open_tail(p.b.control_port)
@@ -108,6 +110,7 @@ def test_multiple_tail_subscribers_all_receive():
             s2.close()
 
 
+@pytest.mark.live_daemon
 def test_tail_subscriber_disconnect_does_not_break_others():
     """If one tail subscriber drops, remaining subscribers must keep
     receiving and the daemon must not error."""

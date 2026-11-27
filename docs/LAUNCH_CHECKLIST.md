@@ -41,8 +41,9 @@ surfaces a release needs to be ready in.
 
 The authoritative `release.yml` contract is configured to package the complete
 PyInstaller onedir output as architecture-labeled portable ZIP archives:
-Windows x86_64/ARM64, macOS ARM64, and Linux x86_64/ARM64. No production tag
-has completed that workflow yet. The contract does **not** include a Windows
+Windows x86_64/ARM64, macOS ARM64, and Linux x86_64/ARM64. Published v0.21.0
+includes these five formats; its qualification gaps are recorded in
+`RELEASE_EVIDENCE.json`. The contract does **not** include a Windows
 installer, macOS DMG/PKG, or Linux AppImage.
 
 - [ ] **Portable ZIP extraction and launch works on every advertised OS and
@@ -177,9 +178,11 @@ roadmap text do not make a format supported.
 - [ ] **`docs/TESTING.md` documents the test pyramid.** Every
       layer + which one catches which bug-class. Already shipped.
 
-- [ ] **The release tag triggers `reproducible_release.yml` +
-      uploads Sigstore bundle.** Per `docs/RELEASE_CHECKLIST.md`
-      post-tag section.
+- [ ] **The release publisher requires its exact Linux wheel rebuild to pass
+      before signing/publication.** `release.yml` retains the compared artifacts
+      and result; `reproducible_release.yml` is a separate diagnostic workflow.
+      Authenticate the published Sigstore bundles as described in
+      `docs/RELEASE_CHECKLIST.md`.
 
 ---
 

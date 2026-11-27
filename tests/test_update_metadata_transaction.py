@@ -378,6 +378,81 @@ def test_extract_authenticated_bundle_rehashes_every_member(tmp_path: Path):
     assert validate_installed_bundle(tree.root, expected_executable=EXECUTABLE) == tree
 
 
+def _write_framework_zip(path: Path, links: dict[str, str]) -> Path:
+    """Archive links as target bytes, including hostile fixtures no OS can create."""
+    files = {
+        EXECUTABLE: b"launcher fixture",
+        "_internal/Python.framework/Versions/3.12/Python": b"framework fixture",
+    }
+    rows = ["# sha256\tkind\tbytes\tpath\ttarget"]
+    with zipfile.ZipFile(path, "w") as archive:
+        for relative in sorted(set(files) | set(links)):
+            target = links.get(relative, "")
+            kind = "SYMLINK" if relative in links else "FILE"
+            payload = target.encode("utf-8") if kind == "SYMLINK" else files[relative]
+            info = zipfile.ZipInfo("one-link/" + relative)
+            info.create_system = 3
+            mode = stat.S_IFLNK | 0o777 if kind == "SYMLINK" else stat.S_IFREG | 0o755
+            info.external_attr = mode << 16
+            archive.writestr(info, payload)
+            rows.append("\t".join((hashlib.sha256(payload).hexdigest(), kind,
+                                    str(len(payload)), info.filename, target)))
+        info = zipfile.ZipInfo("one-link/BUNDLE_SHA256SUMS")
+        info.create_system = 3
+        info.external_attr = (stat.S_IFREG | 0o644) << 16
+        archive.writestr(info, "\n".join(rows) + "\n")
+    return path
+
+
+def test_updater_index_accepts_framework_link_chain(tmp_path: Path):
+    links = {
+        "_internal/Python": "Python.framework/Python",
+        "_internal/Python.framework/Python": "Versions/Current/Python",
+        "_internal/Python.framework/Versions/Current": "3.12",
+    }
+    archive_path = _write_framework_zip(tmp_path / "framework.zip", links)
+    with zipfile.ZipFile(archive_path) as archive:
+        _, _, rows = transaction_module._validate_zip_index(archive, expected_executable=EXECUTABLE)
+    assert len(rows) == 5
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows updates deliberately refuse symlink payloads")
+def test_authenticated_framework_chain_extracts_and_revalidates(tmp_path: Path):
+    links = {
+        "_internal/Python": "Python.framework/Python",
+        "_internal/Python.framework/Python": "Versions/Current/Python",
+        "_internal/Python.framework/Versions/Current": "3.12",
+    }
+    archive_path = _write_framework_zip(tmp_path / "framework.zip", links)
+    tree = extract_authenticated_bundle(archive_path, tmp_path / "stage",
+                                        artifact=_artifact_for_archive(archive_path))
+    assert tree.file_count == 5
+    assert (tree.root / "_internal/Python").read_bytes() == b"framework fixture"
+    for relative, target in links.items():
+        assert (tree.root / relative).is_symlink()
+        assert os.readlink(tree.root / relative) == target
+    assert validate_installed_bundle(tree.root, expected_executable=EXECUTABLE) == tree
+
+
+@pytest.mark.parametrize("links", [
+    {"_internal/a": "b", "_internal/b": "a"},
+    {"_internal/entry": "loop/Python", "_internal/loop": "loop"},
+    {"_internal/entry": "directory/Python", "_internal/directory": "../../outside"},
+    {"_internal/entry": "/outside"},
+    {"_internal/entry": "missing/Python"},
+    {"_internal": "elsewhere"},
+], ids=["direct-cycle", "directory-cycle", "escaping-chain", "absolute", "dangling", "linked-ancestor"])
+def test_updater_index_rejects_unsafe_link_chains_before_extraction(tmp_path: Path, links):
+    archive_path = _write_framework_zip(tmp_path / "unsafe.zip", links)
+    with zipfile.ZipFile(archive_path) as archive, pytest.raises(UpdateArchiveError):
+        transaction_module._validate_zip_index(archive, expected_executable=EXECUTABLE)
+    with pytest.raises(UpdateArchiveError):
+        extract_authenticated_bundle(archive_path, tmp_path / "stage",
+                                     artifact=_artifact_for_archive(archive_path))
+    assert not (tmp_path / "stage").exists()
+    assert not (tmp_path / "outside").exists()
+
+
 def test_extract_rejects_outer_digest_mismatch(tmp_path: Path):
     archive = _write_bundle_zip(tmp_path / "candidate.zip", marker=b"new")
     artifact = _artifact_for_archive(archive)

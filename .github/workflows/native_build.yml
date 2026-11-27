@@ -4,66 +4,25 @@
 # `maturin develop --release` succeeds on Linux + macOS + Windows in CI;
 # all test crates import without error; pyo3 binding integration tests pass.
 #
-# This workflow runs on every PR that touches `native/`, `src/one_link/chunk_native.py`,
-# or `tests/test_chunk_native_*.py`. Expand the path filter as new native
-# crates ship (one_link.aead_native.py, etc.).
+# Every PR receives the native correctness gate. A verified complete source
+# diff determines whether the native matrix is applicable: every changed path
+# is applicable unless a reviewed inert rule proves no job here reads it.
+# Missing scope evidence or skipped required work fails the aggregate. A pull
+# request is judged by scripts/native_ci_scope.py as it exists at its BASE
+# revision, never by its own copy; see that file and docs/RELEASE_PROTECTION.md.
+#
+# Pushes to master always run the native work. There is no `paths:` filter:
+# GitHub's push filter sees at most 300 files and has its own glob dialect, so
+# it cannot express "applicable unless proven inert". The scope script decides,
+# and for a push it requires the work.
 
 name: file-engine v2 native build
 
 on:
+  pull_request:
   push:
     branches: [master]
-    paths:
-      - "native/**"
-      - "src/one_link/web/assets/argon2id-v1.wasm"
-      - "src/one_link/web/assets/argon2id-worker.js"
-      - "src/one_link/web/assets/ed25519-v1.wasm"
-      - "scripts/verify_browser_argon2_wasm.py"
-      - "scripts/verify_browser_ed25519_wasm.py"
-      - "tests/test_browser_argon2_identity.py"
-      - "tests/test_browser_ed25519_identity.py"
-      - "src/one_link/chunk_native.py"
-      - "src/one_link/aead_native.py"
-      - "src/one_link/wal_native.py"
-      - "src/one_link/chunk_store_native.py"
-      - "src/one_link/quic_native.py"
-      - "src/one_link/perf_lab_native.py"
-      - "src/one_link/capability_native.py"
-      - "src/one_link/crdt_native.py"
-      - "src/one_link/hwkey_native.py"
-      - "tests/test_chunk_native_*.py"
-      - "tests/test_aead_native_*.py"
-      - "tests/test_wal_native_*.py"
-      - "tests/test_chunk_store_native_*.py"
-      - "tests/test_quic_native_*.py"
-      - "tests/unit/test_phase_c3_native_smoke.py"
-      - ".github/workflows/native_build.yml"
-  pull_request:
-    paths:
-      - "native/**"
-      - "src/one_link/web/assets/argon2id-v1.wasm"
-      - "src/one_link/web/assets/argon2id-worker.js"
-      - "src/one_link/web/assets/ed25519-v1.wasm"
-      - "scripts/verify_browser_argon2_wasm.py"
-      - "scripts/verify_browser_ed25519_wasm.py"
-      - "tests/test_browser_argon2_identity.py"
-      - "tests/test_browser_ed25519_identity.py"
-      - "src/one_link/chunk_native.py"
-      - "src/one_link/aead_native.py"
-      - "src/one_link/wal_native.py"
-      - "src/one_link/chunk_store_native.py"
-      - "src/one_link/quic_native.py"
-      - "src/one_link/perf_lab_native.py"
-      - "src/one_link/capability_native.py"
-      - "src/one_link/crdt_native.py"
-      - "src/one_link/hwkey_native.py"
-      - "tests/test_chunk_native_*.py"
-      - "tests/test_aead_native_*.py"
-      - "tests/test_wal_native_*.py"
-      - "tests/test_chunk_store_native_*.py"
-      - "tests/test_quic_native_*.py"
-      - "tests/unit/test_phase_c3_native_smoke.py"
-      - ".github/workflows/native_build.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -73,8 +32,57 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  applicability:
+    name: native correctness applicability
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      applicable: ${{ steps.scope.outputs.applicable }}
+      checkout_sha: ${{ steps.scope.outputs.checkout_sha }}
+      base_sha: ${{ steps.scope.outputs.base_sha }}
+      head_sha: ${{ steps.scope.outputs.head_sha }}
+      comparison_base_sha: ${{ steps.scope.outputs.comparison_base_sha }}
+      proof: ${{ steps.scope.outputs.proof }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify source identities and classify the complete diff
+        id: scope
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # Pull requests are judged by the policy at their BASE revision, never
+          # by their own tree. A base that predates the policy falls back to the
+          # candidate's copy, which can skip nothing because its own file is in
+          # the diff. Every other event uses the tested checkout's copy. The
+          # policy re-derives this choice and verifies its own bytes.
+          policy_rev="$GITHUB_SHA"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            listing="$(git ls-tree --full-tree --name-only "$PR_BASE_SHA" -- scripts/native_ci_scope.py)"
+            if [ -n "$listing" ]; then
+              policy_rev="$PR_BASE_SHA"
+            fi
+          fi
+          policy="$RUNNER_TEMP/native-ci-policy.py"
+          git show "$policy_rev:scripts/native_ci_scope.py" > "$policy"
+          sha256sum "$policy"
+          python "$policy" scope --kind correctness --policy-revision "$policy_rev" --report native-scope.json
+      - name: Preserve applicability evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-correctness-scope-${{ github.run_id }}-${{ github.run_attempt }}
+          path: native-scope.json
+          if-no-files-found: warn
+
   rust_workspace:
     name: cargo test (workspace)
+    needs: applicability
+    if: needs.applicability.outputs.applicable == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -88,6 +96,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.applicability.outputs.checkout_sha }}
           persist-credentials: false
 
       - name: Install Rust toolchain
@@ -148,21 +157,15 @@ jobs:
           cargo test --locked --workspace --all-targets --all-features
           --exclude one_link_native --release
 
-      # Non-blocking strict pass: enforce the wall-clock timing gates
-      # (OL_TIMING_GATES=1) + the ignored property-test slow paths. Surfaces
-      # a timing regression as a visible (continue-on-error) signal without
-      # failing the build on runner jitter. Run them strictly + reliably on
-      # a quiet/pinned machine, or promote to a dedicated nightly job later.
-      - name: cargo test (strict timing gates + property slow paths)
-        timeout-minutes: 20
-        env:
-          OL_TIMING_GATES: "1"
-        run: cargo test --locked --workspace --exclude one_link_native --release -- --include-ignored
-        continue-on-error: true # timing gates are noisy on shared runners; property-tests still alpha
+      # This required lane proves default correctness only. Strict wall-clock
+      # timing runs in native_timing.yml on a deliberately provisioned runner.
+      # Ignored TPM/corpus/research cases remain external qualification work;
+      # they are never silently folded into a green optional timing step.
 
   python_binding:
     name: maturin build + python tests
-    needs: rust_workspace
+    needs: [applicability, rust_workspace]
+    if: needs.applicability.outputs.applicable == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -181,6 +184,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.applicability.outputs.checkout_sha }}
           persist-credentials: false
 
       - name: Install Rust
@@ -196,7 +200,7 @@ jobs:
       - name: setup uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.31"
+          version: "0.13.10"
           enable-cache: true
 
       - name: Cache cargo target
@@ -211,9 +215,11 @@ jobs:
         working-directory: native
         run: uv run --project .. --frozen --extra dev --extra release maturin develop --release --locked
 
-      - name: Run native regression tests (chunk + aead + wal + chunk_store + quic)
+      - name: Run native regressions (including fd ownership)
         run: |
+          uv run --frozen --extra dev --extra release python -c "import one_link_native.chunk"
           uv run --frozen --extra dev --extra release pytest tests/test_chunk_native_v0210.py \
+                 tests/test_native_fd_scan.py \
                  tests/test_aead_native_v0210.py \
                  tests/test_wal_native_v0210.py \
                  tests/test_chunk_store_native_v0210.py \
@@ -228,3 +234,185 @@ jobs:
         run: |
           uv run --frozen --extra dev --extra release python -c "from one_link.perf_lab_native import run_full_suite, render_report; \
             print(render_report(run_full_suite(size_mib=8, include_legacy=False)))"
+
+  # Deterministic secret-dependence audit. Each ol_ct_audit case marks its
+  # secret inputs undefined and calls production code; Memcheck reports every
+  # branch and memory address computed from a secret. Clean cases must report
+  # no violation, and the negative controls must report one, so a blind or
+  # broken Valgrind cannot pass. See scripts/run_ct_audit.py.
+  ct_audit:
+    name: constant-time dataflow audit (valgrind)
+    needs: applicability
+    if: needs.applicability.outputs.applicable == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.applicability.outputs.checkout_sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+
+      - name: Install Valgrind and glibc debug symbols
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind libc6-dbg
+          valgrind --version
+
+      - name: Cache cargo target
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: native
+
+      - name: Install Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: setup uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.13.10"
+          enable-cache: true
+
+      - name: Install the locked CT audit parser
+        run: uv sync --frozen --python python --only-group ct-audit
+
+      # The ct-audit profile inherits release (same optimisation, LTO, codegen
+      # units and panic strategy) and keeps only symbols and line tables.
+      - name: Build the audit binary with release code generation
+        working-directory: native
+        run: cargo build --locked --profile ct-audit -p ol_ct_audit
+
+      - name: Run every audit case under Memcheck
+        run: >-
+          uv run --frozen --only-group ct-audit python scripts/run_ct_audit.py
+          --binary native/target/ct-audit/ol_ct_audit
+          --source-root native
+          --report test-results/ct-audit/report.json
+
+      - name: Preserve constant-time audit evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-ct-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: test-results/ct-audit/
+          if-no-files-found: warn
+
+  # BRANCH-02 multi-platform evidence. Peak memory of the native file scanners
+  # (cdc_file, format_aware_file, format_aware_fd) must be a bounded workspace
+  # plus O(returned chunks), never O(records). This is a deterministic
+  # threshold gate on fitted coefficients, not a wall-clock timing gate; the
+  # script exits 1 on a contract violation. Inputs of up to 768 MiB are
+  # generated one at a time and deleted after use, so peak disk use is about
+  # 768 MiB. The sizes are 3*2^k MiB on purpose: a 2^k MiB log returns about
+  # 2^n chunks, where the measured peak steps (scripts/bench_scan_memory.py).
+  scan_memory:
+    name: scan memory qualification (${{ matrix.os }})
+    needs: applicability
+    if: needs.applicability.outputs.applicable == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # The measurement itself is bounded at 30 minutes (step below). The
+    # release build of one_link_native gets the same cold-cache ceiling the
+    # rust_workspace build uses: a cold release build of the native graph can
+    # exceed 30 minutes on shared runners, and that would be a false failure
+    # of the memory contract.
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.applicability.outputs.checkout_sha }}
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+
+      - name: Install Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: setup uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.13.10"
+          enable-cache: true
+
+      - name: Cache cargo target
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: native
+
+      - name: Install maturin + project deps
+        run: uv sync --frozen --python python --extra dev --extra release
+
+      - name: Build + install one_link_native (editable)
+        timeout-minutes: 55
+        working-directory: native
+        run: uv run --project .. --frozen --extra dev --extra release maturin develop --release --locked
+
+      - name: Qualify the scanners' memory contract on dense and sparse logs
+        timeout-minutes: 30
+        env:
+          SCAN_WORKDIR: ${{ runner.temp }}/scanmem
+          SCAN_REPORT: test-results/scan-memory/${{ matrix.os }}.json
+        run: >-
+          uv run --frozen --extra dev --extra release python scripts/bench_scan_memory.py
+          --sizes-mib 192,768 --repeats 2
+          --workdir "$SCAN_WORKDIR" --report "$SCAN_REPORT"
+
+      - name: Preserve scan memory evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-scan-memory-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: test-results/scan-memory/
+          if-no-files-found: warn
+
+  aggregate:
+    name: native correctness gate
+    if: always()
+    needs: [applicability, rust_workspace, python_binding, ct_audit, scan_memory]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require applicable work or a verified not-applicable diff
+        env:
+          NATIVE_CI_NEEDS: ${{ toJSON(needs) }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # Pull requests are judged by the policy at their BASE revision, never
+          # by their own tree. A base that predates the policy falls back to the
+          # candidate's copy, which can skip nothing because its own file is in
+          # the diff. Every other event uses the tested checkout's copy. The
+          # policy re-derives this choice and verifies its own bytes.
+          policy_rev="$GITHUB_SHA"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            listing="$(git ls-tree --full-tree --name-only "$PR_BASE_SHA" -- scripts/native_ci_scope.py)"
+            if [ -n "$listing" ]; then
+              policy_rev="$PR_BASE_SHA"
+            fi
+          fi
+          policy="$RUNNER_TEMP/native-ci-policy.py"
+          git show "$policy_rev:scripts/native_ci_scope.py" > "$policy"
+          sha256sum "$policy"
+          python "$policy" gate --kind correctness --policy-revision "$policy_rev"

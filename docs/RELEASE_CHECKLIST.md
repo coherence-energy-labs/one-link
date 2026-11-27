@@ -3,20 +3,29 @@
 `release.yml` is configured as the sole signing and publication authority for
 `v*` tags. It is intended to re-run the locked native, Python, browser,
 performance, and security gates against the tagged commit before building or
-signing anything. `reproducible_release.yml` separately uploads unsigned,
-narrow comparison evidence; it does not sign or publish.
+signing anything. Its `verify_reproducibility` job rebuilds the actual Linux
+native wheel on a fresh runner and is a direct prerequisite of both signing
+and publication. `reproducible_release.yml` separately uploads unsigned,
+narrow diagnostic comparison evidence; it does not sign or publish.
 
-> **Current status (verified 2026-07-21): not satisfied.** No production tag
-> has completed `release.yml`. The only GitHub release is the old, mutable
-> `auto-latest` prerelease and it has no Sigstore bundles, published SBOM, or
-> provenance assets. Repository version-tag protection is also not configured.
-> Do not publish, promote, or direct users to binary downloads until every box
-> below has exact-tag evidence.
+> **Current qualification status (reviewed 2026-11-24): incomplete.**
+> Published v0.21.0 completed `release.yml` and has Sigstore/SBOM/checksum assets.
+> The independent reproducibility run failed, and publication did not wait for
+> it. Signature/provenance validation of downloaded assets and fresh-device
+> qualification were not completed in that review. See `RELEASE_EVIDENCE.json`.
+> The mutable `auto-latest` prerelease remains outside the trust baseline.
+> The checklist below must be completed for each future candidate.
 
 This checklist defines a future release decision. Its presence is not evidence
 that any release has passed it.
 
 ## Pre-tag (run on the source you're about to tag)
+
+- [ ] **Default-branch policy is enforced by GitHub.** Read back the active
+      ruleset and verify it with `scripts/repository_policy.py`; preserve the
+      result with exact-commit check runs. See `REPOSITORY_POLICY.md` for the
+      required contexts and conservative update procedure. A local policy file
+      does not prove review/check enforcement.
 
 - [ ] **`tests.yml` green on the target SHA.** The fast subset
       (~200 tests, ~2 min). Quick sanity.
@@ -25,11 +34,22 @@ that any release has passed it.
       full pytest suite and Playwright E2E run on Linux + Windows. The native
       picker smoke runs separately on Linux + Windows + macOS. macOS does not
       currently run the full pytest suite or browser E2E in this workflow.
+      Every manifest-selected live-daemon case must execute successfully in
+      the dedicated lane; skipped or incomplete selections fail acceptance.
 
 - [ ] **`security.yml` green on the target SHA.** `uv lock --check`,
       pip-audit against the frozen lock export, bandit SAST, and SBOM generation.
-      Any medium-or-higher Bandit finding or known dependency advisory blocks
-      release.
+      Medium-or-higher Bandit findings and advisories classified by the scanners
+      as vulnerabilities fail their gates. Main native and fuzz RustSec warnings
+      also fail the gate. The shell's original glib version remains listed for
+      a known medium advisory; its official two-line source fix is backported
+      locally with unchanged version/license, exact provenance, optimized
+      regression tests and a live original-version advisory query. The query
+      retains all replies and fails on new findings or query failure. Qualify
+      the real Linux shell build/window job as well as the scoped iterator
+      tests. The separate unmaintained macro dependency and future upstream
+      migration remain documented in
+      [DEPENDENCY_QUALIFICATION.md](DEPENDENCY_QUALIFICATION.md).
 
 - [ ] **`synthetic_monitor.yml` green for the past 7 days.**
       No transient failures in the morning + evening runs - if
@@ -52,8 +72,9 @@ that any release has passed it.
       authority limited to the smallest maintainer set. The publisher also
       resolves the tag before staging and immediately before publication, and
       refuses any target other than the workflow's triggering commit; the
-      server-side rule prevents a later move after the workflow exits. **This
-      ruleset is a current blocker, not an already-enforced control.**
+      server-side rule prevents a later move after the workflow exits. Verify
+      the live server policy at release time; a committed policy proposal is
+      not proof of enforcement.
 
 - [ ] **Tag name exactly matches the `pyproject.toml` version**
       (`vX.Y.Z` / the project's declared pre-release spelling). Annotated tags
@@ -72,10 +93,11 @@ that any release has passed it.
 - [ ] **`release.yml` green end to end.** Both tagged-commit quality jobs,
       every platform build, Sigstore signing/provenance, and the final minimal
       publisher must succeed. The publisher directly depends on
-      `release_quality_gate`.
+      `release_quality_gate` and `verify_reproducibility`.
 
-- [ ] **`reproducible_release.yml` Linux comparison is green.** The second
-      isolated Linux native-wheel build must be byte-identical to the first.
+- [ ] **The required `release.yml::verify_reproducibility` job is green.**
+      The fresh Linux build must be byte-identical to the exact native wheel
+      selected by this release run, not merely to another diagnostic candidate.
       Windows, macOS, and standalone artifacts are not claimed to be
       byte-identical; their exact published bytes must instead be covered by
       provenance, Sigstore bundles, and `SHA256SUMS`.

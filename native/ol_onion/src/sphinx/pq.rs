@@ -53,6 +53,7 @@ use zeroize::Zeroize;
 
 use crate::errors::{OnionError, OnionResult};
 use crate::hop::HopId;
+use crate::keyderiv::is_all_zero_ct;
 #[cfg(test)]
 use crate::sphinx::core::generate_static_keypair;
 use crate::sphinx::core::RISTRETTO_POINT_LEN;
@@ -270,7 +271,8 @@ pub fn build_pq_sphinx_onion<R: RngCore + CryptoRng>(
         let alpha_bytes = alpha_i.compress().to_bytes();
         let classical_shared_point = (sender_eph_sk * cumulative_blind) * hop.static_x_pk;
         let classical_shared = classical_shared_point.compress().to_bytes();
-        if classical_shared.iter().all(|&b| b == 0) {
+        // ct-audit: declassify (small-order verdict is the public result)
+        if is_all_zero_ct(&classical_shared) {
             return Err(OnionError::SmallOrderPubkey);
         }
         let derive_input = if i == 0 {
@@ -360,7 +362,8 @@ pub fn peel_pq_sphinx_entry(
 
     // Classical ECDH.
     let classical_shared = (relay_x_sk * alpha_point).compress().to_bytes();
-    if classical_shared.iter().all(|&b| b == 0) {
+    // ct-audit: declassify (small-order verdict is the public result)
+    if is_all_zero_ct(&classical_shared) {
         return Err(OnionError::SmallOrderPubkey);
     }
     // PQ decapsulation.
@@ -400,7 +403,8 @@ pub fn peel_pq_sphinx_intermediate(
         .decompress()
         .ok_or(OnionError::SmallOrderPubkey)?;
     let classical_shared = (relay_x_sk * alpha_point).compress().to_bytes();
-    if classical_shared.iter().all(|&b| b == 0) {
+    // ct-audit: declassify (small-order verdict is the public result)
+    if is_all_zero_ct(&classical_shared) {
         return Err(OnionError::SmallOrderPubkey);
     }
     let keys = derive_hop_keys(&classical_shared, &alpha_bytes);

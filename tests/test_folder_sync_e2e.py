@@ -41,8 +41,16 @@ def _assert_durable_sync_result(
     response: dict,
     *,
     expected_entries: int,
-    expected_wants: int,
+    expected_wants: int | frozenset[int],
 ) -> dict:
+    """Validate the sender's durable, channel-bound sync result.
+
+    ``expected_wants`` is a set where the count legitimately depends on timing:
+    the folder watcher pushes a new file on its own, so by the time an explicit
+    sync runs the receiver may already hold it (wants 0) or not (wants 1). The
+    receipt must agree with the result either way.
+    """
+    allowed = {expected_wants} if isinstance(expected_wants, int) else set(expected_wants)
     assert response.get("ok") is True, response
     results = response.get("results")
     assert isinstance(results, list) and len(results) == 1, response
@@ -50,7 +58,8 @@ def _assert_durable_sync_result(
     assert result.get("status") == "pushed", result
     assert result.get("ok") is True, result
     assert result.get("durable_receipt") is True, result
-    assert result.get("wants") == expected_wants, result
+    wants = result.get("wants")
+    assert wants in allowed, result
     sync_id = result.get("folder_sync_id")
     assert isinstance(sync_id, str) and sync_id, result
 
@@ -60,7 +69,7 @@ def _assert_durable_sync_result(
     assert receipt.get("sync_id") == sync_id, receipt
     assert isinstance(receipt.get("verify_id"), str) and receipt["verify_id"]
     assert receipt.get("entry_count") == expected_entries, receipt
-    assert receipt.get("wanted_count") == expected_wants, receipt
+    assert receipt.get("wanted_count") == wants, receipt
     assert receipt.get("paths_verified") == expected_entries, receipt
     assert receipt.get("source_root") == result.get("merkle_root"), receipt
     _assert_hex64(receipt.get("source_root"), field="source_root")
@@ -215,11 +224,14 @@ async def _pair_two_daemons(s, base_a, tok_a, base_b, tok_b, p):
     )
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_folder_sync_round_trip():
     """A pairs with B, A creates a folder shared with B, A drops a file.
     B's copy of the folder receives the file byte-identical."""
-    with daemon_pair(pin_trust=True) as p:
+    # No scheduled pushes: this test is about the explicit sync and the
+    # watcher, and a background cycle landing in between proved nothing.
+    with daemon_pair(pin_trust=True, periodic_folder_sync=False) as p:
         port_a = int(_read(p.a.home, "server.port"))
         port_b = int(_read(p.b.home, "server.port"))
         tok_a = _read(p.a.home, "ui.token")
@@ -273,8 +285,14 @@ async def test_folder_sync_round_trip():
                 headers={"Authorization": f"Bearer {tok_a}"}, json={},
             ) as r:
                 sync_res = await r.json()
+            # The watcher may have delivered the new file already. Asserting
+            # wants == 1 here bet that it had not, and lost on a slow runner
+            # (the result was a durable, verified push with wants == 0). What
+            # must hold either way is asserted below: one verified entry, a
+            # receipt that agrees with the result, the bytes on B, B's state
+            # and store, and A's ledger.
             first_result = _assert_durable_sync_result(
-                sync_res, expected_entries=1, expected_wants=1,
+                sync_res, expected_entries=1, expected_wants=frozenset({0, 1}),
             )
 
             # Wait for B to materialize the file
@@ -335,6 +353,7 @@ async def test_folder_sync_round_trip():
             )
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_folder_sync_blocked_for_unpaired_peer():
     """Without pairing, MANIFEST_PUSH should be ignored on the receive side

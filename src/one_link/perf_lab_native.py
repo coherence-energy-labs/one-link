@@ -6,46 +6,61 @@ for the native FastCDC v2020 + BLAKE3 + ADR-0006 derivation kernels:
 - CDC scan throughput (target ≥ 2 GiB/s/core scalar; ≥ 5 GiB/s/core SIMD).
 - BLAKE3 raw + convergent chunk-address throughput.
 - AEAD key / ratchet_key_id / stripe_seed derivation throughput.
-- Comparison against the legacy ``cdc.py`` Python kernel for context.
+- Explicit Python Gear-CDC context and an equivalent native-C Gear-CDC pair.
 
 Per ADR-0008 these benchmarks are JSON-serializable and feed the per-PR
-benchmark gate. CI rejects PRs that regress any reported throughput by >5%.
+benchmark gate. CI uses alternating artifact pairs, per-class limits, and an
+explicit inconclusive outcome when measurement uncertainty crosses a limit.
 The CI workflow lives at ``.github/workflows/native_bench_gate.yml``.
 """
 
 from __future__ import annotations
 
 import argparse
+import blake3
 import json
 import os
 import platform
 import statistics
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Callable
+from unittest.mock import patch
 
 import secrets
 import tempfile
 import threading
 
 from . import aead_native, chunk_native, chunk_store_native, quic_native, wal_native
-from .cdc import chunk_bytes as legacy_chunk_bytes
+from . import cdc
+from .benchmark_contract import corpus_bytes, provenance
 
 
 MiB = 1024 * 1024
 GiB = 1024 * 1024 * 1024
 
 
+@dataclass(frozen=True)
+class SamplingPlan:
+    storage_iterations: int
+    quic_iterations: int
+    quic_warmup_iterations: int
+    quic_min_batch_kib: int
+
+
+SAMPLING_PROFILES = {
+    "quick": SamplingPlan(5, 3, 0, 0),
+    # Predeclared after the first hosted study exposed 3 short QUIC samples
+    # and large storage stalls. Counts never adapt to a passing gate result.
+    "ci": SamplingPlan(31, 31, 3, 16 * 1024),
+}
+
+
 def _xorshift_buf(seed: int, size: int) -> bytes:
-    state = seed & 0xFFFF_FFFF_FFFF_FFFF
-    out = bytearray(size)
-    for i in range(size):
-        state ^= (state << 13) & 0xFFFF_FFFF_FFFF_FFFF
-        state ^= state >> 7
-        state ^= (state << 17) & 0xFFFF_FFFF_FFFF_FFFF
-        out[i] = state & 0xFF
-    return bytes(out)
+    # Preserve the private helper name for callers, but generate the versioned
+    # public corpus outside timing with randbytes rather than a Python loop.
+    return corpus_bytes(size, seed=seed, kind="random")
 
 
 @dataclass
@@ -63,6 +78,13 @@ class BenchResult:
     seconds_per_iter_median: float
     bytes_per_second_median: float
     metadata: dict[str, object]
+    seconds_per_iteration: list[float] = field(default_factory=list)
+    bytes_per_iteration: list[int] = field(default_factory=list)
+    warmup_iterations: int = 0
+    # Warm-up batches are excluded from the timed samples but retained, so a
+    # regime that only warm-ups exercise (first traffic, cache fill) stays
+    # visible in the evidence instead of being discarded unmeasured.
+    warmup_seconds_per_iteration: list[float] = field(default_factory=list)
 
 
 def _bench(
@@ -76,15 +98,26 @@ def _bench(
 
     Reports median to suppress outliers from cold caches and OS scheduling.
     """
-    for _ in range(max(0, warmup_iterations)):
+    if iterations < 1 or warmup_iterations < 0:
+        raise ValueError("iterations must be positive and warmup nonnegative")
+    warmup_durations: list[float] = []
+    for _ in range(warmup_iterations):
+        start = time.perf_counter_ns()
         fn()
+        warmup_durations.append((time.perf_counter_ns() - start) / 1e9)
     durations: list[float] = []
+    byte_counts: list[int] = []
     bytes_one_iter = 0
     for _ in range(iterations):
         start = time.perf_counter_ns()
         bytes_one_iter = fn()
         elapsed_ns = time.perf_counter_ns() - start
+        if type(bytes_one_iter) is not int or bytes_one_iter < 0:
+            raise ValueError("benchmark must return a nonnegative byte count")
+        byte_counts.append(bytes_one_iter)
         durations.append(elapsed_ns / 1e9)
+    if len(set(byte_counts)) != 1:
+        raise ValueError("benchmark work changed across repetitions")
     median_s = statistics.median(durations)
     return BenchResult(
         name=name,
@@ -93,7 +126,11 @@ def _bench(
         seconds_total=sum(durations),
         seconds_per_iter_median=median_s,
         bytes_per_second_median=(bytes_one_iter / median_s) if median_s > 0 else 0.0,
-        metadata=metadata or {},
+        metadata={"measurement_scope": "component", "corpus_version": "native-component-inputs-v2", **(metadata or {})},
+        seconds_per_iteration=durations,
+        bytes_per_iteration=byte_counts,
+        warmup_iterations=warmup_iterations,
+        warmup_seconds_per_iteration=warmup_durations,
     )
 
 
@@ -102,36 +139,84 @@ def bench_native_cdc_scan(size_mib: int = 256, iterations: int = 5) -> BenchResu
         raise RuntimeError("native chunk module unavailable")
     n = size_mib * MiB
     buf = _xorshift_buf(0x1234_5678_DEAD_BEEF + size_mib, n)
+    reference = tuple(chunk_native.cdc_iter(buf))
+    cursor = 0
+    for boundary in reference:
+        if boundary.start != cursor or not cursor < boundary.end <= n:
+            raise RuntimeError("native CDC output does not form a complete partition")
+        if boundary.raw_address != blake3.blake3(buf[boundary.start:boundary.end]).digest():
+            raise RuntimeError("native CDC chunk hash differs from verified input")
+        cursor = boundary.end
+    if cursor != n:
+        raise RuntimeError("native CDC output is truncated")
 
     def go() -> int:
-        count = 0
-        for _b in chunk_native.cdc_iter(buf):
-            count += 1
+        if tuple(chunk_native.cdc_iter(buf)) != reference:
+            raise RuntimeError("native CDC output changed across repetitions")
         return n
 
     return _bench(
         f"native_cdc_scan_{size_mib}MiB",
         go,
         iterations=iterations,
-        metadata={"input_bytes": n, "kernel": "FastCDC v2020 + Gear-256"},
+        metadata={"input_bytes": n, "kernel": "FastCDC v2020 + Gear-256",
+                  "output_verification": "preflight independent BLAKE3 and complete partition; exact outputs each iteration"},
     )
 
 
 def bench_legacy_cdc_scan(size_mib: int = 256, iterations: int = 3) -> BenchResult:
-    """Benchmark the legacy Gear-CDC for context. Slow; small iterations."""
+    """Explicit Python Gear-CDC; not algorithm-equivalent to Rust FastCDC."""
     n = size_mib * MiB
     buf = _xorshift_buf(0x1234_5678_DEAD_BEEF + size_mib, n)
 
     def go() -> int:
-        chunks = legacy_chunk_bytes(buf)
+        cdc.chunk_bytes(buf)
         return n
 
-    return _bench(
-        f"legacy_cdc_scan_{size_mib}MiB",
-        go,
-        iterations=iterations,
-        metadata={"input_bytes": n, "kernel": "legacy Gear-CDC (16/64/256 KiB)"},
-    )
+    # The benchmark runs synchronously. Patching only this private dispatch
+    # boundary avoids mutating the native loader's process-wide cache/status.
+    with patch.object(cdc, "_chunk_bytes_native", return_value=None):
+        return _bench(
+            f"legacy_cdc_scan_{size_mib}MiB", go, iterations=iterations,
+            metadata={"input_bytes": n, "kernel": "Gear-CDC (16/64/256 KiB)",
+                      "engine": "python", "equivalent_to_rust_fastcdc": False},
+        )
+
+
+def bench_equivalent_gear_cdc(size_mib: int = 4, iterations: int = 5) -> list[BenchResult]:
+    """Compare exact Python/C Gear boundaries and hashes before measuring.
+
+    A native failure is explicit; fallback can never masquerade as native C.
+    Both sides include boundary scanning, BLAKE3 hashes and Chunk construction.
+    """
+    buf = corpus_bytes(size_mib * MiB, seed=0xCDC)
+    with patch.object(cdc, "_chunk_bytes_native", return_value=None):
+        reference = cdc.chunk_bytes(buf)
+    native = cdc._chunk_bytes_native(buf)
+    if native is None:
+        raise RuntimeError("native C Gear-CDC unavailable; cannot run equivalent pair")
+    if native != reference:
+        raise RuntimeError("native/Python Gear-CDC boundaries or hashes differ")
+
+    def native_go() -> int:
+        result = cdc._chunk_bytes_native(buf)
+        if result is None or result != reference:
+            raise RuntimeError("native Gear-CDC dispatch/equivalence failed")
+        return len(buf)
+
+    def python_go() -> int:
+        if cdc.chunk_bytes(buf) != reference:
+            raise RuntimeError("Python Gear-CDC equivalence failed")
+        return len(buf)
+
+    meta = {"input_bytes": len(buf), "kernel": "Gear-CDC (16/64/256 KiB)",
+            "output_verified": "exact boundaries and hashes on every iteration"}
+    out = [_bench(f"gear_cdc_c_{size_mib}MiB", native_go, iterations,
+                  {**meta, "engine": "ctypes-c"})]
+    with patch.object(cdc, "_chunk_bytes_native", return_value=None):
+        out.append(_bench(f"gear_cdc_python_{size_mib}MiB", python_go, iterations,
+                          {**meta, "engine": "python"}))
+    return out
 
 
 def bench_native_chunk_address_raw(size_kib: int = 64, iterations: int = 1000) -> BenchResult:
@@ -217,14 +302,17 @@ def bench_native_aead(
     cipher = aead_native.AeadCipher.with_kind(key, kind)  # type: ignore[arg-type]
     # warm-up
     ct = cipher.encrypt_chunk(chunk_id, plaintext)
-    cipher.decrypt_chunk(chunk_id, len(plaintext), ct)
+    if cipher.decrypt_chunk(chunk_id, len(plaintext), ct) != plaintext:
+        raise RuntimeError("native AEAD did not round-trip the benchmark input")
 
     def enc() -> int:
-        ct = cipher.encrypt_chunk(chunk_id, plaintext)
+        if len(cipher.encrypt_chunk(chunk_id, plaintext)) != len(ct):
+            raise RuntimeError("native AEAD ciphertext length changed")
         return len(plaintext)
 
     def dec() -> int:
-        cipher.decrypt_chunk(chunk_id, len(plaintext), ct)
+        if cipher.decrypt_chunk(chunk_id, len(plaintext), ct) != plaintext:
+            raise RuntimeError("native AEAD decrypt returned incorrect bytes")
         return len(plaintext)
 
     enc_res = _bench(
@@ -342,11 +430,44 @@ def bench_native_chunk_store_locate(iterations: int = 1_000_000) -> BenchResult:
 # ─── QUIC benchmarks ──────────────────────────────────────────────────
 
 
+QUIC_SERVER_HELPER_REQUEST_CAP = 8192
+
+
+def _quic_server_groups(items: int, requests_per_item: int = 1) -> list[int]:
+    """Split service calls within the native helper's existing request bound.
+
+    Connections stay open and all planned requests remain served. A long
+    study must not raise or disable native resource limits to fit one call.
+    """
+    if items < 1 or not 1 <= requests_per_item <= QUIC_SERVER_HELPER_REQUEST_CAP:
+        raise ValueError("QUIC benchmark service request count exceeds helper bounds")
+    per_call = QUIC_SERVER_HELPER_REQUEST_CAP // requests_per_item
+    return [min(per_call, items - offset) for offset in range(0, items, per_call)]
+
+
+def _run_quic_server(loop: Callable[[], None], server, holder, done, errors) -> None:
+    try:
+        loop()
+    except Exception as exc:
+        errors.append(exc)
+        # Fail the blocked client promptly instead of leaving it waiting for
+        # responses after a server helper rejects the benchmark configuration.
+        if holder and holder[0] is not None:
+            holder[0].close()
+        server.close()
+        done.set()
+
+
 def _bench_quic_loopback_round_trip(
     payload_kib: int,
     iterations: int = 50,
+    *,
+    bench_iterations: int = 3,
+    warmup_iterations: int = 0,
 ) -> BenchResult:
     """Sequential request/response round-trips on a single connection."""
+    if bench_iterations < 1 or warmup_iterations < 0:
+        raise ValueError("iterations must be positive and warmup nonnegative")
     if not quic_native.HAS_NATIVE:
         raise RuntimeError("quic_native unavailable")
     payload_bytes = payload_kib * 1024
@@ -368,8 +489,9 @@ def _bench_quic_loopback_round_trip(
     addr = server.local_addr
 
     holder: list = []
+    server_errors: list[Exception] = []
     done = threading.Event()
-    bench_iterations = 3
+    server_iterations = bench_iterations + warmup_iterations
 
     def loop() -> None:
         conn = server.accept_blocking(timeout_ms=30_000)
@@ -378,27 +500,24 @@ def _bench_quic_loopback_round_trip(
             done.set()
             return
         if hasattr(conn, "serve_fixed_stream_responses_blocking"):
-            conn.serve_fixed_stream_responses_blocking(
-                bench_iterations,
-                iterations,
-                quic_native.FRAME_CHUNK_RESPONSE,
-                bulk_response,
-                max_in_flight=1,
-            )
+            for streams in _quic_server_groups(server_iterations, iterations):
+                conn.serve_fixed_stream_responses_blocking(
+                    streams, iterations, quic_native.FRAME_CHUNK_RESPONSE,
+                    bulk_response, max_in_flight=1,
+                )
             time.sleep(0.05)
             done.set()
             return
         if hasattr(conn, "serve_fixed_responses_blocking"):
-            conn.serve_fixed_responses_blocking(
-                iterations * bench_iterations,
-                quic_native.FRAME_CHUNK_RESPONSE,
-                bulk_response,
-                max_in_flight=1,
-            )
+            for requests in _quic_server_groups(iterations * server_iterations):
+                conn.serve_fixed_responses_blocking(
+                    requests, quic_native.FRAME_CHUNK_RESPONSE,
+                    bulk_response, max_in_flight=1,
+                )
             time.sleep(0.05)
             done.set()
             return
-        for _ in range(iterations * bench_iterations):
+        for _ in range(iterations * server_iterations):
             r = conn.recv_frame_blocking(timeout_ms=10_000)
             if r is None:
                 break
@@ -407,7 +526,7 @@ def _bench_quic_loopback_round_trip(
         time.sleep(0.05)
         done.set()
 
-    t = threading.Thread(target=loop, daemon=True)
+    t = threading.Thread(target=lambda: _run_quic_server(loop, server, holder, done, server_errors), daemon=True)
     t.start()
 
     client = quic_native.Endpoint.client(
@@ -421,11 +540,14 @@ def _bench_quic_loopback_round_trip(
     )
     conn = client.connect_blocking(addr, alice.fingerprint, timeout_ms=10_000)
     cids = [bytes([i & 0xFF] * 32) for i in range(iterations)]
+    selected_api = next((name for name in (
+        "send_frame_stream_round_trips_count", "send_frame_stream_round_trips",
+        "send_frame_round_trips", "send_frame_round_trip"
+    ) if hasattr(conn, name)), "unavailable")
 
     def go() -> int:
-        # Native bulk streams remove both Python/Rust call overhead and
-        # per-chunk QUIC stream setup. This is the intended fast path for
-        # large file chunk sessions.
+        # This component helper excludes daemon orchestration and receipts.
+        # Its selected API and validation scope are part of the report.
         if hasattr(conn, "send_frame_stream_round_trips_count"):
             received = conn.send_frame_stream_round_trips_count(
                 quic_native.FRAME_CHUNK_REQUEST,
@@ -451,33 +573,50 @@ def _bench_quic_loopback_round_trip(
                 conn.send_frame_round_trip(quic_native.FRAME_CHUNK_REQUEST, cid)
                 for cid in cids
             ]
-        for kind, _payload in replies:
-            if kind != quic_native.FRAME_CHUNK_RESPONSE:
-                raise RuntimeError(f"unexpected response kind {kind:#x}")
+        if len(replies) != iterations:
+            raise RuntimeError("QUIC component returned an incomplete response set")
+        for kind, response_payload in replies:
+            if kind != quic_native.FRAME_CHUNK_RESPONSE or response_payload != bulk_response:
+                raise RuntimeError("QUIC component returned an incorrect response")
         return iterations * payload_bytes
 
-    result = _bench(
-        f"native_quic_round_trip_{payload_kib}KiB_x{iterations}",
-        go,
-        iterations=bench_iterations,
-        metadata={"payload_kib": payload_kib, "round_trips": iterations},
-    )
-    done.wait(timeout=5)
-    conn.close()
-    if holder and holder[0] is not None:
-        holder[0].close()
-    server.close()
-    t.join(timeout=2)
-    client.close()
-    return result
+    try:
+        result = _bench(
+            f"native_quic_round_trip_{payload_kib}KiB_x{iterations}",
+            go,
+            iterations=bench_iterations,
+            warmup_iterations=warmup_iterations,
+            metadata={"payload_kib": payload_kib, "round_trips": iterations,
+                      "warmup_scope": "same established connection; excluded from timed samples",
+                      "server_helper_request_cap": QUIC_SERVER_HELPER_REQUEST_CAP,
+                      "api": selected_api, "measurement_scope": "native_loopback_helper_excludes_daemon",
+                      "payload_validation": "response kind and byte count" if "count" in selected_api else "exact response bytes"},
+        )
+        if not done.wait(timeout=5):
+            raise RuntimeError("QUIC benchmark server did not complete the planned requests")
+        if server_errors:
+            raise RuntimeError("QUIC benchmark server failed") from server_errors[0]
+        return result
+    finally:
+        conn.close()
+        if holder and holder[0] is not None:
+            holder[0].close()
+        server.close()
+        t.join(timeout=2)
+        client.close()
 
 
 def _bench_quic_parallel_streams(
     payload_kib: int = 64,
     parallelism: int = 16,
     iterations_per_stream: int = 4,
+    *,
+    bench_iterations: int = 3,
+    warmup_iterations: int = 0,
 ) -> BenchResult:
     """Concurrent request/response round-trips on one connection."""
+    if bench_iterations < 1 or warmup_iterations < 0:
+        raise ValueError("iterations must be positive and warmup nonnegative")
     if not quic_native.HAS_NATIVE:
         raise RuntimeError("quic_native unavailable")
     payload_bytes = payload_kib * 1024
@@ -500,8 +639,9 @@ def _bench_quic_parallel_streams(
     addr = server.local_addr
 
     holder: list = []
+    server_errors: list[Exception] = []
     done = threading.Event()
-    bench_iterations = 3
+    server_iterations = bench_iterations + warmup_iterations
     stream_lanes = 2 if payload_kib >= 256 and total_round_trips >= 2 else 1
     requests_per_stream = total_round_trips // stream_lanes
 
@@ -512,27 +652,24 @@ def _bench_quic_parallel_streams(
             done.set()
             return
         if hasattr(conn, "serve_fixed_stream_responses_blocking"):
-            conn.serve_fixed_stream_responses_blocking(
-                stream_lanes * bench_iterations,
-                requests_per_stream,
-                quic_native.FRAME_CHUNK_RESPONSE,
-                bulk_response,
-                max_in_flight=stream_lanes,
-            )
+            for streams in _quic_server_groups(stream_lanes * server_iterations, requests_per_stream):
+                conn.serve_fixed_stream_responses_blocking(
+                    streams, requests_per_stream, quic_native.FRAME_CHUNK_RESPONSE,
+                    bulk_response, max_in_flight=stream_lanes,
+                )
             time.sleep(0.05)
             done.set()
             return
         if hasattr(conn, "serve_fixed_responses_blocking"):
-            conn.serve_fixed_responses_blocking(
-                total_round_trips * bench_iterations,
-                quic_native.FRAME_CHUNK_RESPONSE,
-                bulk_response,
-                max_in_flight=parallelism,
-            )
+            for requests in _quic_server_groups(total_round_trips * server_iterations):
+                conn.serve_fixed_responses_blocking(
+                    requests, quic_native.FRAME_CHUNK_RESPONSE,
+                    bulk_response, max_in_flight=parallelism,
+                )
             time.sleep(0.05)
             done.set()
             return
-        for _ in range(total_round_trips * bench_iterations):
+        for _ in range(total_round_trips * server_iterations):
             r = conn.recv_frame_blocking(timeout_ms=10_000)
             if r is None:
                 break
@@ -541,7 +678,7 @@ def _bench_quic_parallel_streams(
         time.sleep(0.05)
         done.set()
 
-    t = threading.Thread(target=loop, daemon=True)
+    t = threading.Thread(target=lambda: _run_quic_server(loop, server, holder, done, server_errors), daemon=True)
     t.start()
 
     client = quic_native.Endpoint.client(
@@ -559,6 +696,10 @@ def _bench_quic_parallel_streams(
         for worker_id in range(parallelism)
         for i in range(iterations_per_stream)
     ]
+    selected_api = next((name for name in (
+        "send_frame_stream_round_trips_count_parallel", "send_frame_stream_round_trips_parallel",
+        "send_frame_round_trips_parallel", "send_frame_round_trip"
+    ) if hasattr(conn, name)), "unavailable")
 
     def go() -> int:
         # Parallel native bulk streams avoid spinning Python worker threads
@@ -615,39 +756,82 @@ def _bench_quic_parallel_streams(
                 f"QUIC parallel benchmark expected {total_round_trips} replies, "
                 f"got {len(replies)}"
             )
-        for kind, _payload in replies:
-            if kind != quic_native.FRAME_CHUNK_RESPONSE:
-                raise RuntimeError(f"unexpected response kind {kind:#x}")
+        for kind, response_payload in replies:
+            if kind != quic_native.FRAME_CHUNK_RESPONSE or response_payload != bulk_response:
+                raise RuntimeError("QUIC component returned an incorrect response")
         return total_round_trips * payload_bytes
 
-    result = _bench(
-        f"native_quic_parallel_{parallelism}x{iterations_per_stream}_{payload_kib}KiB",
-        go,
-        iterations=bench_iterations,
-        metadata={
-            "payload_kib": payload_kib,
-            "parallelism": parallelism,
-            "iterations_per_stream": iterations_per_stream,
-            "stream_lanes": stream_lanes,
-            "requests_per_stream": requests_per_stream,
-        },
-    )
-    done.wait(timeout=10)
-    conn.close()
-    if holder and holder[0] is not None:
-        holder[0].close()
-    server.close()
-    t.join(timeout=5)
-    client.close()
-    return result
+    try:
+        result = _bench(
+            f"native_quic_parallel_{parallelism}x{iterations_per_stream}_{payload_kib}KiB",
+            go,
+            iterations=bench_iterations,
+            warmup_iterations=warmup_iterations,
+            metadata={
+                "payload_kib": payload_kib,
+                "parallelism": parallelism,
+                "iterations_per_stream": iterations_per_stream,
+                "stream_lanes": stream_lanes,
+                "requests_per_stream": requests_per_stream,
+                "warmup_scope": "same established connection; excluded from timed samples",
+                "server_helper_request_cap": QUIC_SERVER_HELPER_REQUEST_CAP,
+                "api": selected_api,
+                "measurement_scope": "native_loopback_helper_excludes_daemon",
+                "payload_validation": "response kind and byte count" if "count" in selected_api else "exact response bytes",
+            },
+        )
+        if not done.wait(timeout=10):
+            raise RuntimeError("QUIC benchmark server did not complete the planned requests")
+        if server_errors:
+            raise RuntimeError("QUIC benchmark server failed") from server_errors[0]
+        return result
+    finally:
+        conn.close()
+        if holder and holder[0] is not None:
+            holder[0].close()
+        server.close()
+        t.join(timeout=5)
+        client.close()
 
 
-def run_full_suite(size_mib: int = 256, include_legacy: bool = True) -> list[BenchResult]:
+def quic_size_order(pair_index: int | None) -> tuple[int, ...]:
+    """QUIC payload sizes, rotated by the paired-run index.
+
+    Both arms of a pair share the index, so a pair compares the same position;
+    across pairs every size runs first equally often, so no metric is always
+    the one that meets the process's earliest QUIC traffic.
+    """
+    sizes = (16, 64, 256, 1024)
+    shift = (pair_index or 0) % len(sizes)
+    return sizes[shift:] + sizes[:shift]
+
+
+def _pair_index() -> int | None:
+    raw = os.environ.get("ONE_LINK_BENCH_PAIR")
+    try:
+        return int(raw) if raw not in (None, "") else None
+    except ValueError:
+        return None
+
+
+def run_full_suite(
+    size_mib: int = 256, include_legacy: bool = True, sampling_profile: str = "quick",
+    diagnostics: dict[str, object] | None = None,
+) -> list[BenchResult]:
     """Run the complete A1 native-bench suite.
 
     ``size_mib`` controls the CDC scan input size (256 MiB default; reduce
-    for quick checks on slow disks).
+    for quick checks on slow disks). ``ci`` uses a predeclared longer storage
+    and QUIC sample plan; ``quick`` retains the local/build smoke workload.
+
+    ``diagnostics``, when given, receives ungated observations, such as the
+    process's first QUIC traffic on a freshly created runtime. That regime is
+    timed once by an explicit probe before any gated QUIC metric, so no gated
+    metric measures runtime start-up and the start-up cost stays recorded.
     """
+    if sampling_profile not in SAMPLING_PROFILES:
+        raise ValueError(f"unknown sampling profile: {sampling_profile}")
+    plan = SAMPLING_PROFILES[sampling_profile]
     results: list[BenchResult] = []
     if not chunk_native.HAS_NATIVE:
         raise RuntimeError(
@@ -659,6 +843,7 @@ def run_full_suite(size_mib: int = 256, include_legacy: bool = True) -> list[Ben
     if include_legacy:
         # Legacy is slow (~8 MiB/s); use 32 MiB so the run finishes quickly.
         results.append(bench_legacy_cdc_scan(size_mib=min(size_mib, 32)))
+        results.extend(bench_equivalent_gear_cdc(size_mib=min(size_mib, 4)))
     results.append(bench_native_chunk_address_raw(size_kib=64))
     results.append(bench_native_chunk_address_convergent(size_kib=64))
     results.append(bench_native_aead_key_derivation())
@@ -672,21 +857,44 @@ def run_full_suite(size_mib: int = 256, include_legacy: bool = True) -> list[Ben
                 results.append(dec)
     # ol_wal
     if wal_native.HAS_NATIVE:
-        results.append(bench_native_wal_group_commit(batch_size=128, payload_kib=4))
-        results.append(bench_native_wal_group_commit(batch_size=128, payload_kib=64))
+        results.append(bench_native_wal_group_commit(batch_size=128, payload_kib=4, iterations=plan.storage_iterations))
+        results.append(bench_native_wal_group_commit(batch_size=128, payload_kib=64, iterations=plan.storage_iterations))
     # ol_chunk_store
     if chunk_store_native.HAS_NATIVE:
-        results.append(bench_native_chunk_store_write(batch_size=32, plaintext_kib=64))
-        results.append(bench_native_chunk_store_write(batch_size=128, plaintext_kib=64))
+        results.append(bench_native_chunk_store_write(batch_size=32, plaintext_kib=64, iterations=plan.storage_iterations))
+        results.append(bench_native_chunk_store_write(batch_size=128, plaintext_kib=64, iterations=plan.storage_iterations))
         results.append(bench_native_chunk_store_locate(iterations=500_000))
     # ol_quic
     if quic_native.HAS_NATIVE:
-        for size_kib in (16, 64, 256, 1024):
+        # The first QUIC traffic of the process creates the shared runtime;
+        # time it once, ungated, before the gated metrics (see docstring).
+        first = _bench_quic_loopback_round_trip(
+            payload_kib=16, iterations=200, bench_iterations=1, warmup_iterations=0,
+        )
+        if diagnostics is not None:
+            diagnostics["quic_first_traffic"] = {
+                "seconds": first.seconds_per_iteration[0],
+                "bytes": first.bytes_processed,
+                "payload_kib": 16, "round_trips": 200,
+                "scope": "first QUIC traffic of this process, on a freshly created runtime; not gated",
+            }
+        for size_kib in quic_size_order(_pair_index()):
             iters = 200 if size_kib <= 64 else 50 if size_kib <= 256 else 20
-            results.append(_bench_quic_loopback_round_trip(payload_kib=size_kib, iterations=iters))
+            iters = max(iters, (plan.quic_min_batch_kib + size_kib - 1) // size_kib)
+            results.append(_bench_quic_loopback_round_trip(
+                payload_kib=size_kib, iterations=iters,
+                bench_iterations=plan.quic_iterations, warmup_iterations=plan.quic_warmup_iterations,
+            ))
         # Parallel multi-stream: hits multi-thread tokio scheduler hard.
-        results.append(_bench_quic_parallel_streams(payload_kib=64, parallelism=16, iterations_per_stream=4))
-        results.append(_bench_quic_parallel_streams(payload_kib=256, parallelism=8, iterations_per_stream=4))
+        for size_kib, parallelism in ((64, 16), (256, 8)):
+            lane_kib = size_kib * parallelism
+            iters = max(4, (plan.quic_min_batch_kib + lane_kib - 1) // lane_kib)
+            results.append(_bench_quic_parallel_streams(
+                payload_kib=size_kib, parallelism=parallelism, iterations_per_stream=iters,
+                bench_iterations=plan.quic_iterations, warmup_iterations=plan.quic_warmup_iterations,
+            ))
+    for result in results:
+        result.metadata["sampling_profile"] = sampling_profile
     return results
 
 
@@ -738,17 +946,23 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Emit JSON results for CI ingestion (default: human-readable).",
     )
+    parser.add_argument("--profile", choices=tuple(SAMPLING_PROFILES), default="quick",
+                        help="quick smoke or predeclared longer CI sampling (default: quick)")
     args = parser.parse_args(argv)
 
-    results = run_full_suite(size_mib=args.size_mib, include_legacy=not args.no_legacy)
+    observed: dict[str, object] = {}
+    results = run_full_suite(size_mib=args.size_mib, include_legacy=not args.no_legacy,
+                             sampling_profile=args.profile, diagnostics=observed)
     if args.json:
+        identity = provenance()
         out = {
+            "schema": "one-link-native-benchmark-v2",
+            "measurement_contract": {"scope": "components", "corpus": "seeded-randbytes-v1", "size_mib": args.size_mib,
+                                     "sampling_profile": args.profile, "sampling_plan": asdict(SAMPLING_PROFILES[args.profile])},
+            "provenance": identity,
             "diagnostics": chunk_native.diagnostics(),
-            "host": {
-                "platform": platform.platform(),
-                "python": platform.python_version(),
-                "cpu_count": os.cpu_count(),
-            },
+            "ungated_observations": observed,
+            "host": identity["host"],
             "results": [asdict(r) for r in results],
         }
         json.dump(out, sys.stdout, indent=2)

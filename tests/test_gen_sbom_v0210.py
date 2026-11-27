@@ -12,6 +12,33 @@ import pytest
 from scripts import gen_sbom
 
 
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("MIT", [{"license": {"id": "MIT"}}]),
+        ("AGPL-3.0-or-later", [{"license": {"id": "AGPL-3.0-or-later"}}]),
+        ("Apache-2.0 OR MIT", [{"expression": "Apache-2.0 OR MIT"}]),
+        ("MIT AND Unicode-3.0", [{"expression": "MIT AND Unicode-3.0"}]),
+        ("GPL-2.0-only WITH Classpath-exception-2.0", [{"expression": "GPL-2.0-only WITH Classpath-exception-2.0"}]),
+        ("(MIT OR Apache-2.0) AND BSD-3-Clause", [{"expression": "(MIT OR Apache-2.0) AND BSD-3-Clause"}]),
+    ],
+)
+def test_compound_spdx_licenses_use_the_expression_form(value, expected):
+    # CycloneDX `license.id` takes one SPDX identifier; an expression there
+    # fails schema validation (found with the dual-licensed ml-kem backport).
+    assert gen_sbom._license_choice(value) == expected
+
+
+def test_every_vendored_backport_license_validates_in_the_generated_sbom():
+    for record in sorted(REPO.glob("native/**/patches/*.json")):
+        proof = json.loads(record.read_text(encoding="utf-8"))
+        if proof.get("schema") != "one-link-vendored-cargo-patch/v1":
+            continue
+        choice = gen_sbom._license_choice(proof["package"]["license"])
+        compound = any(word in proof["package"]["license"].split() for word in ("OR", "AND", "WITH"))
+        assert ("expression" in choice[0]) is compound, record.name
+
+
 REPO = Path(__file__).resolve().parent.parent
 ARTIFACT_PATTERNS = (
     "one_link-*.whl",
@@ -402,6 +429,85 @@ def test_real_native_workspace_inventory_passes_locked_cyclonedx_schema(tmp_path
         output_path=artifacts / "sbom.cdx.json",
     )
     gen_sbom._strict_schema_validate(gen_sbom._canonical_json(merged))
+
+
+def test_independent_cargo_graphs_preserve_separate_resolutions(tmp_path: Path):
+    cargo_lock, workspace = _write_cargo_fixture(tmp_path)
+    shell = tmp_path / "shell"
+    shell.mkdir()
+    manifest = shell / "Cargo.toml"
+    manifest.write_text('[package]\nname="ol_shell"\nversion="0.1.0"\n[workspace]\n')
+    (shell / "Cargo.lock").write_text(
+        cargo_lock.read_text().replace("one_link_native", "ol_shell").replace("0.21.0-alpha.0", "0.1.0")
+        + '\ndependencies = ["leaf"]\n\n[[package]]\nname="leaf"\nversion="2.0.0"\n'
+    )
+    merged = gen_sbom.augment_sbom(
+        copy.deepcopy(_base_bom()), cargo_lock=cargo_lock, cargo_workspace=workspace,
+        additional_cargo=[("shell", manifest)], output_path=tmp_path / "sbom.json",
+    )
+    deps = {row["ref"]: row["dependsOn"] for row in merged["dependencies"]}
+    duplicate = [row for row in merged["components"] if row["purl"] == "pkg:cargo/dep@1.2.3"]
+    assert len(duplicate) == 2
+    main = next(row for row in duplicate if "one-link:cargo:graph" not in _property_map(row))
+    other = next(row for row in duplicate if _property_map(row).get("one-link:cargo:graph") == "shell")
+    assert deps[main["bom-ref"]] == []
+    assert len(deps[other["bom-ref"]]) == 1
+    assert deps[other["bom-ref"]][0].startswith("urn:one-link:cargo-graph:shell:")
+    metadata = _property_map(merged["metadata"])
+    assert metadata["one-link:sbom:cargo-graph:shell:workspace-member-count"] == "1"
+    assert metadata["one-link:sbom:cargo-graph:shell:lock-sha256"] == hashlib.sha256(
+        (shell / "Cargo.lock").read_bytes()
+    ).hexdigest()
+
+
+def test_all_three_real_cargo_graphs_are_complete_and_schema_valid(tmp_path: Path):
+    merged = gen_sbom.augment_sbom(
+        copy.deepcopy(_base_bom()), cargo_lock=REPO / "native/Cargo.lock",
+        cargo_workspace=REPO / "native/Cargo.toml",
+        additional_cargo=[("shell", REPO / "native/ol_shell/Cargo.toml"),
+                          ("fuzz", REPO / "native/fuzz/Cargo.toml")],
+        output_path=tmp_path / "sbom.json",
+    )
+    for name, path in [("shell", "native/ol_shell"), ("fuzz", "native/fuzz")]:
+        expected = gen_sbom._parse_cargo_packages(REPO / path / "Cargo.lock")
+        actual = [row for row in merged["components"]
+                  if _property_map(row).get("one-link:cargo:graph") == name]
+        assert {(row["name"], row["version"]) for row in actual} == {
+            (package.name, package.version) for package in expected}
+        assert all(row["purl"].startswith("pkg:cargo/") for row in actual)
+        assert _property_map(merged["metadata"])[f"one-link:sbom:cargo-graph:{name}:package-count"] == str(len(expected))
+    if importlib.util.find_spec("cyclonedx") is not None:
+        gen_sbom._strict_schema_validate(gen_sbom._canonical_json(merged))
+
+
+def test_vendored_glib_sbom_identifies_actual_bytes_and_original_advisory_identity(tmp_path: Path):
+    merged = gen_sbom.augment_sbom(
+        copy.deepcopy(_base_bom()),
+        additional_cargo=[("shell", REPO / "native/ol_shell/Cargo.toml")],
+        output_path=tmp_path / "sbom.json",
+    )
+    glib = next(row for row in merged["components"] if row["name"] == "glib")
+    proof = json.loads((REPO / "native/ol_shell/patches/glib-0.18.5.json").read_text(encoding="utf-8"))
+    assert glib["version"] == "0.18.5"
+    assert glib["purl"] == "pkg:cargo/glib@0.18.5"
+    assert glib["modified"] is True
+    assert glib["licenses"] == [{"license": {"id": "MIT"}}]
+    assert _property_map(glib)["one-link:cargo:source"] == "vendored"
+    assert glib["hashes"][0]["content"] == proof["source_tree_sha256"]
+    assert glib["pedigree"]["ancestors"][0]["hashes"][0]["content"] == proof["upstream"]["crate_sha256"]
+    assert glib["pedigree"]["patches"][0]["type"] == "backport"
+    if importlib.util.find_spec("cyclonedx") is not None:
+        gen_sbom._strict_schema_validate(gen_sbom._canonical_json(merged))
+
+
+@pytest.mark.parametrize("names", [("native",), ("shell", "shell"), ("bad graph",)])
+def test_additional_cargo_graph_names_are_unambiguous(tmp_path: Path, names):
+    with pytest.raises(gen_sbom.SbomError, match="Cargo graph name"):
+        gen_sbom.augment_sbom(
+            copy.deepcopy(_base_bom()),
+            additional_cargo=[(name, tmp_path / "Cargo.toml") for name in names],
+            output_path=tmp_path / "sbom.json",
+        )
 
 
 def test_cli_builds_atomic_reproducible_complete_document(tmp_path: Path):

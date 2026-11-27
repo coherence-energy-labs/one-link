@@ -1,15 +1,38 @@
 # File-engine benchmark results
 
+## Current measurement contract — November 24, 2026
+
+The benchmark implementation now records every attempt, verifies receiver bytes
+and application completion, and uses explicit representative corpora. Transport
+comparisons require requested routes and actual payload-accounting receipts.
+Unavailable or unverified routes produce an inconclusive result and no speedup.
+The current desktop file channel may be authenticated TCP; peer pinning does
+not identify its payload transport.
+
+See [benchmark acceptance policy](../bench_baselines/README.md) for current
+commands, the alternating native-artifact gate, production-preparation profiles,
+raw-sample/provenance fields, and pass/fail/inconclusive semantics.
+
+## Historical measurements below — retained, not requalified
+
+All numerical tables and original interpretations below describe the dated
+May 2026 experiments. Their repetitive corpus, incomplete attempt accounting
+and unverified transport selection prevent their use as current unique-data,
+LAN/WAN, transport-comparison or release-acceptance evidence. They remain a
+historical record; run the corrected harness to make a new qualified claim.
+A loopback observation does not establish LAN line rate, and sampled RSS at
+a few sizes does not prove a constant-memory bound.
+
+
 > Run with `python scripts/bench_file_engine.py --json results.json`.
 > The numbers below are from a Windows 11 laptop on loopback (no
 > real network), Python 3.14, native crate built in release mode.
-> Use as a baseline for regression detection; absolute numbers
-> will vary by hardware. Updated 2026-05-19 on
+> Historical observation only. Updated 2026-05-19 on
 > commit b03fbe0 (`push-relay-health`).
 
 ## Headline numbers
 
-| Metric | Value | What this proves |
+| Metric | Value | Original interpretation (historical, unqualified) |
 |---|---|---|
 | **256 MiB receiver RSS peak** | 90.6 MiB | Stream-to-disk works. Pre-Wave-1d this would have been ~340 MiB (full file in heap + base RSS). Overhead ratio **0.354×** — receiver uses LESS memory than the file size. |
 | **256 MiB sender RSS peak** | 94.0 MiB | Sender also streams; overhead ratio **0.367×**. Symmetric memory hygiene end-to-end. |
@@ -61,12 +84,10 @@ plaintext (~256 KiB) is in heap at any given moment.
 | Aggregate throughput | 80.8 MiB/s |
 | Completion rate | 4/4 |
 
-A single 8 MiB transfer runs at ~100 MiB/s in 80 ms; 4 in parallel
-take 400 ms instead of the perfect-parallel 80 ms. The per-peer
-send-lock serializes work through one channel. The architecture
-fights the bench here; this isn't a defect to fix in the engine,
-it's a property of the WebRTC datagram channel that QUIC's
-multi-stream model would unlock.
+The historical concurrent observation was slower than ideal parallel scaling.
+Its uncontrolled route and missing per-stage timing cannot attribute that
+effect to WebRTC, QUIC, a particular lock, or any specific transport property.
+Use the corrected receipt-aware harness before drawing a causal conclusion.
 
 ## Resume effectiveness
 
@@ -253,23 +274,21 @@ clean Wave 2f+ ships QUIC into the CDC chunk loop too — the earlier
 attempt did and regressed 8 MiB transfers by ~2200×, so it was
 reverted. Tracked by the documented xfail.
 
-This is why the QUIC-vs-WebRTC A/B at 16 MiB looks like this:
+The historical pinned/unpinned experiment reported the following observations.
+It did not establish a QUIC-versus-WebRTC comparison:
 
 | Phase | Wall time | Throughput |
 |---|---|---|
 | Pinned (intended QUIC) | 0.236 s | 67.9 MiB/s |
-| Unpinned (WebRTC) | 0.142 s | 112.5 MiB/s |
+| Unpinned (payload route unverified) | 0.142 s | 112.5 MiB/s |
 | "Speedup" | **0.60×** | — |
 
-The "speedup" is < 1× because the pinned phase pays QUIC dial +
-`broadcast_endpoint_to_paired` coordination cost without taking
-the QUIC fast path for the bytes. The CDC path that actually
-carries the data is the same in both phases. The right read of
-this number is: **on loopback today, the QUIC overhead for a
-file-sized transfer is real and not yet offset by a faster wire**.
-Real network latency (where QUIC's congestion control + 0-RTT
-matter most) will make the picture different; this is one of the
-two-laptop bring-up's first measurements.
+The ratio is retained as an uncontrolled historical observation. It proves
+neither a QUIC overhead nor a WebRTC speed advantage. The current desktop
+`send_file` contract accepts `auto`, `tcp`, and `relay`; forced `quic` or
+`webrtc` requests fail explicitly. Native primitives and browser DataChannels
+must be qualified through their own complete delivery paths before a new
+transport comparison is published.
 
 ## Wave 2 closeout measurements (median of 2 runs on loopback)
 
@@ -289,7 +308,7 @@ two new scenarios are baselines, not regressions.
 | Resume after kill+restart | 3.4 s | unchanged |
 | Sidecar persist | 759 µs/op | unchanged |
 | Cache GC eviction | 7950 files/s | unchanged |
-| **QUIC vs WebRTC @ 16 MiB** | **0.60×** (QUIC slower) | see "Honest QUIC status" above |
+| **Uncontrolled pinned/unpinned @ 16 MiB** | **0.60×** (unqualified ratio) | payload routes were not verified |
 | **Many-small-files (20 × 4 KiB sequential)** | 605 ms total / **30.2 ms per file avg** | baseline before FILE_OFFER_BATCH fires on this path |
 | **Share-link round-trip @ 1 MiB** | mint 3.4 ms + delivery 59.9 ms = **63 ms total (15.8 MiB/s)** | one-time bearer token + 1 MiB blob |
 

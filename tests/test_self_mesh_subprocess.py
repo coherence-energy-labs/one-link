@@ -99,6 +99,7 @@ def _wait_self_mesh_event(
     raise AssertionError(f"self-mesh event {event!r} not observed; last={last!r}")
 
 
+@pytest.mark.live_daemon
 def test_self_mesh_remote_send_crosses_real_daemon_transport(tmp_path: Path):
     with daemon_pair(pin_trust=True) as p:
         # Warm the encrypted channel and ensure both daemons have peer rows.

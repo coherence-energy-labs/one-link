@@ -17,20 +17,22 @@
 # usable. Proving the UI *runs* needs a live daemon and authenticated API traffic; that heavier
 # experiment has been done on Windows only. A green run here is the sentence above and nothing more.
 
+# Every PR emits native shell gate. Only a verified source diff can mark the
+# three-OS matrix not applicable: every changed path is applicable unless a
+# reviewed inert rule proves no job here reads it. Failed scope or skipped
+# required work blocks. A pull request is judged by scripts/native_ci_scope.py
+# as it exists at its BASE revision; see docs/RELEASE_PROTECTION.md.
+#
+# Pushes to master always run the work. There is no `paths:` filter: GitHub's
+# push filter sees at most 300 files and cannot express "applicable unless
+# proven inert". The scope script decides, and for a push it requires the work.
 name: native shell builds
 
 on:
+  pull_request:
   push:
     branches: [master]
-    paths:
-      - 'native/ol_shell/**'
-      - 'src/one_link/web/index.html'      # the pin's input: a change here must rebuild
-      - '.github/workflows/native_shell.yml'
-  pull_request:
-    paths:
-      - 'native/ol_shell/**'
-      - 'src/one_link/web/index.html'
-      - '.github/workflows/native_shell.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -40,8 +42,57 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  applicability:
+    name: native shell applicability
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      applicable: ${{ steps.scope.outputs.applicable }}
+      checkout_sha: ${{ steps.scope.outputs.checkout_sha }}
+      base_sha: ${{ steps.scope.outputs.base_sha }}
+      head_sha: ${{ steps.scope.outputs.head_sha }}
+      comparison_base_sha: ${{ steps.scope.outputs.comparison_base_sha }}
+      proof: ${{ steps.scope.outputs.proof }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify source identities and classify the complete diff
+        id: scope
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # Pull requests are judged by the policy at their BASE revision, never
+          # by their own tree. A base that predates the policy falls back to the
+          # candidate's copy, which can skip nothing because its own file is in
+          # the diff. Every other event uses the tested checkout's copy. The
+          # policy re-derives this choice and verifies its own bytes.
+          policy_rev="$GITHUB_SHA"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            listing="$(git ls-tree --full-tree --name-only "$PR_BASE_SHA" -- scripts/native_ci_scope.py)"
+            if [ -n "$listing" ]; then
+              policy_rev="$PR_BASE_SHA"
+            fi
+          fi
+          policy="$RUNNER_TEMP/native-ci-policy.py"
+          git show "$policy_rev:scripts/native_ci_scope.py" > "$policy"
+          sha256sum "$policy"
+          python "$policy" scope --kind shell --policy-revision "$policy_rev" --report native-scope.json
+      - name: Preserve applicability evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-shell-scope-${{ github.run_id }}-${{ github.run_attempt }}
+          path: native-scope.json
+          if-no-files-found: warn
+
   build:
     name: ol_shell / ${{ matrix.os }}
+    needs: applicability
+    if: needs.applicability.outputs.applicable == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false          # one platform's break must not hide another's
@@ -50,6 +101,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.applicability.outputs.checkout_sha }}
           # Without this, checkout leaves the job's token in `.git/config` on the runner, where
           # any later step -- or an uploaded artifact -- can carry it off. This job only needs to
           # READ the tree to compile it. Matches every other workflow in this repo.
@@ -59,6 +111,9 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
+
+      - name: verify the pinned owner page matches its canonical sources
+        run: python scripts/build_owner_ui.py --page owner --check
 
       - name: install Rust toolchain
         shell: bash
@@ -79,6 +134,19 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: native/ol_shell
+
+      - name: verify reviewed vendor source and upstream patch
+        run: python scripts/verify_vendor_patches.py --fetch-upstream --report test-results/vendor-provenance.json
+
+      - name: optimized GLib Variant iterator regression tests
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: '3'
+        run: |
+          mkdir -p test-results
+          cargo test --manifest-path native/ol_shell/Cargo.toml --locked --release \
+            -p ol_shell_glib_regression 2>&1 | tee test-results/glib-optimized.log
 
       - name: build the window
         working-directory: native/ol_shell
@@ -133,3 +201,46 @@ jobs:
           else
             python scripts/smoke_native_shell.py --timeout 120
           fi
+
+      - name: retain vendor and native window qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-shell-qualification-${{ matrix.os }}
+          path: test-results/
+          if-no-files-found: warn
+
+  aggregate:
+    name: native shell gate
+    if: always()
+    needs: [applicability, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require applicable work or a verified not-applicable diff
+        env:
+          NATIVE_CI_NEEDS: ${{ toJSON(needs) }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # Pull requests are judged by the policy at their BASE revision, never
+          # by their own tree. A base that predates the policy falls back to the
+          # candidate's copy, which can skip nothing because its own file is in
+          # the diff. Every other event uses the tested checkout's copy. The
+          # policy re-derives this choice and verifies its own bytes.
+          policy_rev="$GITHUB_SHA"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            listing="$(git ls-tree --full-tree --name-only "$PR_BASE_SHA" -- scripts/native_ci_scope.py)"
+            if [ -n "$listing" ]; then
+              policy_rev="$PR_BASE_SHA"
+            fi
+          fi
+          policy="$RUNNER_TEMP/native-ci-policy.py"
+          git show "$policy_rev:scripts/native_ci_scope.py" > "$policy"
+          sha256sum "$policy"
+          python "$policy" gate --kind shell --policy-revision "$policy_rev"

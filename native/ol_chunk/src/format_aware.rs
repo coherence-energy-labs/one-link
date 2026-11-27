@@ -31,8 +31,11 @@
 //!   floor — two LFHs <8 KiB apart only produce one boundary.
 
 use crate::blake3_wrap;
-use crate::cdc::{Boundary, CdcParams, ChunkScanner};
+use crate::cdc::{scan_to_vec_parallel_with_params, Boundary, CdcParams};
 use crate::error::ChunkError;
+use crate::select::{CutSelector, HEAD_BYTES};
+use crate::walk::{self, RecordWalk};
+use rayon::prelude::*;
 
 /// Container formats recognized by the format-aware chunker.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -135,6 +138,12 @@ pub fn detect_format(leading: &[u8], path_extension: Option<&str>) -> Option<Con
 #[must_use]
 pub fn h264_keyframe_offsets(buffer: &[u8]) -> Vec<usize> {
     let mut offsets = Vec::new();
+    for_each_h264_keyframe(buffer, |pos| offsets.push(pos));
+    offsets
+}
+
+/// [`h264_keyframe_offsets`] as a visitor, in ascending order, holding no list.
+fn for_each_h264_keyframe(buffer: &[u8], mut visit: impl FnMut(usize)) {
     let mut i = 0usize;
     while i + 4 < buffer.len() {
         // Look for the 4-byte start code (0x00 0x00 0x00 0x01) or the
@@ -166,11 +175,10 @@ pub fn h264_keyframe_offsets(buffer: &[u8]) -> Vec<usize> {
         // needs IDR-marked cuts. We also include SPS because the
         // SPS-PPS-IDR triplet is the canonical GOP-start pattern.
         if matches!(nal_type, 5 | 7) {
-            offsets.push(i);
+            visit(i);
         }
         i += start_code_len + 1;
     }
-    offsets
 }
 
 /// Helper: does the leading 8 bytes look plausibly like an ISO BMFF
@@ -189,86 +197,40 @@ fn matches_iso_bmff_extension(leading: &[u8]) -> bool {
 /// a forced cut. Stops on the first malformed header so a
 /// non-BMFF buffer that happens to match the leading-bytes check
 /// can't drive the scanner off a cliff.
+///
+/// Total on every input, and the same walker (`walk::walk_mp4_boxes`) as
+/// [`crate::stream::mp4_box_offsets_seekable`], so the two agree byte for
+/// byte. Box sizes are untrusted 32/64-bit values; no position arithmetic
+/// can wrap.
 #[must_use]
 pub fn mp4_box_offsets(buffer: &[u8]) -> Vec<usize> {
+    collect_offsets(buffer, RecordWalk::mp4())
+}
+
+/// Every record start a walk yields over an in-memory buffer.
+fn collect_offsets(buffer: &[u8], mut walk: RecordWalk) -> Vec<usize> {
+    let mut source = walk::Memory(buffer);
     let mut offsets = Vec::new();
-    let mut pos = 0usize;
-    while pos + 8 <= buffer.len() {
-        let size = u64::from(u32::from_be_bytes([
-            buffer[pos],
-            buffer[pos + 1],
-            buffer[pos + 2],
-            buffer[pos + 3],
-        ]));
-        let kind = &buffer[pos + 4..pos + 8];
-        // Sanity: the 4-byte type MUST be 4 ASCII chars. Any non-
-        // printable rejects the rest of the buffer.
-        if !kind.iter().all(|b| b.is_ascii_alphanumeric() || *b == b' ') {
-            break;
-        }
+    loop {
+        let Ok(next) = walk.next(&mut source);
+        let Some((pos, _)) = next else {
+            return offsets;
+        };
         offsets.push(pos);
-        let advance = match size {
-            // Size == 1 means a 64-bit extended size in the next 8
-            // bytes (rare in practice; bail out if not enough room).
-            1 => {
-                if pos + 16 > buffer.len() {
-                    break;
-                }
-                let mut be = [0u8; 8];
-                be.copy_from_slice(&buffer[pos + 8..pos + 16]);
-                u64::from_be_bytes(be)
-            }
-            // Size == 0 means "to end of file". This is the last
-            // box; stop after collecting its offset.
-            0 => break,
-            _ => size,
-        };
-        // Defensive: a corrupt size field smaller than the header
-        // would loop forever. Refuse to advance less than 8 bytes.
-        if advance < 8 {
-            break;
-        }
-        let Ok(advance) = usize::try_from(advance) else {
-            break;
-        };
-        let Some(next_pos) = pos.checked_add(advance) else {
-            break;
-        };
-        pos = next_pos;
     }
-    offsets
 }
 
 /// Walk a RIFF/WAV buffer and return the offset of the `data` chunk
 /// header (length-prefixed RIFF sub-chunk). The data chunk is the
 /// dominant payload of a WAV; cutting there isolates the audio
 /// samples from the variable-size metadata before it.
+///
+/// Same walker as [`crate::stream::wav_data_offset_seekable`]; sizes are
+/// widened to `u64` and positions advanced with checked arithmetic.
 #[must_use]
 pub fn wav_data_offset(buffer: &[u8]) -> Option<usize> {
-    if buffer.len() < 12 || &buffer[0..4] != b"RIFF" || &buffer[8..12] != b"WAVE" {
-        return None;
-    }
-    let mut pos = 12usize;
-    while pos + 8 <= buffer.len() {
-        let id = &buffer[pos..pos + 4];
-        let size = u32::from_le_bytes([
-            buffer[pos + 4],
-            buffer[pos + 5],
-            buffer[pos + 6],
-            buffer[pos + 7],
-        ]) as usize;
-        if id == b"data" {
-            return Some(pos);
-        }
-        // RIFF sub-chunks are byte-aligned but their size word is
-        // not padded; the actual layout pads odd sizes by 1.
-        let advance = 8 + size + (size & 1);
-        if advance < 8 {
-            break;
-        }
-        pos = pos.saturating_add(advance);
-    }
-    None
+    let Ok(offset) = walk::find_wav_data(&mut walk::Memory(buffer));
+    offset
 }
 
 /// Walk an MCAP v0 buffer and return structurally validated top-level
@@ -278,47 +240,11 @@ pub fn wav_data_offset(buffer: &[u8]) -> Option<usize> {
 /// after the 8-byte magic. A crashed/in-progress recording may not yet
 /// have trailing magic; in that case every complete prefix record is
 /// still usable as a conservative structural boundary.
+///
+/// Same walker as [`crate::stream::mcap_record_offsets_seekable`].
 #[must_use]
 pub fn mcap_record_offsets(buffer: &[u8]) -> Vec<usize> {
-    const RECORD_HEADER: usize = 9;
-    if buffer.len() < MCAP_MAGIC.len() + RECORD_HEADER
-        || !buffer.starts_with(&MCAP_MAGIC)
-        || buffer[MCAP_MAGIC.len()] != 0x01
-    {
-        return Vec::new();
-    }
-
-    let data_end = if buffer.ends_with(&MCAP_MAGIC) && buffer.len() >= 2 * MCAP_MAGIC.len() {
-        buffer.len() - MCAP_MAGIC.len()
-    } else {
-        buffer.len()
-    };
-    let mut offsets = Vec::new();
-    let mut pos = MCAP_MAGIC.len();
-
-    while pos + RECORD_HEADER <= data_end {
-        let opcode = buffer[pos];
-        if opcode == 0 {
-            break;
-        }
-        let mut raw_len = [0u8; 8];
-        raw_len.copy_from_slice(&buffer[pos + 1..pos + RECORD_HEADER]);
-        let Ok(content_len) = usize::try_from(u64::from_le_bytes(raw_len)) else {
-            break;
-        };
-        let Some(next) = pos
-            .checked_add(RECORD_HEADER)
-            .and_then(|value| value.checked_add(content_len))
-        else {
-            break;
-        };
-        if next > data_end {
-            break;
-        }
-        offsets.push(pos);
-        pos = next;
-    }
-    offsets
+    collect_offsets(buffer, RecordWalk::mcap())
 }
 
 /// Walk `buffer` and collect ZIP local-file-header offsets that pass the
@@ -336,8 +262,14 @@ pub fn mcap_record_offsets(buffer: &[u8]) -> Vec<usize> {
 #[must_use]
 pub fn zip_lfh_offsets(buffer: &[u8]) -> Vec<usize> {
     let mut out = Vec::new();
+    for_each_zip_lfh(buffer, |pos| out.push(pos));
+    out
+}
+
+/// [`zip_lfh_offsets`] as a visitor, in ascending order, holding no list.
+fn for_each_zip_lfh(buffer: &[u8], mut visit: impl FnMut(usize)) {
     if buffer.len() < ZIP_LFH_FIXED_LEN {
-        return out;
+        return;
     }
     let mut start = 0usize;
     // SIMD-search for the first signature byte; check full 4-byte
@@ -348,7 +280,7 @@ pub fn zip_lfh_offsets(buffer: &[u8]) -> Vec<usize> {
             break;
         }
         if buffer[i..i + 4] == ZIP_LFH_MAGIC && zip_lfh_sanity_check(&buffer[i..]) {
-            out.push(i);
+            visit(i);
             // Skip past the fixed prefix to avoid re-matching the same
             // header. Body false positives are caught by the sanity
             // gate above (cheap), not by trying to parse name_length /
@@ -361,7 +293,6 @@ pub fn zip_lfh_offsets(buffer: &[u8]) -> Vec<usize> {
             break;
         }
     }
-    out
 }
 
 /// Cheap structural sanity check on a candidate LFH. `tail` must include
@@ -393,12 +324,16 @@ fn zip_lfh_sanity_check(tail: &[u8]) -> bool {
     )
 }
 
-/// Run format-aware chunking. Returns the boundaries plus a parallel
-/// `Vec<bool>` indicating whether each chunk's *starting* edge was a
-/// format-forced cut (vs natural CDC).
+/// Run format-aware chunking (format-aware chunking v2). Returns the boundaries
+/// plus a parallel `Vec<bool>` indicating whether each chunk's *starting* edge
+/// was a format-forced cut (vs natural CDC).
 ///
-/// When `format` is `None` or the buffer doesn't contain any forced
-/// cuts, falls back to plain CDC.
+/// The container's structural candidates (ZIP local file headers, ISO BMFF
+/// boxes, the WAV `data` chunk, H.264 IDR/SPS NAL units, MCAP records) are
+/// selected by the v2 rule in `select.rs` and cut at, and every segment between
+/// accepted cuts is one chunk (up to `max_size`) or plain CDC. Segments are
+/// hashed in parallel. When `format` is `None` or no candidate is accepted the
+/// result is plain CDC of the whole buffer.
 ///
 /// # Errors
 ///
@@ -409,106 +344,116 @@ pub fn scan_format_aware(
     params: CdcParams,
 ) -> Result<FormatAwareChunkSet, ChunkError> {
     params.validate()?;
-
-    let forced_cuts = match format {
-        Some(ContainerFormat::Zip) => zip_lfh_offsets(buffer),
-        Some(ContainerFormat::Mp4) => mp4_box_offsets(buffer),
-        Some(ContainerFormat::Wav) => {
-            // Single forced cut at the `data` chunk header (if any).
-            // The metadata in `fmt ` / `LIST` etc. before it tends
-            // to be small, so one cut is enough to isolate the
-            // audio body.
-            wav_data_offset(buffer).into_iter().collect()
-        }
-        Some(ContainerFormat::H264AnnexB) => {
-            // GOP-aligned cuts at IDR + SPS NAL units. A re-encoded
-            // video where only the first few frames changed will
-            // still hit the same IDR boundaries downstream, so dedup
-            // recovers everything past the edit.
-            h264_keyframe_offsets(buffer)
-        }
-        Some(ContainerFormat::Mcap) => {
-            // Keep MCAP record framing visible to the content-addressed
-            // layer. Large Chunk/Index records then remain independently
-            // reusable and seekable across local log revisions.
-            mcap_record_offsets(buffer)
-        }
-        None => Vec::new(),
-    };
-
-    // Absorb cuts that are too close together to be useful. Any cut
-    // less than `min_size` away from the previous accepted cut (or the
-    // start of the buffer) gets dropped to avoid degenerate tiny chunks.
-    let mut accepted: Vec<usize> = Vec::new();
-    let mut last_accepted: usize = 0;
-    let min = params.min_size as usize;
-    for &c in &forced_cuts {
-        if c >= last_accepted + min && c <= buffer.len().saturating_sub(min) {
-            accepted.push(c);
-            last_accepted = c;
-        }
-    }
-
-    if accepted.is_empty() {
-        // No forced cuts → pure CDC.
-        let bounds: Vec<Boundary> = ChunkScanner::with_params(buffer, params)?.collect();
-        let format_aware = vec![false; bounds.len()];
+    let cuts = select_cuts(buffer, format, params);
+    if cuts.is_empty() {
+        let boundaries = scan_to_vec_parallel_with_params(buffer, params)?;
+        let format_aware = vec![false; boundaries.len()];
         return Ok(FormatAwareChunkSet {
-            boundaries: bounds,
+            boundaries,
             format_aware,
         });
     }
-
-    // Build segment list `[0, cut_1)`, `[cut_1, cut_2)`, ... `[cut_n, end)`.
-    let mut segments: Vec<(usize, usize)> = Vec::with_capacity(accepted.len() + 1);
-    let mut prev = 0usize;
-    for &c in &accepted {
-        segments.push((prev, c));
-        prev = c;
-    }
-    segments.push((prev, buffer.len()));
-
-    let mut out_bounds: Vec<Boundary> = Vec::new();
-    let mut out_flags: Vec<bool> = Vec::new();
-    for (seg_idx, &(s, e)) in segments.iter().enumerate() {
-        let segment_buf = &buffer[s..e];
-        if segment_buf.is_empty() {
-            continue;
+    // Segments [0, cut_1), [cut_1, cut_2), ..., [cut_n, len): none is empty,
+    // since accepted cuts are strictly increasing and in [min_size, len - min_size].
+    let segments: Vec<(usize, usize)> = std::iter::once(0)
+        .chain(cuts.iter().copied())
+        .zip(cuts.iter().copied().chain(std::iter::once(buffer.len())))
+        .collect();
+    let chunked = segments
+        .par_iter()
+        .map(|&(start, end)| segment_chunks(buffer, start, end, params))
+        .collect::<Result<Vec<Vec<Boundary>>, ChunkError>>()?;
+    let mut out = FormatAwareChunkSet {
+        boundaries: Vec::with_capacity(chunked.iter().map(Vec::len).sum()),
+        format_aware: Vec::new(),
+    };
+    for (segment, chunks) in chunked.into_iter().enumerate() {
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            // A segment's first chunk starts at a format-forced cut, except
+            // the first segment's, which starts at the start of the buffer.
+            out.format_aware.push(i == 0 && segment > 0);
+            out.boundaries.push(chunk);
         }
-        // If the segment is shorter than `max_size`, emit it as a single
-        // chunk without running CDC (CDC would just emit one chunk
-        // anyway, plus the boundary tail).
-        let segment_bounds: Vec<Boundary> = if segment_buf.len() <= params.max_size as usize {
-            vec![Boundary {
-                start: 0,
-                end: segment_buf.len(),
-                raw_address: blake3_wrap::chunk_address_raw(segment_buf),
-            }]
-        } else {
-            ChunkScanner::with_params(segment_buf, params)?.collect()
+    }
+    Ok(out)
+}
+
+/// The accepted v2 cuts of an in-memory container, in increasing order.
+fn select_cuts(buffer: &[u8], format: Option<ContainerFormat>, params: CdcParams) -> Vec<usize> {
+    let mut selector = CutSelector::new(buffer.len(), params);
+    let mut cuts = Vec::new();
+    let head_at = |pos: usize| &buffer[pos..buffer.len().min(pos.saturating_add(HEAD_BYTES))];
+    let mut offer = |pos: usize, head: &[u8]| {
+        selector.offer(pos, head);
+        while let Some(cut) = selector.pop_accepted() {
+            cuts.push(cut);
+        }
+    };
+    match format {
+        // Every local file header (sanity-checked); a member edit stays inside
+        // its own chunks.
+        Some(ContainerFormat::Zip) => for_each_zip_lfh(buffer, |pos| offer(pos, head_at(pos))),
+        Some(ContainerFormat::Mp4) => offer_records(buffer, RecordWalk::mp4(), &mut offer),
+        // The `data` chunk header: isolates the audio samples from the
+        // variable-size metadata before them.
+        Some(ContainerFormat::Wav) => {
+            if let Some(pos) = wav_data_offset(buffer) {
+                offer(pos, head_at(pos));
+            }
+        }
+        // GOP starts (IDR and SPS NAL units): a re-encode that changes the
+        // first frames still meets the same IDR boundaries downstream.
+        Some(ContainerFormat::H264AnnexB) => {
+            for_each_h264_keyframe(buffer, |pos| offer(pos, head_at(pos)));
+        }
+        // MCAP record framing: large Chunk/Index records stay independently
+        // reusable across local log revisions.
+        Some(ContainerFormat::Mcap) => offer_records(buffer, RecordWalk::mcap(), &mut offer),
+        None => {}
+    }
+    selector.finish();
+    while let Some(cut) = selector.pop_accepted() {
+        cuts.push(cut);
+    }
+    cuts
+}
+
+/// Feed every record start of an in-memory walk, with its head bytes, to `offer`.
+fn offer_records(buffer: &[u8], mut walk: RecordWalk, offer: &mut impl FnMut(usize, &[u8])) {
+    let mut source = walk::Memory(buffer);
+    loop {
+        let Ok(next) = walk.next(&mut source);
+        let Some((pos, head)) = next else {
+            return;
         };
-
-        for (chunk_idx, b) in segment_bounds.into_iter().enumerate() {
-            // Translate offsets back to the source buffer.
-            let translated = Boundary {
-                start: b.start + s,
-                end: b.end + s,
-                raw_address: b.raw_address,
-            };
-            // The chunk starting at the segment's first byte (chunk_idx
-            // == 0) is the format-forced one — unless we're in the very
-            // first segment, whose first chunk is the natural start of
-            // the buffer (not a forced cut).
-            let forced = chunk_idx == 0 && seg_idx > 0;
-            out_bounds.push(translated);
-            out_flags.push(forced);
-        }
+        offer(pos, head);
     }
+}
 
-    Ok(FormatAwareChunkSet {
-        boundaries: out_bounds,
-        format_aware: out_flags,
-    })
+/// The chunks of the segment `[start, end)` of `buffer`: one chunk up to
+/// `max_size`, plain CDC above it.
+fn segment_chunks(
+    buffer: &[u8],
+    start: usize,
+    end: usize,
+    params: CdcParams,
+) -> Result<Vec<Boundary>, ChunkError> {
+    let segment = &buffer[start..end];
+    if segment.len() <= params.max_size as usize {
+        return Ok(vec![Boundary {
+            start,
+            end,
+            raw_address: blake3_wrap::chunk_address_raw(segment),
+        }]);
+    }
+    Ok(scan_to_vec_parallel_with_params(segment, params)?
+        .into_iter()
+        .map(|b| Boundary {
+            start: b.start + start,
+            end: b.end + start,
+            raw_address: b.raw_address,
+        })
+        .collect())
 }
 
 /// Result of [`scan_format_aware`]: boundaries plus a parallel `bool`
@@ -548,6 +493,7 @@ impl FormatAwareChunkSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cdc::ChunkScanner;
 
     fn make_dummy_zip(entries: usize, entry_size: usize) -> Vec<u8> {
         // Build a minimum-shape ZIP-like buffer: each entry is an LFH

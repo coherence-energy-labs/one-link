@@ -1,0 +1,12 @@
+[package]
+name = "ol_shell_glib_regression"
+version = "0.1.0"
+edition = "2021"
+description = "Regression checks for the reviewed Linux shell GLib backport"
+license = "Apache-2.0"
+publish = false
+
+# The workspace override selects the exact reviewed local GLib source. This
+# harness is not part of the shipped window or a default workspace build.
+[target.'cfg(target_os = "linux")'.dependencies]
+glib = "=0.18.5"

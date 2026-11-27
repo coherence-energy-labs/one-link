@@ -18,7 +18,8 @@
 //! engine's wire-format compatibility surface — changing them silently
 //! breaks dedup with peers running older builds.
 
-use ol_chunk::{scan_to_vec, Boundary};
+use ol_chunk::{scan_to_vec, scan_to_vec_parallel, stream::scan_stream, Boundary, CdcParams};
+use std::io::Cursor;
 
 /// Deterministic xorshift fill. Seed pinned for reproducibility.
 fn pseudo_random_buf(seed: u64, len: usize) -> Vec<u8> {
@@ -33,41 +34,116 @@ fn pseudo_random_buf(seed: u64, len: usize) -> Vec<u8> {
     buf
 }
 
-/// Expected boundaries (start offsets) produced by ADR-0001 kernel on
-/// `pseudo_random_buf(0xDEAD_BEEF_CAFE_F00D, 1 MiB)`.
-///
-/// These are filled in the first time CI runs on the reference build by
-/// reading `boundary.start` for every yielded boundary. After that, this
-/// list is the determinism contract: any change here is a wire-format
-/// break.
-///
-/// For the initial commit we only assert the *count* is stable; once
-/// the first reference run happens in CI we'll pin the exact offset list.
-const EXPECTED_BOUNDARY_COUNT_RANGE: std::ops::RangeInclusive<usize> = 12..=20;
+/// Frozen before the streaming remediation using the audited 0.22.1 native
+/// build (1279a450). Exact starts, ends and hashes are committed; CI never
+/// regenerates this file. The input hash also freezes the corpus generator.
+const GOLDEN: &str = include_str!("fixtures/cdc_golden_v1.txt");
+
+#[derive(Debug, Eq, PartialEq)]
+struct GoldenFixture {
+    input_len: usize,
+    input_hash: [u8; 32],
+    boundaries: Vec<Boundary>,
+}
+
+fn parse_golden_fixture(fixture: &str, name: &str) -> GoldenFixture {
+    let marker = format!("[{name}]");
+    // `lines` recognizes both LF and CRLF without changing the fixture values.
+    let mut lines = fixture.lines();
+    assert!(
+        lines.any(|line| line == marker),
+        "missing golden fixture section {name}"
+    );
+    let mut lines = lines.take_while(|line| !line.starts_with('['));
+    let identity: Vec<&str> = lines.next().unwrap().split_whitespace().collect();
+    assert_eq!(identity.len(), 3);
+    assert_eq!(identity[0], "input");
+    let boundaries = lines
+        .map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(fields.len(), 3);
+            Boundary {
+                start: fields[0].parse().unwrap(),
+                end: fields[1].parse().unwrap(),
+                raw_address: hex::decode(fields[2]).unwrap().try_into().unwrap(),
+            }
+        })
+        .collect();
+    GoldenFixture {
+        input_len: identity[1].parse().unwrap(),
+        input_hash: hex::decode(identity[2]).unwrap().try_into().unwrap(),
+        boundaries,
+    }
+}
+
+fn assert_golden(name: &str, buf: &[u8]) {
+    let expected = parse_golden_fixture(GOLDEN, name);
+    assert_eq!(expected.input_len, buf.len());
+    assert_eq!(expected.input_hash, *blake3::hash(buf).as_bytes());
+    for (engine, boundaries) in [
+        ("serial", scan_to_vec(buf)),
+        ("parallel", scan_to_vec_parallel(buf)),
+        (
+            "streamed",
+            scan_stream(Cursor::new(buf), buf.len(), CdcParams::default()).unwrap(),
+        ),
+    ] {
+        assert_eq!(
+            boundaries, expected.boundaries,
+            "fixture {name}, engine {engine}"
+        );
+        assert_eq!(boundaries.first().unwrap().start, 0);
+        assert_eq!(boundaries.last().unwrap().end, buf.len());
+        for b in &boundaries {
+            assert_eq!(
+                b.raw_address,
+                *blake3::hash(&buf[b.start..b.end]).as_bytes()
+            );
+        }
+        for pair in boundaries.windows(2) {
+            assert_eq!(pair[0].end, pair[1].start);
+        }
+    }
+}
 
 #[test]
-fn boundaries_are_within_expected_count_range() {
-    let buf = pseudo_random_buf(0xDEAD_BEEF_CAFE_F00D, 1024 * 1024);
-    let boundaries: Vec<Boundary> = scan_to_vec(&buf);
-    let count = boundaries.len();
-    assert!(
-        EXPECTED_BOUNDARY_COUNT_RANGE.contains(&count),
-        "1 MiB random buffer with default CDC params should produce \
-         {EXPECTED_BOUNDARY_COUNT_RANGE:?} boundaries, got {count}",
+fn frozen_fixture_parses_identically_with_lf_or_crlf() {
+    // Git may check this text fixture out with CRLF on Windows. Exercise both
+    // encodings on every host, comparing the full corpus identity and every
+    // frozen start, end and hash rather than only checking section discovery.
+    let lf = GOLDEN.replace("\r\n", "\n");
+    let crlf = lf.replace('\n', "\r\n");
+    for name in ["RANDOM", "ZEROS", "EDITED"] {
+        assert_eq!(
+            parse_golden_fixture(&crlf, name),
+            parse_golden_fixture(&lf, name),
+            "newline encoding changed fixture {name}"
+        );
+    }
+}
+
+#[test]
+fn frozen_random_boundaries_and_hashes_match_all_engines() {
+    assert_golden(
+        "RANDOM",
+        &pseudo_random_buf(0xDEAD_BEEF_CAFE_F00D, 1024 * 1024),
     );
+}
 
-    // Every boundary's BLAKE3 must equal hashing the underlying slice.
-    for b in &boundaries {
-        let actual = blake3::hash(&buf[b.start..b.end]);
-        assert_eq!(b.raw_address, *actual.as_bytes());
-    }
+#[test]
+fn frozen_zero_boundaries_and_hashes_match_all_engines() {
+    assert_golden("ZEROS", &vec![0; 640 * 1024]);
+}
 
-    // Boundaries tile the buffer exactly.
-    assert_eq!(boundaries[0].start, 0);
-    assert_eq!(boundaries.last().unwrap().end, buf.len());
-    for w in boundaries.windows(2) {
-        assert_eq!(w[0].end, w[1].start);
+#[test]
+fn frozen_edited_boundaries_and_hashes_match_all_engines() {
+    let original = pseudo_random_buf(0xDEAD_BEEF_CAFE_F00D, 1024 * 1024);
+    let mut edited = original[..512 * 1024].to_vec();
+    for _ in 0..317 {
+        edited.extend_from_slice(b"one-link-edit\0");
     }
+    edited.extend_from_slice(&original[512 * 1024..]);
+    assert_golden("EDITED", &edited);
 }
 
 #[test]

@@ -101,11 +101,33 @@ def test_apply_online_state_helper_present(index_html: str):
     assert "function _applyOnlineState(online)" in index_html
 
 
-def test_apply_online_state_toggles_show_class(index_html: str):
+def test_apply_online_state_reports_to_the_status_line_owner(index_html: str):
+    """The offline fact goes to windowLink, which owns the status line.
+
+    Until 2026-11-25 this helper toggled ``.show`` on the element itself,
+    the event socket rewrote the same element's text, and the session
+    handler created a second element on top of it. Three writers of one
+    line is how "Restoring One Link…" and "access key expired" came to be
+    printed over each other. What the line shows for each combination of
+    facts is tested in tests/js/test_window_link.cjs; that offline really
+    shows and hides it in a browser, in tests/e2e/test_window_status_line.py.
+    """
     idx = index_html.find("function _applyOnlineState(online)")
-    snippet = index_html[idx:idx + 500]
-    assert '#offline-banner' in snippet
-    assert 'classList.toggle("show", !online)' in snippet
+    end = index_html.find("\n  }", idx)
+    body = index_html[idx:end]
+    assert "windowLink.setOffline(!online);" in body
+    assert "classList" not in body and "querySelector" not in body
+
+
+def test_exactly_one_function_touches_the_status_line_element(index_html: str):
+    """One reader of ``#offline-banner`` in the whole page: the renderer
+    windowLink calls. A second one is a second writer of the line."""
+    assert index_html.count('querySelector("#offline-banner")') == 1
+    assert index_html.count('getElementById("offline-banner")') == 0
+    idx = index_html.find('querySelector("#offline-banner")')
+    owner = index_html.rfind("\n  function ", 0, idx)
+    assert index_html[owner:idx].lstrip().startswith("function _renderWindowStatus(kind)")
+    assert index_html.count('id="offline-banner"') == 1
 
 
 def test_initial_state_read_at_boot(index_html: str):

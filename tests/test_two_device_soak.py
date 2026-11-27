@@ -138,6 +138,7 @@ def _assert_no_silent_fallback(handle, *, allow: tuple = ()) -> None:
 # Phase A — chat soak
 # ────────────────────────────────────────────────────────────────────
 
+@pytest.mark.live_daemon
 def test_soak_chat_50_messages():
     """50 messages from A → B, then 50 B → A, verify both sides
     received the full set without dropping or reordering body text.
@@ -191,6 +192,7 @@ def test_soak_chat_50_messages():
         )
 
 
+@pytest.mark.live_daemon
 def test_soak_long_message():
     """A 1000-char paste must round-trip intact. This is the surface
     that the collapsible-long-message UI feature targets."""
@@ -202,6 +204,7 @@ def test_soak_long_message():
         assert _wait_for_inbound(p.b, body, timeout=5.0)
 
 
+@pytest.mark.live_daemon
 def test_soak_unicode_emoji_burst():
     """Mixed-script body + emoji on every message in a 20-message
     burst. Tests both encoding stability AND the burst-doesn't-drop
@@ -237,6 +240,7 @@ def test_soak_unicode_emoji_burst():
 # Phase B — file transfer soak
 # ────────────────────────────────────────────────────────────────────
 
+@pytest.mark.live_daemon
 def test_soak_small_file_round_trip(tmp_path):
     """1 KB file from A to B. Verifies that the file engine
     (chunk store + AEAD + WAL) handles a trivial round-trip end-
@@ -286,6 +290,7 @@ def test_soak_small_file_round_trip(tmp_path):
 # Phase C — bursty send
 # ────────────────────────────────────────────────────────────────────
 
+@pytest.mark.live_daemon
 def test_soak_burst_10_messages():
     """10 messages in <1s. Stresses the per-peer send pipeline + the
     ACK plumbing. If anything ratchets / re-queues incorrectly under
@@ -316,6 +321,7 @@ def test_soak_burst_10_messages():
 # Phase D — peer identity stability
 # ────────────────────────────────────────────────────────────────────
 
+@pytest.mark.live_daemon
 def test_soak_peer_caps_advertised():
     """After a brief settle, the peers entry on both sides should
     expose the capability set (app_version + features). Verifies
@@ -352,6 +358,7 @@ def test_soak_peer_caps_advertised():
 # Phase E — quoted aggregate gate
 # ────────────────────────────────────────────────────────────────────
 
+@pytest.mark.live_daemon
 def test_soak_no_silent_drops():
     """Anchor the no-silent-fallback contract on a fresh daemon
     pair. Brings up two daemons, pairs them via mDNS, then queries
@@ -377,6 +384,7 @@ def test_soak_no_silent_drops():
 # Phase F — regression cases that bit us this session
 # ────────────────────────────────────────────────────────────────────
 
+@pytest.mark.live_daemon
 def test_soak_large_file_round_trip(tmp_path):
     """10 MB file from A to B. Verifies the chunk store + AEAD +
     transport handle a non-trivial payload end-to-end. Previous
@@ -417,6 +425,7 @@ def test_soak_large_file_round_trip(tmp_path):
         _assert_no_silent_fallback(p.b)
 
 
+@pytest.mark.live_daemon
 def test_soak_message_after_reconnect():
     """Send → kill the receiver mid-session → restart receiver →
     sender sends a fresh message → receiver gets it. Exercises the
@@ -436,6 +445,7 @@ def test_soak_message_after_reconnect():
         assert _wait_for_inbound(p.b, "post-warmup", timeout=5.0)
 
 
+@pytest.mark.live_daemon
 def test_soak_send_after_brief_idle():
     """Idle the connection for 5 seconds, then send. Catches
     channel-state regressions where idle timeouts close the
@@ -461,6 +471,7 @@ def test_soak_send_after_brief_idle():
         )
 
 
+@pytest.mark.live_daemon
 def test_soak_bidi_interleaved():
     """A and B send alternating messages without waiting for each
     other's ACK. Catches concurrent-send + ratchet-ordering bugs
@@ -512,6 +523,7 @@ def test_soak_bidi_interleaved():
         _assert_no_silent_fallback(p.b)
 
 
+@pytest.mark.live_daemon
 def test_soak_long_body_round_trip():
     """5 KB body — well past the 600-char client-side collapse
     threshold AND past any small-buffer assumptions in the channel

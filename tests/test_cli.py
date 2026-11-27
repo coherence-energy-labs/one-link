@@ -205,6 +205,7 @@ def test_daemon_stop_revalidates_authenticated_pid_before_force_kill(monkeypatch
     assert checked == [4242]
 
 
+@pytest.mark.live_daemon
 @pytest.mark.timeout(120)
 def test_full_cli_round_trip():
     """Two daemons via the harness; drive A's CLI as a subprocess."""
@@ -232,6 +233,7 @@ def test_full_cli_round_trip():
         assert "hi from CLI" in bodies, bodies
 
 
+@pytest.mark.live_daemon
 @pytest.mark.timeout(120)
 def test_cli_send_file_round_trip():
     with daemon_pair(pin_trust=True) as p:

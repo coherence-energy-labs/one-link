@@ -8,8 +8,8 @@
 # buy a title bar. The shell is a LEAF BINARY — nothing links it, it only receives a URL and paints
 # — so its dependency set is isolated here and `../Cargo.toml` never sees it.
 #
-# The cost of that choice, stated: a second lockfile to audit and update. That is the right trade
-# for keeping `cargo audit` over the daemon meaningful.
+# This is a separately audited lockfile, alongside the main native and fuzz graphs.
+# All three are included in release and continuous dependency evidence.
 
 [package]
 name = "ol_shell"
@@ -19,29 +19,27 @@ description = "Native window host for the One Link UI (WebView2 / WKWebView / We
 license = "Apache-2.0"
 publish = false
 
-# Empty table => this directory is its own workspace root, so `cargo` does not try to attach it to
-# the parent workspace it physically sits inside.
+# The first-party regression harness uses this lock without importing upstream
+# benchmark / UI-test tooling into the window's dependency graph.
 [workspace]
+members = ["regression/glib_variant_backport"]
+exclude = ["vendor/glib-0.18.5"]
+default-members = ["."]
 
-# ── KNOWN ADVISORY, NAMED RATHER THAN SILENT ────────────────────────────────────────────────
-#
-# GHSA-wrw7-89jp-8q8g (medium) — unsoundness in the `Iterator`/`DoubleEndedIterator` impls for
-# `glib::VariantStrIter`, in glib 0.18.5.
-#
-# NOT FIXABLE HERE. 0.18.5 is the newest 0.18.x, and it is pinned by `gtk 0.18.2` <- `tao 0.36`.
-# The fix requires tao/gtk to move to glib 0.19+, which is upstream of this crate.
-#
-# SCOPE, measured rather than assumed:
-#   * glib is the LINUX GTK backend. `cargo tree -i glib` on Windows prints nothing — it is not
-#     in the Windows dependency graph at all, so Windows builds do not compile it.
-#   * this crate never references `glib` or `Variant`; the unsound iterators are not reachable
-#     from any code here.
-#   * ol_shell is a LEAF BINARY in its OWN workspace, so this does not enter the daemon's
-#     lockfile. The crates that touch keys, ciphertext and the wire are unaffected — which is
-#     the reason the workspace was split in the first place.
-#
-# This is the cost of choosing a webview stack, stated plainly. Re-check when tao releases a
-# version built on glib 0.19+, and delete this block when it lands.
+[patch.crates-io]
+glib = { path = "vendor/glib-0.18.5" }
+
+[package.metadata.one-link.vendored-patches]
+glib = "patches/glib-0.18.5.json"
+
+# The official two-line fix for RUSTSEC-2024-0429 / GHSA-wrw7-89jp-8q8g
+# is backported to the original glib 0.18.5 source, with its version/license
+# unchanged. This is a One Link maintained patch, not an upstream 0.18 release.
+# CI verifies every source byte and queries the registry ancestor's advisories:
+# cargo-audit alone omits local path packages. See patches/glib-0.18.5.json and
+# docs/DEPENDENCY_QUALIFICATION.md for qualification and migration obligations.
+# RUSTSEC-2024-0370: proc-macro-error 1.x is unmaintained, with no patched release.
+# This remaining warning stays visible; there are no globally ignored IDs.
 
 [dependencies]
 ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }

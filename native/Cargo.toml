@@ -56,6 +56,7 @@ members = [
     "ol_selector",
     "ol_radio_batcher",
     "ol_compress",
+    "ol_ct_audit",
     "one_link_native",
     # Future crates (added as they ship):
     # Future Phase A2:
@@ -78,6 +79,22 @@ members = [
     # "ol_active_inference",
     # "ol_grammar",
 ]
+exclude = ["vendor/ml-kem-0.2.3"]
+
+# Verified backport (same mechanism as ol_shell's glib backport). ml-kem
+# 0.2.3's CBD sampler indexed a table by bits that, during decapsulation's
+# re-encryption, derive from the decrypted message: a secret-dependent memory
+# index found by the constant-time audit (ol_ct_audit, case
+# pqkem_decapsulate_*). Upstream removed the table in ml-kem 0.3.4; the
+# backport replaces exactly that function and keeps 0.2.3's version, license
+# and key formats. CI verifies every source byte against the crates.io archive
+# and the reviewed diff (scripts/verify_vendor_patches.py) and queries the
+# registry ancestor's advisories. Retire it by migrating to ml-kem >= 0.3.4.
+[patch.crates-io]
+ml-kem = { path = "vendor/ml-kem-0.2.3" }
+
+[workspace.metadata.one-link.vendored-patches]
+ml-kem = "patches/ml-kem-0.2.3.json"
 
 # Pinned across all crates so the engine has one decision per dep.
 [workspace.dependencies]
@@ -118,10 +135,10 @@ bloomfilter       = "3.0"
 # Phase A2: QUIC transport (per ADR-0009, ADR-0010). Pin a stable quinn,
 # matching rustls + rcgen versions for self-signed identity-bound TLS.
 quinn             = { version = "0.11.9", default-features = false, features = ["rustls-aws-lc-rs", "runtime-tokio"] }
-rustls            = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls            = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen             = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 ring              = "0.17"
-tokio             = { version = "1.41", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
+tokio             = { version = "1.53.3", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
 ed25519-dalek     = { version = "2.1", features = ["rand_core", "pkcs8", "pem"] }
 x509-parser       = "0.16"
 # rand 0.8 for ed25519-dalek compatibility (it pins rand_core 0.6 which
@@ -170,6 +187,15 @@ codegen-units = 1
 strip = "symbols"
 panic = "abort"
 debug = 0
+
+[profile.ct-audit]
+# The constant-time audit (ol_ct_audit, scripts/run_ct_audit.py) must judge
+# the release code generation: same optimisation, LTO, codegen units and
+# panic strategy. It keeps symbols and line tables only so Valgrind can map
+# each report to a source line; DWARF line tables do not change codegen.
+inherits = "release"
+strip = "none"
+debug = "line-tables-only"
 
 [profile.bench]
 # Benchmarks need the same optimization as release.

@@ -1,8 +1,8 @@
 //! Duress gate: passphrase → volume unlock + covert signaling.
 
-use subtle::ConstantTimeEq;
+use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 use thiserror::Error;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Length of a volume secret.
 pub const VOLUME_SECRET_LEN: usize = 32;
@@ -41,6 +41,104 @@ pub enum DuressOutcome {
     },
 }
 
+/// What the gate decided, as a plain value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OutcomeKind {
+    /// The real passphrase was presented.
+    Real = 0,
+    /// The duress passphrase was presented.
+    Duress = 1,
+    /// The passphrase matched neither enrolment.
+    Rejected = 2,
+}
+
+/// The gate's decision in one uniform shape (see [`DuressGate::decide`]).
+///
+/// Every field is always written, whatever the outcome:
+///
+/// | outcome | `volume` | `covert_signal` |
+/// |---|---|---|
+/// | real | real-volume secret | zeros |
+/// | duress | decoy-volume secret | the covert signal |
+/// | rejected | zeros | zeros |
+///
+/// The accessors do not branch. Only [`Self::kind`] and
+/// [`Self::into_outcome`] turn the outcome into control flow, and they are
+/// where a caller chooses to reveal it. Secrets are zeroized on drop and
+/// never printed.
+pub struct GateDecision {
+    kind_code: u8,
+    volume: Volume,
+    covert_signal: [u8; SIGNAL_LEN],
+}
+
+impl GateDecision {
+    /// The outcome as its numeric code ([`OutcomeKind`] as `u8`), read
+    /// without branching.
+    #[must_use]
+    pub fn kind_code(&self) -> u8 {
+        self.kind_code
+    }
+
+    /// The outcome. Matching on it reveals the outcome to control flow.
+    #[must_use]
+    pub fn kind(&self) -> OutcomeKind {
+        // ct-audit: declassify (the caller asks for the real/duress/rejected verdict)
+        match self.kind_code {
+            0 => OutcomeKind::Real,
+            1 => OutcomeKind::Duress,
+            _ => OutcomeKind::Rejected,
+        }
+    }
+
+    /// The selected volume secret (zeros when rejected).
+    #[must_use]
+    pub fn volume(&self) -> &[u8; VOLUME_SECRET_LEN] {
+        &self.volume
+    }
+
+    /// The covert signal for a duress open; zeros otherwise.
+    #[must_use]
+    pub fn covert_signal(&self) -> &[u8; SIGNAL_LEN] {
+        &self.covert_signal
+    }
+
+    /// Classify into a [`DuressOutcome`]. This branches on the outcome and
+    /// its arms build different payloads, so it is not timing-uniform across
+    /// outcomes; see [`DuressGate::open`].
+    ///
+    /// # Errors
+    ///
+    /// [`GateError::Rejected`] when the passphrase matched neither enrolment.
+    pub fn into_outcome(self) -> Result<DuressOutcome, GateError> {
+        // ct-audit: declassify (real/duress/rejected verdict)
+        match self.kind_code {
+            0 => Ok(DuressOutcome::Real(Zeroizing::new(*self.volume))),
+            1 => Ok(DuressOutcome::Duress {
+                volume: Zeroizing::new(*self.volume),
+                covert_signal: self.covert_signal,
+            }),
+            _ => Err(GateError::Rejected),
+        }
+    }
+}
+
+impl Drop for GateDecision {
+    fn drop(&mut self) {
+        // `volume` zeroizes itself; the signal and the outcome are cleared too.
+        self.covert_signal.zeroize();
+        self.kind_code.zeroize();
+    }
+}
+
+impl std::fmt::Debug for GateDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Neither the secrets nor the outcome are printed.
+        f.debug_struct("GateDecision").finish_non_exhaustive()
+    }
+}
+
 /// Stateless gate that classifies a presented passphrase. Holds the
 /// per-account roots: `real_root` + `duress_root` + a paired-secret used
 /// to derive covert signals that only paired peers can decode.
@@ -69,77 +167,114 @@ impl DuressGate {
         }
     }
 
-    /// Open a volume given a presented passphrase.
+    /// Classify a presented passphrase without revealing the outcome through
+    /// control flow, memory access or the shape of the result.
     ///
-    /// The gate computes BOTH potential volume secrets in constant
-    /// time (so a timing-side-channel doesn't reveal which root the
-    /// passphrase derives from). The returned outcome tells the
-    /// caller what to do with the unlocked secret.
+    /// This is the gate's timing-uniform API. Every derivation runs on every
+    /// call, both comparisons are constant-time, and the result is selected
+    /// with constant-time selects into ONE record whose every field is always
+    /// written: a real open, a duress open and a rejection execute the same
+    /// instructions. `ol_ct_audit` proves no branch or memory index depends on
+    /// any secret here, and its statistical timing test compares the outcomes
+    /// directly.
     ///
-    /// **Caller invariant**: pass the SAME `passphrase_bytes` for both
-    /// the real and duress passphrase paths. The decision of which
-    /// passphrase a user typed is the operator's secret — this gate
-    /// only knows whether a presented bytes matches one of the two
-    /// derivations.
+    /// A caller that must not reveal the outcome through timing keeps
+    /// treating the record uniformly (for example: always installs
+    /// [`GateDecision::volume`], always writes
+    /// [`GateDecision::covert_signal`]) and only later lets the outcome
+    /// influence anything observable.
     ///
-    /// Implementation: derive_key("ol-duress-real-v1", root||passphrase)
-    /// for the real candidate, derive_key("ol-duress-decoy-v1", root||
-    /// passphrase) for the duress candidate. The gate's input is a
-    /// 32-byte "expected real" and "expected duress" hash that the
-    /// account setup precomputed; this `open()` compares against both
-    /// in constant time.
+    /// **Caller invariant**: pass the SAME `passphrase_bytes` for both the
+    /// real and duress passphrase paths. Which passphrase a user typed is the
+    /// operator's secret; the gate only learns whether the presented bytes
+    /// match one of the two enrolled derivations.
+    ///
+    /// # Errors
+    ///
+    /// [`GateError::InvalidInput`] for an empty passphrase. Its length is
+    /// public; nothing else about the input reaches control flow. A
+    /// passphrase that matches neither enrolment is NOT an error here: it is
+    /// a decision of kind [`OutcomeKind::Rejected`] carrying zeroed fields.
+    pub fn decide(
+        &self,
+        passphrase_bytes: &[u8],
+        expected_real_check: &[u8; 32],
+        expected_duress_check: &[u8; 32],
+    ) -> Result<GateDecision, GateError> {
+        if passphrase_bytes.is_empty() {
+            return Err(GateError::InvalidInput);
+        }
+        // Five derivations, unconditionally. (An earlier implementation
+        // derived 1, 2 or 0 values depending on the outcome, measurable at
+        // about 1.45x.) The keyed inputs and every intermediate are
+        // zeroized when they go out of scope.
+        let real_input = Zeroizing::new(concat(&self.real_root, passphrase_bytes));
+        let duress_input = Zeroizing::new(concat(&self.duress_root, passphrase_bytes));
+        let real_check = Zeroizing::new(blake3::derive_key("ol-duress-real-check-v1", &real_input));
+        let duress_check = Zeroizing::new(blake3::derive_key(
+            "ol-duress-decoy-check-v1",
+            &duress_input,
+        ));
+        let real_volume =
+            Zeroizing::new(blake3::derive_key("ol-duress-real-volume-v1", &real_input));
+        let decoy_volume = Zeroizing::new(blake3::derive_key(
+            "ol-duress-decoy-volume-v1",
+            &duress_input,
+        ));
+        let covert = Zeroizing::new(blake3::derive_key(
+            "ol-duress-covert-signal-v1",
+            &self.pair_secret,
+        ));
+
+        let real_match: Choice = real_check.ct_eq(expected_real_check);
+        let duress_match: Choice = duress_check.ct_eq(expected_duress_check);
+        // The real passphrase wins if a passphrase matches both enrolments.
+        let duress_selected = !real_match & duress_match;
+        let rejected = !real_match & !duress_match;
+
+        let mut volume = Zeroizing::new([0u8; VOLUME_SECRET_LEN]);
+        let mut covert_signal = [0u8; SIGNAL_LEN];
+        for i in 0..VOLUME_SECRET_LEN {
+            volume[i] = u8::conditional_select(&0, &real_volume[i], real_match);
+            volume[i].conditional_assign(&decoy_volume[i], duress_selected);
+        }
+        for i in 0..SIGNAL_LEN {
+            covert_signal[i] = u8::conditional_select(&0, &covert[i], duress_selected);
+        }
+        let mut kind_code = OutcomeKind::Real as u8;
+        kind_code.conditional_assign(&(OutcomeKind::Duress as u8), duress_selected);
+        kind_code.conditional_assign(&(OutcomeKind::Rejected as u8), rejected);
+        Ok(GateDecision {
+            kind_code,
+            volume,
+            covert_signal,
+        })
+    }
+
+    /// Open a volume given a presented passphrase: [`Self::decide`] followed
+    /// by [`GateDecision::into_outcome`].
+    ///
+    /// Everything up to the classification is timing-uniform (it is
+    /// `decide`). Turning the decision into a [`DuressOutcome`] is NOT: a
+    /// Rust enum can only be built by branching on its variant, and the
+    /// variants carry different payloads. Measured with the statistical
+    /// timing test (2026-11-25, Core Ultra 9 275HX): a duress `open` took
+    /// about 1 to 6 TSC ticks longer than a real one. Use `decide` wherever
+    /// the outcome itself must not be observable through timing; `open` is
+    /// the convenience for callers that act on the outcome immediately.
+    ///
+    /// # Errors
+    ///
+    /// [`GateError::InvalidInput`] for an empty passphrase;
+    /// [`GateError::Rejected`] when it matches neither enrolment.
     pub fn open(
         &self,
         passphrase_bytes: &[u8],
         expected_real_check: &[u8; 32],
         expected_duress_check: &[u8; 32],
     ) -> Result<DuressOutcome, GateError> {
-        if passphrase_bytes.is_empty() {
-            return Err(GateError::InvalidInput);
-        }
-        // ─── Constant-time hardened path ───────────────────────────────
-        // All four BLAKE3 derive_key calls (real_check, duress_check,
-        // real_volume, duress_volume, covert_signal) run UNCONDITIONALLY
-        // regardless of which branch is taken. The branch decision uses
-        // subtle::ConstantTimeEq for the comparisons + a final
-        // pattern-match that only selects which precomputed value to
-        // return — no early returns inside the BLAKE3 chain.
-        //
-        // This closes a real timing side-channel found by the gate's
-        // constant-time test: the previous implementation did 1 derive
-        // on real-path, 2 on duress-path, 0 on reject — measurable at
-        // ≈1.45× variance.
-        let real_check = blake3::derive_key(
-            "ol-duress-real-check-v1",
-            &concat(&self.real_root, passphrase_bytes),
-        );
-        let duress_check = blake3::derive_key(
-            "ol-duress-decoy-check-v1",
-            &concat(&self.duress_root, passphrase_bytes),
-        );
-        // Always compute both candidate volume secrets + the covert
-        // signal. Total cost: 5 derive_key calls. Identical across all
-        // three branches.
-        let real_volume = blake3::derive_key(
-            "ol-duress-real-volume-v1",
-            &concat(&self.real_root, passphrase_bytes),
-        );
-        let decoy_volume = blake3::derive_key(
-            "ol-duress-decoy-volume-v1",
-            &concat(&self.duress_root, passphrase_bytes),
-        );
-        let covert = blake3::derive_key("ol-duress-covert-signal-v1", &self.pair_secret);
-        // Constant-time compare against expected.
-        let real_match = real_check.ct_eq(expected_real_check).unwrap_u8() == 1;
-        let duress_match = duress_check.ct_eq(expected_duress_check).unwrap_u8() == 1;
-        match (real_match, duress_match) {
-            (true, _) => Ok(DuressOutcome::Real(Zeroizing::new(real_volume))),
-            (false, true) => Ok(DuressOutcome::Duress {
-                volume: Zeroizing::new(decoy_volume),
-                covert_signal: covert,
-            }),
-            (false, false) => Err(GateError::Rejected),
-        }
+        self.decide(passphrase_bytes, expected_real_check, expected_duress_check)?
+            .into_outcome()
     }
 
     /// Compute the covert signal a peer would expect from this gate.
@@ -270,5 +405,104 @@ mod tests {
             panic!("expected duress path");
         };
         assert_ne!(*real_vol, *decoy_vol);
+    }
+
+    #[test]
+    fn decision_fields_follow_the_documented_table_for_every_outcome() {
+        let g = fixed_gate();
+        let (real_pw, duress_pw, wrong_pw) = (
+            b"real".as_slice(),
+            b"duress".as_slice(),
+            b"neither".as_slice(),
+        );
+        let (r_check, _) = expected_checks(&g, real_pw);
+        let (_, d_check) = expected_checks(&g, duress_pw);
+        let zero = [0u8; 32];
+
+        let real = g.decide(real_pw, &r_check, &d_check).unwrap();
+        assert_eq!((real.kind_code(), real.kind()), (0, OutcomeKind::Real));
+        assert_ne!(real.volume(), &zero);
+        assert_eq!(real.covert_signal(), &zero, "a real open signals nothing");
+
+        let duress = g.decide(duress_pw, &r_check, &d_check).unwrap();
+        assert_eq!(
+            (duress.kind_code(), duress.kind()),
+            (1, OutcomeKind::Duress)
+        );
+        assert_ne!(duress.volume(), &zero);
+        assert_ne!(duress.volume(), real.volume());
+        assert_eq!(duress.covert_signal(), &g.signal_in_ratchet_header());
+
+        let rejected = g.decide(wrong_pw, &r_check, &d_check).unwrap();
+        assert_eq!(
+            (rejected.kind_code(), rejected.kind()),
+            (2, OutcomeKind::Rejected)
+        );
+        assert_eq!(
+            rejected.volume(),
+            &zero,
+            "a rejection returns no key material"
+        );
+        assert_eq!(rejected.covert_signal(), &zero);
+
+        assert_eq!(
+            g.decide(b"", &r_check, &d_check).unwrap_err(),
+            GateError::InvalidInput
+        );
+    }
+
+    #[test]
+    fn decide_and_open_agree_on_every_outcome() {
+        let g = fixed_gate();
+        let (real_pw, duress_pw) = (b"real".as_slice(), b"duress".as_slice());
+        let (r_check, _) = expected_checks(&g, real_pw);
+        let (_, d_check) = expected_checks(&g, duress_pw);
+        for pw in [real_pw, duress_pw, b"neither".as_slice()] {
+            let decision = g.decide(pw, &r_check, &d_check).unwrap();
+            let (volume, signal) = (*decision.volume(), *decision.covert_signal());
+            match (decision.into_outcome(), g.open(pw, &r_check, &d_check)) {
+                (Ok(DuressOutcome::Real(a)), Ok(DuressOutcome::Real(b))) => {
+                    assert_eq!((*a, *b), (volume, volume));
+                }
+                (
+                    Ok(DuressOutcome::Duress {
+                        volume: a,
+                        covert_signal: sa,
+                    }),
+                    Ok(DuressOutcome::Duress {
+                        volume: b,
+                        covert_signal: sb,
+                    }),
+                ) => {
+                    assert_eq!((*a, *b), (volume, volume));
+                    assert_eq!((sa, sb), (signal, signal));
+                }
+                (Err(GateError::Rejected), Err(GateError::Rejected)) => {}
+                other => panic!("decide and open disagree: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_passphrase_enrolled_as_both_opens_the_real_volume() {
+        // Same precedence as before the uniform core: real wins.
+        let g = fixed_gate();
+        let pw = b"shared";
+        let (r_check, d_check) = expected_checks(&g, pw);
+        let decision = g.decide(pw, &r_check, &d_check).unwrap();
+        assert_eq!(decision.kind(), OutcomeKind::Real);
+        assert_eq!(decision.covert_signal(), &[0u8; 32]);
+        assert!(matches!(
+            g.open(pw, &r_check, &d_check),
+            Ok(DuressOutcome::Real(_))
+        ));
+    }
+
+    #[test]
+    fn a_decision_never_prints_its_secrets_or_its_outcome() {
+        let g = fixed_gate();
+        let (r_check, d_check) = expected_checks(&g, b"real");
+        let shown = format!("{:?}", g.decide(b"real", &r_check, &d_check).unwrap());
+        assert_eq!(shown, "GateDecision { .. }");
     }
 }

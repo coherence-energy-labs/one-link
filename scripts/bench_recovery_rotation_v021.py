@@ -62,9 +62,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 def _bench(name: str, fn: Callable[[], object], iters: int = 1_000) -> dict:
     """Run fn iters times in a tight loop, repeat 5 times for
-    median + p95. Defaults to fewer iters than the audit bench
+    median and worst batch-average. Defaults to fewer iters than the audit bench
     because some of these primitives (Shamir wrap of 5 guardians)
     cost orders of magnitude more per op."""
+    if iters < 1:
+        raise ValueError("iters must be positive")
     # Warmup so per-op caches are hot.
     for _ in range(min(50, iters)):
         fn()
@@ -76,12 +78,14 @@ def _bench(name: str, fn: Callable[[], object], iters: int = 1_000) -> dict:
         t1 = time.perf_counter_ns()
         durations.append((t1 - t0) / iters)
     median = statistics.median(durations)
-    p95 = sorted(durations)[-1]
+    worst_batch_average = max(durations)
     return {
         "name": name,
         "iters": iters,
         "ns_per_op_median": median,
-        "ns_per_op_p95": p95,
+        "ns_per_op_worst_batch_average": worst_batch_average,
+        "batch_mean_ns_per_op_samples": durations,
+        "sample_kind": "batch means; not individual-operation tail latency",
         "ops_per_sec_median": 1e9 / median if median > 0 else float("inf"),
     }
 
@@ -395,7 +399,7 @@ def main() -> int:
         _bench_test_bundle_against_phrase,
     ]
     print("v0.21.x recovery + rotation primitives")
-    print(f"{'name':<46} {'ns/op (med)':>14} {'ns/op (p95)':>14} {'ops/sec':>14}")
+    print(f"{'name':<46} {'ns/op (med)':>14} {'worst batch avg':>14} {'ops/sec':>14}")
     print("-" * 92)
     results: list[dict] = []
     for b in benchmarks:
@@ -408,7 +412,7 @@ def main() -> int:
         print(
             f"{r['name']:<46}"
             f" {r['ns_per_op_median']:>14,.0f}"
-            f" {r['ns_per_op_p95']:>14,.0f}"
+            f" {r['ns_per_op_worst_batch_average']:>14,.0f}"
             f" {r['ops_per_sec_median']:>14,.0f}"
         )
     # JSON dump for regression tracking.

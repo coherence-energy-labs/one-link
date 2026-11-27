@@ -6,7 +6,9 @@ property — the user-visible reason these matter.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -62,6 +64,20 @@ def _assert_well_known_or_saturated_fallback(port: int) -> None:
     assert port > 0, "daemon failed to bind any port"
 
 
+def _assert_os_assigned(port: int) -> None:
+    """ONE_LINK_UI_PORT=0: a real port, and not one from the well-known range."""
+    assert 0 < port <= 65535, f"daemon published an impossible UI port {port}"
+    assert not _WELL_KNOWN_BASE <= port <= _WELL_KNOWN_BASE + _WELL_KNOWN_SPAN, (
+        f"daemon bound {port} in the well-known range although an OS-assigned port was requested"
+    )
+
+
+def _free_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
 def _control_request(
     port: int,
     cmd: str,
@@ -80,17 +96,32 @@ def _control_request(
     )
 
 
-def _read_port(home: Path, name: str, timeout: float = 12.0) -> int:
-    p = home / "data" / name
-    end = time.time() + timeout
-    while time.time() < end:
-        if p.exists():
-            try:
-                return int(p.read_text().strip())
-            except (ValueError, OSError):
-                pass
-        time.sleep(0.1)
-    raise RuntimeError(f"port file did not appear: {p}")
+# The daemon and log behind each home, so a missing port file can say why.
+_STARTED: dict[Path, tuple[subprocess.Popen, Path]] = {}
+
+
+def _read_port(home: Path, name: str, timeout: float | None = None) -> int:
+    """Wait for a port file; on failure say whether the daemon is alive and what it logged.
+
+    A daemon that is slow to start logs which startup step it is in. A bare
+    "port file did not appear" throws that away, and for a long time this
+    intermittent failure on hosted Windows runners stayed unexplained.
+
+    It is explained now, by that evidence. On 2026-11-27 a start took longer
+    than the flat 12 s this helper waited: every start-up step in the daemon's
+    log was slow, schema initialisation alone 8.1 s against 0.2 to 1.1 s on a
+    workstation. That is the runner's load, which none of these tests is
+    about, and the harness had already met and settled the same thing for its
+    own wait (see ``daemon_boot_budget_s``). The default here is now that one
+    budget. A daemon that never starts is still bounded, by it and by each
+    test's timeout.
+    """
+    from tests.harness import _read_port as read_port_with_evidence
+    from tests.harness import daemon_boot_budget_s
+
+    proc, log = _STARTED.get(home, (None, None))
+    wait = daemon_boot_budget_s() if timeout is None else timeout
+    return read_port_with_evidence(home, name, wait, proc=proc, log=log)
 
 
 def _read_text(
@@ -128,13 +159,23 @@ def _owner_api_status(port: int, token: str) -> int:
         return int(exc.code)
 
 
-def _spawn_daemon(home: Path, log: Path) -> subprocess.Popen:
+def _spawn_daemon(home: Path, log: Path, *, ui_port: str | None = "0") -> subprocess.Popen:
+    """Start a real daemon. ``ui_port`` is its ONE_LINK_UI_PORT; None leaves the variable unset.
+
+    The default is an OS-assigned port, so a test daemon never takes the
+    product's well-known UI port on a machine that also runs a real one. Only
+    the test of the default port policy passes None.
+    """
     # Live-daemon lane only: skip in the default hermetic gate.
     from tests.harness import private_mdns_type, require_live_daemon
 
     require_live_daemon()
     env = dict(os.environ)
     env["ONE_LINK_HOME"] = str(home)
+    if ui_port is None:
+        env.pop("ONE_LINK_UI_PORT", None)
+    else:
+        env["ONE_LINK_UI_PORT"] = ui_port
     # Private mDNS scope so this daemon never cross-discovers ambient
     # daemons on the LAN while the lifecycle test exercises port/token.
     env["ONE_LINK_MDNS_SERVICE_TYPE"] = private_mdns_type()
@@ -154,6 +195,7 @@ def _spawn_daemon(home: Path, log: Path) -> subprocess.Popen:
         ),
     )
     proc._one_link_new_process_group = os.name == "nt"  # type: ignore[attr-defined]
+    _STARTED[home] = (proc, log)
     return proc
 
 
@@ -182,6 +224,7 @@ def test_stale_runtime_publication_is_removed_without_following_paths(
     assert publication.is_dir()
 
 
+@pytest.mark.live_daemon
 @pytest.mark.timeout(60)
 def test_owner_bootstrap_token_rotates_across_daemon_restart():
     """A bearer leaked by an old plaintext cookie dies on restart."""
@@ -197,7 +240,7 @@ def test_owner_bootstrap_token_rotates_across_daemon_restart():
             token1 = _read_text(home, "ui.token")
             port1 = _read_port(home, "server.port")
             assert len(token1) >= 32
-            _assert_well_known_or_saturated_fallback(port1)
+            _assert_os_assigned(port1)
         finally:
             _stop(proc, home=home)
 
@@ -219,18 +262,80 @@ def test_owner_bootstrap_token_rotates_across_daemon_restart():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _bootstrap_browser_bearer(port: int, token: str) -> tuple[str, bool]:
+    """Load the owner page as a window does; return (the bearer it is given, persisted?)."""
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/?t={token}", timeout=10.0) as response:
+        page = response.read().decode("utf-8", errors="replace")
+    match = re.search(r'const b=("[^"]*");const persist=(true|false);', page)
+    assert match, "the owner page no longer carries the bootstrap bearer script"
+    return json.loads(match.group(1)), match.group(2) == "true"
+
+
+@pytest.mark.live_daemon
+@pytest.mark.timeout(240)
+def test_a_browser_session_survives_daemon_restarts():
+    """The other half of the test above: the owner token dies with the process,
+    and the browser session a window is given does NOT.
+
+    From 2026-07-25 to 2026-11-25 it did. The schema runner re-applied the
+    one-way session-key migration on every start, so each restart (each
+    update) signed every open window out, and no test restarted a daemon with
+    a session to notice. Two restarts here, because the damage compounded: a
+    session that survives one could still be lost on the next.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="ol_lifecycle_"))
+    try:
+        home = tmp / "H"
+        home.mkdir()
+
+        proc = _spawn_daemon(home, tmp / "0.log")
+        try:
+            owner_token = _read_text(home, "ui.token")
+            port = _read_port(home, "server.port")
+            bearer, persisted = _bootstrap_browser_bearer(port, owner_token)
+            assert persisted, "a default install no longer gives its window a persistent session"
+            assert bearer != owner_token, "the window was handed the process owner token"
+            assert re.fullmatch("[0-9a-f]{64}", bearer)
+            assert _owner_api_status(port, bearer) == 200
+        finally:
+            _stop(proc, home=home)
+
+        for restart in (1, 2):
+            time.sleep(0.4)
+            proc = _spawn_daemon(home, tmp / f"{restart}.log")
+            try:
+                previous_owner_token = owner_token
+                owner_token = _read_text(home, "ui.token", different_from=previous_owner_token)
+                port = _read_port(home, "server.port")
+                assert _owner_api_status(port, bearer) == 200, (
+                    f"restart {restart} signed the browser session out"
+                )
+                # The rule the neighbouring test pins still holds beside it.
+                assert _owner_api_status(port, previous_owner_token) == 401
+            finally:
+                _stop(proc, home=home)
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@pytest.mark.live_daemon
 @pytest.mark.timeout(60)
 def test_ui_port_is_in_well_known_range():
     """The daemon must prefer the well-known range when a slot is free.
     When the range is saturated by other daemons, an OS-assigned
-    fallback port is correct (the daemon must still start)."""
+    fallback port is correct (the daemon must still start).
+
+    This is the product's default policy, so it is the one live test that
+    leaves ONE_LINK_UI_PORT unset and lets a test daemon take a well-known
+    port, for the seconds this test runs."""
     tmp = Path(tempfile.mkdtemp(prefix="ol_port_"))
     try:
         home = tmp / "H"
         home.mkdir()
         log = tmp / "out.log"
 
-        proc = _spawn_daemon(home, log)
+        proc = _spawn_daemon(home, log, ui_port=None)
         try:
             port = _read_port(home, "server.port")
             _assert_well_known_or_saturated_fallback(port)
@@ -241,6 +346,77 @@ def test_ui_port_is_in_well_known_range():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+@pytest.mark.live_daemon
+@pytest.mark.timeout(60)
+def test_ui_port_zero_gives_a_real_daemon_an_os_assigned_port():
+    """ONE_LINK_UI_PORT=0: the daemon serves its owner API on a port outside the well-known range."""
+    tmp = Path(tempfile.mkdtemp(prefix="ol_port0_"))
+    try:
+        home = tmp / "H"
+        home.mkdir()
+        proc = _spawn_daemon(home, tmp / "out.log", ui_port="0")
+        try:
+            port = _read_port(home, "server.port")
+            _assert_os_assigned(port)
+            assert _owner_api_status(port, _read_text(home, "ui.token")) == 200
+        finally:
+            _stop(proc, home=home)
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@pytest.mark.live_daemon
+@pytest.mark.timeout(60)
+def test_ui_port_exact_is_bound_exactly_by_a_real_daemon():
+    """ONE_LINK_UI_PORT=N: the daemon serves on N and nowhere else."""
+    tmp = Path(tempfile.mkdtemp(prefix="ol_portn_"))
+    try:
+        home = tmp / "H"
+        home.mkdir()
+        wanted = _free_loopback_port()
+        proc = _spawn_daemon(home, tmp / "out.log", ui_port=str(wanted))
+        try:
+            assert _read_port(home, "server.port") == wanted
+            assert _owner_api_status(wanted, _read_text(home, "ui.token")) == 200
+        finally:
+            _stop(proc, home=home)
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@pytest.mark.live_daemon
+@pytest.mark.timeout(90)
+def test_ui_port_in_use_stops_a_real_daemon_instead_of_moving_it():
+    """An exact port that is taken is a startup failure: no fallback port, no headless daemon."""
+    tmp = Path(tempfile.mkdtemp(prefix="ol_portbusy_"))
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        home = tmp / "H"
+        home.mkdir()
+        log = tmp / "out.log"
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        taken = int(holder.getsockname()[1])
+        proc = _spawn_daemon(home, log, ui_port=str(taken))
+        try:
+            try:
+                code = proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                pytest.fail("the daemon kept running although its exact UI port was taken")
+            assert code != 0, "the daemon reported success without its UI port"
+            assert not (home / "data" / "server.port").exists(), "a UI port was published anyway"
+            assert "ONE_LINK_UI_PORT" in log.read_text(encoding="utf-8", errors="replace")
+        finally:
+            _stop(proc, home=home)
+    finally:
+        holder.close()
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@pytest.mark.live_daemon
 @pytest.mark.timeout(60)
 def test_control_status_and_shutdown_contract(monkeypatch):
     """The launcher depends on status/shutdown to self-heal stale daemons."""
@@ -298,6 +474,7 @@ def test_control_status_and_shutdown_contract(monkeypatch):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+@pytest.mark.live_daemon
 @pytest.mark.timeout(60)
 def test_harness_stop_reaps_serving_interpreter_and_launcher():
     """Teardown must not leak the socket-owning child behind a venv launcher."""
@@ -509,6 +686,7 @@ def test_launcher_prefers_control_reported_ui_port(monkeypatch):
     assert info.server_port == 7999
 
 
+@pytest.mark.live_daemon
 @pytest.mark.timeout(60)
 def test_corrupt_token_file_is_replaced_safely():
     """If the persisted token file is garbage, daemon generates a fresh one

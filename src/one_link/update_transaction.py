@@ -56,6 +56,7 @@ from one_link.key_material import (
 from one_link.update_metadata import (
     AuthenticatedUpdateManifest,
     MAX_STANDALONE_ARTIFACT_BYTES,
+    PLATFORM_CONTRACTS,
     StandaloneArtifact,
 )
 
@@ -174,6 +175,8 @@ class UpdateJournal:
     health_deadline: str
     created_at: str
     updated_at: str
+    # Existing authenticated journals predate .app support and use one-link.
+    bundle_root: str = "one-link"
 
 
 @dataclass(frozen=True)
@@ -436,6 +439,12 @@ def _validate_component(component: str, *, context: str) -> None:
 DEFAULT_ARCHIVE_ROOT = "one-link"
 
 
+def _validate_archive_root(root: str) -> str:
+    if root not in ("one-link", "one-link.app"):
+        raise UpdateArchiveError("bundle root is not an established standalone layout")
+    return root
+
+
 def _manifest_name_for(root: str) -> str:
     return f"{root}/BUNDLE_SHA256SUMS"
 
@@ -450,11 +459,9 @@ def _discover_manifest_root(raw: bytes) -> str:
     staged update. The packager's archive validator has always discovered the
     root this way (`archive_root = roots.pop()`).
 
-    Discovery is not trust. `_parse_bundle_manifest` then requires EVERY row to
-    share this root, and `validate_installed_bundle` maps each row to
-    `bundle / <relative>` -- so a manifest naming an unexpected root still
-    cannot reach outside the bundle, and the file-set equality check still has
-    to match what is actually on disk.
+    Only the two established standalone roots are accepted. Discovery is not
+    trust: `_parse_bundle_manifest` then requires EVERY row to share this root,
+    and the file-set equality check must match what is actually on disk.
     """
     try:
         text = raw.decode("utf-8", "strict")
@@ -473,7 +480,7 @@ def _discover_manifest_root(raw: bytes) -> str:
             continue
         head = PurePosixPath(fields[3]).parts[:1]
         if head:
-            return head[0]
+            return _validate_archive_root(head[0])
     raise UpdateArchiveError("bundle member manifest names no members")
 
 
@@ -492,6 +499,7 @@ def _validate_archive_name(value: str, root: str = DEFAULT_ARCHIVE_ROOT) -> Pure
     `as_posix()` round-tripping the input. Those are unchanged; the root only
     decides WHICH directory everything must sit under.
     """
+    _validate_archive_root(root)
     if not value or "\\" in value or value.startswith("/"):
         raise UpdateArchiveError(f"unsafe archive member path: {value!r}")
     path = PurePosixPath(value)
@@ -718,15 +726,14 @@ def _safe_symlink_target(
     def _present(name: str) -> bool:
         return name in all_names or any(n.startswith(name + "/") for n in all_names)
 
-    if _present(relocated_name):
-        return
-    # Not a literal member: follow the chain before declaring it missing.
+    # A literal manifest member may itself be a link. Resolve before testing
+    # presence so direct cycles cannot bypass the bounded chain validator.
     if rows is not None:
-        resolved = _resolve_through_manifest(
+        relocated_name = _resolve_through_manifest(
             relocated_name, rows, root, label=row.path,
         )
-        if _present(resolved):
-            return
+    if _present(relocated_name):
+        return
     raise UpdateArchiveError(f"bundle symlink escapes or targets missing content: {row.path!r}")
 
 
@@ -748,6 +755,7 @@ def _validate_zip_index(
     archive: zipfile.ZipFile,
     *,
     expected_executable: str,
+    expected_bundle_root: str | None = None,
 ) -> tuple[list[zipfile.ZipInfo], bytes, Mapping[str, _ManifestRow]]:
     max_bytes, max_entries, max_members = _archive_budgets()
     infos = archive.infolist()
@@ -757,15 +765,22 @@ def _validate_zip_index(
     folded = [_collision_key(name) for name in names]
     if len(names) != len(set(names)) or len(folded) != len(set(folded)):
         raise UpdateArchiveError("standalone ZIP has duplicate or portable-colliding names")
-    if names.count(ARCHIVE_MANIFEST) != 1:
+    roots = {path.parts[0] for name in names if (path := PurePosixPath(name)).parts}
+    if len(roots) != 1:
+        raise UpdateArchiveError("standalone ZIP must have exactly one bundle root")
+    archive_root = _validate_archive_root(roots.pop())
+    if expected_bundle_root is not None and archive_root != _validate_archive_root(expected_bundle_root):
+        raise UpdateArchiveError("standalone ZIP root differs from signed release metadata")
+    manifest_name = _manifest_name_for(archive_root)
+    if names.count(manifest_name) != 1:
         raise UpdateArchiveError("standalone ZIP must contain exactly one member manifest")
-    expected_member = f"one-link/{expected_executable}"
+    expected_member = f"{archive_root}/{expected_executable}"
     if names.count(expected_member) != 1:
         raise UpdateArchiveError("standalone ZIP does not contain its exact executable")
     total = 0
     symlink_names: set[str] = set()
     for info in infos:
-        _validate_archive_name(info.filename)
+        _validate_archive_name(info.filename, archive_root)
         if info.is_dir() or info.flag_bits & 0x1 or info.file_size < 0 or info.compress_size < 0:
             raise UpdateArchiveError(f"standalone ZIP member shape is unsafe: {info.filename!r}")
         total += info.file_size
@@ -783,15 +798,15 @@ def _validate_zip_index(
         if prefixes & symlink_names:
             raise UpdateArchiveError(f"standalone ZIP nests content under a symlink: {name!r}")
     try:
-        manifest_raw = archive.read(ARCHIVE_MANIFEST)
+        manifest_raw = archive.read(manifest_name)
     except (KeyError, RuntimeError, OSError) as exc:
         raise UpdateArchiveError("cannot read standalone ZIP member manifest") from exc
-    rows = _parse_bundle_manifest(manifest_raw)
-    if set(rows) != set(names) - {ARCHIVE_MANIFEST}:
+    rows = _parse_bundle_manifest(manifest_raw, archive_root)
+    if set(rows) != set(names) - {manifest_name}:
         raise UpdateArchiveError("standalone ZIP member set differs from its manifest")
     all_names = set(names)
     for info in infos:
-        if info.filename == ARCHIVE_MANIFEST:
+        if info.filename == manifest_name:
             continue
         row = rows[info.filename]
         mode = (int(info.external_attr) >> 16) & 0xFFFF
@@ -799,7 +814,7 @@ def _validate_zip_index(
         if (row.kind == "SYMLINK") != is_link or info.file_size != row.size:
             raise UpdateArchiveError(f"standalone ZIP type/size differs from manifest: {info.filename!r}")
         if row.kind == "SYMLINK":
-            _safe_symlink_target(row, all_names)
+            _safe_symlink_target(row, all_names, archive_root, rows)
     if rows[expected_member].kind != "FILE" or rows[expected_member].size <= 0:
         raise UpdateArchiveError("standalone executable is not a non-empty regular file")
     return infos, manifest_raw, rows
@@ -875,9 +890,11 @@ def extract_authenticated_bundle(
                     infos, manifest_raw, rows = _validate_zip_index(
                         archive,
                         expected_executable=artifact.executable,
+                        expected_bundle_root=artifact.bundle_root,
                     )
+                    manifest_name = _manifest_name_for(artifact.bundle_root)
                     for info in infos:
-                        if info.filename == ARCHIVE_MANIFEST:
+                        if info.filename == manifest_name:
                             continue
                         row = rows[info.filename]
                         if row.kind == "SYMLINK":
@@ -914,7 +931,7 @@ def extract_authenticated_bundle(
                         safe_mode = 0o755 if mode & 0o111 else 0o644
                         if os.name != "nt":
                             destination_path.chmod(safe_mode)
-                    manifest_path = target / ARCHIVE_MANIFEST
+                    manifest_path = target / manifest_name
                     manifest_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                     with manifest_path.open("xb") as output:
                         output.write(manifest_raw)
@@ -923,7 +940,7 @@ def extract_authenticated_bundle(
                     if os.name != "nt":
                         manifest_path.chmod(0o644)
                     for info in infos:
-                        if info.filename == ARCHIVE_MANIFEST:
+                        if info.filename == manifest_name:
                             continue
                         row = rows[info.filename]
                         if row.kind != "SYMLINK":
@@ -1378,6 +1395,9 @@ def _validate_journal(journal: UpdateJournal, *, expected_state_root: Path) -> N
         raise UpdateStateError("transaction journal version is not canonical stable")
     if journal.tag != f"v{journal.version}" or not _TXID.fullmatch(journal.txid):
         raise UpdateStateError("transaction journal tag or id is invalid")
+    contract = PLATFORM_CONTRACTS.get(journal.platform)
+    if contract is None or journal.bundle_root not in ("one-link", contract.bundle_root):
+        raise UpdateStateError("transaction journal bundle root violates its platform contract")
     if not _HEX_40.fullmatch(journal.commit_sha):
         raise UpdateStateError("transaction journal commit is invalid")
     if not all(
@@ -1564,6 +1584,7 @@ def prepare_update_transaction(
                 health_deadline=_format_utc(observed + health_window),
                 created_at=created,
                 updated_at=created,
+                bundle_root=artifact.bundle_root,
             )
             store.write_journal(journal)
             journal_persisted = True
@@ -1738,7 +1759,7 @@ def require_guarded_process_exit(
 def _journal_paths(journal: UpdateJournal) -> tuple[Path, Path, Path, Path, Path]:
     install = Path(journal.install_root)
     stage = Path(journal.stage_container)
-    candidate = stage / "one-link"
+    candidate = stage / journal.bundle_root
     backup = Path(journal.backup_root)
     failed = Path(journal.failed_root)
     return install, stage, candidate, backup, failed

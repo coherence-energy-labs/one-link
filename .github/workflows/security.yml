@@ -46,6 +46,15 @@ jobs:
         run: >-
           ./gitleaks git . --no-banner --no-color --redact=100
           --max-decode-depth=5 --max-archive-depth=2 --timeout=300
+          --report-format=json --report-path=gitleaks-redacted.json
+
+      - name: Retain redacted full-history findings
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gitleaks-redacted
+          path: gitleaks-redacted.json
+          if-no-files-found: warn
 
   audit:
     name: pip-audit + bandit + sbom
@@ -64,20 +73,23 @@ jobs:
       - name: setup uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.31"
+          version: "0.13.10"
           enable-cache: true
 
       - name: verify universal lock + install audit tools
+        id: audit_tools
         run: |
           uv lock --check
           uv sync --frozen --extra dev --extra security
 
       - name: zizmor (GitHub Actions security gate)
+        if: ${{ !cancelled() && steps.audit_tools.outcome == 'success' }}
         run: >-
           uv run --frozen --extra security zizmor
           --pedantic --strict-collection .github
 
       - name: export audited runtime requirements
+        if: ${{ !cancelled() && steps.audit_tools.outcome == 'success' }}
         run: |
           # `native` is a local path dependency audited by RustSec below. Exclude
           # that unhashed path while retaining every registry-backed extra and
@@ -85,23 +97,30 @@ jobs:
           uv export --frozen --all-extras --all-groups --no-extra native --no-emit-project --output-file requirements.lock
 
       - name: pip-audit (PyPI and OSV vulnerability scans)
+        if: ${{ !cancelled() && steps.audit_tools.outcome == 'success' }}
         # Audit the freshly-resolved lockfile (so TRANSITIVE vulns are
         # caught too, not just declared deps). 2026-06-16: this is now a
         # HARD GATE — the external audit flagged the old report-only
         # `|| true` as "supply-chain not enforceable." First line writes
-        # the JSON artifact (kept non-fatal so the artifact always
-        # uploads). Second line FAILS the build on any known
-        # vulnerability. The current resolved tree is clean (verified
-        # locally: pip-audit exit 0). If a future transitive advisory
-        # has no fix yet, add a documented `--ignore-vuln <ID>` here
-        # rather than reinstating a blanket `|| true`.
+        # both JSON reports before either enforcing command runs. A failed
+        # advisory check still permits the independent Bandit/SBOM steps, and
+        # the job remains failed. No unchecked advisory exception is added.
         run: |
           uv run --frozen --extra security python -m pip_audit --requirement requirements.lock --no-deps --disable-pip --format json --output pip-audit.json || true
           uv run --frozen --extra security python -m pip_audit --requirement requirements.lock --no-deps --disable-pip --vulnerability-service osv --format json --output pip-audit-osv.json || true
           uv run --frozen --extra security python -m pip_audit --requirement requirements.lock --no-deps --disable-pip
           uv run --frozen --extra security python -m pip_audit --requirement requirements.lock --no-deps --disable-pip --vulnerability-service osv
 
+      - name: audit locked rendezvous container subset
+        if: ${{ !cancelled() && steps.audit_tools.outcome == 'success' }}
+        run: |
+          uv run --frozen --extra security python -m pip_audit --requirement deploy/rendezvous/requirements.lock --no-deps --disable-pip --format json --output rendezvous-pip-audit.json || true
+          uv run --frozen --extra security python -m pip_audit --requirement deploy/rendezvous/requirements.lock --no-deps --disable-pip --vulnerability-service osv --format json --output rendezvous-pip-audit-osv.json || true
+          uv run --frozen --extra security python -m pip_audit --requirement deploy/rendezvous/requirements.lock --no-deps --disable-pip
+          uv run --frozen --extra security python -m pip_audit --requirement deploy/rendezvous/requirements.lock --no-deps --disable-pip --vulnerability-service osv
+
       - name: bandit (SAST)
+        if: ${{ !cancelled() && steps.audit_tools.outcome == 'success' }}
         # Excludes + skip-list configured in pyproject.toml [tool.bandit].
         # First line archives the FULL findings (all severities) as the
         # bandit.json artifact for review. Second line is the GATE: it
@@ -115,10 +134,18 @@ jobs:
           uv run --frozen --extra security bandit -c pyproject.toml -r src/one_link scripts --severity-level medium
 
       - name: generate SBOM
+        if: ${{ !cancelled() && steps.audit_tools.outcome == 'success' }}
         run: |
-          uv run --frozen --extra security python scripts/gen_sbom.py --from requirements --output dist/sbom.cdx.json
+          uv run --frozen --extra security python scripts/verify_vendor_patches.py --fetch-upstream --report vendor-provenance.json
+          uv run --frozen --extra security python scripts/gen_sbom.py \
+            --from requirements --python-lock uv.lock --exclude-python-extra native \
+            --cargo-lock native/Cargo.lock --cargo-workspace native/Cargo.toml \
+            --additional-cargo shell native/ol_shell/Cargo.toml \
+            --additional-cargo fuzz native/fuzz/Cargo.toml \
+            --output dist/sbom.cdx.json
 
       - name: upload supply-chain artifacts
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: supply-chain
@@ -126,7 +153,10 @@ jobs:
             requirements.lock
             pip-audit.json
             pip-audit-osv.json
+            rendezvous-pip-audit.json
+            rendezvous-pip-audit-osv.json
             bandit.json
+            vendor-provenance.json
             dist/sbom.cdx.json
           if-no-files-found: warn
 
@@ -144,6 +174,10 @@ jobs:
         with:
           persist-credentials: false
 
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
       - name: Install Rust toolchain
         run: |
           rustup toolchain install 1.96.0 --profile minimal --no-self-update
@@ -152,15 +186,34 @@ jobs:
       - name: Install pinned cargo-audit
         run: cargo install --locked --version 0.22.2 cargo-audit
 
+      # The archived JSON reports carry no exception, so every warning stays
+      # visible in the evidence, including the one dispositioned below.
       - name: Archive RustSec report
+        id: rustsec_reports
         run: |
           cargo audit --file native/Cargo.lock --deny warnings --json > cargo-audit.json || true
           cargo audit --file native/fuzz/Cargo.lock --deny warnings --json > cargo-audit-fuzz.json || true
+          cargo audit --file native/ol_shell/Cargo.lock --json > cargo-audit-shell.json || true
 
       - name: Gate on RustSec vulnerabilities and warnings
         run: |
           cargo audit --file native/Cargo.lock --deny warnings
           cargo audit --file native/fuzz/Cargo.lock --deny warnings
+
+      # Every warning class (unsound, unmaintained, yanked, notice) fails the
+      # shell graph too. The one exception is exact: RUSTSEC-2024-0370
+      # (proc-macro-error unmaintained, no patched release), dispositioned in
+      # docs/DEPENDENCY_QUALIFICATION.md. Any other or new warning fails.
+      # RustSec omits path packages, so the separately required live ancestor
+      # query below covers every vendored backport and fails closed on any
+      # advisory not addressed by the exact verified patch.
+      - name: Gate shell RustSec vulnerabilities and warnings with one dispositioned exception
+        if: ${{ !cancelled() && steps.rustsec_reports.outcome == 'success' }}
+        run: cargo audit --file native/ol_shell/Cargo.lock --deny warnings --ignore RUSTSEC-2024-0370
+
+      - name: Audit verified vendor registry ancestors against live advisories
+        if: ${{ !cancelled() }}
+        run: python scripts/audit_vendor_advisories.py --report vendor-upstream-advisories.json
 
       - name: Upload RustSec report
         if: always()
@@ -170,4 +223,6 @@ jobs:
           path: |
             cargo-audit.json
             cargo-audit-fuzz.json
+            cargo-audit-shell.json
+            vendor-upstream-advisories.json
           if-no-files-found: error

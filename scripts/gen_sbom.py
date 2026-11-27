@@ -4,7 +4,7 @@ The Python portion is produced by the lock-aware, pinned ``cyclonedx-bom``
 tool.  This module then performs a deterministic, offline merge of:
 
 * the complete frozen Python requirements graph;
-* every package and dependency edge in the native Cargo workspace lock;
+* every package and dependency edge in the selected Cargo workspace locks;
 * every local Cargo workspace member; and
 * SHA-256 hashes of the exact release artifacts already assembled on disk.
 
@@ -27,10 +27,15 @@ import sys
 import tempfile
 import tomllib
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 from urllib.parse import quote, urlencode
+
+if __package__:
+    from .verify_vendor_patches import VendorError, inspect_patches
+else:
+    from verify_vendor_patches import VendorError, inspect_patches
 
 
 CYCLONEDX_SPEC_VERSION = "1.6"
@@ -143,6 +148,19 @@ def _validate_frozen_requirements(path: Path) -> None:
             raise SbomError(f"Python requirement has no SHA-256 distribution hash: {requirement!r}")
 
 
+def _license_choice(value: str) -> list[dict[str, Any]]:
+    """CycloneDX license entry for a Cargo `license` string.
+
+    A compound SPDX expression ("Apache-2.0 OR MIT") must use the `expression`
+    form; `license.id` accepts only a single SPDX identifier, and the schema
+    rejects an expression there. Every component (workspace member, vendored
+    backport, and its pedigree ancestor) goes through this one function.
+    """
+    if re.search(r"(?:^|\s)(?:AND|OR|WITH)(?:\s|$)|[()]", value):
+        return [{"expression": value}]
+    return [{"license": {"id": value}}]
+
+
 def _cargo_purl(name: str, version: str, source: str | None) -> str:
     base = f"pkg:cargo/{quote(name, safe='-._~')}@{quote(version, safe='-._~')}"
     qualifiers: list[tuple[str, str]] = []
@@ -239,16 +257,23 @@ def _workspace_member_manifests(workspace_manifest: Path) -> dict[tuple[str, str
     workspace = workspace_document.get("workspace")
     if not isinstance(workspace, dict):
         raise SbomError(f"manifest has no [workspace] table: {workspace_manifest}")
-    members = workspace.get("members")
-    if not isinstance(members, list) or not members or not all(
+    members = workspace.get("members", [])
+    if not isinstance(members, list) or not all(
         isinstance(member, str) and member for member in members
     ):
+        raise SbomError(f"workspace has no explicit members: {workspace_manifest}")
+    members = list(members)
+    if isinstance(workspace_document.get("package"), dict) and "." not in members:
+        members.insert(0, ".")
+    if not members:
         raise SbomError(f"workspace has no explicit members: {workspace_manifest}")
 
     workspace_root = workspace_manifest.parent.resolve()
     manifests: dict[tuple[str, str], dict[str, str]] = {}
     for pattern in members:
-        matches = sorted(workspace_root.glob(pattern), key=lambda path: path.as_posix())
+        matches = [workspace_root] if pattern == "." else sorted(
+            workspace_root.glob(pattern), key=lambda path: path.as_posix()
+        )
         if not matches:
             raise SbomError(f"workspace member pattern did not match: {pattern!r}")
         for member in matches:
@@ -303,6 +328,14 @@ def _cargo_inventory(
     workspace_manifest: Path,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, str]]:
     packages = _parse_cargo_packages(lock_path)
+    try:
+        vendors = inspect_patches(workspace_manifest)
+    except (OSError, ValueError, KeyError, TypeError, VendorError) as exc:
+        raise SbomError(f"vendored dependency provenance failed: {exc}") from exc
+    packages = [replace(package, ref=(
+        f"urn:one-link:vendored-cargo:{package.name}:{package.version}:sha256:"
+        + vendors[(package.name, package.version)]["proof"]["source_tree_sha256"]
+    )) if (package.name, package.version) in vendors else package for package in packages]
     workspace_members = _workspace_member_manifests(workspace_manifest)
     local_packages = {
         (package.name, package.version): package
@@ -333,13 +366,46 @@ def _cargo_inventory(
             additions["one-link:cargo:workspace-member"] = "true"
             additions["one-link:cargo:workspace-path"] = member["path"]
             if "license" in member:
-                license_value = member["license"]
-                if re.search(r"(?:^|\s)(?:AND|OR|WITH)(?:\s|$)|[()]", license_value):
-                    component["licenses"] = [{"expression": license_value}]
-                else:
-                    component["licenses"] = [{"license": {"id": license_value}}]
+                component["licenses"] = _license_choice(member["license"])
             if "description" in member:
                 component["description"] = member["description"]
+        vendor = vendors.get((package.name, package.version))
+        if vendor is not None:
+            proof = vendor["proof"]
+            upstream = proof["upstream"]
+            backport = proof["backport"]
+            # Keep the original package/version visible to advisory scanners,
+            # but identify the actual local bytes and their modified pedigree.
+            component["purl"] = _cargo_purl(
+                package.name, package.version, "registry+https://github.com/rust-lang/crates.io-index"
+            )
+            component["modified"] = True
+            component["licenses"] = _license_choice(proof["package"]["license"])
+            component["hashes"] = [{"alg": "SHA-256", "content": proof["source_tree_sha256"]}]
+            component["pedigree"] = {
+                "ancestors": [{
+                    "type": "library", "name": package.name, "version": package.version,
+                    "purl": component["purl"],
+                    "hashes": [{"alg": "SHA-256", "content": upstream["crate_sha256"]}],
+                    "licenses": _license_choice(proof["package"]["license"]),
+                    "externalReferences": [{"type": "distribution", "url": upstream["crate_url"]}],
+                }],
+                "patches": [{"type": "backport", "diff": {
+                    "text": {"contentType": "text/plain", "content": vendor["patch_text"]},
+                    "url": backport["upstream_url"],
+                }}],
+                "notes": proof["maintenance"],
+            }
+            additions.update({
+                "one-link:cargo:source": "vendored",
+                "one-link:cargo:vendored-path": proof["package"]["path"],
+                "one-link:cargo:source-tree-sha256": proof["source_tree_sha256"],
+                "one-link:cargo:source-tree-hash-format": proof["tree_hash_format"],
+                "one-link:cargo:upstream-crate-sha256": upstream["crate_sha256"],
+                "one-link:cargo:upstream-fix-commit": backport["upstream_fix_commit"],
+                "one-link:cargo:patch-sha256": backport["patch_sha256"],
+                "one-link:cargo:backported-advisories": ",".join(backport["advisories"]),
+            })
         _properties(component, additions)
         components.append(component)
         dependencies.append(
@@ -357,6 +423,7 @@ def _cargo_inventory(
         "one-link:sbom:cargo-package-count": str(len(packages)),
         "one-link:sbom:cargo-workspace-member-count": str(len(workspace_members)),
         "one-link:sbom:cargo-scope": "complete Cargo.lock resolution, including build and test packages",
+        "one-link:sbom:cargo-vendored-backport-count": str(len(vendors)),
     }
     return components, dependencies, metadata
 
@@ -879,6 +946,7 @@ def augment_sbom(
     excluded_python_extras: Sequence[str] = (),
     cargo_lock: Path | None = None,
     cargo_workspace: Path | None = None,
+    additional_cargo: Sequence[tuple[str, Path]] = (),
     artifact_dir: Path | None = None,
     artifact_patterns: Sequence[str] = (),
     output_path: Path,
@@ -889,6 +957,11 @@ def augment_sbom(
         raise SbomError("base document must be CycloneDX JSON spec 1.6")
     if (cargo_lock is None) != (cargo_workspace is None):
         raise SbomError("--cargo-lock and --cargo-workspace must be provided together")
+    graph_names = {"native"}
+    for name, _ in additional_cargo:
+        if re.fullmatch(r"[a-z][a-z0-9_-]*", name) is None or name in graph_names:
+            raise SbomError(f"invalid or duplicate Cargo graph name: {name!r}")
+        graph_names.add(name)
     if artifact_patterns and artifact_dir is None:
         raise SbomError("artifact patterns require --artifacts-dir")
 
@@ -897,7 +970,8 @@ def augment_sbom(
         raise SbomError("CycloneDX metadata must be an object")
     metadata_additions: dict[str, str] = {
         "one-link:sbom:inventory-scope": (
-            "frozen Python graph, native Cargo.lock workspace, and exact release artifact bytes"
+            "selected frozen Python and Cargo dependency graphs, including build/test packages; "
+            "exact release artifact bytes when supplied; not per-artifact runtime reachability"
         )
     }
     if requirements_lock is not None:
@@ -924,6 +998,31 @@ def augment_sbom(
         added_components.extend(components)
         added_dependencies.extend(dependencies)
         metadata_additions.update(cargo_metadata)
+    for name, manifest in additional_cargo:
+        components, dependencies, cargo_metadata = _cargo_inventory(
+            manifest.with_name("Cargo.lock"), manifest
+        )
+        # A registry package can have different resolved edges in independent
+        # lockfiles. Keep each graph's BOM identities distinct while retaining
+        # its standard package URL; merging edges would invent a resolution
+        # that no build actually used.
+        refs = {
+            component["bom-ref"]: f"urn:one-link:cargo-graph:{name}:"
+            + quote(component["bom-ref"], safe="")
+            for component in components
+        }
+        for component in components:
+            component["bom-ref"] = refs[component["bom-ref"]]
+            _properties(component, {"one-link:cargo:graph": name})
+        for dependency in dependencies:
+            dependency["ref"] = refs[dependency["ref"]]
+            dependency["dependsOn"] = sorted(refs[ref] for ref in dependency["dependsOn"])
+        added_components.extend(components)
+        added_dependencies.extend(dependencies)
+        metadata_additions.update({
+            key.replace("one-link:sbom:cargo-", f"one-link:sbom:cargo-graph:{name}:", 1): value
+            for key, value in cargo_metadata.items()
+        })
     if artifact_dir is not None:
         components, dependencies, artifact_metadata = _artifact_inventory(
             artifact_dir,
@@ -1002,6 +1101,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cargo-lock", help="Cargo.lock to merge")
     parser.add_argument("--cargo-workspace", help="workspace Cargo.toml to merge")
+    parser.add_argument(
+        "--additional-cargo", action="append", nargs=2, default=[],
+        metavar=("NAME", "MANIFEST"),
+        help="named independent Cargo manifest and its sibling lockfile; repeat as needed",
+    )
     parser.add_argument("--artifacts-dir", help="directory containing final release artifacts")
     parser.add_argument(
         "--artifact-pattern",
@@ -1095,6 +1199,9 @@ def main(argv: list[str] | None = None) -> int:
                 excluded_python_extras=args.exclude_python_extra,
                 cargo_lock=cargo_lock,
                 cargo_workspace=cargo_workspace,
+                additional_cargo=[
+                    (name, _absolute(root, manifest)) for name, manifest in args.additional_cargo
+                ],
                 artifact_dir=artifact_dir,
                 artifact_patterns=args.artifact_pattern,
                 output_path=output,

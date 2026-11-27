@@ -27,10 +27,18 @@
 //!
 //! - [`Volume`] represents a 32-byte volume secret. Real and decoy
 //!   volumes are independent.
-//! - [`DuressGate::open`] takes a presented passphrase plus expected check
-//!   values and decides real | decoy | reject. It evaluates both derivations
-//!   before selecting an outcome, but source structure and timing tests are
+//! - [`DuressGate::decide`] takes a presented passphrase plus expected check
+//!   values and decides real | decoy | reject without revealing which: every
+//!   derivation runs, the result is selected in constant time into one
+//!   uniform [`GateDecision`], and no branch or memory index depends on a
+//!   secret (checked on the release code by `ol_ct_audit` under Valgrind,
+//!   and compared across outcomes by its statistical timing test). Those
+//!   checks bound what was measured on the audited build and CPU; they are
 //!   not a universal side-channel proof.
+//! - [`DuressGate::open`] is `decide` plus the classification into a
+//!   [`DuressOutcome`]. Building an enum branches on the outcome, so `open`
+//!   is NOT timing-uniform across outcomes; callers that must hide the
+//!   outcome use `decide`.
 //! - [`DuressGate::signal_in_ratchet_header`] emits a deterministic 32-byte
 //!   keyed marker. This crate does not place it on a wire or establish that
 //!   its surrounding traffic is covert or indistinguishable from non-duress
@@ -42,8 +50,8 @@
 mod gate;
 
 pub use gate::{
-    decode_covert_signal, DuressGate, DuressOutcome, GateError, Volume, SIGNAL_LEN,
-    VOLUME_SECRET_LEN,
+    decode_covert_signal, DuressGate, DuressOutcome, GateDecision, GateError, OutcomeKind, Volume,
+    SIGNAL_LEN, VOLUME_SECRET_LEN,
 };
 
 /// Crate version embedded for diagnostics.

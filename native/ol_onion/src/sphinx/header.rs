@@ -199,6 +199,7 @@ pub fn peel_header(
         return Err(());
     }
     // 1. Verify MAC.
+    // ct-audit: declassify (MAC verdict: drop or process)
     if !verify_header_mac(&keys.mac_key, received_header, received_mac) {
         return Err(());
     }
@@ -217,7 +218,10 @@ pub fn peel_header(
     let mut next_mac = [0u8; SLOT_MAC_LEN];
     next_mac.copy_from_slice(&decrypted[SLOT_ID_LEN..SLOT_LEN]);
 
-    // 5. Destination check.
+    // 5. Destination check. The relay reveals this slot by acting on it
+    // (deliver here, or forward to `next_hop_id`), so the comparison is a
+    // public routing verdict.
+    // ct-audit: declassify (deliver-or-forward routing verdict)
     if next_hop_id == DESTINATION_MARKER {
         return Ok(HeaderPeelOutcome::Deliver);
     }

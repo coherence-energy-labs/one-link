@@ -278,7 +278,7 @@ def test_call_driver_suppresses_duplicate_rings_after_accept(index_html: str) ->
     assert "lastAcceptRetryMs" in index_html
     accept_idx = index_html.find("async function acceptInboundCall")
     accept_snippet = index_html[accept_idx:accept_idx + 1800]
-    assert "callUI.acceptedCallIds.add(inboundCallId)" in accept_snippet
+    assert "callState.acceptCall(inboundCallId)" in accept_snippet
     assert "accept_sent" in accept_snippet
     backfill_idx = index_html.find("async function backfillLivingPresenceCalls")
     backfill_snippet = index_html[backfill_idx:backfill_idx + 3600]
@@ -342,15 +342,15 @@ def test_inbound_sdp_waits_for_local_media_before_answer(index_html: str) -> Non
     accept_idx = index_html.find("async function acceptInboundCall")
     assert accept_idx > 0
     accept_snippet = index_html[accept_idx:accept_idx + 2200]
-    assert "callUI.localMediaReady = false" in accept_snippet
-    assert accept_snippet.find("media.pc.addTrack") < accept_snippet.find("callUI.localMediaReady = true")
-    assert accept_snippet.find("callUI.localMediaReady = true") < accept_snippet.find("await applyRemoteSdpOffer")
+    assert 'callState.set("localMediaReady", false)' in accept_snippet
+    assert accept_snippet.find("media.pc.addTrack") < accept_snippet.find('callState.set("localMediaReady", true)')
+    assert accept_snippet.find('callState.set("localMediaReady", true)') < accept_snippet.find("await applyRemoteSdpOffer")
 
     handler_idx = index_html.find('if (tail === "sdp_offer")')
     assert handler_idx > 0
     handler_snippet = index_html[handler_idx:handler_idx + 700]
     assert "callUI.localMediaReady" in handler_snippet
-    assert "callUI.pendingRemoteOffer = null" in handler_snippet
+    assert 'callState.set("pendingRemoteOffer", null)' in handler_snippet
 
 
 def test_call_buttons_clear_surfaces_before_network_wait(index_html: str) -> None:

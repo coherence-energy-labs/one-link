@@ -359,9 +359,16 @@ def test_rolling_publisher_is_deliberate_gated_and_unsigned():
 
     # Gated: it must verify the gating workflows concluded successfully for
     # the exact commit before the public download moves.
-    assert "conclusion" in text and "refusing to publish" in text
-    for gate in ('"tests"', '"security"', '"auto-build standalone binary"'):
-        assert gate in text, f"rolling publisher does not require {gate}"
+    guard = (path.parents[2] / "scripts" / "rolling_publish_guard.py").read_text(encoding="utf-8")
+    assert "rolling_publish_guard.py resolve" in text
+    assert "rolling_publish_guard.py recheck" in text
+    assert "rolling_publish_guard.py verify-assets" in text
+    assert "conclusion" in guard and "refusing to publish" in guard
+    for gate in ('"tests"', '"security"', '"auto-build standalone binary"',
+                 '"full-suite + e2e"', '"file-engine v2 native build"',
+                 '"file-engine v2 bench gate"', '"native shell builds"',
+                 '"lint"', '"formal verification"'):
+        assert gate in guard, f"rolling publisher does not require {gate}"
 
     # Unsigned tier, honestly labelled: prerelease, no code-signing primitive,
     # and it must not touch a tagged release.
@@ -407,7 +414,7 @@ def test_rolling_publisher_never_empties_the_release_before_uploading():
 
 def test_workflows_use_frozen_uv_and_explicit_root_for_native_builds():
     sync_count = 0
-    nested_maturin_count = 0
+    nested_maturin_workflows = set()
     for path, workflow in _workflow_documents():
         text = path.read_text(encoding="utf-8")
         for line in text.splitlines():
@@ -417,32 +424,36 @@ def test_workflows_use_frozen_uv_and_explicit_root_for_native_builds():
         for job in workflow.get("jobs", {}).values():
             for step in job.get("steps", []):
                 run = str(step.get("run", ""))
-                if step.get("working-directory") == "native" and "maturin" in run:
-                    nested_maturin_count += 1
-                    assert "uv run --project .. --frozen" in run, (
+                # Builders may set cwd in YAML or enter either the candidate
+                # or separate baseline workspace explicitly inside the shell.
+                native_transition = re.search(
+                    r"(?m)^\s*cd\s+(?:[\"']?[^\n]*/)?native[\"']?\s*$", run
+                )
+                nested_native = step.get("working-directory") == "native" or (
+                    native_transition is not None
+                    and native_transition.start() < run.find("maturin")
+                )
+                if nested_native and "maturin" in run:
+                    nested_maturin_workflows.add(path.name)
+                    assert any(command in run for command in (
+                        "uv run --project .. --frozen", "uv run --project .. --no-sync")), (
                         f"{path.name}: nested maturin build would discover native/pyproject "
                         "instead of the root uv.lock"
                     )
+                    if "uv run --project .. --no-sync" in run:
+                        earlier = job["steps"][:job["steps"].index(step)]
+                        assert any("uv sync --frozen" in item.get("run", "") for item in earlier), (
+                            f"{path.name}: no-sync requires an earlier frozen environment install"
+                        )
     assert sync_count >= 15
-    # 10th audited site 2026-07-25: full_suite_and_e2e.yml builds the native
-    # engine so the suite exercises the real fail-closed PQ channel path.
-    # 12 as of the tests.yml native builds. Two were added there: the test
-    # matrix (test_channel's live handshake fails closed without the native
-    # pqkem ABI) and build_windows_binary (build_binary.py treats
-    # one_link_native as mandatory for a stable artifact). Both were invisible
-    # while the tests gate could not conclude.
-    # 13 as of e2e_call_ui_browser.yml. That gate had failed on every run it
-    # ever had because it never built the engine: the daemon came up reporting
-    # "PQ-hybrid KEM UNAVAILABLE" and the call never reached media
-    # (caller_frames=0, stopped during incoming_call). It was measuring an
-    # incomplete install rather than the product.
-    # 16 as of the paired benchmark gates. Three were added in
-    # native_bench_gate.yml: the PR gate builds the head AND its merge base,
-    # and drift_watch builds master AND the anchor commit. Both compare two
-    # builds made on ONE runner because the old gate compared a 4-core cloud
-    # VM against a baseline recorded on a 24-core Windows desktop, and failed
-    # every PR it ever ran on.
-    assert nested_maturin_count == 16
+    # Check every discovered invocation, plus the important explicit builders.
+    # The acceptance matrix now consumes one source-bootstrap wheel per OS;
+    # counting old duplicated builds would reject that supported design.
+    assert {"release.yml", "native_build.yml", "native_bench_gate.yml"} <= nested_maturin_workflows
+    acceptance = dict(_workflow_documents())[_WORKFLOWS / "full_suite_and_e2e.yml"]
+    commands = "\n".join(step.get("run", "")
+                         for step in acceptance["jobs"]["native_runtime"]["steps"])
+    assert "python scripts/bootstrap_source.py --report" in commands
 
 
 def test_windows_native_binding_uses_shell_matching_its_commands():
@@ -545,7 +556,7 @@ def test_tagged_release_separates_signing_from_release_mutation():
         "attestations": "write",
     }
     assert publish["permissions"] == {"contents": "write"}
-    assert set(publish["needs"]) == {"release_quality_gate", "build", "sign"}
+    assert set(publish["needs"]) == {"release_quality_gate", "build", "sign", "verify_reproducibility"}
     publish_actions = [
         step["uses"]
         for step in publish["steps"]
@@ -610,14 +621,131 @@ def test_rolling_archives_have_noncolliding_archive_sidecars():
     # the format the product actually parses. The inline version wrote classic
     # sha256sum output with no header, so every bundle built here failed
     # validate_installed_bundle and the in-app updater was dead. What this
-    # test cares about is unchanged: the manifest lands INSIDE dist/one-link,
+    # test cares about is unchanged: the manifest lands INSIDE the final bundle,
     # the .zip.sha256 sidecar is separate, and neither name collides.
     assert "scripts/write_bundle_manifest.py" in text
-    assert "--bundle dist/one-link" in text
+    assert '--bundle "${BUNDLE_PATH}"' in text
     assert '"${ARTIFACT_NAME}.zip.sha256"' in text
     assert "dist/${{ matrix.artifact-name }}.zip.sha256" in text
     assert "dist/one-link.sha256" not in text
     assert "| sort -z" not in text
+
+
+@pytest.mark.parametrize("runner", ["ubuntu-latest", "macos-latest"])
+@pytest.mark.parametrize("helper_kind", ["file", "missing", "directory", "symlink"])
+def test_continuous_zip_step_preserves_stamps_and_framework_links(tmp_path, runner, helper_kind):
+    """Archive the finalized layout, including its helper and framework chain."""
+    import hashlib
+    import os
+    import shutil
+    import stat
+    import subprocess
+    import zipfile
+
+    if os.name == "nt" or shutil.which("bash") is None:
+        pytest.skip("executes the Bash workflow fixture on a POSIX host")
+    workflows = dict(_workflow_documents())
+    build_job = workflows[_WORKFLOWS / "auto_build.yml"]["jobs"]["build"]
+    steps = build_job["steps"]
+    matrix = next(row for row in build_job["strategy"]["matrix"]["include"] if row["os"] == runner)
+    root = "one-link.app" if runner == "macos-latest" else "one-link"
+    executable_relative = "Contents/MacOS/one-link" if runner == "macos-latest" else "one-link"
+    assert matrix["bundle-path"] == "dist/" + root
+    assert matrix["bundle-root"] == root
+    assert matrix["exe-name"] == executable_relative
+    matches = [step for step in steps
+               if "scripts/package_standalone_bundle.py" in step.get("run", "")]
+    assert len(matches) == 1
+    step = matches[0]
+    assert step["shell"] == "bash"
+    assert step.get("env", {}).get("EXE_NAME") == "${{ matrix.exe-name }}"
+    assert "if" not in step and "continue-on-error" not in step
+    command = step["run"]
+    assert command.index("package_standalone_bundle.py") < command.index("write_bundle_manifest.py")
+    assert "zip -r" not in command and "Compress-Archive -Path" not in command
+
+    bundle = tmp_path / matrix["bundle-path"]
+    runtime = bundle / ("Contents/Frameworks" if runner == "macos-latest" else "_internal")
+    framework = runtime / "Python.framework" / "Versions"
+    (framework / "3.12").mkdir(parents=True)
+    (framework / "3.12" / "Python").write_bytes(b"framework binary fixture")
+    (framework / "Current").symlink_to("3.12", target_is_directory=True)
+    (runtime / "Python").symlink_to("Python.framework/Versions/Current/Python")
+    executable = bundle / executable_relative
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.write_bytes(b"launcher fixture")
+    executable.chmod(0o755)
+    helper = executable.with_name("one-link-update-helper")
+    if helper_kind == "file":
+        helper.write_bytes(b"required finished helper")
+    elif helper_kind == "directory":
+        helper.mkdir()
+        (helper / "not-a-helper").write_bytes(b"directory with content")
+    elif helper_kind == "symlink":
+        helper.symlink_to(executable.name)
+    stamp = runtime / "one_link_build_stamp.json"
+    stamp.write_text(json.dumps({"schema": 1, "commit": "a" * 40, "channel": "rolling"}))
+    if runner == "macos-latest":
+        intermediate = tmp_path / "dist" / "one-link"
+        intermediate.mkdir()
+        (intermediate / "one-link").write_bytes(b"unfinalized COLLECT intermediate")
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    for name in ("package_standalone_bundle.py", "write_bundle_manifest.py"):
+        shutil.copyfile(_REPO / "scripts" / name, scripts / name)
+    shims = tmp_path / "tools"
+    shims.mkdir()
+    (shims / "uv").write_text(
+        '#!/bin/sh\nset -eu\n[ "$1 $2 $3 $4 $5" = "run --frozen --extra release python" ]\n'
+        'shift 5\nexec "$ONE_LINK_TEST_PYTHON" "$@"\n'
+    )
+    (shims / "git").write_text(
+        '#!/bin/sh\nset -eu\n[ "$*" = "show -s --format=%ct HEAD" ]\n'
+        'printf "%s\\n" 1700000001\n'
+    )
+    for shim in shims.iterdir():
+        shim.chmod(0o755)
+    env = dict(os.environ, PATH=str(shims) + os.pathsep + os.environ["PATH"],
+               PYTHONPATH=str(_REPO / "src"), ONE_LINK_TEST_PYTHON=sys.executable,
+               GITHUB_SHA="a" * 40, GITHUB_REF="refs/heads/test", GITHUB_RUN_ID="123")
+    step_names = ["stamp build metadata", "compute SHA-256 of the bundle", step["name"]]
+    for step_name in step_names:
+        current = next(item for item in steps if item.get("name") == step_name)
+        step_env = {key: matrix[value.removeprefix("${{ matrix.").removesuffix(" }}")]
+                    for key, value in current["env"].items()}
+        completed = subprocess.run(["bash", "-c", current["run"]], cwd=tmp_path, env=env | step_env,
+                                   text=True, capture_output=True, check=False)
+        if step_name == step["name"] and helper_kind != "file":
+            assert completed.returncode != 0
+            assert not (tmp_path / "dist" / (matrix["artifact-name"] + ".zip")).exists()
+            return
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+    archive_path = tmp_path / "dist" / (matrix["artifact-name"] + ".zip")
+    digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+    assert (archive_path.with_suffix(".zip.sha256")).read_text().split() == [digest, archive_path.name]
+    with zipfile.ZipFile(archive_path) as archive:
+        assert all(not member.is_dir() and "\\" not in member.filename for member in archive.infolist())
+        assert {name.split("/", 1)[0] for name in archive.namelist()} == {root}
+        build_info = archive.read(root + "/BUILD_INFO.txt").decode()
+        assert f"commit: {'a' * 40}\n" in build_info and "run_id: 123\n" in build_info
+        assert f"runner: {runner}\n" in build_info
+        assert archive.read(root + "/" + stamp.relative_to(bundle).as_posix()) == stamp.read_bytes()
+        helper_member = root + "/" + helper.relative_to(bundle).as_posix()
+        assert archive.read(helper_member) == b"required finished helper"
+        launcher_member = root + "/" + executable_relative
+        assert archive.read(launcher_member + ".sha256").decode().split() == [
+            hashlib.sha256(executable.read_bytes()).hexdigest(), launcher_member,
+        ]
+        link = archive.getinfo(root + "/" + runtime.relative_to(bundle).as_posix() + "/Python")
+        assert stat.S_ISLNK(link.external_attr >> 16)
+        assert archive.read(link) == b"Python.framework/Versions/Current/Python"
+        from one_link.update_transaction import _validate_zip_index
+
+        _, _, rows = _validate_zip_index(
+            archive, expected_executable=executable_relative, expected_bundle_root=root,
+        )
+        assert rows[helper_member].digest == hashlib.sha256(helper.read_bytes()).hexdigest()
+    assert (bundle / "BUNDLE_SHA256SUMS").is_file()
 
 
 def test_continuous_aggregate_never_mutates_a_public_release():

@@ -108,3 +108,89 @@ def test_real_subprocess_that_never_writes_a_port_file_is_reaped_as_dead(
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
+
+
+def test_a_failing_live_test_carries_both_daemon_log_tails(tmp_path: Path) -> None:
+    """A hosted failure must arrive with the daemons' own account, not just the assertion."""
+    from tests.harness import FAILED_TEST_LOG_TAIL, _attach_daemon_logs
+
+    a_log, b_log = tmp_path / "a.log", tmp_path / "b.log"
+    a_log.write_text("A started\nA sent the offer\n", encoding="utf-8")
+    # Longer than the tail, with the line that explains the failure thirty
+    # thousand characters before the end: the place a 4000-character tail
+    # cut off in the two hosted failures that arrived unreadable.
+    b_log.write_text(
+        "x" * 200_000 + "B received the offer\n" + "y" * 30_000 + "B never committed the file\n",
+        encoding="utf-8",
+    )
+    failure = AssertionError("a.txt didn't land on B within 30s after Accept")
+    _attach_daemon_logs(failure, {"A": a_log, "B": b_log})
+    notes = getattr(failure, "__notes__", [])
+    assert len(notes) == 2
+    assert notes[0].startswith("--- daemon A log tail ---") and "A sent the offer" in notes[0]
+    assert "B never committed the file" in notes[1]
+    assert "B received the offer" in notes[1], "the tail is too short to hold the cause"
+    assert len(notes[1]) < FAILED_TEST_LOG_TAIL + 200, "only the tail travels, not the whole log"
+    assert FAILED_TEST_LOG_TAIL >= 40_000
+    assert str(failure) == "a.txt didn't land on B within 30s after Accept", "the failure itself is unchanged"
+
+
+def test_missing_logs_and_non_failures_never_mask_the_original_exception(tmp_path: Path) -> None:
+    from tests.harness import _attach_daemon_logs
+
+    failure = AssertionError("original")
+    _attach_daemon_logs(failure, {"A": tmp_path / "absent.log"})
+    assert failure.__notes__ == ["--- daemon A log tail ---\n<no log>"]
+    closing = GeneratorExit()
+    _attach_daemon_logs(closing, {"A": tmp_path / "absent.log"})
+    assert not getattr(closing, "__notes__", [])
+
+
+def test_pytest_prints_the_attached_logs_under_the_traceback(tmp_path: Path) -> None:
+    """The note is part of what pytest renders for a failure, in both traceback styles a job log uses."""
+    from tests.harness import _attach_daemon_logs
+
+    log = tmp_path / "b.log"
+    log.write_text("B: still in step data-key acquisition after 5.0 s", encoding="utf-8")
+    try:
+        raise AssertionError("did not land")
+    except AssertionError as failure:
+        _attach_daemon_logs(failure, {"B": log})
+        info = pytest.ExceptionInfo.from_exception(failure)
+    for style in ("short", "long"):
+        rendered = str(info.getrepr(style=style))
+        assert "--- daemon B log tail ---" in rendered, style
+        assert "still in step data-key acquisition" in rendered, style
+
+
+def test_every_wait_for_a_daemon_to_start_uses_one_budget(monkeypatch) -> None:
+    from tests.harness import daemon_boot_budget_s
+
+    monkeypatch.delenv("ONE_LINK_TEST_DAEMON_BOOT_S", raising=False)
+    assert daemon_boot_budget_s() == 45.0
+    monkeypatch.setenv("ONE_LINK_TEST_DAEMON_BOOT_S", "120")
+    assert daemon_boot_budget_s() == 120.0
+
+
+def test_the_lifecycle_tests_wait_for_start_up_as_long_as_the_harness_does(tmp_path: Path, monkeypatch) -> None:
+    """They waited a flat 12 s of their own. A hosted Windows runner once took longer
+    (schema initialisation alone took 8.1 s there), and a test about a token file failed
+    on the runner's load. The wait is the shared budget now; an explicit one is still honoured."""
+    import tests.test_lifecycle as lifecycle
+
+    home = tmp_path / "home"
+    (home / "data").mkdir(parents=True)
+
+    monkeypatch.setenv("ONE_LINK_TEST_DAEMON_BOOT_S", "0.4")
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="port file did not appear") as shared:
+        lifecycle._read_port(home, "server.port")
+    assert 0.3 <= time.monotonic() - started < 3.0
+    assert "of 0.40s" in str(shared.value)
+
+    monkeypatch.setenv("ONE_LINK_TEST_DAEMON_BOOT_S", "30")
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="port file did not appear") as explicit:
+        lifecycle._read_port(home, "server.port", timeout=0.2)
+    assert time.monotonic() - started < 3.0
+    assert "of 0.20s" in str(explicit.value)

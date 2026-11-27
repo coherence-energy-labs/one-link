@@ -63,7 +63,7 @@ jobs:
       - name: setup uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.31"
+          version: "0.13.10"
           enable-cache: false
 
       - name: install
@@ -107,7 +107,7 @@ jobs:
       - name: setup uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.31"
+          version: "0.13.10"
           enable-cache: false
 
       - name: install checksummed Node.js LTS without a shared package cache
@@ -140,7 +140,7 @@ jobs:
 
       - name: build tagged native Python binding
         working-directory: native
-        run: uv run --project .. --frozen --extra dev --extra release maturin develop --release --locked
+        run: uv run --project .. --no-sync maturin develop --release --locked
 
       - name: native formatting and lint gates
         working-directory: native
@@ -165,21 +165,24 @@ jobs:
         run: python scripts/verify_browser_ed25519_wasm.py --rebuild
 
       - name: Python correctness lint
-        run: uv run --frozen --extra dev ruff check src/one_link
+        run: uv run --no-sync ruff check src/one_link
 
       - name: full Python suite for tagged source
         env:
           ONE_LINK_RUN_LIVE_INTEGRATION: "1"
           PYTHONUNBUFFERED: "1"
         run: |
-          # Extras match the canonical full-suite workflow exactly: uv run
-          # re-syncs the env to the extras NAMED HERE, so a bare --extra dev
-          # pruned the security tooling (cyclonedx) the SBOM-authority tests
-          # import, failing them only in this workflow.
-          uv run --frozen --extra dev --extra release --extra security python -m pytest tests/ \
+          # Keep the frozen environment and freshly built native binding intact.
+          uv run --no-sync python -m pytest tests/ \
             --ignore=tests/e2e \
             --ignore=tests/test_call_reliability_soak.py \
-            -q --tb=short --maxfail=20 --reruns 2 --reruns-delay 5
+            -p no:playwright -m "not live_daemon" -q --tb=short --maxfail=20 --reruns 2 --reruns-delay 5 --junitxml=test-results/full-suite.xml
+
+      - name: Strict live-daemon acceptance for tagged source
+        env:
+          ONE_LINK_RUN_LIVE_INTEGRATION: "1"
+          PYTHONUNBUFFERED: "1"
+        run: uv run --no-sync python scripts/live_suite.py --run --report test-results/live-suite.json
 
       # --timeout is LOAD-BEARING, not tidiness. A hung browser test eats the
       # remainder of the JOB budget and is then reported as "cancelled",
@@ -192,9 +195,12 @@ jobs:
         env:
           ONE_LINK_RUN_BROWSER_E2E: "1"
         run: |
-          uv run --frozen --extra e2e playwright install --with-deps chromium firefox
-          uv run --frozen --extra e2e python -m pytest tests/e2e/ -v --tb=short --browser chromium --timeout=600 --timeout-method=thread
-          uv run --frozen --extra e2e python -m pytest tests/e2e/test_peer_live_transport.py::test_two_isolated_peer_pages_complete_manual_webrtc_and_exchange_probe tests/e2e/test_browser_identity_possession_live.py::test_required_mode_live_pair_owner_request_and_immediate_revoke tests/e2e/test_call_local_candidate_live.py::test_call_media_local_candidate_augmentation_uses_real_browser_ice -v --tb=short --browser firefox --timeout=600 --timeout-method=thread
+          uv run --no-sync playwright install --with-deps chromium firefox
+          uv run --no-sync python -m pytest tests/e2e/ -v --tb=short --browser chromium --output=test-results/playwright-chromium --junitxml=test-results/browser-chromium.xml --timeout=600 --timeout-method=thread
+          uv run --no-sync python -m pytest tests/e2e/test_browser_readiness_gate.py tests/e2e/test_peer_live_transport.py::test_two_isolated_peer_pages_complete_manual_webrtc_and_exchange_probe tests/e2e/test_browser_identity_possession_live.py::test_required_mode_live_pair_owner_request_and_immediate_revoke tests/e2e/test_call_local_candidate_live.py::test_call_media_local_candidate_augmentation_uses_real_browser_ice -v --tb=short --browser firefox --output=test-results/playwright-firefox --junitxml=test-results/browser-firefox.xml --timeout=600 --timeout-method=thread
+
+      - name: Verify generated owner UI matches its reviewed source modules
+        run: python scripts/build_owner_ui.py --check
 
       - name: exact JavaScript dependency and static-contract gates
         working-directory: tests/js
@@ -205,7 +211,7 @@ jobs:
 
       - name: GitHub Actions security gate
         run: >-
-          uv run --frozen --extra security zizmor
+          uv run --no-sync zizmor
           --pedantic --strict-collection .github
 
       - name: Python dependency and source security gates
@@ -214,18 +220,43 @@ jobs:
           # locked RustSec gates below; audit every registry-backed Python extra
           # and dependency group without invoking pip's resolver.
           uv export --frozen --all-extras --all-groups --no-extra native --no-emit-project --output-file "$RUNNER_TEMP/requirements.lock"
-          uv run --frozen --extra security python -m pip_audit \
+          uv run --no-sync python -m pip_audit \
             --requirement "$RUNNER_TEMP/requirements.lock" --no-deps --disable-pip
-          uv run --frozen --extra security python -m pip_audit \
+          uv run --no-sync python -m pip_audit \
             --requirement "$RUNNER_TEMP/requirements.lock" --no-deps --disable-pip \
             --vulnerability-service osv
-          uv run --frozen --extra security bandit -c pyproject.toml -r src/one_link scripts --severity-level medium
+          uv run --no-sync bandit -c pyproject.toml -r src/one_link scripts --severity-level medium
 
-      - name: install pinned cargo-audit and gate both Rust lockfiles
+      - name: install pinned cargo-audit
+        id: cargo_audit
+        if: ${{ !cancelled() }}
+        run: cargo install --locked --version 0.22.2 cargo-audit
+
+      - name: retain reports for all three Rust lockfiles
+        if: ${{ !cancelled() && steps.cargo_audit.outcome == 'success' }}
         run: |
-          cargo install --locked --version 0.22.2 cargo-audit
+          mkdir -p test-results
+          cargo audit --file native/Cargo.lock --deny warnings --json > test-results/cargo-audit.json || true
+          cargo audit --file native/fuzz/Cargo.lock --deny warnings --json > test-results/cargo-audit-fuzz.json || true
+          cargo audit --file native/ol_shell/Cargo.lock --json > test-results/cargo-audit-shell.json || true
+
+      - name: gate native and fuzz Rust dependencies
+        if: ${{ !cancelled() && steps.cargo_audit.outcome == 'success' }}
+        run: |
           cargo audit --file native/Cargo.lock --deny warnings
           cargo audit --file native/fuzz/Cargo.lock --deny warnings
+
+      - name: gate shell RustSec vulnerabilities and warnings with one dispositioned exception
+        if: ${{ !cancelled() && steps.cargo_audit.outcome == 'success' }}
+        # Every warning class fails except the exact, documented
+        # RUSTSEC-2024-0370 (proc-macro-error unmaintained, no patched release;
+        # docs/DEPENDENCY_QUALIFICATION.md). The archived JSON above keeps it
+        # visible. Path packages are covered by the live ancestor query below.
+        run: cargo audit --file native/ol_shell/Cargo.lock --deny warnings --ignore RUSTSEC-2024-0370
+
+      - name: audit verified vendor registry ancestors against live advisories
+        if: ${{ !cancelled() }}
+        run: python scripts/audit_vendor_advisories.py --report test-results/vendor-upstream-advisories.json
 
       - name: install checksummed Gitleaks release
         env:
@@ -242,9 +273,19 @@ jobs:
           ./gitleaks version
 
       - name: full-history secret gate
-        run: >-
-          ./gitleaks git . --no-banner --no-color --redact=100
-          --max-decode-depth=5 --max-archive-depth=2 --timeout=300
+        run: |
+          mkdir -p test-results
+          ./gitleaks git . --no-banner --no-color --redact=100 \
+            --max-decode-depth=5 --max-archive-depth=2 --timeout=300 \
+            --report-format=json --report-path=test-results/gitleaks-redacted.json
+
+      - name: Preserve tagged Linux qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tagged-quality-linux-evidence
+          path: test-results/
+          if-no-files-found: warn
 
   release_quality_windows:
     name: tagged commit quality / Windows
@@ -270,7 +311,7 @@ jobs:
       - name: setup uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.31"
+          version: "0.13.10"
           enable-cache: false
 
       # Live-tier daemons self-build the native CDC scanner at runtime; on
@@ -317,31 +358,36 @@ jobs:
       - name: verify lock and install the reviewed Windows toolchain
         run: |
           uv lock --check
-          uv sync --frozen --python python --extra dev --extra e2e --extra release
+          uv sync --frozen --python python --extra dev --extra e2e --extra release --extra security
 
       - name: build tagged native Python binding
         working-directory: native
-        run: uv run --project .. --frozen --extra dev --extra release maturin develop --release --locked
+        run: uv run --project .. --no-sync maturin develop --release --locked
 
       - name: canonical Windows type gate
-        run: uv run --frozen --extra dev mypy src/one_link
+        run: uv run --no-sync mypy src/one_link
 
       - name: operator pre-release, native SLO, fuzz, and live-demo gates
         run: >-
-          uv run --frozen --extra dev --extra release python
+          uv run --no-sync python
           scripts/pre_release_audit.py --skip-cargo --skip-pytest
 
       - name: full Python suite for tagged source
         env:
           ONE_LINK_RUN_LIVE_INTEGRATION: "1"
           PYTHONUNBUFFERED: "1"
-        # Extras mirror the canonical full-suite workflow; see the Linux
-        # quality job for why a bare --extra dev fails the SBOM tests here.
+        # Preserve the frozen environment and the tagged native binding.
         run: >-
-          uv run --frozen --extra dev --extra release --extra security python -m pytest tests/
+          uv run --no-sync python -m pytest tests/
           --ignore=tests/e2e
           --ignore=tests/test_call_reliability_soak.py
-          -q --tb=short --maxfail=20 --reruns 2 --reruns-delay 5
+          -p no:playwright -m "not live_daemon" -q --tb=short --maxfail=20 --reruns 2 --reruns-delay 5 --junitxml=test-results/full-suite.xml
+
+      - name: Strict live-daemon acceptance for tagged source
+        env:
+          ONE_LINK_RUN_LIVE_INTEGRATION: "1"
+          PYTHONUNBUFFERED: "1"
+        run: uv run --no-sync python scripts/live_suite.py --run --report test-results/live-suite.json
 
       # --timeout is LOAD-BEARING, not tidiness. A hung browser test eats the
       # remainder of the JOB budget and is then reported as "cancelled",
@@ -354,9 +400,17 @@ jobs:
         env:
           ONE_LINK_RUN_BROWSER_E2E: "1"
         run: |
-          uv run --frozen --extra e2e playwright install chromium firefox
-          uv run --frozen --extra e2e python -m pytest tests/e2e/ -v --tb=short --browser chromium --timeout=600 --timeout-method=thread
-          uv run --frozen --extra e2e python -m pytest tests/e2e/test_peer_live_transport.py::test_two_isolated_peer_pages_complete_manual_webrtc_and_exchange_probe tests/e2e/test_browser_identity_possession_live.py::test_required_mode_live_pair_owner_request_and_immediate_revoke tests/e2e/test_call_local_candidate_live.py::test_call_media_local_candidate_augmentation_uses_real_browser_ice -v --tb=short --browser firefox --timeout=600 --timeout-method=thread
+          uv run --no-sync playwright install chromium firefox
+          uv run --no-sync python -m pytest tests/e2e/ -v --tb=short --browser chromium --output=test-results/playwright-chromium --junitxml=test-results/browser-chromium.xml --timeout=600 --timeout-method=thread
+          uv run --no-sync python -m pytest tests/e2e/test_browser_readiness_gate.py tests/e2e/test_peer_live_transport.py::test_two_isolated_peer_pages_complete_manual_webrtc_and_exchange_probe tests/e2e/test_browser_identity_possession_live.py::test_required_mode_live_pair_owner_request_and_immediate_revoke tests/e2e/test_call_local_candidate_live.py::test_call_media_local_candidate_augmentation_uses_real_browser_ice -v --tb=short --browser firefox --output=test-results/playwright-firefox --junitxml=test-results/browser-firefox.xml --timeout=600 --timeout-method=thread
+
+      - name: Preserve tagged Windows qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tagged-quality-windows-evidence
+          path: test-results/
+          if-no-files-found: warn
 
   # Branch checks do not automatically follow a tag. Re-run the complete,
   # checksum-pinned TLA+ model inventory at this exact publication commit and
@@ -411,7 +465,7 @@ jobs:
       - name: setup uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.31"
+          version: "0.13.10"
           enable-cache: false
 
       - name: read version + source-date-epoch
@@ -507,21 +561,6 @@ jobs:
           rustup toolchain install 1.96.0 --profile minimal --no-self-update
           rustup default 1.96.0
 
-      # ONE LINK'S NATIVE WINDOW needs WebKitGTK on Linux. Without it `wry` cannot build, and
-      # `build_binary.py` packages the browser fallback instead (the shell is `--required` only on
-      # Windows, where it is verified end to end). Installing these lets the Linux build produce
-      # the window; whether it OPENS correctly on Linux is a separate question this does not answer.
-      #
-      # `|| true` deliberately: a runner image that already carries these, or an apt hiccup, must
-      # not fail a release over a window that is optional on this platform.
-      - name: Install WebKitGTK for the native window (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update || true
-          sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
-            librsvg2-dev libxdo-dev || true
-
       - name: setup Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -530,7 +569,7 @@ jobs:
       - name: setup uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.31"
+          version: "0.13.10"
           enable-cache: false
 
       - name: install locked build tooling
@@ -605,6 +644,21 @@ jobs:
         with:
           persist-credentials: false
 
+      # ONE LINK'S NATIVE WINDOW needs WebKitGTK on Linux. Without it `wry` cannot build, and
+      # `build_binary.py` packages the browser fallback instead (the shell is `--required` only on
+      # Windows, where it is verified end to end). Installing these lets the Linux build produce
+      # the window; whether it OPENS correctly on Linux is a separate question this does not answer.
+      #
+      # `|| true` deliberately: a runner image that already carries these, or an apt hiccup, must
+      # not fail a release over a window that is optional on this platform.
+      - name: Install WebKitGTK for the native window (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev || true
+
       - name: setup Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -613,7 +667,7 @@ jobs:
       - name: setup uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.31"
+          version: "0.13.10"
           enable-cache: false
 
       # The standalone bundle build compiles the native CDC scanner and
@@ -668,6 +722,27 @@ jobs:
         run: |
           rustup toolchain install 1.96.0 --profile minimal --no-self-update
           rustup default 1.96.0
+
+      - name: verify reviewed vendor source and upstream patch
+        run: python scripts/verify_vendor_patches.py --fetch-upstream --report test-results/vendor-provenance.json
+
+      - name: optimized GLib Variant iterator regression tests
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: '3'
+        run: |
+          mkdir -p test-results
+          cargo test --manifest-path native/ol_shell/Cargo.toml --locked --release \
+            -p ol_shell_glib_regression 2>&1 | tee test-results/glib-optimized.log
+
+      - name: retain vendor qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vendor-qualification-${{ matrix.native_artifact }}
+          path: test-results/
+          if-no-files-found: warn
 
       - name: install/verify OpenSSL on Windows ARM64 (cryptography build dep)
         # See auto_build.yml for the full rationale. Tagged releases do not
@@ -782,10 +857,248 @@ jobs:
           name: ${{ matrix.artifact }}
           path: staged/${{ matrix.asset_name }}
 
+  verify_reproducibility:
+    name: released Linux wheel byte-equivalent rebuild
+    needs: [build, native_wheels]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the release Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+      - name: setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: setup uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.13.10"
+          enable-cache: false
+      - name: install the release native build tooling
+        run: uv sync --frozen --python python --only-group wheel-tools
+      - name: Download the actual wheel selected for publication
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-wheel-linux-x86_64
+          path: reproducibility/candidate/
+      - name: Independently rebuild the same source on a fresh runner
+        working-directory: native
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.build.outputs.source_date_epoch }}
+        run: >-
+          uv run --project .. --frozen --only-group wheel-tools maturin build
+          --release --strip --locked --out ../reproducibility/rebuilt/
+      - name: Compare exact candidate and rebuilt wheel bytes
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+        run: >-
+          python scripts/verify_reproducible_wheels.py
+          --candidate reproducibility/candidate --rebuilt reproducibility/rebuilt
+          --source-revision "$SOURCE_REVISION"
+          --report reproducibility/comparison.json
+      - name: Preserve reproducibility result and both compared artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-reproducibility-evidence
+          path: reproducibility/
+          if-no-files-found: error
+
+  # Every release artifact a fresh runner of the SAME OS image can rebuild is
+  # rebuilt there and compared with the artifact selected for publication.
+  # x86_64 Linux native wheel: verify_reproducibility above. aarch64 Linux
+  # native wheel: this job. Pure-Python wheel and sdist: the next job. The
+  # Windows and macOS native wheels, the standalone binaries, and the derived
+  # SBOM, update manifest, SHA256SUMS and Sigstore bundles have no independent
+  # rebuild; docs/RELEASE_PROTECTION.md lists them.
+  verify_reproducibility_linux_arm64:
+    name: released Linux aarch64 wheel byte-equivalent rebuild
+    needs: [build, native_wheels]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the release Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+      - name: setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: setup uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.13.10"
+          enable-cache: false
+      - name: install the release native build tooling
+        run: uv sync --frozen --python python --only-group wheel-tools
+      - name: Download the actual wheel selected for publication
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-wheel-linux-arm64
+          path: reproducibility/candidate/
+      - name: Independently rebuild the same source on a fresh runner
+        working-directory: native
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.build.outputs.source_date_epoch }}
+        run: >-
+          uv run --project .. --frozen --only-group wheel-tools maturin build
+          --release --strip --locked --out ../reproducibility/rebuilt/
+      - name: Compare exact candidate and rebuilt wheel bytes
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+        run: >-
+          python scripts/verify_reproducible_wheels.py
+          --candidate reproducibility/candidate --rebuilt reproducibility/rebuilt
+          --source-revision "$SOURCE_REVISION"
+          --report reproducibility/comparison.json
+      - name: Preserve reproducibility result and both compared artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-reproducibility-evidence-linux-arm64
+          path: reproducibility/
+          if-no-files-found: error
+
+  # The pure-Python wheel must match byte for byte. The sdist is compared
+  # member by member (names, order, types, modes, sizes, link targets and
+  # content). Its archive bytes are NOT reproducible: setuptools writes the
+  # build time into the gzip header MTIME and checkout/build times into tar
+  # member mtimes, and it does not honour SOURCE_DATE_EPOCH for sdists
+  # (measured 2026-11-25 with setuptools 84.2.1: two builds of one commit
+  # differed in exactly those fields). The report states what was not compared.
+  verify_reproducibility_python:
+    name: released Python wheel and sdist independent rebuild
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: setup uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.13.10"
+          enable-cache: false
+      - name: install build tooling
+        run: uv sync --frozen --python python --only-group release-tools
+      # Same command and environment as the build job, on a fresh checkout.
+      # The candidate is downloaded only afterwards, so it cannot enter the
+      # rebuilt sdist.
+      - name: Independently rebuild sdist + wheel from locked tooling
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.build.outputs.source_date_epoch }}
+          PYTHONHASHSEED: 0
+        run: |
+          rm -rf dist/ build/ *.egg-info src/*.egg-info
+          uv run --frozen --only-group release-tools python -m build --no-isolation --sdist --wheel --outdir dist/
+          mkdir -p reproducibility/rebuilt
+          cp dist/*.whl dist/*.tar.gz reproducibility/rebuilt/
+      - name: Download the actual distributions selected for publication
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: reproducibility/candidate/
+      - name: Compare exact candidate and rebuilt wheel bytes
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+        run: >-
+          python scripts/verify_reproducible_wheels.py
+          --candidate reproducibility/candidate --rebuilt reproducibility/rebuilt
+          --source-revision "$SOURCE_REVISION"
+          --report reproducibility/wheel-comparison.json
+      - name: Compare every sdist member of candidate and rebuild
+        if: ${{ !cancelled() }}
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, pathlib, sys, tarfile
+
+          def inventory(directory):
+              found = sorted(pathlib.Path(directory).glob("*.tar.gz"))
+              if len(found) != 1:
+                  sys.exit(f"REPRODUCIBILITY VACUOUS: expected one sdist in {directory}, found {[p.name for p in found]}")
+              rows = []
+              with tarfile.open(found[0], "r:gz") as archive:
+                  for member in archive.getmembers():
+                      stream = archive.extractfile(member) if member.isfile() else None
+                      rows.append({
+                          "name": member.name, "type": member.type.decode("ascii"), "mode": member.mode,
+                          "size": member.size, "linkname": member.linkname,
+                          "sha256": hashlib.sha256(stream.read()).hexdigest() if stream else None,
+                      })
+              data = found[0].read_bytes()
+              return rows, {"name": found[0].name, "sha256": hashlib.sha256(data).hexdigest(), "size_bytes": len(data)}
+
+          left, candidate = inventory("reproducibility/candidate")
+          right, rebuilt = inventory("reproducibility/rebuilt")
+          differences = [
+              {"index": index, "candidate": a, "rebuilt": b}
+              for index, (a, b) in enumerate(zip(left, right)) if a != b
+          ]
+          if len(left) != len(right):
+              differences.append({"member_count": {"candidate": len(left), "rebuilt": len(right)}})
+          identical = not differences and bool(left) and candidate["name"] == rebuilt["name"]
+          report = {
+              "schema": "one-link-reproducible-sdist/v1",
+              "source_revision": os.environ["SOURCE_REVISION"],
+              "compared": "sdist file name and every member's name, order, type, mode, size, link target and content",
+              "not_compared": ("member mtime, uid, gid, uname and gname, and the gzip header MTIME: setuptools "
+                               "writes build-time and checkout-time values there, so the archive bytes are not reproducible"),
+              "candidate": candidate, "rebuilt": rebuilt,
+              "archive_bytes_identical": candidate["sha256"] == rebuilt["sha256"],
+              "members_identical": identical, "member_count": len(left), "differences": differences[:50],
+          }
+          pathlib.Path("reproducibility/sdist-comparison.json").write_text(json.dumps(report, indent=2) + "\n")
+          print(json.dumps(report, indent=2))
+          sys.exit(0 if identical else 1)
+          PY
+      - name: Preserve reproducibility results and both compared distributions
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-reproducibility-evidence-python
+          path: reproducibility/
+          if-no-files-found: error
+
   sign:
     name: sigstore-attest dist
-    needs: [release_quality_gate, build, native_wheels, binaries]
+    needs:
+      - release_quality_gate
+      - build
+      - native_wheels
+      - binaries
+      - verify_reproducibility
+      - verify_reproducibility_linux_arm64
+      - verify_reproducibility_python
     runs-on: ubuntu-latest
+    # Release-protection boundary (docs/RELEASE_PROTECTION.md). A YAML key
+    # cannot protect itself: the reviewers and the v* tag deployment policy
+    # that make this gate real are environment settings. GitHub creates an
+    # environment named here on first use, unprotected, so this key is inert
+    # until those settings are applied and cannot break an unconfigured run.
+    environment: release
     permissions:
       contents: read
       id-token: write # Required to obtain the Sigstore/GitHub OIDC identity.
@@ -828,7 +1141,7 @@ jobs:
       - name: setup uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.31"
+          version: "0.13.10"
           enable-cache: false
 
       - name: install locked SBOM and signing clients
@@ -852,6 +1165,8 @@ jobs:
             --exclude-python-extra native \
             --cargo-lock native/Cargo.lock \
             --cargo-workspace native/Cargo.toml \
+            --additional-cargo shell native/ol_shell/Cargo.toml \
+            --additional-cargo fuzz native/fuzz/Cargo.toml \
             --artifacts-dir dist \
             --artifact-pattern 'one_link-*.whl' \
             --artifact-pattern 'one_link-*.tar.gz' \
@@ -945,8 +1260,10 @@ jobs:
 
   publish:
     name: publish tagged release
-    needs: [release_quality_gate, build, sign]
+    needs: [release_quality_gate, build, sign, verify_reproducibility]
     runs-on: ubuntu-latest
+    # Same release-protection environment as sign; see the note there.
+    environment: release
     permissions:
       contents: write # Required only for `gh release` publication below.
     steps:
@@ -990,14 +1307,27 @@ jobs:
             (the deterministic source-timestamp input used by this build).
 
             `SHA256SUMS` verifies the exact published bytes. Separate unsigned
-            CI evidence currently proves byte-for-byte reproducibility only for
-            the explicitly compared Linux native wheel; no such claim is made
-            for the standalone cross-platform binaries.
+            CI evidence from an independent rebuild on a fresh runner proves
+            byte-for-byte reproducibility only for the compared Linux x86_64
+            and aarch64 native wheels and the pure-Python wheel. The sdist's
+            members (names, modes, sizes and content) are rebuilt identically,
+            but its archive timestamps are not reproducible, so no byte-level
+            claim is made for it. No rebuild claim is made for the Windows and
+            macOS native wheels or the standalone cross-platform binaries.
 
             `sbom.cdx.json` inventories the frozen Python graph, the complete
-            native Cargo.lock/workspace graph, and SHA-256 hashes of the exact
+            native, shell and fuzz Cargo.lock graphs, and SHA-256 hashes of the exact
             wheels and standalone bundles assembled by this run. The SBOM is
             itself covered by SHA256SUMS, Sigstore, and provenance attestation.
+            It includes build and test dependencies and does not assert runtime
+            reachability in every artifact. The local Linux shell glib backport
+            preserves its original version and license, with exact source hashes,
+            an upstream patch pedigree and a live original-version advisory check.
+            The known upstream advisory remains visible and only that exact issue
+            is covered by the verified source patch. A separate macro-maintenance
+            warning remains; see `docs/DEPENDENCY_QUALIFICATION.md` and this run's
+            RustSec/vendor evidence. These checks do not by themselves establish
+            complete production qualification.
 
             `UPDATE_MANIFEST.json` is the signed, commit-bound authority used by
             the standalone transactional updater. It names and hashes each

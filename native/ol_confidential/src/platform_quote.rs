@@ -11,7 +11,7 @@
 //! On the verifying side (ANY platform), this module:
 //! 1. Parses the wire bytes.
 //! 2. Reads the `BCRYPT_ECCKEY_BLOB` public key into a p256-friendly
-//!    `EncodedPoint` (SEC1 uncompressed: `0x04 || X || Y`).
+//!    `Sec1Point` (SEC1 uncompressed: `0x04 || X || Y`).
 //! 3. Reads the 64-byte `r || s` ECDSA signature.
 //! 4. Computes `BLAKE3` over the sub-transcript and verifies the sig
 //!    against the parsed public key.
@@ -23,7 +23,7 @@
 use blake3::Hasher;
 use p256::ecdsa::signature::hazmat::PrehashVerifier;
 use p256::ecdsa::{Signature, VerifyingKey};
-use p256::EncodedPoint;
+use p256::Sec1Point;
 
 use crate::attestation::AttestationNonce;
 use crate::errors::{ConfidentialError, ConfidentialResult};
@@ -100,8 +100,8 @@ pub fn parse_platform_quote(quote: &[u8]) -> ConfidentialResult<(Vec<u8>, Vec<u8
 }
 
 /// Convert a CNG `BCRYPT_ECCKEY_BLOB` public-key payload into a
-/// p256 `EncodedPoint` (uncompressed SEC1).
-fn cng_public_blob_to_sec1(blob: &[u8]) -> ConfidentialResult<EncodedPoint> {
+/// p256 `Sec1Point` (uncompressed SEC1).
+fn cng_public_blob_to_sec1(blob: &[u8]) -> ConfidentialResult<Sec1Point> {
     if blob.len() < 8 + 32 + 32 {
         return Err(ConfidentialError::Internal(
             "BCRYPT_ECCKEY_BLOB too short for ECDSA-P256",
@@ -123,8 +123,8 @@ fn cng_public_blob_to_sec1(blob: &[u8]) -> ConfidentialResult<EncodedPoint> {
     sec1[0] = 0x04;
     sec1[1..33].copy_from_slice(&blob[8..40]);
     sec1[33..65].copy_from_slice(&blob[40..72]);
-    EncodedPoint::from_bytes(sec1)
-        .map_err(|_| ConfidentialError::Internal("p256 EncodedPoint::from_bytes failed"))
+    Sec1Point::from_bytes(sec1)
+        .map_err(|_| ConfidentialError::Internal("p256 Sec1Point::from_bytes failed"))
 }
 
 /// Verify a TPM-issued `platform_quote` against the sub-transcript
@@ -148,7 +148,7 @@ pub fn verify_platform_quote(
 ) -> ConfidentialResult<Vec<u8>> {
     let (pub_blob, sig_bytes) = parse_platform_quote(quote)?;
     let point = cng_public_blob_to_sec1(&pub_blob)?;
-    let vk = VerifyingKey::from_encoded_point(&point)
+    let vk = VerifyingKey::from_sec1_point(&point)
         .map_err(|_| ConfidentialError::Internal("p256 VerifyingKey decode failed"))?;
     // The TPM produces a raw r||s ECDSA signature. p256 expects the
     // same layout via `Signature::from_slice`.
@@ -172,6 +172,53 @@ pub fn verify_platform_quote(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verifies_independent_p256_cng_wire_fixture() {
+        // Software-generated compatibility fixture: P-256 test private scalar 1,
+        // signed with Python cryptography/OpenSSL over the BLAKE3 prehash.
+        // This checks CNG wire-format verification after a dependency upgrade;
+        // it does not assert TPM issuance or hardware-backed key storage.
+        let quote: [u8; 140] = [
+            0x00, 0x48, 0x45, 0x43, 0x53, 0x31, 0x20, 0x00, 0x00, 0x00, 0x6b, 0x17, 0xd1, 0xf2,
+            0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5, 0x63, 0xa4, 0x40, 0xf2, 0x77, 0x03,
+            0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4, 0xa1, 0x39, 0x45, 0xd8, 0x98, 0xc2, 0x96,
+            0x4f, 0xe3, 0x42, 0xe2, 0xfe, 0x1a, 0x7f, 0x9b, 0x8e, 0xe7, 0xeb, 0x4a, 0x7c, 0x0f,
+            0x9e, 0x16, 0x2b, 0xce, 0x33, 0x57, 0x6b, 0x31, 0x5e, 0xce, 0xcb, 0xb6, 0x40, 0x68,
+            0x37, 0xbf, 0x51, 0xf5, 0x00, 0x40, 0xdf, 0x74, 0x04, 0x74, 0x2e, 0x51, 0xf0, 0x89,
+            0x6b, 0xaa, 0xd7, 0x4d, 0x58, 0x5d, 0x8b, 0x23, 0xd2, 0xec, 0x94, 0xb4, 0xb4, 0xee,
+            0xf7, 0xa6, 0xe2, 0x66, 0x4e, 0xb2, 0x16, 0xb1, 0x0d, 0x1b, 0xc2, 0xf0, 0x68, 0xbe,
+            0x97, 0x4f, 0x98, 0x29, 0xf3, 0xf1, 0xc0, 0xa3, 0x22, 0xfb, 0xc2, 0x4b, 0x85, 0x40,
+            0x3b, 0x25, 0x0a, 0xe2, 0xa5, 0x5f, 0x62, 0x4f, 0x46, 0xe1, 0x3a, 0xb7, 0x41, 0x6c,
+        ];
+        let expected_digest: [u8; 32] = [
+            0xc8, 0x8a, 0xe5, 0xef, 0x91, 0xab, 0x31, 0xd9, 0x5f, 0x9b, 0xbf, 0x0d, 0x99, 0xe3,
+            0x99, 0x30, 0xcb, 0x27, 0xea, 0x93, 0x95, 0x66, 0x3e, 0x70, 0x60, 0xd9, 0x27, 0x1a,
+            0xd8, 0x0c, 0x13, 0xd6,
+        ];
+        assert_eq!(
+            canonical_platform_quote_subtranscript(
+                ProviderTag::WindowsTpm,
+                &[0u8; 1984],
+                &[0u8; 32],
+                100,
+                120,
+                None,
+            ),
+            expected_digest,
+        );
+        let public_blob = verify_platform_quote(
+            &quote,
+            ProviderTag::WindowsTpm,
+            &[0u8; 1984],
+            &[0u8; 32],
+            100,
+            120,
+            None,
+        )
+        .expect("independent P-256 prehash signature must remain compatible");
+        assert_eq!(public_blob, quote[2..74]);
+    }
 
     #[test]
     fn parse_rejects_short_input() {

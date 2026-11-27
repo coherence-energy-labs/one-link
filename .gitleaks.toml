@@ -1,0 +1,58 @@
+# Gitleaks configuration for the full-history secret gates (security.yml and
+# release.yml run `gitleaks git .`, which reads this file from the checkout).
+#
+# The default rule set applies unchanged. Each allowlist below is a
+# CONTENT-anchored false positive: one rule, one path, one exact line. A
+# .gitleaksignore fingerprint (commit:path:rule:line) names a commit SHA, and a
+# squash or rebase merge re-creates the same content under a new SHA, which
+# turns the required full-history scan red on master and on every later pull
+# request. These entries match the content itself, so they hold under merge,
+# squash and rebase alike. Any other line, path or rule is still scanned.
+#
+# Regexes are written so that this file never matches the rule it narrows. In
+# `git` mode the line Gitleaks tests can begin with the preceding newline, so
+# each anchor starts with \s* rather than assuming column one.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = """courier_service.py CourierIdentity dataclass: the field annotation names the
+public cryptography class Ed25519PrivateKey and carries no value. generic-api-key reads the type
+identifier after the key-named field as a token. Introduced in aac9f834855c."""
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^src/one_link/courier_service\.py$''']
+regexTarget = "line"
+regexes = ['''^\s*signing_key: Ed25519PrivateKey\s*$''']
+
+[[allowlists]]
+description = """relay_client.py relay-route builder: the keyword-only parameter annotation names
+the public class Ed25519PrivateKey with a None default and carries no credential. Introduced in
+62318233f84d; formerly the line-number fingerprint relay_client.py:generic-api-key:1366, which
+would also have hidden any real secret later placed on that line."""
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^src/one_link/relay_client\.py$''']
+regexTarget = "line"
+regexes = ['''^\s*source_private_key: Ed25519PrivateKey\x20\|\x20None\x20=\x20None,\s*$''']
+
+[[allowlists]]
+description = """relay_routing.py DerivedRoute dataclass: the field annotation names the public
+class Ed25519PrivateKey and carries no value. Introduced in 62318233f84d; formerly the
+line-number fingerprint relay_routing.py:generic-api-key:146."""
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^src/one_link/relay_routing\.py$''']
+regexTarget = "line"
+regexes = ['''^\s*auth_private: Ed25519PrivateKey\s*$''']
+
+[[allowlists]]
+description = """The first .gitleaksignore rationale (commit 27cc28be750027a8) quoted that same
+annotation in a comment. Only that historical comment line is covered; the current
+.gitleaksignore no longer contains it."""
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^\.gitleaksignore$''']
+regexTarget = "line"
+regexes = ['''^\s*# The historical line is signing_key: Ed25519PrivateKey\x20\(AST AnnAssign with\s*$''']

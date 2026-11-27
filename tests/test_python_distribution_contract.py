@@ -81,7 +81,17 @@ def test_stable_distribution_contract_exactly_matches_source_tree() -> None:
     # 208: one_link.reachability_doctor added 2026-08-27. Being in this tuple
     # is also what bundles it as a PyInstaller hidden import, so the diagnosis
     # ships with the app rather than only existing in a source checkout.
-    assert len(build_identity.EXPECTED_STABLE_RUNTIME_MODULES) == 208
+    # 222: seven MNT-01/RUN-01 runtime services added 2026-11-25 (call_lifecycle,
+    # call_routes, fabric_snapshot, folder_manifest_policy, folder_sync_receipts,
+    # folder_sync_scheduler, off_loop_import); each is imported by daemon/server.
+    # 224: held_offers (imported by daemon) and owner_auth_note (imported by
+    # server), 2026-11-25. Both hold logic that would otherwise have been added
+    # to the two orchestration classes.
+    # 225: connection_shutdown (imported by daemon), 2026-11-26: how a stopping
+    # daemon ends its open connections.
+    # 226: ack_batching (imported by daemon), 2026-11-26: when a file sender may
+    # wait for an acknowledgement and when a receiver answers a short batch.
+    assert len(build_identity.EXPECTED_STABLE_RUNTIME_MODULES) == 226
     assert build_identity.EXPECTED_STABLE_RUNTIME_MODULES == tuple(
         sorted(set(build_identity.EXPECTED_STABLE_RUNTIME_MODULES))
     )
@@ -154,9 +164,16 @@ def test_distribution_source_contract_hashes_every_packaged_python_file() -> Non
     # (222 / 242 before it: certified_surface.py + data/certified/peer_row.json, the
     # peer row's proven layout table, laws discharged over every integer input.)
     # (221 / 240 before it: env_bounds.py, 2026-08-05. 220 / 239: bounded_resolver.py.)
-    assert len(source_python) == 224
+    # Eight new reviewed modules: benchmark contract plus seven runtime services.
+    # MNT-01/RUN-01 (2026-11-25): seven more runtime services -- call_lifecycle,
+    # call_routes, fabric_snapshot, folder_manifest_policy, folder_sync_receipts,
+    # folder_sync_scheduler, off_loop_import.
+    # (239 / 262 before them.) Two more the same day: held_offers, owner_auth_note.
+    # (241 / 264 before it.) connection_shutdown, 2026-11-26.
+    # (242 / 265 before it.) ack_batching, 2026-11-26.
+    assert len(source_python) == 243
     assert packaged_python == source_python
-    assert len(contract.payload_hashes) == 247
+    assert len(contract.payload_hashes) == 266
 
 
 def test_developer_only_modules_are_not_stable_distribution_requirements() -> None:
@@ -303,7 +320,7 @@ def test_core_wheel_configuration_is_genuinely_universal() -> None:
         "NOTICE",
     ]
     assert project["build-system"]["requires"] == [
-        "setuptools>=83,<84",
+        "setuptools>=84.1,<85",
         "wheel>=0.47,<0.48",
     ]
     assert project["tool"]["setuptools"]["include-package-data"] is False
@@ -509,7 +526,8 @@ def test_fresh_wheel_and_sdist_pass_two_clean_install_probes(tmp_path: Path) -> 
     assert result["source_python_file_count"] == sum(
         name.endswith(".py") for name in staged_contract.payload_hashes
     )
-    assert result["declared_requirement_count"] == 48
+    # The dev extra declares defusedxml for the hardened CT-audit XML parser.
+    assert result["declared_requirement_count"] == 53
     assert result["declared_extra_count"] == 9
     assert result["wheel_bytes"] > 0
     assert result["sdist_bytes"] > 0

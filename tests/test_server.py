@@ -530,6 +530,7 @@ async def _post_json(session, url, payload, *, token=None):
 
 # ─── tests ────────────────────────────────────────────────────────────
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_server_unauth_returns_401():
     with daemon_pair() as p:
@@ -539,6 +540,7 @@ async def test_server_unauth_returns_401():
             assert status == 401
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_server_index_serves_html_and_scopes_browser_bearer_to_origin():
     with daemon_pair() as p:
@@ -560,6 +562,7 @@ async def test_server_index_serves_html_and_scopes_browser_bearer_to_origin():
                 assert r.headers.get("ETag", "").startswith('"')
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_server_index_returns_304_on_matching_etag():
     """Conditional GET with a matching If-None-Match must return
@@ -579,6 +582,7 @@ async def test_server_index_returns_304_on_matching_etag():
                 assert r.headers.get("ETag") == etag
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_server_bootstrap_ignores_matching_etag_and_mints_origin_session():
     """A cached public shell must not turn a credential bootstrap into 304."""
@@ -598,6 +602,7 @@ async def test_server_bootstrap_ignores_matching_etag_and_mints_origin_session()
                 assert "ol_persistent_session_token" in await r.text()
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_stale_index_token_never_mints_loopback_owner_credentials():
     with daemon_pair() as p:
@@ -618,6 +623,7 @@ async def test_stale_index_token_never_mints_loopback_owner_credentials():
                 assert r.headers.get("Cache-Control") == "no-store"
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_stale_index_token_still_rejects_subresource_request():
     with daemon_pair() as p:
@@ -634,6 +640,7 @@ async def test_stale_index_token_still_rejects_subresource_request():
                 assert await r.text() == "unauthorized"
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_local_document_reopen_without_query_token_sets_no_cookie():
     with daemon_pair() as p:
@@ -655,6 +662,7 @@ async def test_local_document_reopen_without_query_token_sets_no_cookie():
                 assert r.headers.get("ETag", "").startswith('"')
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_query_token_only_bootstraps_index_not_api():
     with daemon_pair() as p:
@@ -677,6 +685,7 @@ async def test_query_token_only_bootstraps_index_not_api():
                 assert r.status == 401
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_api_me_returns_identity():
     with daemon_pair() as p:
@@ -689,6 +698,7 @@ async def test_api_me_returns_identity():
             assert "hostname" in j
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_api_peers_lists_other_peer():
     """The two paired daemons spun up by `daemon_pair()` have not gone
@@ -711,6 +721,7 @@ async def test_api_peers_lists_other_peer():
             assert p.b.short_id in {pp["short_id"] for pp in j["peers"]}
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_api_send_text_round_trip():
     with daemon_pair(pin_trust=True) as p:
@@ -736,6 +747,7 @@ async def test_api_send_text_round_trip():
         assert "hi via api" in bodies, bodies
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_api_send_to_unknown_peer_404():
     with daemon_pair() as p:
@@ -750,6 +762,7 @@ async def test_api_send_to_unknown_peer_404():
             assert "no peer" in j["error"].lower()
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_api_send_missing_fields_400():
     with daemon_pair() as p:
@@ -759,6 +772,7 @@ async def test_api_send_missing_fields_400():
             assert status == 400
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_api_send_file_round_trip(tmp_path: Path):
     with daemon_pair(pin_trust=True) as p:
@@ -790,6 +804,7 @@ async def test_api_send_file_round_trip(tmp_path: Path):
         assert match[0].read_bytes() == payload
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_api_send_file_sanitizes_uploaded_filename():
     with daemon_pair(pin_trust=True) as p:
@@ -1414,6 +1429,7 @@ async def test_api_send_file_offline_paired_peer_queues_staged_upload(
     state.close()
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_api_files_lists_and_downloads():
     with daemon_pair(pin_trust=True) as p:
@@ -1444,6 +1460,7 @@ async def test_api_files_lists_and_downloads():
                 assert data == b"hello world"
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_api_file_download_resolves_unique_collision_prefix():
     with daemon_pair() as p:
@@ -1462,6 +1479,7 @@ async def test_api_file_download_resolves_unique_collision_prefix():
                 assert await r.read() == b"png-bytes"
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_api_file_download_blocks_path_traversal():
     """Defense in depth: even if a client crafts a URL that bypasses
@@ -1506,6 +1524,7 @@ async def test_api_file_download_blocks_path_traversal():
                 sock.close()
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_api_messages_returns_list():
     with daemon_pair() as p:
@@ -1525,6 +1544,7 @@ async def test_api_messages_returns_list():
             assert "m1" in bodies and "m2" in bodies
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_websocket_event_stream_pushes_messages():
     with daemon_pair(pin_trust=True) as p:
@@ -1559,6 +1579,7 @@ async def test_websocket_event_stream_pushes_messages():
                 assert got, "WS never delivered the inbound TEXT"
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_api_search_finds_message_by_word():
     with daemon_pair(pin_trust=True) as p:
@@ -1577,6 +1598,7 @@ async def test_api_search_finds_message_by_word():
             assert "the quick brown fox" in bodies
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_api_search_q_required():
     with daemon_pair() as p:
@@ -1586,6 +1608,7 @@ async def test_api_search_q_required():
             assert status == 400
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_api_audit_describes_surface():
     with daemon_pair() as p:
@@ -1603,6 +1626,12 @@ async def test_api_audit_describes_surface():
             assert "CAPS" in j["peer_protocol"]["message_types"]
             assert "CAPSULE_RECEIPT" in j["peer_protocol"]["message_types"]
             assert "FILE_COMMIT" in j["peer_protocol"]["message_types"]
+            assert j["peer_protocol"]["handshake_policy"]["default_version"] == 3
+            assert "ML-KEM-768" in j["peer_protocol"]["encryption"]
+            assert j["peer_protocol"]["handshake_policy"]["browser_webrtc_pq_qualified"] is False
+            assert j["peer_protocol"]["file_payload_routes"]["supported_requests"] == [
+                "auto", "tcp", "relay",
+            ]
             assert "CALL_SDP_ANSWER" in j["peer_protocol"]["message_types"]
             assert any(s["name"] == "file_cdc_transfer" for s in j["peer_protocol"]["sessions"])
             assert "file_cdc" in j["local_capabilities"]
@@ -1626,6 +1655,7 @@ async def test_api_audit_describes_surface():
             )
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_api_set_trust_round_trip():
     with daemon_pair() as p:
@@ -1673,6 +1703,7 @@ async def test_api_set_trust_round_trip():
             assert status_bad == 400
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_api_peer_capability_policy_round_trip():
     with daemon_pair() as p:
@@ -1711,6 +1742,7 @@ async def test_api_peer_capability_policy_round_trip():
             assert status == 200
             assert cleared["allowed"] is None
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_set_trust_auto_seeds_from_mdns_for_unmessaged_peer():
     """User clicks Accept/Block on a peer they've only seen via mDNS, never
@@ -1746,6 +1778,7 @@ async def test_set_trust_auto_seeds_from_mdns_for_unmessaged_peer():
             assert after["trust"] == "pinned"
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_set_trust_for_truly_unknown_peer_returns_404():
     """If a fingerprint isn't in the DB and isn't visible via mDNS either,
@@ -1760,6 +1793,7 @@ async def test_set_trust_for_truly_unknown_peer_returns_404():
             assert status == 404
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_outbound_blocked_for_rejected_peer():
     """If we mark a peer 'rejected', outbound sends to them must error."""
@@ -1803,6 +1837,7 @@ async def test_outbound_blocked_for_rejected_peer():
             assert j2.get("code") == "peer_rejected", j2
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_inbound_blocked_for_rejected_peer():
     """Rejecting a peer must stop their future inbound messages too."""
@@ -1840,6 +1875,7 @@ async def test_inbound_blocked_for_rejected_peer():
         assert "blocked inbound" not in bodies
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_websocket_unauthorized_closes():
     with daemon_pair() as p:
@@ -1856,6 +1892,7 @@ async def test_websocket_unauthorized_closes():
                 )
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 async def test_settings_round_trip():
     with daemon_pair() as p:

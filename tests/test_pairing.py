@@ -234,6 +234,7 @@ import aiohttp
 from tests.harness import daemon_pair
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 @pytest.mark.timeout(120)
 async def test_pairing_round_trip_pins_both_sides():
@@ -360,6 +361,7 @@ async def test_pairing_round_trip_pins_both_sides():
                 )
 
 
+@pytest.mark.live_daemon
 @pytest.mark.asyncio
 @pytest.mark.timeout(120)
 async def test_pair_reject_blocks_outbound():

@@ -6,7 +6,8 @@
 //! - Long-running operations detach from the interpreter via `py.detach`.
 //! - Buffer arguments use the Python buffer protocol (`bytes`, `bytearray`,
 //!   `memoryview`) for zero-copy ingest.
-//! - Errors map to `one_link_native.OlChunkError` (subclass of `OlError`).
+//! - Buffer errors map to `OlChunkError`; invalid parameters/format names to
+//!   `ValueError`; file I/O and length-change failures to `OSError`.
 
 use ol_chunk::{
     blake3_wrap, frame_count_for_plaintext, scan_format_aware, scan_to_vec_parallel,
@@ -192,7 +193,9 @@ pub fn cdc_iter(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<PyBoundaryIt
 
 /// Scan a contiguous byte buffer with caller-selected `FastCDC` sizing.
 ///
-/// Sizes are validated by `ol_chunk` (positive min < avg < max, max <= 16 MiB).
+/// Sizes are validated by `ol_chunk` against `FastCDC` v2020's own limits
+/// (min 64..=1 MiB, avg 256..=4 MiB, max 1024..=16 MiB, and min < avg < max);
+/// anything else raises `ValueError` before the kernel runs.
 /// This exists so ONE Memory can benchmark workload-specific profiles rather
 /// than assuming one chunk size is optimal for maps, point clouds and media.
 #[pyfunction]
@@ -234,19 +237,35 @@ pub fn cdc_iter_params(
     })
 }
 
-fn scan_file_boundaries_with_params(
-    path: &Path,
+fn addressable_len(len: u64) -> std::io::Result<usize> {
+    usize::try_from(len).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file exceeds this platform's addressable size",
+        )
+    })
+}
+
+/// Plain bounded-memory CDC of exactly `len` bytes of `file`, from offset 0.
+///
+/// The one core behind [`cdc_file`] (which opens a path) and [`cdc_fd`]
+/// (which duplicates a caller's already-verified handle). The stream scanner
+/// fails on a short read and on any byte past `len`, so a file that shrank or
+/// grew never yields boundaries for other bytes.
+fn scan_open_file_boundaries(
+    mut file: File,
+    len: usize,
     params: CdcParams,
 ) -> std::io::Result<Vec<PyBoundary>> {
+    use std::io::{Seek, SeekFrom};
     params
         .validate()
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string()))?;
     // Bounded windows, each scanned by the parallel two-phase FastCDC and
     // addressed in parallel, boundaries equal to the in-memory scanner's
     // (ol_chunk::stream::scan_stream, shared with format_aware_file).
-    let file = File::open(path)?;
-    let file_len = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
-    Ok(ol_chunk::stream::scan_stream(file, file_len, params)?
+    file.seek(SeekFrom::Start(0))?;
+    Ok(ol_chunk::stream::scan_stream(file, len, params)?
         .into_iter()
         .map(|b| PyBoundary {
             start: b.start,
@@ -256,22 +275,32 @@ fn scan_file_boundaries_with_params(
         .collect())
 }
 
+fn scan_file_boundaries_with_params(
+    path: &Path,
+    params: CdcParams,
+) -> std::io::Result<Vec<PyBoundary>> {
+    params
+        .validate()
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string()))?;
+    let file = File::open(path)?;
+    let len = addressable_len(file.metadata()?.len())?;
+    scan_open_file_boundaries(file, len, params)
+}
+
 /// Bytes a format-aware file scan may hold whole for formats whose cuts need
 /// a byte scan (ZIP, H.264); record-framed formats never need it.
 const FORMAT_AWARE_IN_MEMORY_LIMIT: usize = 256 << 20;
 
-fn scan_format_aware_path(
-    path: &Path,
+/// Format-aware scan of exactly `len` bytes of `file`: the one core behind
+/// [`format_aware_file`] and [`format_aware_fd`]. `label` names the source in
+/// error messages.
+fn scan_format_aware_open_file(
+    mut file: File,
+    len: usize,
     format: Option<ContainerFormat>,
     params: CdcParams,
+    label: &str,
 ) -> PyResult<Vec<PyFormatBoundary>> {
-    let open = || -> std::io::Result<(File, usize)> {
-        let file = File::open(path)?;
-        let len = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
-        Ok((file, len))
-    };
-    let (mut file, len) = open()
-        .map_err(|err| PyOSError::new_err(format!("failed to open {}: {err}", path.display())))?;
     let set = ol_chunk::stream::scan_format_aware_seekable(
         &mut file,
         len,
@@ -281,7 +310,7 @@ fn scan_format_aware_path(
     )
     .map_err(|err| match err {
         ol_chunk::stream::StreamScanError::Io(io) => {
-            PyOSError::new_err(format!("failed to scan {}: {io}", path.display()))
+            PyOSError::new_err(format!("failed to scan {label}: {io}"))
         }
         other => PyValueError::new_err(other.to_string()),
     })?;
@@ -298,12 +327,196 @@ fn scan_format_aware_path(
         .collect())
 }
 
-/// [`format_aware_boundaries`] of a file, with bounded memory: record-framed
-/// containers (MCAP, MP4/MOV, WAV) are walked by their record headers and
-/// chunked range by range, so a multi-GB robot log never has to fit in RAM.
-/// Equal to `format_aware_boundaries(open(path).read(), format_name)`.
+fn scan_format_aware_path(
+    path: &Path,
+    format: Option<ContainerFormat>,
+    params: CdcParams,
+) -> PyResult<Vec<PyFormatBoundary>> {
+    let open = || -> std::io::Result<(File, usize)> {
+        let file = File::open(path)?;
+        let len = addressable_len(file.metadata()?.len())?;
+        Ok((file, len))
+    };
+    let (file, len) = open()
+        .map_err(|err| PyOSError::new_err(format!("failed to open {}: {err}", path.display())))?;
+    scan_format_aware_open_file(file, len, format, params, &path.display().to_string())
+}
+
+/// Duplicate a caller's open file handle into a `File` this call owns.
+///
+/// POSIX: `handle` is a file descriptor (`f.fileno()`). Windows: it is the OS
+/// handle (`msvcrt.get_osfhandle(f.fileno())`). The duplicate refers to the
+/// same open file description, so the scan reads the file the caller verified
+/// even if its pathname is replaced meanwhile, and it stays valid if Python
+/// closes its own object while the scan runs without the GIL. It shares the
+/// file position: after a `*_fd` call that position is unspecified, so
+/// callers seek before reading further. Callers retain the original until
+/// duplication completes and prevent concurrent reads/seeks through any
+/// handle sharing that position. A raw integer does not prove ownership.
+fn duplicate_handle(handle: i64) -> PyResult<File> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+        let raw = RawFd::try_from(handle)
+            .ok()
+            .filter(|fd| *fd >= 0)
+            .ok_or_else(|| PyValueError::new_err("file descriptor must be a non-negative int"))?;
+        // SAFETY: fcntl accepts a raw integer and reports EBADF for a closed
+        // descriptor; no Rust borrow assumes it is valid. Atomically retain
+        // CLOEXEC and avoid stdio slots, as std's try_clone_to_owned does.
+        let duplicate = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicate < 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(PyOSError::new_err(format!(
+                "cannot duplicate descriptor {raw}: {err}"
+            )));
+        }
+        // SAFETY: successful fcntl returned a new live descriptor owned only
+        // by this call. OwnedFd closes the duplicate, never the caller's fd.
+        let owned = unsafe { OwnedFd::from_raw_fd(duplicate) };
+        Ok(File::from(owned))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
+        use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // A file handle is always positive. 0 is NULL, -1 INVALID_HANDLE_VALUE,
+        // and other negative values are pseudo-handles (-1 the current
+        // process, -2 the current thread, ...) that DuplicateHandle would
+        // happily turn into a non-file handle.
+        let value = isize::try_from(handle)
+            .ok()
+            .filter(|v| *v > 0)
+            .ok_or_else(|| PyValueError::new_err("handle must be an open OS file handle"))?;
+        let raw = value as RawHandle;
+        let mut duplicate = std::ptr::null_mut();
+        // SAFETY: the process pseudo-handle is valid for both process
+        // arguments, and the output points to a live local. DuplicateHandle
+        // validates the raw source and cannot close it without CLOSE_SOURCE.
+        // The duplicate is noninheritable and has the same access rights.
+        let success = unsafe {
+            let process = GetCurrentProcess();
+            DuplicateHandle(
+                process,
+                raw,
+                process,
+                &mut duplicate,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if success == 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(PyOSError::new_err(format!(
+                "cannot duplicate handle: {err}"
+            )));
+        }
+        // SAFETY: successful DuplicateHandle returned a new live handle that
+        // this call exclusively owns. Only that duplicate transfers to Rust.
+        let owned = unsafe { OwnedHandle::from_raw_handle(duplicate) };
+        Ok(File::from(owned))
+    }
+}
+
+fn declared_len(size: u64) -> PyResult<usize> {
+    addressable_len(size).map_err(|err| PyValueError::new_err(err.to_string()))
+}
+
+/// [`cdc_file`] of an already-open file: scan exactly `size` bytes of the
+/// caller's verified handle without reopening any pathname.
+///
+/// `handle` is the descriptor (POSIX) or OS handle (Windows) of a file the
+/// caller opened and identity-checked; `size` is the length it verified
+/// (`os.fstat`). A file that is shorter or longer than `size` raises
+/// `OSError`; nothing is returned for other bytes.
+#[pyfunction]
+pub fn cdc_fd(py: Python<'_>, handle: i64, size: u64) -> PyResult<Vec<PyBoundary>> {
+    let file = duplicate_handle(handle)?;
+    let len = declared_len(size)?;
+    py.detach(move || scan_open_file_boundaries(file, len, CdcParams::default()))
+        .map_err(|err| PyOSError::new_err(format!("failed to scan descriptor: {err}")))
+}
+
+/// [`cdc_fd`] with caller-selected `FastCDC` sizing (validated first).
+#[pyfunction]
+pub fn cdc_fd_params(
+    py: Python<'_>,
+    handle: i64,
+    size: u64,
+    min_size: u32,
+    avg_size: u32,
+    max_size: u32,
+) -> PyResult<Vec<PyBoundary>> {
+    let params = CdcParams {
+        min_size,
+        avg_size,
+        max_size,
+    };
+    params
+        .validate()
+        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+    let file = duplicate_handle(handle)?;
+    let len = declared_len(size)?;
+    py.detach(move || scan_open_file_boundaries(file, len, params))
+        .map_err(|err| PyOSError::new_err(format!("failed to scan descriptor: {err}")))
+}
+
+/// [`format_aware_file`] of an already-open file (see [`cdc_fd`] for the
+/// `handle` and `size` contract). Same boundaries as [`format_aware_file`]
+/// and [`format_aware_boundaries`] on the same bytes.
+#[pyfunction]
+pub fn format_aware_fd(
+    py: Python<'_>,
+    handle: i64,
+    size: u64,
+    format_name: &str,
+) -> PyResult<Vec<PyFormatBoundary>> {
+    let format = parse_container_format(format_name)?;
+    let file = duplicate_handle(handle)?;
+    let len = declared_len(size)?;
+    py.detach(move || {
+        scan_format_aware_open_file(file, len, format, CdcParams::default(), "descriptor")
+    })
+}
+
+/// [`format_aware_fd`] with caller-selected `FastCDC` sizing (validated first).
+#[pyfunction]
+pub fn format_aware_fd_params(
+    py: Python<'_>,
+    handle: i64,
+    size: u64,
+    format_name: &str,
+    min_size: u32,
+    avg_size: u32,
+    max_size: u32,
+) -> PyResult<Vec<PyFormatBoundary>> {
+    let format = parse_container_format(format_name)?;
+    let params = CdcParams {
+        min_size,
+        avg_size,
+        max_size,
+    };
+    params
+        .validate()
+        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+    let file = duplicate_handle(handle)?;
+    let len = declared_len(size)?;
+    py.detach(move || scan_format_aware_open_file(file, len, format, params, "descriptor"))
+}
+
+/// [`format_aware_boundaries`] of an immutable file. Record-framed containers
+/// (MCAP, MP4/MOV, WAV) coalesce headers online, without retaining every record
+/// offset. Payload workspace is at most max(32 MiB, 4 * `max_size`), plus bounded
+/// CDC candidate workspace and 64 KiB header read-ahead. Returned boundary/hash
+/// objects still require O(output chunks) memory; total RAM is not constant.
+/// Equal to `format_aware_boundaries(open(path).read(), format_name)` for the
+/// same immutable bytes. Shrinkage, growth and IO failures raise `OSError`;
+/// same-length concurrent rewrites require caller-owned snapshot protection.
 /// ZIP and H.264 need a byte scan: up to 256 MiB they are read whole; above
-/// that `ValueError` (the caller falls back to plain `cdc_file`).
+/// that `ValueError` is raised. Fallback to plain `cdc_file` is an explicit
+/// caller policy, never an automatic change of chunking algorithm.
 #[pyfunction]
 pub fn format_aware_file(
     py: Python<'_>,
@@ -344,9 +557,12 @@ fn scan_file_boundaries(path: &Path) -> std::io::Result<Vec<PyBoundary>> {
 
 /// Scan a file with bounded memory instead of materializing its complete bytes.
 ///
-/// The scanner retains at most roughly two `FastCDC` maximum chunks (~512 KiB)
-/// plus the boundary vector. Output is byte-for-byte equivalent to `cdc_iter` on
-/// the same immutable file, while avoiding file-size-proportional RAM use.
+/// Payload workspace is at most 32 MiB with the default parameters (or
+/// max(32 MiB, 4 * `max_size`) with selected parameters), capped by file length.
+/// Parallel CDC also uses candidate workspace bounded by that window. Returned
+/// boundary/hash objects occupy O(output chunks); total RAM is not constant.
+/// Output equals `cdc_iter` on the same immutable bytes. Shrinkage and growth
+/// raise `OSError`; callers must prevent same-length concurrent rewrites.
 #[pyfunction]
 pub fn cdc_file(py: Python<'_>, path: &str) -> PyResult<Vec<PyBoundary>> {
     let owned = PathBuf::from(path);
@@ -612,6 +828,14 @@ pub(crate) fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     m.add("CDC_MIN_SIZE", 8 * 1024usize)?;
     m.add("CDC_AVG_SIZE", 64 * 1024usize)?;
     m.add("CDC_MAX_SIZE", 256 * 1024usize)?;
+    m.add("CDC_FILE_WINDOW_BYTES", ol_chunk::stream::STREAM_WINDOW)?;
+    m.add("FORMAT_AWARE_IN_MEMORY_LIMIT", FORMAT_AWARE_IN_MEMORY_LIMIT)?;
+    // The format-aware boundary definition in force; stores record it next to
+    // a manifest (see ol_chunk::FORMAT_AWARE_CHUNKING_VERSION).
+    m.add(
+        "FORMAT_AWARE_CHUNKING_VERSION",
+        ol_chunk::FORMAT_AWARE_CHUNKING_VERSION,
+    )?;
     m.add("AEAD_FRAME_PLAINTEXT_LEN", AEAD_FRAME_PLAINTEXT_LEN)?;
     m.add("AEAD_TAG_LEN", AEAD_TAG_LEN)?;
 
@@ -629,6 +853,10 @@ pub(crate) fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     m.add_function(wrap_pyfunction!(format_aware_boundaries_params, m)?)?;
     m.add_function(wrap_pyfunction!(format_aware_file, m)?)?;
     m.add_function(wrap_pyfunction!(format_aware_file_params, m)?)?;
+    m.add_function(wrap_pyfunction!(cdc_fd, m)?)?;
+    m.add_function(wrap_pyfunction!(cdc_fd_params, m)?)?;
+    m.add_function(wrap_pyfunction!(format_aware_fd, m)?)?;
+    m.add_function(wrap_pyfunction!(format_aware_fd_params, m)?)?;
     m.add_function(wrap_pyfunction!(chunk_address_raw, m)?)?;
     m.add_function(wrap_pyfunction!(chunk_address_convergent, m)?)?;
     m.add_function(wrap_pyfunction!(derive_aead_key, m)?)?;

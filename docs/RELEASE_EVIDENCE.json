@@ -1,0 +1,217 @@
+{
+  "schema": "one-link-release-evidence/v1",
+  "observed_on": "2026-11-24",
+  "repository": "coherence-energy-labs/one-link",
+  "release": {
+    "tag": "v0.21.0",
+    "source_revision": "0e90c8dd821d41030cb20e73ea1e523366e7d594",
+    "url": "https://github.com/coherence-energy-labs/one-link/releases/tag/v0.21.0",
+    "published_at": "2026-08-01T04:39:03Z",
+    "draft": false,
+    "prerelease": false,
+    "api_reported_immutable": false,
+    "release_workflow": {
+      "run_id": 30680657323,
+      "conclusion": "success"
+    },
+    "independent_reproducibility_workflow": {
+      "run_id": 30680657255,
+      "conclusion": "failure"
+    },
+    "assets": [
+      {
+        "name": "one-link-linux-arm64.zip",
+        "size_bytes": 171721401,
+        "api_reported_digest": "sha256:2cd54dc14a03bb8c15783571b739057f2696aba6763fd518a7787ddd051bc758",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one-link-linux-arm64.zip"
+      },
+      {
+        "name": "one-link-linux-arm64.zip.sigstore",
+        "size_bytes": 11197,
+        "api_reported_digest": "sha256:32c0e120a51e6c6a7460585a5dde073a7467f216a240e902ad17480f4fe5e1d6",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one-link-linux-arm64.zip.sigstore"
+      },
+      {
+        "name": "one-link-linux-x86_64.zip",
+        "size_bytes": 179557243,
+        "api_reported_digest": "sha256:c73a508c70750e869a6b9faf734cf54f4853001360d30d5466f9683c488df11b",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one-link-linux-x86_64.zip"
+      },
+      {
+        "name": "one-link-linux-x86_64.zip.sigstore",
+        "size_bytes": 11350,
+        "api_reported_digest": "sha256:ccdc6adeffc6b8c6618a881c6887237c9dc41f6f36e5dc0b58cb45cef1824764",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one-link-linux-x86_64.zip.sigstore"
+      },
+      {
+        "name": "one-link-macos-arm64.zip",
+        "size_bytes": 84489335,
+        "api_reported_digest": "sha256:f4bdf9dcd72a9f05182ca6985b8368068199777b7e36159bed768b9146a8b3e4",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one-link-macos-arm64.zip"
+      },
+      {
+        "name": "one-link-macos-arm64.zip.sigstore",
+        "size_bytes": 11099,
+        "api_reported_digest": "sha256:73d0c7e208a5df0d5b3c86e9373033b084cc36f05174eba918fa59a6dcb96bbf",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one-link-macos-arm64.zip.sigstore"
+      },
+      {
+        "name": "one-link-windows-arm64.zip",
+        "size_bytes": 62252304,
+        "api_reported_digest": "sha256:0c1de091464231e35d5788489e28fe6bad670ac005eb569c8db0572c14ec4736",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one-link-windows-arm64.zip"
+      },
+      {
+        "name": "one-link-windows-arm64.zip.sigstore",
+        "size_bytes": 11209,
+        "api_reported_digest": "sha256:ca1cfe5353757cef75bda81a0858f11362c94cf55fa991ce7d435ec0f5c6118e",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one-link-windows-arm64.zip.sigstore"
+      },
+      {
+        "name": "one-link-windows-x86_64.zip",
+        "size_bytes": 96578815,
+        "api_reported_digest": "sha256:3fc47d2f668f37e0859a2fdac69c41c018aabe35a6f6195d036d3af3a9ad1c63",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one-link-windows-x86_64.zip"
+      },
+      {
+        "name": "one-link-windows-x86_64.zip.sigstore",
+        "size_bytes": 11166,
+        "api_reported_digest": "sha256:69e83f212bf98fdf33d59c60e1846ec4937d591d1de677d2c4acd53de1db3cf8",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one-link-windows-x86_64.zip.sigstore"
+      },
+      {
+        "name": "one_link-0.21.0-py3-none-any.whl",
+        "size_bytes": 3057371,
+        "api_reported_digest": "sha256:b6fe65f007337f29f6572223a0f5904d093d344ce9910eee7c1fed6227b56d81",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one_link-0.21.0-py3-none-any.whl"
+      },
+      {
+        "name": "one_link-0.21.0-py3-none-any.whl.sigstore",
+        "size_bytes": 11291,
+        "api_reported_digest": "sha256:d35e97ba115b234829f92e7024c8c5edee02f69675aeb3631d42a456036cfebb",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one_link-0.21.0-py3-none-any.whl.sigstore"
+      },
+      {
+        "name": "one_link-0.21.0.tar.gz",
+        "size_bytes": 2939947,
+        "api_reported_digest": "sha256:8f49a076cac509690aa748baabdd2557c18b5d59037827323f52dd599579c394",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one_link-0.21.0.tar.gz"
+      },
+      {
+        "name": "one_link-0.21.0.tar.gz.sigstore",
+        "size_bytes": 11252,
+        "api_reported_digest": "sha256:acca29cfc5fbcb17f5359c18f087cfd7870a3d83190df6e7236bb26582a3c79c",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one_link-0.21.0.tar.gz.sigstore"
+      },
+      {
+        "name": "one_link_native-0.21.0-cp311-abi3-macosx_11_0_arm64.whl",
+        "size_bytes": 2705204,
+        "api_reported_digest": "sha256:d66bae33d010503a60add0646d90aea5050dacada23683653e79968e686584ce",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one_link_native-0.21.0-cp311-abi3-macosx_11_0_arm64.whl"
+      },
+      {
+        "name": "one_link_native-0.21.0-cp311-abi3-macosx_11_0_arm64.whl.sigstore",
+        "size_bytes": 11205,
+        "api_reported_digest": "sha256:ff0bfb12babfddff3a9653ab24550b2c0ce072294836abf0cc2da103e7397b00",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one_link_native-0.21.0-cp311-abi3-macosx_11_0_arm64.whl.sigstore"
+      },
+      {
+        "name": "one_link_native-0.21.0-cp311-abi3-manylinux_2_39_aarch64.whl",
+        "size_bytes": 2823390,
+        "api_reported_digest": "sha256:f29a11c57b3df3a207e57b313380e831b39118f68b0215d3d29a241b824ced0a",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one_link_native-0.21.0-cp311-abi3-manylinux_2_39_aarch64.whl"
+      },
+      {
+        "name": "one_link_native-0.21.0-cp311-abi3-manylinux_2_39_aarch64.whl.sigstore",
+        "size_bytes": 11260,
+        "api_reported_digest": "sha256:0a4cb20a6ea04bfcee137428638a9c7a4464a9792202e312e2f326a46b937029",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one_link_native-0.21.0-cp311-abi3-manylinux_2_39_aarch64.whl.sigstore"
+      },
+      {
+        "name": "one_link_native-0.21.0-cp311-abi3-manylinux_2_39_x86_64.whl",
+        "size_bytes": 2945650,
+        "api_reported_digest": "sha256:cf07193d3da27ac3ba833089c44cd5d2f26e717a2399d93673da879b2dca4e29",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one_link_native-0.21.0-cp311-abi3-manylinux_2_39_x86_64.whl"
+      },
+      {
+        "name": "one_link_native-0.21.0-cp311-abi3-manylinux_2_39_x86_64.whl.sigstore",
+        "size_bytes": 11244,
+        "api_reported_digest": "sha256:64f1ac54640f954209a4dc1507646de808b6406eed95a7718648334902619ca7",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one_link_native-0.21.0-cp311-abi3-manylinux_2_39_x86_64.whl.sigstore"
+      },
+      {
+        "name": "one_link_native-0.21.0-cp311-abi3-win_amd64.whl",
+        "size_bytes": 3043220,
+        "api_reported_digest": "sha256:11ad71450fbdc5224a4406a028871113adc23f88bacb3579c0f68e59e48757e8",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one_link_native-0.21.0-cp311-abi3-win_amd64.whl"
+      },
+      {
+        "name": "one_link_native-0.21.0-cp311-abi3-win_amd64.whl.sigstore",
+        "size_bytes": 11193,
+        "api_reported_digest": "sha256:fa9728a80603e5c8ae693fdca6c1289bf775d6bff34e190a35a0ea4be69b06f4",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one_link_native-0.21.0-cp311-abi3-win_amd64.whl.sigstore"
+      },
+      {
+        "name": "one_link_native-0.21.0-cp311-abi3-win_arm64.whl",
+        "size_bytes": 3089608,
+        "api_reported_digest": "sha256:a2827a28577d0109971dca3fc3e9313396da9bf3b35c3a476f7fd9c5e76aabfb",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one_link_native-0.21.0-cp311-abi3-win_arm64.whl"
+      },
+      {
+        "name": "one_link_native-0.21.0-cp311-abi3-win_arm64.whl.sigstore",
+        "size_bytes": 11217,
+        "api_reported_digest": "sha256:802927604acdf31aa4d1c71cafb7fe23a0b579c58751bc6d0714e8629d553c4a",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/one_link_native-0.21.0-cp311-abi3-win_arm64.whl.sigstore"
+      },
+      {
+        "name": "sbom.cdx.json",
+        "size_bytes": 934389,
+        "api_reported_digest": "sha256:60061e6948f6936235e639f5b56c3789b54c9514ee8f42eb2c68ad41eeab87fa",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/sbom.cdx.json"
+      },
+      {
+        "name": "sbom.cdx.json.sigstore",
+        "size_bytes": 11209,
+        "api_reported_digest": "sha256:fd54be95095632e317c3aa91fcf89908f076788723e4e179d1e48137c62a2349",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/sbom.cdx.json.sigstore"
+      },
+      {
+        "name": "SHA256SUMS",
+        "size_bytes": 1419,
+        "api_reported_digest": "sha256:9092922489963dc70d1e97964eadba4990ab3aa18a6ea44e74668d049a455b15",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/SHA256SUMS"
+      },
+      {
+        "name": "SHA256SUMS.sigstore",
+        "size_bytes": 11150,
+        "api_reported_digest": "sha256:75561cd077ac5cbcd70add5881e5e5c5beece143f35dde6b1755eeb5c040dfff",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/SHA256SUMS.sigstore"
+      },
+      {
+        "name": "UPDATE_MANIFEST.json",
+        "size_bytes": 1795,
+        "api_reported_digest": "sha256:6ffb163a956c7dc5a0327b92e2197e9e9c31c5e2d3623c2304e64e31063da812",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/UPDATE_MANIFEST.json"
+      },
+      {
+        "name": "UPDATE_MANIFEST.json.sigstore",
+        "size_bytes": 11162,
+        "api_reported_digest": "sha256:d57fa8b4ad1a87616e00b8f6a97a3e388a88643d21f7b583e150573db75ca646",
+        "download_url": "https://github.com/coherence-energy-labs/one-link/releases/download/v0.21.0/UPDATE_MANIFEST.json.sigstore"
+      }
+    ]
+  },
+  "verification": {
+    "asset_contents": "not_independently_downloaded_in_this_audit",
+    "sigstore_bundles": "published_presence_observed; cryptographic_verification_not_performed",
+    "provenance": "publication_workflow_observed; independent_attestation_verification_not_performed",
+    "fresh_device_platform_qualification": "incomplete",
+    "production_signoff": "not_granted"
+  },
+  "limitations": [
+    "Asset metadata and workflow conclusions do not authenticate downloaded bytes.",
+    "The historical reproducibility failure was not a dependency of publication.",
+    "Whole-product byte reproducibility is not claimed.",
+    "auto-latest is mutable and is not a production trust baseline."
+  ]
+}

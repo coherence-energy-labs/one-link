@@ -23,6 +23,7 @@ from tests.harness import daemon_pair, inbox_files, request
 pytestmark = [pytest.mark.timeout(180), pytest.mark.soak]
 
 
+@pytest.mark.live_daemon
 def test_concurrent_pin_peer_idempotent() -> None:
     """Two simultaneous pin_peer requests for the same peer must
     both succeed AND end with the peer trusted exactly once. No
@@ -62,6 +63,7 @@ def test_concurrent_pin_peer_idempotent() -> None:
         assert final.get("trust") == "pinned"
 
 
+@pytest.mark.live_daemon
 def test_concurrent_send_file_and_chat() -> None:
     """A send_file racing with a flurry of chat sends — neither
     side should starve the other or drop messages. The send_file
@@ -121,6 +123,7 @@ def test_concurrent_send_file_and_chat() -> None:
                 assert r.get("ok"), r
 
 
+@pytest.mark.live_daemon
 def test_concurrent_quic_ping_under_load() -> None:
     """Multiple concurrent quic_ping requests against the same
     peer must all succeed without deadlocking on the per-peer

@@ -26,7 +26,11 @@
 
 use crate::blake3_wrap;
 use crate::error::ChunkError;
+use fastcdc::v2020::{
+    AVERAGE_MAX, AVERAGE_MIN, MAXIMUM_MAX, MAXIMUM_MIN, MINIMUM_MAX, MINIMUM_MIN,
+};
 use rayon::prelude::*;
+use std::ops::RangeInclusive;
 
 /// `FastCDC` chunk size parameters fixed by [ADR-0001].
 ///
@@ -57,17 +61,42 @@ impl Default for CdcParams {
 }
 
 impl CdcParams {
-    /// Validate `FastCDC` invariants: min < avg < max, none zero, all within
-    /// reasonable bounds (max ≤ 16 MiB for sanity).
+    /// Accepted `min_size` values: the `FastCDC` v2020 kernel's own bounds.
+    pub const MIN_SIZE_RANGE: RangeInclusive<u32> = MINIMUM_MIN..=MINIMUM_MAX;
+    /// Accepted `avg_size` values: the `FastCDC` v2020 kernel's own bounds.
+    pub const AVG_SIZE_RANGE: RangeInclusive<u32> = AVERAGE_MIN..=AVERAGE_MAX;
+    /// Accepted `max_size` values: the `FastCDC` v2020 kernel's own bounds.
+    pub const MAX_SIZE_RANGE: RangeInclusive<u32> = MAXIMUM_MIN..=MAXIMUM_MAX;
+
+    /// Validate the parameters before any of them reaches the kernel.
+    ///
+    /// Accepts exactly the profiles the `FastCDC` v2020 constructor accepts
+    /// (each size within [`Self::MIN_SIZE_RANGE`], [`Self::AVG_SIZE_RANGE`],
+    /// [`Self::MAX_SIZE_RANGE`], which are the library's exported constants)
+    /// that also satisfy this crate's ordering `min < avg < max`. Every scan
+    /// entry point calls this, so an invalid profile is an error rather than
+    /// a kernel `assert!` (a process abort under `panic = "abort"`) or a
+    /// zero-length cut (an unbounded loop in the parallel kernel).
     ///
     /// # Errors
     ///
-    /// Returns `ChunkError::InvalidParameters` if any invariant is violated.
+    /// [`ChunkError::SizeOutOfRange`] for a size outside the kernel's range
+    /// (checked first, in field order); [`ChunkError::InvalidParameters`]
+    /// when the ordering is violated.
     pub fn validate(self) -> Result<(), ChunkError> {
-        if self.min_size == 0 || self.avg_size == 0 || self.max_size == 0 {
-            return Err(ChunkError::InvalidParameters(
-                "min/avg/max sizes must be positive",
-            ));
+        for (field, value, range) in [
+            ("min_size", self.min_size, Self::MIN_SIZE_RANGE),
+            ("avg_size", self.avg_size, Self::AVG_SIZE_RANGE),
+            ("max_size", self.max_size, Self::MAX_SIZE_RANGE),
+        ] {
+            if !range.contains(&value) {
+                return Err(ChunkError::SizeOutOfRange {
+                    field,
+                    value,
+                    min: *range.start(),
+                    max: *range.end(),
+                });
+            }
         }
         if self.min_size >= self.avg_size {
             return Err(ChunkError::InvalidParameters(
@@ -78,9 +107,6 @@ impl CdcParams {
             return Err(ChunkError::InvalidParameters(
                 "avg_size must be strictly less than max_size",
             ));
-        }
-        if self.max_size > 16 * 1024 * 1024 {
-            return Err(ChunkError::InvalidParameters("max_size must be ≤ 16 MiB"));
         }
         Ok(())
     }
@@ -137,10 +163,15 @@ impl<'a> ChunkScanner<'a> {
 
     /// Create a scanner over `buffer` with custom CDC parameters.
     ///
+    /// Validation is what makes the wrapped iterator total: `fastcdc` first
+    /// tests a cut at byte `2 * (min_size / 2)`, so with `min_size >= 64`
+    /// every cut is at least 64 bytes or the whole remainder. A zero-length
+    /// cut, which would end the iteration early (silently dropping the
+    /// input) or repeat forever, cannot occur.
+    ///
     /// # Errors
     ///
-    /// Returns `ChunkError::InvalidParameters` if `params` violates
-    /// `FastCDC` invariants.
+    /// Returns the [`CdcParams::validate`] error if `params` is invalid.
     pub fn with_params(buffer: &'a [u8], params: CdcParams) -> Result<Self, ChunkError> {
         params.validate()?;
         let inner =
@@ -214,7 +245,7 @@ pub fn scan_to_vec_parallel_with_params(
     }
     // Boundaries from the parallel two-phase scanner (crate::pcdc): identical
     // to fastcdc::v2020::FastCDC, proven by pcdc's differential tests.
-    let ranges = crate::pcdc::chunk_ranges(buffer, params);
+    let ranges = crate::pcdc::chunk_ranges(buffer, params)?;
 
     Ok(ranges
         .par_iter()

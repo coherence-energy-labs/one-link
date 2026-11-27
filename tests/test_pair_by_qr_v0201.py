@@ -337,6 +337,13 @@ def test_autopair_hide_manual_cards_helper_present(peer_html: str):
         assert card_id in snippet, f"hide path missing {card_id}"
 
 
+def _autopair_flow(html: str) -> str:
+    """Inspect the whole lifecycle, independent of its formatting or byte length."""
+    start = html.index("async function _runAutoPairFlow")
+    end = html.index("// ── v0.20.2 — daemon DataChannel router", start)
+    return html[start:end]
+
+
 def test_autopair_waits_for_identity(peer_html: str):
     """Identity must be unlocked + loaded before we can sign the
     offer envelope. _waitForIdentity polls state.rec for up to 12s."""
@@ -349,7 +356,7 @@ def test_autopair_signs_offer_envelope(peer_html: str):
     """The offer envelope MUST carry pubkey + fingerprint +
     pair_token + ts + signature. Daemon's verify_offer_envelope
     rejects anything missing any of these."""
-    snippet = _snippet(peer_html, "async function _runAutoPairFlow", 12000)
+    snippet = _autopair_flow(peer_html)
     assert "pubkey_b64u: rec.public_key_b64u" in snippet
     assert "fingerprint: rec.fingerprint" in snippet
     assert "pair_token: pair.pair_token" in snippet
@@ -364,8 +371,8 @@ def test_autopair_waits_for_ice_gathering(peer_html: str):
     Pin both the call site and the helper's event/timeout semantics so a
     refactor cannot silently send a host-candidate-incomplete offer.
     """
-    snippet = _snippet(peer_html, "async function _runAutoPairFlow", 12000)
-    assert "await _waitForIceGatheringComplete(pc)" in snippet
+    snippet = _autopair_flow(peer_html)
+    assert "await step(_waitForIceGatheringComplete(pc))" in snippet
     assert "if (!iceComplete)" in snippet
     waiter = _snippet(peer_html, "function _waitForIceGatheringComplete", 2000)
     assert 'iceGatheringState === "complete"' in waiter
@@ -378,7 +385,7 @@ def test_autopair_persists_daemon_as_peer(peer_html: str):
     """On control:open, the daemon's fingerprint MUST be saved as
     a paired peer in OPFS so future /peer visits without ?pair=
     can recognize this daemon."""
-    snippet = _snippet(peer_html, "async function _runAutoPairFlow", 6000)
+    snippet = _autopair_flow(peer_html)
     assert "savePeer({" in snippet
     assert 'paired_via: "qr"' in snippet
     assert 'fingerprint: pair.daemon_fingerprint' in snippet
@@ -389,7 +396,7 @@ def test_autopair_surfaces_clear_failure_states(peer_html: str):
     fail, daemon error, connection failed) MUST update the status
     line to a specific message — never leave the user with a
     stuck spinner."""
-    snippet = _snippet(peer_html, "async function _runAutoPairFlow", 12000)
+    snippet = _autopair_flow(peer_html)
     for failure_label in (
         "no identity",
         "no webrtc",
@@ -406,7 +413,7 @@ def test_autopair_surfaces_clear_failure_states(peer_html: str):
 def test_autopair_cancel_button_tears_down(peer_html: str):
     """The user can cancel mid-flight. Cancel MUST close the
     WebSocket + the RTCPeerConnection so we don't leak."""
-    snippet = _snippet(peer_html, "async function _runAutoPairFlow", 12000)
+    snippet = _autopair_flow(peer_html)
     assert '"#btn-autopair-cancel"' in snippet
     assert "ws.close()" in snippet
     assert "pc.close()" in snippet
@@ -436,7 +443,7 @@ def test_boot_chains_autopair_after_identity(peer_html: str):
     idx = peer_html.find("const _pairQuery = _detectPairQuery();")
     dispatch_idx = peer_html.find("function _dispatchPostIdentityFlow()", idx)
     gate_idx = peer_html.find(
-        "if (!state.rec || state.post_identity_flow_started) return;",
+        "if (!peerIdentity.beginPostIdentityFlow()) return;",
         dispatch_idx,
     )
     run_idx = peer_html.find("_runAutoPairFlow(_pairQuery)", dispatch_idx)

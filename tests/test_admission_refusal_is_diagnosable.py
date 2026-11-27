@@ -20,6 +20,18 @@ confirm or eliminate exactly that on the next occurrence.
 
 These tests pin the evidence, because a diagnostic nobody verified is a comment
 rather than a fix.
+
+2026-11-25: the evidence was used. A live install logged the refusal 13 times
+in 16 minutes, each with `holder_has_transfer_row=True` and
+`holder_transfer_status=offered`, held for up to 855 seconds. The holder was
+not an orphan the reaper missed: it was an offer held for the owner's answer,
+and the refused offers were the same sender sending the same file again. That
+case now gets the answer the first offer got (FILE_OFFER_HELD) and is tested in
+tests/test_held_offer_makes_later_offers_wait.py and, between two real daemons,
+tests/test_held_offers_two_daemon_e2e.py. The refusal itself, and everything
+pinned below, is unchanged for content that really is in delivery under another
+identity. Whether the 2026-08-05 CI refusal was the same thing is not known:
+that run left no evidence line to read.
 """
 
 from __future__ import annotations

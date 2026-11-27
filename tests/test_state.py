@@ -1010,3 +1010,26 @@ def test_prune_folder_audit_noop_below_cap(state: State):
     assert state._conn.execute(
         "SELECT COUNT(*) FROM folder_audit"
     ).fetchone()[0] == 50
+
+
+def test_short_id_lookup_prefers_the_pinned_peer_and_refuses_ambiguity(tmp_path):
+    from one_link.state import State
+
+    state = State(db_path=tmp_path / "shortid.db")
+    try:
+        friend, grinder, second_friend = "aa" * 32, "bb" * 32, "cc" * 32
+        for fp, key in ((friend, b"\x01"), (grinder, b"\x02")):
+            state.upsert_peer(fingerprint=fp, short_id="deadbeef", pubkey=key * 32)
+        # Two unpinned keys share a short ID: neither can be meant.
+        assert state.get_peer_by_short_id("deadbeef") is None
+        state.set_peer_trust(friend, "pinned")
+        # The pinned peer wins even though the other key was seen later.
+        state.upsert_peer(fingerprint=grinder, short_id="deadbeef", pubkey=b"\x02" * 32)
+        assert state.get_peer_by_short_id("deadbeef").fingerprint == friend
+        # Two pinned peers with one short ID: only a fingerprint can tell them apart.
+        state.upsert_peer(fingerprint=second_friend, short_id="deadbeef", pubkey=b"\x03" * 32)
+        state.set_peer_trust(second_friend, "pinned")
+        assert state.get_peer_by_short_id("deadbeef") is None
+        assert state.get_peer_by_short_id("nope") is None
+    finally:
+        state.close()

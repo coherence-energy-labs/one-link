@@ -317,6 +317,11 @@ async def test_large_payload(tmp_path: Path, channel_pair: ChannelPairFactory):
     bob = load_or_create(tmp_path / "b.key")
     a_chan, b_chan = await channel_pair(alice, bob)
     payload = os.urandom(1024 * 1024)  # 1 MiB
+    # A new channel accepts only small frames until its owner says the peer
+    # is trusted (tests/test_peer_admission.py covers the untrusted case).
+    from one_link.wire import MAX_FRAME
+
+    b_chan.max_inbound_frame = MAX_FRAME
     await a_chan.send(payload)
     assert await b_chan.recv() == payload
 

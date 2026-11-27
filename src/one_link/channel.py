@@ -94,7 +94,13 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from one_link.capabilities import PQ_HYBRID_HANDSHAKE_V1
 from one_link.identity import Identity, fingerprint_of, verify
-from one_link.wire import read_frame, write_frame, write_frame_nowait
+from one_link.wire import (
+    HANDSHAKE_MAX_FRAME,
+    UNPINNED_MAX_FRAME,
+    read_frame,
+    write_frame,
+    write_frame_nowait,
+)
 
 log = logging.getLogger(__name__)
 
@@ -207,20 +213,41 @@ _handshake_replay_cache: "OrderedDict[tuple[bytes, bytes], float]" = OrderedDict
 _handshake_replay_lock = threading.Lock()
 
 
+def _handshake_replay_expire_locked(now: float) -> None:
+    """Drop expired entries. Only the head can be expired (insertion order)."""
+    cache = _handshake_replay_cache
+    cutoff = now - _HANDSHAKE_REPLAY_WINDOW_S
+    while cache:
+        oldest_k = next(iter(cache))
+        if cache[oldest_k] >= cutoff:
+            break
+        cache.popitem(last=False)
+
+
+def _handshake_replay_known(peer_ed_pub: bytes, nonce: bytes, now: float) -> bool:
+    """Return True iff ``(peer_ed_pub, nonce)`` was recorded inside the
+    current replay window. Never inserts.
+
+    The responder calls this before any signature work, so a replayed HELLO
+    is still refused at dictionary-lookup cost. Because it does not insert, a
+    HELLO whose signature has not been checked cannot occupy a cache slot:
+    an attacker cannot pre-register a victim's nonce to get the genuine HELLO
+    refused, nor flush real entries out with forged ones.
+    """
+    with _handshake_replay_lock:
+        _handshake_replay_expire_locked(now)
+        return (peer_ed_pub, nonce) in _handshake_replay_cache
+
+
 def _handshake_replay_seen(peer_ed_pub: bytes, nonce: bytes, now: float) -> bool:
     """Return True iff ``(peer_ed_pub, nonce)`` has been observed
     inside the current replay window. Inserts the entry as a side
-    effect on first-seen. Bounded; FIFO-evicts when over the cap."""
+    effect on first-seen. Bounded; FIFO-evicts when over the cap.
+
+    Call this only for a HELLO whose signature has verified."""
     with _handshake_replay_lock:
         cache = _handshake_replay_cache
-        cutoff = now - _HANDSHAKE_REPLAY_WINDOW_S
-        # Drop expired entries cheaply — only those at the head are
-        # candidates (insertion-ordered).
-        while cache:
-            oldest_k = next(iter(cache))
-            if cache[oldest_k] >= cutoff:
-                break
-            cache.popitem(last=False)
+        _handshake_replay_expire_locked(now)
         key = (peer_ed_pub, nonce)
         if key in cache:
             return True
@@ -289,6 +316,14 @@ class Channel:
     handshake_suite: str = "x25519-classical-v2"
     pq_protected: bool = False
     key_confirmed: bool = False
+    # Largest inbound frame this channel will buffer. A frame above the
+    # ceiling is refused from its 4-byte length, before any payload is read.
+    # A channel starts at the ceiling for a peer nobody vouched for; the
+    # owner of the channel raises it for a trusted peer, either by assigning
+    # ``max_inbound_frame`` or by installing ``inbound_frame_policy``, which is
+    # consulted for every frame so a trust change takes effect mid-connection.
+    max_inbound_frame: int = UNPINNED_MAX_FRAME
+    inbound_frame_policy: Optional[Callable[[], int]] = None
     # Set after CAPS exchange (post-handshake first encrypted message).
     # None = peer hasn't sent CAPS yet (legacy or pre-CAPS).
     peer_caps: dict | None = None
@@ -855,13 +890,19 @@ class Channel:
     async def flush(self) -> None:
         await self.writer.drain()
 
+    def _inbound_frame_ceiling(self) -> int:
+        policy = self.inbound_frame_policy
+        if policy is not None:
+            self.max_inbound_frame = policy()
+        return self.max_inbound_frame
+
     async def recv(self) -> bytes:
         # The authenticated CAPS frame is the exact final legacy boundary.
         # Once DR is active, accepting even correctly authenticated legacy
         # bytes would be a downgrade; parse/decrypt exclusively as DR.
         if self._dr_state is not None:
             while True:
-                payload = await read_frame(self.reader)
+                payload = await read_frame(self.reader, self._inbound_frame_ceiling)
                 # One RatchetState contains both directional root/chain state.
                 # A concurrent send and receive must not interleave their DH
                 # mutations, even though network reads/writes remain duplex.
@@ -907,7 +948,7 @@ class Channel:
         # propagates and the
         # channel is closed by the caller, so leaving rx_seq unmodified
         # is safe (the channel will not be reused).
-        ct = await read_frame(self.reader)
+        ct = await read_frame(self.reader, self._inbound_frame_ceiling)
         nonce = self._nonce(self.rx_seq)
         pt = self.rx_aead.decrypt(nonce, ct, self._aad())
         self.rx_seq += 1
@@ -984,7 +1025,7 @@ class Channel:
         # ES-18: explicit raise, not assert.
         if self._dr_state is None:
             raise RuntimeError("ratchet not yet activated")
-        payload = await read_frame(self.reader)
+        payload = await read_frame(self.reader, self._inbound_frame_ceiling)
         if len(payload) < DR_HEADER_LEN:
             raise RuntimeError(
                 f"ratchet frame too short: {len(payload)} bytes "
@@ -1096,7 +1137,7 @@ async def _initiate_classical(
     hello = me.public_bytes + x_pub + nonce_i + sig_i
     await write_frame(writer, hello)
 
-    reply = await read_frame(reader)
+    reply = await read_frame(reader, HANDSHAKE_MAX_FRAME)
     if len(reply) != 32 + 32 + NONCE_LEN + 64:
         raise RuntimeError(f"bad REPLY length: {len(reply)}")
     r_ed = reply[0:32]
@@ -1151,7 +1192,7 @@ async def _respond_classical(
     lookups fail closed to fixed-memory aggregate telemetry.
     """
     if hello is None:
-        hello = await read_frame(reader)
+        hello = await read_frame(reader, HANDSHAKE_MAX_FRAME)
     if len(hello) != 32 + 32 + NONCE_LEN + 64:
         raise RuntimeError(f"bad HELLO length: {len(hello)}")
     i_ed = hello[0:32]
@@ -1164,7 +1205,7 @@ async def _respond_classical(
     # captured one valid HELLO would otherwise force unbounded
     # Ed25519+X25519+HKDF cycles per replay. Stays single-µs on the
     # happy path (hash + dict lookup).
-    if _handshake_replay_seen(i_ed, nonce_i, time.monotonic()):
+    if _handshake_replay_known(i_ed, nonce_i, time.monotonic()):
         raise RuntimeError(
             "HELLO replay rejected (duplicate nonce inside "
             f"{int(_HANDSHAKE_REPLAY_WINDOW_S)} s window)"
@@ -1216,6 +1257,13 @@ async def _respond_classical(
         )
     else:
         raise RuntimeError("HELLO signature invalid")
+    # Record only now that the signature has verified. The insert also
+    # catches two copies of one genuine HELLO racing past the lookup above.
+    if _handshake_replay_seen(i_ed, nonce_i, time.monotonic()):
+        raise RuntimeError(
+            "HELLO replay rejected (duplicate nonce inside "
+            f"{int(_HANDSHAKE_REPLAY_WINDOW_S)} s window)"
+        )
 
     x_priv, x_pub = _x25519_keypair()
     nonce_r = os.urandom(NONCE_LEN)
@@ -1560,7 +1608,7 @@ async def _initiate_pq(
     hello = hello_unsigned + me.sign(PQ_HELLO_TAG + hello_unsigned + expected_responder_ed_pub)
     await write_frame(writer, hello)
 
-    raw_reply = await read_frame(reader)
+    raw_reply = await read_frame(reader, HANDSHAKE_MAX_FRAME)
     reply = _parse_pq_reply(raw_reply)
     hello_hash = _sha256(hello)
     if not hmac.compare_digest(reply.hello_hash, hello_hash):
@@ -1605,7 +1653,7 @@ async def _initiate_pq(
         role=b"I",
     )
     await write_frame(writer, initiator_confirmation)
-    raw_responder_confirmation = await read_frame(reader)
+    raw_responder_confirmation = await read_frame(reader, HANDSHAKE_MAX_FRAME)
     _verify_pq_confirmation(
         raw_responder_confirmation,
         confirmation_key=confirmation_key,
@@ -1643,7 +1691,7 @@ async def _respond_pq(
     raw_hello: bytes,
 ) -> Channel:
     hello = _parse_pq_hello(raw_hello)
-    if _handshake_replay_seen(hello.initiator_ed, hello.nonce, time.monotonic()):
+    if _handshake_replay_known(hello.initiator_ed, hello.nonce, time.monotonic()):
         raise RuntimeError(
             "PQ HELLO replay rejected (duplicate nonce inside "
             f"{int(_HANDSHAKE_REPLAY_WINDOW_S)} s window)"
@@ -1654,6 +1702,13 @@ async def _respond_pq(
         PQ_HELLO_TAG + hello.unsigned + me.public_bytes,
     ):
         raise RuntimeError("PQ HELLO signature invalid")
+    # Record only now that the signature has verified. The insert also
+    # catches two copies of one genuine HELLO racing past the lookup above.
+    if _handshake_replay_seen(hello.initiator_ed, hello.nonce, time.monotonic()):
+        raise RuntimeError(
+            "PQ HELLO replay rejected (duplicate nonce inside "
+            f"{int(_HANDSHAKE_REPLAY_WINDOW_S)} s window)"
+        )
     supported = (PQ_SUITE_X25519_MLKEM768_V1,)
     selected_suite = next(
         (suite for suite in supported if suite in hello.offered_suites),
@@ -1691,7 +1746,7 @@ async def _respond_pq(
         suite=selected_suite,
     )
     confirmation_key = _derive_pq_confirmation_key(shared, transcript_hash, selected_suite)
-    raw_initiator_confirmation = await read_frame(reader)
+    raw_initiator_confirmation = await read_frame(reader, HANDSHAKE_MAX_FRAME)
     initiator_tag = _verify_pq_confirmation(
         raw_initiator_confirmation,
         confirmation_key=confirmation_key,
@@ -1771,20 +1826,26 @@ def _reject_legacy_hello_by_policy(
     initiator_x = raw_hello[32:64]
     nonce = raw_hello[64 : 64 + NONCE_LEN]
     signature = raw_hello[64 + NONCE_LEN :]
-    if _handshake_replay_seen(initiator_ed, nonce, time.monotonic()):
+    if _handshake_replay_known(initiator_ed, nonce, time.monotonic()):
         raise RuntimeError(
             "HELLO replay rejected (duplicate nonce inside "
             f"{int(_HANDSHAKE_REPLAY_WINDOW_S)} s window)"
         )
     v2 = HELLO_TAG + initiator_ed + initiator_x + nonce + me.public_bytes
     v1 = HELLO_TAG + initiator_ed + initiator_x + nonce
-    if verify(initiator_ed, signature, v2):
+    signed_v2 = verify(initiator_ed, signature, v2)
+    signed_v1 = not signed_v2 and verify(initiator_ed, signature, v1)
+    if signed_v2 or signed_v1:
+        # Only a HELLO its claimed sender really signed may occupy a cache
+        # slot; an unsigned one must not be able to evict genuine entries.
+        _handshake_replay_seen(initiator_ed, nonce, time.monotonic())
+    if signed_v2:
         raise RuntimeError(
             "legacy classical handshake rejected: live channels require the "
             "versioned X25519+ML-KEM-768 suite (explicit migration override: "
             "ONE_LINK_ALLOW_CLASSICAL_HANDSHAKE=1)"
         )
-    if not verify(initiator_ed, signature, v1):
+    if not signed_v1:
         raise RuntimeError("HELLO signature invalid")
     pinned = False
     if is_pinned_peer is not None:
@@ -1888,7 +1949,7 @@ async def respond(
     allow_classical_downgrade: bool | None = None,
 ) -> Channel:
     """Accept v3 PQ channels and fail closed on legacy/classical peers."""
-    raw_hello = await read_frame(reader)
+    raw_hello = await read_frame(reader, HANDSHAKE_MAX_FRAME)
     if raw_hello.startswith(PQ_HANDSHAKE_MAGIC):
         return await _respond_pq(reader, writer, me, raw_hello=raw_hello)
     if not _legacy_handshake_override_enabled(allow_classical_downgrade):

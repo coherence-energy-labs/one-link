@@ -5,7 +5,7 @@ description = "Direct-first encrypted chat, calls, resilient file transfer, and 
 requires-python = ">=3.11"
 authors = [{ name = "One Link contributors", email = "weareone@oneunity.earth" }]
 license = "AGPL-3.0-or-later"
-license-files = ["LICENSE", "LICENSE-NOTICE", "NOTICE"]
+license-files = ["LICENSE", "LICENSE-NOTICE", "NOTICE", "THIRD_PARTY_NOTICES.md"]
 
 dependencies = [
   # cryptography >= 44 was the first release that ships pre-built

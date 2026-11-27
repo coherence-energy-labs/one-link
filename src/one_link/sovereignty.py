@@ -111,6 +111,13 @@ class SovereigntyPreset:
     # UI hint — the chooser surfaces this as a one-line "what flows
     # outbound" summary so the user understands the trade.
     outbound_summary: str
+    # What the mDNS announcement says about this device beyond the minimum.
+    # The minimum is the short ID and the public key, which a peer needs to
+    # authenticate the connection it is about to open. With details on, the
+    # announcement also carries the chosen display name, the device kind
+    # ("macos-laptop") and any rendezvous URLs: convenient at home, and a
+    # description of the device to everyone else on a shared network.
+    mdns_announce_details_enabled: bool = False
 
 
 JUST_WORKS = SovereigntyPreset(
@@ -135,6 +142,7 @@ JUST_WORKS = SovereigntyPreset(
     ui_session_labels_enabled=True,
     turn_relay_enabled=True,
     inherit_rendezvous_from_mdns_enabled=True,
+    mdns_announce_details_enabled=True,
     outbound_summary=(
         "Uses disclosed community STUN for address discovery (not "
         "signaling) and checks the public GitHub Releases API once every "
@@ -522,6 +530,37 @@ def resolve_inherit_rendezvous_from_mdns_enabled(
         preset_value=get_preset(
             preset_name,
         ).inherit_rendezvous_from_mdns_enabled,
+    )
+
+
+def resolve_mdns_announce_details_enabled(
+    *,
+    state_setting: Optional[str],
+    preset_name: Optional[str],
+) -> bool:
+    """May the mDNS announcement describe this device?
+
+    When ``False`` the announcement carries only the short ID and public key:
+    no display name, no device kind, no rendezvous URLs. Just Works allows
+    the details; Quiet and Off-grid do not, as a hard ceiling. An explicit
+    ``mdns_announce_details`` setting may turn them off under Just Works.
+    """
+    return _resolve_bool_setting(
+        state_setting=state_setting,
+        preset_value=get_preset(preset_name).mdns_announce_details_enabled,
+    )
+
+
+def mdns_announce_details_for(state) -> bool:
+    """:func:`resolve_mdns_announce_details_enabled` for a state store."""
+    setting = None
+    if state is not None:
+        try:
+            setting = state.get_setting("mdns_announce_details")
+        except Exception:
+            setting = None
+    return resolve_mdns_announce_details_enabled(
+        state_setting=setting, preset_name=current_preset_name(state)
     )
 
 

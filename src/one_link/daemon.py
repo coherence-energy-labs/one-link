@@ -71,7 +71,7 @@ from collections import OrderedDict, deque
 from one_link.env_bounds import env_float, env_int
 from one_link._coerce import to_int
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import (
     IO,
     BinaryIO,
@@ -289,7 +289,13 @@ from one_link.transfer_safety import (
     known_bytes_from_chunks,
     same_storage_volume,
 )
-from one_link import ack_batching, connection_shutdown, held_offers
+from one_link import (
+    ack_batching,
+    connection_shutdown,
+    held_offers,
+    peer_admission,
+    transfer_names,
+)
 from one_link.wire import decode_msg, encode_msg, make_msg
 
 log = logging.getLogger("one_link.daemon")
@@ -3640,12 +3646,12 @@ class Daemon:
         self._relay_listener_clients: list = []
         # v0.5.6: per-peer connection regime, last-seen.
         # peer_fp -> {"outbound": str, "inbound": str, "ts": float}
-        self._inbound_regime: dict[str, str] = {}
+        self._inbound_regime: dict[str, str] = peer_admission.BoundedDict(peer_admission.PEER_BOOKKEEPING_MAX)
         # v0.10.4 peer presence cache. peer_fp -> 'online' | 'away'
         # | 'dnd' | 'offline'. 'invisible' is never observed on the
         # wire — invisible peers report 'offline'. NOT persisted —
         # presence is transient (resets when the peer disconnects).
-        self._peer_presence: dict[str, str] = {}
+        self._peer_presence: dict[str, str] = peer_admission.BoundedDict(peer_admission.PEER_BOOKKEEPING_MAX)
         # v0.7.0: per-pairing health metrics. Updated on every
         # successful send / receive. Surfaced in /api/peers so the
         # UI can show real "last alive" + latency instead of guessing
@@ -3672,7 +3678,7 @@ class Daemon:
         self._fabric_snapshots = _build_fabric_snapshot_cache(self)
         # v0.7.1: dedup table for capability_request WS events.
         # (peer_fp, cap) -> monotonic ts of last UI prompt fired.
-        self._capability_request_seen: dict[tuple[str, str], float] = {}
+        self._capability_request_seen: dict[tuple[str, str], float] = peer_admission.BoundedDict(peer_admission.PEER_BOOKKEEPING_MAX)
         # v0.7.1: outbox flush concurrency. One in-flight flush per
         # peer at a time — multiple session-up events shouldn't fire
         # parallel deliveries that ACK out of order.
@@ -7549,6 +7555,7 @@ class Daemon:
         # sessions are stamped separately on OutboundSession.
         inbound_regime = regime if regime is not None else _classify_address_regime(peer_ip)
         self._inbound_regime[peer_fp] = inbound_regime
+        frame_admitted = self.admission.bind_channel(channel, peer_fp)
         if self._inbound_is_rejected(peer_fp):
             log.warning("rejected peer attempted inbound connection: %s", peer_fp[:8])
             await channel.close()
@@ -7608,6 +7615,7 @@ class Daemon:
                 # open tab raises the red banner without waiting for
                 # the next /api/peers poll.
                 self._broadcast_key_change_if_present(rec)
+                self.admission.after_handshake(rec)
             except Exception as e:
                 log.warning("upsert_peer failed: %s", e)
 
@@ -7641,6 +7649,8 @@ class Daemon:
                         channel.peer_short_id, read_deadline_s,
                     )
                     break
+                if not frame_admitted(len(plaintext)):
+                    raise RuntimeError("peer without standing exceeded its frame allowance")
                 if plaintext.startswith(BINARY_FRAME_MAGIC):
                     msg = _decode_binary_frame(plaintext)
                 else:
@@ -7691,11 +7701,14 @@ class Daemon:
                 if not live:
                     self._inbound_live_channels.pop(peer_fp, None)
 
+    #: Decisions about peers without standing live in peer_admission.py.
+    admission = peer_admission.PerDaemon()
+
     def _admit_inbound_chat_rate(self, peer_fp: str) -> bool:
         """Consume one bounded per-peer chat/control admission token."""
 
         if not hasattr(self, "_text_rate_per_peer"):
-            self._text_rate_per_peer: dict[str, deque[float]] = {}
+            self._text_rate_per_peer: dict[str, deque[float]] = peer_admission.BoundedDict(peer_admission.PEER_BOOKKEEPING_MAX)
         rate_window = self._text_rate_per_peer.setdefault(peer_fp, deque())
         rate_now = time.monotonic()
         rate_cutoff = rate_now - TEXT_RATE_WINDOW_S
@@ -10619,6 +10632,9 @@ class Daemon:
                         of=msg.get("id"),
                     )))
         elif t == "PAIR_REQUEST":
+            if not self.admission.prompt_admitted(peer_fp):
+                await self.admission.refuse(channel, msg, "pair_request_rate_limited")
+                return
             # Peer wants to pair with us. Compute the SAS bound to the
             # channel's transcript_hash (audit fix H11) and store as
             # incoming, surface to UI for the user to verify.
@@ -10736,6 +10752,9 @@ class Daemon:
                 })
             await channel.send(encode_msg(make_msg("ACK", self.me.short_id, of=msg["id"])))
         elif t == "PAIR_REJECT":
+            if not self.admission.pair_reject_allowed(peer_fp):
+                await self.admission.refuse(channel, msg, "no_live_pair_context")
+                return
             self.pairing.reject(peer_fp)
             if self.state is not None:
                 # Rejection must be durable; otherwise the same identity can
@@ -10955,6 +10974,8 @@ class Daemon:
             sender_pub_bytes = channel.peer_ed_pub
         except Exception:
             return
+        if not self.admission.has_standing(peer_fp, sender_pub_bytes):
+            return  # only a peer with standing can have sent the file frame
         try:
             parsed, verified = handle_inbound_provenance(
                 msg=msg,
@@ -11715,61 +11736,11 @@ class Daemon:
         return rel
 
     def _safe_transfer_name(self, value) -> str:
-        # Take the basename against BOTH separators regardless of host.
-        # ``Path(...).name`` only understands the local one, so on POSIX a
-        # peer-supplied "C:\\Windows\\System32\\evil.dll" survived whole and
-        # was stored with its backslashes intact. That is harmless where it
-        # lands -- backslash is an ordinary character on POSIX -- but this is
-        # a FILE TRANSFER product: that artifact travels, and the same name on
-        # a Windows machine is a traversal path. A received name must never
-        # carry another platform's separators.
-        raw = str(value or "").replace("\\", "/")
-        name = PurePosixPath(raw).name
-        if not name or name in (".", ".."):
-            return "unnamed.bin"
-        # v0.20.7 (security audit H16):
-        #   - Reject NUL + control chars (0x00-0x1f, 0x7f).
-        #   - Reject trailing dots and spaces (Windows silently strips
-        #     them, so "report.pdf." collides with "report.pdf").
-        #   - Reject Windows reserved device names (CON, NUL, COM1-9,
-        #     LPT1-9, AUX, PRN). Match by stem so "CON.txt" is also
-        #     rejected — Windows treats the device-name stem as the
-        #     reserved meaning even with an extension.
-        # 2026-05-21 audit T3-R: also strip the ``:`` separator. On
-        # NTFS, ``report.pdf:hidden.exe`` is a valid filename where
-        # ``:hidden.exe`` is an Alternate Data Stream — invisible to
-        # Explorer but executable. A paired peer could ship an
-        # executable hidden as a document attachment.
-        clean = name.replace("\x00", "").replace(":", "_").rstrip(". ")
-        if not clean:
-            return "unnamed.bin"
-        if any(0 <= ord(c) <= 0x1F or ord(c) == 0x7F for c in clean):
-            clean = "".join(
-                c for c in clean
-                if not (0 <= ord(c) <= 0x1F or ord(c) == 0x7F)
-            )
-            if not clean:
-                return "unnamed.bin"
-        stem = Path(clean).stem
-        if stem.upper() in self._WINDOWS_RESERVED_BASENAMES:
-            clean = "_" + clean
-        encoded = clean.encode("utf-8", errors="ignore")
-        if len(encoded) <= MAX_TRANSFER_FILE_NAME_BYTES:
-            return clean
-        # Preserve the extension when clipping by total byte length so
-        # a long-prefix attacker can't collide on the trimmed name.
-        suffix = Path(clean).suffix.encode("utf-8", errors="ignore")
-        if 0 < len(suffix) < MAX_TRANSFER_FILE_NAME_BYTES // 2:
-            stem_budget = MAX_TRANSFER_FILE_NAME_BYTES - len(suffix)
-            stem_bytes = encoded[:stem_budget]
-            clipped = stem_bytes.decode("utf-8", errors="ignore").rstrip() + suffix.decode(
-                "utf-8", errors="ignore"
-            )
-        else:
-            clipped = (
-                encoded[:MAX_TRANSFER_FILE_NAME_BYTES].decode("utf-8", errors="ignore").strip()
-            )
-        return clipped or "unnamed.bin"
+        return transfer_names.safe_transfer_name(
+            value,
+            reserved=self._WINDOWS_RESERVED_BASENAMES,
+            max_bytes=MAX_TRANSFER_FILE_NAME_BYTES,
+        )
 
     def _unique_inbox_path(
         self, blob: str, name: str, *, rel_path: str | None = None,
@@ -21829,12 +21800,12 @@ class Daemon:
                     "peer identity mismatch: expected full fingerprint "
                     f"{expected_fp}, got {actual_fp}"
                 )
-            return actual_fp
-        if channel.peer_short_id != peer.short_id:
+        elif channel.peer_short_id != peer.short_id:
             raise RuntimeError(
                 f"peer fingerprint mismatch: expected short id {peer.short_id}, "
                 f"got {channel.peer_short_id}"
             )
+        self.admission.bind_channel(channel, actual_fp)
         return actual_fp
 
     def _check_outbound_trust(self, peer: Peer) -> str | None:
@@ -24667,14 +24638,11 @@ class Daemon:
         last = self._capability_request_seen.get(key, 0.0)
         if now - last < CAPABILITY_REQUEST_DEDUP_S:
             return
-        # Per-peer prompt budget. Maintained on the daemon under a
-        # bounded deque keyed by peer_fp.
-        from collections import deque as _deque
+        # Per-peer prompt budget: a bounded map of deques keyed by peer_fp.
         if not hasattr(self, "_capability_request_per_peer"):
-            self._capability_request_per_peer: dict[str, _deque] = {}
-        window = self._capability_request_per_peer.setdefault(peer_fp, _deque())
-        cutoff = now - 60.0
-        while window and window[0] < cutoff:
+            self._capability_request_per_peer: dict[str, deque] = peer_admission.BoundedDict(peer_admission.PEER_BOOKKEEPING_MAX)
+        window = self._capability_request_per_peer.get(peer_fp) or deque()
+        while window and window[0] < now - 60.0:
             window.popleft()
         if len(window) >= 5:
             log.info(
@@ -24682,6 +24650,9 @@ class Daemon:
                 peer_fp[:8], cap,
             )
             return
+        if not self.admission.prompt_admitted(peer_fp):
+            return
+        self._capability_request_per_peer[peer_fp] = window
         window.append(now)
         self._capability_request_seen[key] = now
         with contextlib.suppress(Exception):
@@ -34406,20 +34377,9 @@ class Daemon:
         rec = self.state.get_peer_by_short_id(needle)
         if rec is not None and rec.trust == "pinned":
             return rec.fingerprint
-        for rec in self.state.list_peers():
-            values = (
-                rec.fingerprint,
-                rec.short_id,
-                rec.hostname or "",
-                rec.local_alias or "",
-                rec.display_name,
-            )
-            if rec.trust == "pinned" and any(
-                v and (v.lower() == lowered or lowered in v.lower())
-                for v in values
-            ):
-                return rec.fingerprint
-        return None
+        return peer_admission.unique_pinned_match(
+            needle, (rec for rec in self.state.list_peers() if rec.trust == "pinned")
+        )
 
     async def resolve_for_send(self, needle: str) -> Peer | None:
         """v0.5.1: send-path peer resolution. mDNS first, rendezvous
@@ -35385,6 +35345,7 @@ class Daemon:
             ed_pub_hex=self.me.public_bytes.hex(),
             rendezvous_urls=rdz_to_advertise,
             device_kind=kind_tag,
+            announce_details=_sov.mdns_announce_details_for(self.state),
         )
         if _mdns_active:
             await self.discovery.start()
@@ -35644,26 +35605,19 @@ class Daemon:
         # page reload. Errors swallowed silently — the loop never
         # raises in a way that takes down the daemon.
         #
-        # May 15 2026 — SOVEREIGNTY DEFAULT: the update-check poll
-        # is the ONLY external network call this daemon makes
-        # (GitHub is Microsoft-owned). One Link's promise is "no
-        # corp dependencies, no calls home." So the poll is now
-        # opt-IN, not opt-out.
+        # The poll is ON by default: a fresh install uses the "just_works"
+        # preset, which permits it. It is one of the outside contacts a
+        # default install makes (the others are the community STUN servers);
+        # docs/NETWORK_CONTACTS.md lists them all for users.
         #
-        # Enable via either:
-        #   - Env var:  ONE_LINK_UPDATE_CHECK=1
-        #   - Setting:  state.set_setting("update_check_enabled", "1")
-        #               (Settings panel surfaces this checkbox)
+        # The decision is read through the sovereignty preset layer. The
+        # strict presets ("quiet", "off_grid") keep it off; an explicit
+        # setting or ONE_LINK_UPDATE_CHECK may disable a permitted check but
+        # cannot loosen a strict preset.
         #
-        # When disabled, the daemon never reaches api.github.com.
-        # The /api/update/check HTTP endpoint also short-circuits
-        # to status=disabled so a UI tab refresh doesn't quietly
-        # poke GitHub anyway.
-        # May 15 2026 — read through the sovereignty preset layer so a
-        # fresh install (preset="just_works") gets update notifications
-        # by default while strict modes ("quiet", "off_grid") stay
-        # silent. Explicit settings may disable a permitted check but cannot
-        # loosen a strict preset.
+        # When disabled, the daemon never reaches api.github.com. The
+        # /api/update/check HTTP endpoint also short-circuits to
+        # status=disabled so a UI tab refresh doesn't poke GitHub anyway.
         from one_link import sovereignty as _sov
         update_check_setting: str | None = None
         preset_name: str | None = None

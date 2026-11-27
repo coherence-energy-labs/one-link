@@ -194,24 +194,18 @@ def test_a_name_resolves_to_a_peer_it_names_or_to_nothing(labels, needle) -> Non
     found = peer_admission.unique_pinned_match(needle, peers)
     lowered = needle.strip().lower()
 
-    def names(peer) -> set[str]:
-        return {
-            v.lower()
-            for v in (peer.fingerprint, peer.short_id, peer.hostname, peer.local_alias, peer.display_name)
-            if v
-        }
+    def names(peer) -> list[str]:
+        return [v.lower() for v in (peer.hostname, peer.local_alias, peer.display_name) if v]
 
-    exact = [p for p in peers if lowered and lowered in names(p)]
-    if found is None:
-        # Nothing is returned only when no single peer is named.
-        assert len(exact) != 1
-        return
-    (winner,) = [p for p in peers if p.fingerprint == found]
-    if exact:
-        assert exact == [winner]
-    else:
-        assert len(lowered) >= 8 and winner.fingerprint.startswith(lowered)
-        assert sum(p.fingerprint.startswith(lowered) for p in peers) == 1
+    whole = [p for p in peers if lowered in (p.fingerprint, p.short_id, *names(p))]
+    prefix = [p for p in peers if len(lowered) >= 8 and p.fingerprint.startswith(lowered)]
+    part = [p for p in peers if any(lowered in name for name in names(p))]
+    # The first rule that matches anything decides, and it must match one peer.
+    deciding = next((group for group in (whole, prefix, part) if group), []) if lowered else []
+    expected = deciding[0].fingerprint if len(deciding) == 1 else None
+    assert found == expected
+    if found is not None:
+        assert found in {p.fingerprint for p in peers}
 
 
 # ─── sealed identity key ────────────────────────────────────────────

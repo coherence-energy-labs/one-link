@@ -905,7 +905,11 @@ def test_pinned_name_resolution_is_exact_and_refuses_ambiguity(tmp_path: Path) -
         # which used to make the answer depend on who was seen last.
         assert resolve("al") == alice.fingerprint
         assert resolve("malory") == malory.fingerprint
-        assert resolve("alo") is None
+        # Part of a name is accepted when only one peer has it...
+        assert resolve("alo") == malory.fingerprint
+        # ...and refused when two do ("a" is in both "Al" and "Malory").
+        assert resolve("a") is None
+        assert resolve("nobody") is None
         assert resolve(alice.fingerprint) == alice.fingerprint
         assert resolve(alice.fingerprint[:12]) == alice.fingerprint
         assert resolve(alice.fingerprint[:4]) is None

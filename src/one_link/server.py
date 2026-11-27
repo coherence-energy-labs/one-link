@@ -156,7 +156,9 @@ def _atomic_settings_update(handler):
         # now, so a client that sends it one byte a minute holds nothing.
         read_body = getattr(request, "read", None)
         if callable(read_body):
-            await read_body()
+            arriving = read_body()
+            if hasattr(arriving, "__await__"):
+                await arriving
         try:
             with transaction():
                 # Run the handler to completion without ever yielding to the

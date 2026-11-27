@@ -93,6 +93,11 @@ from one_link.passphrase_source import (  # noqa: E402
 )
 
 
+# What the session's environment held before any test in this file ran.
+_PASSPHRASE_AT_IMPORT = __import__("os").environ.get(PASSPHRASE_ENV)
+_PASSPHRASE_FILE_AT_IMPORT = __import__("os").environ.get(FILE_ENV_VAR)
+
+
 def _sealed_fields(path: Path) -> tuple[bytes, bytes]:
     text = path.read_bytes().strip()
     assert text.startswith(identity_module._SEALED_BEGIN)
@@ -358,5 +363,5 @@ def test_passphrase_tests_leave_the_environment_as_they_found_it():
     """
     import os
 
-    assert PASSPHRASE_ENV not in os.environ
-    assert FILE_ENV_VAR not in os.environ
+    assert os.environ.get(PASSPHRASE_ENV) == _PASSPHRASE_AT_IMPORT
+    assert os.environ.get(FILE_ENV_VAR) == _PASSPHRASE_FILE_AT_IMPORT

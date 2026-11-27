@@ -261,40 +261,55 @@ class PromptBudget:
 def unique_pinned_match(needle: str, pinned: Iterable[Any]) -> Optional[str]:
     """Fingerprint of the one pinned peer ``needle`` names, else ``None``.
 
-    A name resolves only when it names exactly one peer: a full fingerprint,
-    short ID, hostname, alias or display name, compared whole and without
-    regard to case, or a fingerprint prefix of at least 8 hex digits. Partial
-    matches used to pick whichever peer was seen last, so "al" could deliver
-    to "malory"; a queued send must never guess its recipient.
+    Tried in order, and the first rule that matches anything decides:
+
+    1. a whole name: fingerprint, short ID, hostname, alias or display name,
+       compared without regard to case;
+    2. a fingerprint prefix of at least 8 hex digits;
+    3. part of a hostname, alias or display name ("computer" for
+       "Computer 2").
+
+    Whichever rule matches, the answer is a peer only when exactly one peer
+    matches it. The old lookup returned whichever matching peer was seen
+    last, so "al" could deliver to "malory"; a queued send must never guess
+    its recipient.
     """
     lowered = needle.strip().lower()
     if not lowered:
         return None
     records = list(pinned)
-    matches = {
-        rec.fingerprint
-        for rec in records
-        if lowered
-        in {
+
+    def labels(rec: Any) -> list[str]:
+        return [
             value.lower()
-            for value in (
-                rec.fingerprint,
-                rec.short_id,
-                rec.hostname or "",
-                rec.local_alias or "",
-                rec.display_name,
-            )
+            for value in (rec.hostname or "", rec.local_alias or "", rec.display_name)
             if value
-        }
-    }
-    if not matches and len(lowered) >= 8 and all(c in "0123456789abcdef" for c in lowered):
-        matches = {rec.fingerprint for rec in records if rec.fingerprint.startswith(lowered)}
-    if len(matches) == 1:
-        return matches.pop()
-    if matches:
-        log.warning(
-            "peer name %r matches %d pinned peers; refusing to guess", needle[:32], len(matches)
-        )
+        ]
+
+    def whole(rec: Any) -> bool:
+        return lowered in (rec.fingerprint, rec.short_id.lower(), *labels(rec))
+
+    def fingerprint_prefix(rec: Any) -> bool:
+        return rec.fingerprint.startswith(lowered)
+
+    def part(rec: Any) -> bool:
+        return any(lowered in label for label in labels(rec))
+
+    rules = [whole]
+    if len(lowered) >= 8 and all(c in "0123456789abcdef" for c in lowered):
+        rules.append(fingerprint_prefix)
+    rules.append(part)
+    for rule in rules:
+        matches = {rec.fingerprint for rec in records if rule(rec)}
+        if len(matches) == 1:
+            return matches.pop()
+        if matches:
+            log.warning(
+                "peer name %r matches %d pinned peers; refusing to guess",
+                needle[:32],
+                len(matches),
+            )
+            return None
     return None
 
 

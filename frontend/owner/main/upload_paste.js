@@ -66,11 +66,14 @@
   function _htmlToMarkdown(html) {
     let scratch;
     try {
-      scratch = document.createElement("div");
-      scratch.innerHTML = html;
+      // Parse into an inert document. Markup assigned to an element of the
+      // live document, even a detached one, starts loading its images and
+      // runs their error handlers; a parsed document does neither.
+      scratch = new DOMParser().parseFromString(String(html), "text/html").body;
     } catch (_) {
       return "";
     }
+    if (!scratch) return "";
     // Strip dangerous / noisy elements before walking.
     scratch.querySelectorAll(
       "script, style, link, meta, iframe, noscript, head, title, svg"

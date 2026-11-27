@@ -853,7 +853,16 @@
       const label = document.createElement("div");
       label.style.fontSize = "12px";
       const peer = v.peer_fp ? v.peer_fp.slice(0, 8) : "?";
-      label.innerHTML = `<strong>${v.action}</strong> · ${_humanAgo(v.ts_ms)} · by <code>${peer}</code> · ${v.size != null ? _humanBytes(v.size) : "—"}`;
+      const action = document.createElement("strong");
+      action.textContent = String(v.action || "");
+      const by = document.createElement("code");
+      by.textContent = peer;
+      label.replaceChildren(
+        action,
+        ` · ${_humanAgo(v.ts_ms)} · by `,
+        by,
+        ` · ${v.size != null ? _humanBytes(v.size) : "—"}`,
+      );
       head.appendChild(label);
       const hash = document.createElement("code");
       hash.style.fontSize = "10px";

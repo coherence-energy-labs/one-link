@@ -8,7 +8,7 @@
 # forgot the regeneration step).
 #
 # Output:
-#   src/one_link/web/assets/one-glyph.icns
+#   The output path passed by build_binary.py, or build/one-glyph.icns.
 #
 # Source:
 #   src/one_link/web/assets/one-glyph-512.png  (preferred high-res)
@@ -17,6 +17,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ASSETS="$REPO_ROOT/src/one_link/web/assets"
+OUT="${1:-$REPO_ROOT/build/one-glyph.icns}"
 
 # Pick the highest-quality source PNG available.
 SRC=""
@@ -57,7 +58,7 @@ for pair in "${SIZES[@]}"; do
   sips -z "$px" "$px" "$SRC" --out "$ISET/$name" > /dev/null
 done
 
-OUT="$ASSETS/one-glyph.icns"
+mkdir -p "$(dirname "$OUT")"
 iconutil -c icns -o "$OUT" "$ISET"
 echo "[icns] wrote $OUT ($(wc -c < "$OUT") bytes)"
 rm -rf "$TMP"

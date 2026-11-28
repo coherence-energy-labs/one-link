@@ -146,6 +146,11 @@ def _install_fake_runner(
 
     def fake_run(cmd, *args, **kwargs):
         captured_cmds.append(list(cmd))
+        if len(cmd) == 3 and Path(str(cmd[1])).name == "make_icns.sh":
+            icon = Path(cmd[2])
+            assert icon == output_root / "build" / "one-glyph.icns"
+            icon.write_bytes(b"fixture macOS application icon")
+            return FakeCompleted()
         if any("build_native_cdc.py" in str(a) for a in cmd):
             assert Path(kwargs["cwd"]).resolve() == repo.resolve()
             output_flag = cmd.index("--output-dir")
@@ -625,6 +630,9 @@ def test_macos_finalization_rebinds_both_native_binaries_before_helper_and_manif
 
     monkeypatch.setattr(mod.subprocess, "run", fake_macos_run)
     assert mod.main(output_root=isolated_output_root) == 0
+    icon = isolated_output_root / "build" / "one-glyph.icns"
+    assert icon.read_bytes() == b"fixture macOS application icon"
+    assert icon.as_posix() in (icon.parent / "one-link.spec").read_text(encoding="utf-8")
     assert_final_hashes()
     archive_path = isolated_output_root / "finished-app.zip"
     package_bundle(bundle, archive_path, executable="Contents/MacOS/one-link", epoch=1700000001)

@@ -987,25 +987,17 @@ def main(
 
     icon_arg: list[str] = []
     if platform.system() == "Darwin":
-        # Prefer ``.icns`` (native macOS multi-resolution icon format)
-        # over ``.ico``. PyInstaller's BUNDLE() expects .icns; .ico
-        # works for the EXE but produces a low-res Dock icon. The
-        # .icns is generated at CI time on the macOS runner via
-        # ``iconutil`` from the existing PNG family (see
-        # ``packaging/macos/make_icns.sh``); on developer machines
-        # the file may not exist yet, in which case we fall back to
-        # the .ico — still valid for the EXE icon, just less crisp.
-        icns = web_dir / "assets" / "one-glyph.icns"
-        ico = web_dir / "assets" / "one-glyph.ico"
-        chosen = icns if icns.is_file() else ico
-        if chosen.is_file():
-            icon_arg = ["--icon", str(chosen)]
-            print(f"[build] icon embedded: {chosen} ({chosen.stat().st_size} bytes)")
-        else:
-            print(
-                f"[build] WARNING: no icon found at {icns} or {ico} — "
-                f"exe will ship with the default Python+floppy icon"
-            )
+        # PyInstaller consumes this native icon when it builds the app.
+        # Generating it under web/assets would also expose it as package data.
+        icns = build / "one-glyph.icns"
+        result = subprocess.run(
+            ["bash", str(repo / "packaging" / "macos" / "make_icns.sh"), str(icns)],
+            cwd=repo,
+        )
+        if result.returncode or not icns.is_file() or not icns.stat().st_size:
+            print("[build] could not generate the macOS application icon")
+            return 2
+        icon_arg = ["--icon", str(icns)]
     elif platform.system() == "Windows":
         ico = web_dir / "assets" / "one-glyph.ico"
         if ico.is_file():

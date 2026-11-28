@@ -230,20 +230,6 @@ jobs:
           "OPENSSL_NO_VENDOR=1"                 | Out-File -Append $env:GITHUB_ENV -Encoding utf8
           "VCPKG_DEFAULT_TRIPLET=arm64-windows-static" | Out-File -Append $env:GITHUB_ENV -Encoding utf8
 
-      - name: generate macOS .icns icon
-        # PyInstaller's BUNDLE() block expects a .icns for the Dock
-        # icon to render crisply at every size. Generated from the
-        # existing PNG family via macOS-native iconutil + sips so the
-        # repo never has to carry a pre-baked .icns next to the PNG
-        # (which would drift the moment someone updated the source
-        # art and forgot the regenerate step). Only runs on the
-        # macOS legs; no-op everywhere else.
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          chmod +x packaging/macos/make_icns.sh
-          packaging/macos/make_icns.sh
-
       - name: install build tooling
         shell: bash
         # The universal lock covers PyInstaller, maturin, the project, and all

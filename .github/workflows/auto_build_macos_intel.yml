@@ -47,12 +47,6 @@ jobs:
           rustup toolchain install 1.96.0 --profile minimal --no-self-update
           rustup default 1.96.0
 
-      - name: generate macOS .icns icon
-        shell: bash
-        run: |
-          chmod +x packaging/macos/make_icns.sh
-          packaging/macos/make_icns.sh
-
       - name: install build tooling
         shell: bash
         run: uv sync --frozen --python python --extra release --extra tray

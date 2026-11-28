@@ -155,3 +155,61 @@ async def test_a_caller_that_hangs_up_before_the_certificate_can_be_sent_leaves_
     assert await _call(tmp_path, owed=2, caller_speaks=False) == {
         "frames": [], "answered": False, **_CLEAN,
     }
+
+@pytest.mark.asyncio
+async def test_revoked_peer_before_caps_releases_connection_without_waiting(tmp_path: Path) -> None:
+    """A refusal must not send from the task still responsible for reading CAPS."""
+    receiver, caller = _identity("receiver"), _identity("caller")
+    daemon = Daemon(receiver)
+    state = State(db_path=tmp_path / "state.db")
+    daemon.state = state
+    handlers: set[asyncio.Task] = set()
+
+    async def handle(reader, writer):
+        task = asyncio.current_task()
+        assert task is not None
+        handlers.add(task)
+        try:
+            await daemon._handle_peer(reader, writer)
+        finally:
+            handlers.discard(task)
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    client = None
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.sockets[0].getsockname()[1])
+        client = await channel_module.initiate(
+            reader, writer, caller, expected_responder_ed_pub=receiver.public_bytes,
+        )
+        server_caps = decode_msg(await asyncio.wait_for(client.recv(), timeout=2))
+        assert server_caps["t"] == "CAPS"
+        # The server has already admitted the connection. Revoke it in the
+        # interval between that admission and receipt of the client's CAPS.
+        state.set_peer_trust(caller.fingerprint, "rejected")
+        client.note_caps_received(list(server_caps["features"]))
+        await client.send(encode_msg(make_msg(
+            "CAPS", caller.short_id, protocol="OL1.2", features=list(LOCAL_CAPABILITIES),
+            channel_bind={"self_fp": caller.fingerprint, "peer_fp": receiver.fingerprint,
+                          "transcript": client.transcript_hex, "features": list(LOCAL_CAPABILITIES)},
+        )))
+        client.note_caps_sent()
+        client.maybe_activate_ratchet()
+        with pytest.raises((asyncio.IncompleteReadError, ConnectionError)):
+            await asyncio.wait_for(client.recv(), timeout=2)
+        # The read task must exit, not just close the TCP writer.
+        for _ in range(100):
+            if not handlers:
+                break
+            await asyncio.sleep(0.01)
+        assert not handlers
+        assert daemon._inbound_peer_count == 0
+        assert daemon._inbound_per_fp.get(caller.fingerprint, 0) == 0
+    finally:
+        if client is not None:
+            await client.close()
+        for task in list(handlers):
+            task.cancel()
+        await asyncio.gather(*list(handlers), return_exceptions=True)
+        server.close()
+        await asyncio.wait_for(server.wait_closed(), timeout=3)
+        state.close()

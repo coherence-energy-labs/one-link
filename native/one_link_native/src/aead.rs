@@ -82,40 +82,40 @@ fn copy_buffer_bounded(
     Ok(owned)
 }
 
-fn check_chunk_id(chunk_id: &[u8]) -> PyResult<[u8; 32]> {
-    if chunk_id.len() != 32 {
-        return Err(PyValueError::new_err(format!(
-            "chunk_id must be 32 bytes (BLAKE3-256), got {}",
-            chunk_id.len(),
-        )));
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(chunk_id);
-    Ok(out)
+/// The error for an argument of the wrong length. Out of line, so that the
+/// checks below are a length test and a copy that the compiler folds into
+/// each caller (see the same note in `store.rs`).
+#[cold]
+#[inline(never)]
+fn wrong_length(what: &str, want: usize, got: usize) -> PyErr {
+    PyValueError::new_err(format!("{what} must be {want} bytes, got {got}"))
 }
 
+#[cold]
+#[inline(never)]
+fn wrong_chunk_id_length(got: usize) -> PyErr {
+    PyValueError::new_err(format!("chunk_id must be 32 bytes (BLAKE3-256), got {got}"))
+}
+
+#[inline]
+fn check_chunk_id(chunk_id: &[u8]) -> PyResult<[u8; 32]> {
+    chunk_id
+        .try_into()
+        .map_err(|_| wrong_chunk_id_length(chunk_id.len()))
+}
+
+#[inline]
 fn check_key(key: &[u8]) -> PyResult<ChunkAeadKey> {
-    if key.len() != RUST_FRAME_KEY_LEN {
-        return Err(PyValueError::new_err(format!(
-            "key must be {RUST_FRAME_KEY_LEN} bytes, got {}",
-            key.len(),
-        )));
-    }
-    let mut bytes = [0u8; RUST_FRAME_KEY_LEN];
-    bytes.copy_from_slice(key);
+    let bytes: [u8; RUST_FRAME_KEY_LEN] = key
+        .try_into()
+        .map_err(|_| wrong_length("key", RUST_FRAME_KEY_LEN, key.len()))?;
     Ok(ChunkAeadKey::from_bytes(bytes))
 }
 
+#[inline]
 fn check_tag(tag: &[u8]) -> PyResult<[u8; RUST_AEAD_TAG_LEN]> {
-    if tag.len() != RUST_AEAD_TAG_LEN {
-        return Err(PyValueError::new_err(format!(
-            "tag must be {RUST_AEAD_TAG_LEN} bytes, got {}",
-            tag.len(),
-        )));
-    }
-    let mut out = [0u8; RUST_AEAD_TAG_LEN];
-    out.copy_from_slice(tag);
-    Ok(out)
+    tag.try_into()
+        .map_err(|_| wrong_length("tag", RUST_AEAD_TAG_LEN, tag.len()))
 }
 
 /// AEAD cipher initialized with a 32-byte key.

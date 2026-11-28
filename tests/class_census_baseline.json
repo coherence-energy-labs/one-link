@@ -1,7 +1,7 @@
 {
   "classes": {
     "Daemon": {
-      "class_lines": 33989,
+      "class_lines": 33785,
       "domains": {
         "call": {
           "lines": 660,
@@ -28,11 +28,11 @@
           "methods": 21
         },
         "other": {
-          "lines": 10931,
+          "lines": 10928,
           "methods": 206
         },
         "peer": {
-          "lines": 4478,
+          "lines": 4509,
           "methods": 35
         },
         "recovery": {
@@ -44,16 +44,16 @@
           "methods": 13
         },
         "transfer": {
-          "lines": 9879,
-          "methods": 124
+          "lines": 9646,
+          "methods": 122
         }
       },
-      "method_lines": 33312,
-      "methods": 499,
+      "method_lines": 33107,
+      "methods": 497,
       "self_attributes_assigned": 192
     },
     "UIServer": {
-      "class_lines": 25844,
+      "class_lines": 25837,
       "domains": {
         "call": {
           "lines": 537,
@@ -72,7 +72,7 @@
           "methods": 51
         },
         "group": {
-          "lines": 619,
+          "lines": 617,
           "methods": 19
         },
         "mesh": {
@@ -80,7 +80,7 @@
           "methods": 19
         },
         "other": {
-          "lines": 11359,
+          "lines": 11354,
           "methods": 214
         },
         "peer": {
@@ -100,7 +100,7 @@
           "methods": 26
         }
       },
-      "method_lines": 25034,
+      "method_lines": 25027,
       "methods": 445,
       "self_attributes_assigned": 52
     }
@@ -282,6 +282,71 @@
         },
         "UIServer": {
           "method_lines": 25034,
+          "methods": 445
+        }
+      }
+    },
+    {
+      "label": "Extract receive consent lifecycle through explicit HeldOfferPort extension; keep public daemon API",
+      "totals": {
+        "Daemon": {
+          "method_lines": 33171,
+          "methods": 497
+        },
+        "UIServer": {
+          "method_lines": 25034,
+          "methods": 445
+        }
+      }
+    },
+    {
+      "label": "Bound sender acknowledgement receipt state and retain local observation timestamps after consent extraction",
+      "totals": {
+        "Daemon": {
+          "method_lines": 33162,
+          "methods": 497
+        },
+        "UIServer": {
+          "method_lines": 25034,
+          "methods": 445
+        }
+      }
+    },
+    {
+      "label": "Refuse revoked peer before CAPS without deadlocking the read task",
+      "totals": {
+        "Daemon": {
+          "method_lines": 33162,
+          "methods": 497
+        },
+        "UIServer": {
+          "method_lines": 25034,
+          "methods": 445
+        }
+      }
+    },
+    {
+      "label": "Move peer admission, name sanitising and rate limiting out of Daemon and UIServer",
+      "totals": {
+        "Daemon": {
+          "method_lines": 33107,
+          "methods": 497
+        },
+        "UIServer": {
+          "method_lines": 25029,
+          "methods": 445
+        }
+      }
+    },
+    {
+      "label": "Hold fire-and-forget tasks through task_refs; drop a no-op expression",
+      "totals": {
+        "Daemon": {
+          "method_lines": 33107,
+          "methods": 497
+        },
+        "UIServer": {
+          "method_lines": 25027,
           "methods": 445
         }
       }

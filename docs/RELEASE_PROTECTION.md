@@ -270,3 +270,16 @@ neither was made here.
 - the derived files `sbom.cdx.json`, `UPDATE_MANIFEST.json` and `SHA256SUMS`,
   which hash the artifacts above, and the Sigstore bundles, which are
   non-deterministic by design.
+
+
+## 2026-11-26 application checkpoint
+
+The version-tag ruleset (28202878) and release environment described above
+have now been applied through the authorized repository administrator and
+read back: tag-only v* deployment, required reviewer CoherenceEnergyLabs,
+self-review prohibited and environment administrator bypass disabled. The
+existing default-branch ruleset (20516627) was unchanged. The admin-only
+tag bypass remains as documented. No tag, release or PR approval was created
+by this action. See the Phase Zero checkpoint for the retained evidence
+digest and limits. This does not qualify a release or demonstrate enforcement
+of the environment by every possible tagged workflow.

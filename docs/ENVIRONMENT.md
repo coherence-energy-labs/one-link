@@ -198,3 +198,88 @@ automatically.
 - To roll back deliberately, install the older release over the current one.
   There is no "undo last update" command; the automatic rollback exists for
   updates that fail, not for updates you regret.
+
+---
+
+## Passphrase and key material
+
+| Variable | Default | Effect |
+|---|---|---|
+| `ONE_LINK_PASSPHRASE` | unset | The passphrase that seals the identity key (scrypt + ChaCha20-Poly1305) and unlocks the lockbox. See `docs/SECURITY.md`. |
+| `ONE_LINK_PASSPHRASE_FILE` | unset | Path of a file holding that passphrase: a systemd credential, a Docker or Kubernetes secret. Read once at start; one trailing newline is ignored. Preferred over `ONE_LINK_PASSPHRASE`, which ends up in unit files, shell history and the environment of child processes. Startup fails if the file is missing, empty, not UTF-8, writable by other users, or disagrees with `ONE_LINK_PASSPHRASE` when both are set. |
+| `ONE_LINK_DISABLE_AT_REST_ENCRYPTION` | off | **Weakens security.** Skips the OS keychain and leaves `state.db` unencrypted. Exists so the test suite does not touch a developer's real keychain. Requires exactly `1`; an explicit `ONE_LINK_PASSPHRASE` still wins over it. |
+| `ONE_LINK_THRESHOLD_RECOVERY_PYTHON_FALLBACK` | on | Whether share recovery may use the pure-Python Shamir implementation when the native one is missing or incomplete. `0`/`false`/`no`/`off` forbids the fallback; an unrecognised value also forbids it and logs an error. |
+| `ONE_LINK_ALLOW_UNSNAPSHOTTED_MIGRATION` | off | Lets a schema upgrade of `state.db` proceed when the pre-upgrade snapshot (`state.db.pre-migration-vN.bak`) could not be written, for example on a full disk. Without it the upgrade is refused and the database is left unchanged. Requires exactly `1`. |
+
+## Peers without standing
+
+| Variable | Default | Effect |
+|---|---|---|
+| `ONE_LINK_MAX_PENDING_PEERS` | `256` | How many `pending` peer records with no history are kept. Anyone who completes a handshake gets one, so beyond this count the least recently seen are deleted. Peers you pinned, rejected, renamed, verified, muted, or have any stored history with are never deleted. Clamped to 16..65536. |
+
+## UI listener and developer pages
+
+| Variable | Default | Effect |
+|---|---|---|
+| `ONE_LINK_UI_PORT` | unset | Unset: the preferred port (7117), then a small fallback range, then an OS-assigned port. `0`: an OS-assigned port. `N` (1..65535): exactly that port, or startup fails. |
+| `ONE_LINK_SERVE_DEV_PAGES` | off | Serves the Double Ratchet self-test page at `/dr_test`. Release bundles do not contain the page at all; in a source or pip install it stays hidden unless this is exactly `1`. |
+| `ONE_LINK_NO_NATIVE_SHELL` | off | Opens the UI in the browser instead of the native window. Set by the test suite so a run cannot open windows on a developer's machine. |
+
+## Rendezvous privacy
+
+| Variable | Default | Effect |
+|---|---|---|
+| `ONE_LINK_TOR_PROXY` | unset | A SOCKS proxy URL (for example `socks5://127.0.0.1:9050`). All outbound rendezvous traffic goes through it, so a rendezvous server sees the proxy's address instead of yours. Needs the optional `tor` install extra. |
+
+## Cache sizing
+
+| Variable | Default | Effect |
+|---|---|---|
+| `ONE_LINK_CHUNK_CACHE_MAX_BYTES` | `536870912` | Ceiling of the received-chunk cache. Unparseable values fall back to the default with a warning. |
+| `ONE_LINK_CHUNK_CACHE_TARGET_RATIO` | `0.80` | Fraction of the ceiling that eviction trims down to. Must be strictly between 0 and 1; anything else falls back to the default with a warning. |
+
+## Hardware capability overrides
+
+These change what the hardware inventory *reports*. They do not add a radio
+or a drive; they exist for testing transports on machines where detection
+gives the wrong answer.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `ONE_LINK_ASSUME_BLE` | off | Report a Bluetooth LE adapter as present without probing. |
+| `ONE_LINK_ASSUME_USB_COURIER` | off | Report removable storage for the courier transport as present. |
+| `ONE_LINK_DISABLE_WEBRTC` | off | Report WebRTC as unavailable. |
+| `ONE_LINK_DISABLE_QR` | off | Report QR pairing as unavailable. |
+| `ONE_LINK_ENABLE_AUDIO_CONTROL` | off | Report the audio control channel as available. |
+
+## Benchmark metadata
+
+Read only by the performance lab, and only to label its output. They have no
+effect on the daemon.
+
+| Variable | Effect |
+|---|---|
+| `ONE_LINK_BENCH_SESSION` | Session identifier written into benchmark records. |
+| `ONE_LINK_BENCH_PAIR` | Index of the A/B pair a run belongs to; also rotates the order sizes are measured in. |
+| `ONE_LINK_BENCH_ARM` | Which arm of the pair this run is. |
+| `ONE_LINK_BENCH_NATIVE_REVISION` | Source revision of the native library under test. |
+
+## More switches that weaken security or run programs
+
+These were readable only in the source until the reference check
+(`tests/test_env_reference_is_complete.py`) required every named switch to be
+listed here.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `ONE_LINK_ALLOW_PLAINTEXT` | off | **Weakens security.** When the state database cannot be encrypted (no usable keychain, no passphrase), One Link refuses to start. This opts in to starting anyway with an unencrypted `state.db`. |
+| `ONE_LINK_NATIVE_PATH_HELPERS` | unset | **Runs programs.** A JSON list of helper registrations, each with a `command` to execute for a transport path (for example Wi-Fi Direct). Whoever can set this variable chooses programs the daemon will run as you. Leave it unset unless you wrote the helper. |
+
+## Field solver and phone reach
+
+| Variable | Default | Effect |
+|---|---|---|
+| `ONE_LINK_FIELD_DISABLE` | off | Stops the background field solve. Consumers fall back to their safe defaults; clearing it resumes solving on the next tick. |
+| `ONE_LINK_FIELD_CADENCE_DISABLE` | off | Ignores the solver's key-rotation cadence advice and uses the baseline cadence. |
+| `ONE_LINK_PHONE_STORAGE_BUDGET_BYTES` | built-in | Storage budget assumed for a phone when planning what to keep on it. |
+| `ONE_LINK_ENABLE_ONEFIELD_LOOPBACK` | off | Reports the OneField loopback path as available in the hardware inventory, for testing. |

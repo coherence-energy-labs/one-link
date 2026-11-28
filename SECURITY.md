@@ -112,6 +112,10 @@ Will be listed here as `CVE-YYYY-NNNNN: short title (date)`.
 The 2026-05-09 audit (commits `8857bcf` … `fbe066c`) closed 55+
 internal findings ahead of any public-disclosure window; the
 finding-by-finding record is in
-[`docs/SECURITY_AUDIT_v0.7.0.md`](docs/SECURITY_AUDIT_v0.7.0.md)
-and the 2026-05-09 audit findings file in the project's memory
-notes.
+[`docs/SECURITY_AUDIT_v0.7.0.md`](docs/SECURITY_AUDIT_v0.7.0.md).
+Later reviews and the evidence behind them are under
+[`docs/audit/`](docs/audit/).
+
+These were internal reviews. No independent third party has reviewed the
+protocol or the implementation; until one has, treat the cryptographic
+design as unaudited.

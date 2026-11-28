@@ -19,8 +19,12 @@
 //! vector proportional to record count. Header read-ahead and short-segment
 //! batches are 64 KiB; dense walks also retain a bounded unhashed span. The
 //! parallel CDC kernel has additional candidate workspace bounded by the
-//! payload window, not by the file length. This is not a constant-total-memory
-//! API: its returned boundaries and format flags occupy O(output chunks).
+//! payload window and the profile, whatever the bytes are: about a sixtieth
+//! of the window with the default profile, at most about one and a quarter
+//! times the window with the smallest average. On input built to fill it,
+//! `pcdc` stops recording and hashes each chunk directly. This is not a
+//! constant-total-memory API: its returned boundaries and format flags
+//! occupy O(output chunks).
 //!
 //! Declared lengths are checked, including short reads and growth. Callers
 //! must nevertheless keep the contents immutable: a same-length concurrent

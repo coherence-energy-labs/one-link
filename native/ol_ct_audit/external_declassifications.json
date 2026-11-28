@@ -1,14 +1,14 @@
 {
   "schema": "one-link/ct-audit-external-declassifications/v1",
-  "policy": "A verdict branch inside a third-party crate may be declassified only by an entry here: exact package and version (as locked), file, line and the reviewed source text. A version bump or any edit to that line stops the entry matching, so the audit fails until the new code is reviewed.",
+  "policy": "A verdict branch inside a third-party crate may be declassified only by an entry here: exact package and version (as locked), file, line and the reviewed source text, and only in the audit cases the entry names. A version bump or any edit to that line stops the entry matching, so the audit fails until the new code is reviewed. An entry that declassifies nothing in a case it names also fails the audit: the compiler decides which inlined line a branch is attributed to, so a change of code generation means reviewing the new line and replacing the entry, never keeping both.",
   "entries": [
     {
-      "package": "universal-hash",
-      "version": "0.5.1",
-      "file": "src/lib.rs",
-      "line": 154,
-      "source_text": "if self.finalize().ct_eq(expected).into() {",
-      "reason": "Poly1305 tag verdict: the tag is compared with subtle::ConstantTimeEq and only accept/reject (the AEAD's public result) is branched on. Reached from chacha20poly1305 0.10.1 decrypt_in_place_detached.",
+      "package": "chacha20poly1305",
+      "version": "0.10.1",
+      "file": "src/cipher.rs",
+      "line": 87,
+      "source_text": "if self.mac.verify(tag).is_ok() {",
+      "reason": "Poly1305 tag verdict. verify() is universal-hash 0.5.1 src/lib.rs:154, `if self.finalize().ct_eq(expected).into()`: the tag is compared with subtle::ConstantTimeEq and only accept/reject, the AEAD's public result, leaves it; this line tests that same result. With the release panic strategy (unwind) the compiler folds verify()'s branch into this one, so Memcheck attributes the four verdict branches of the case here; built with panic=abort the same four are attributed to universal-hash src/lib.rs:154.",
       "cases": ["confidential_unseal_tampered"]
     }
   ]

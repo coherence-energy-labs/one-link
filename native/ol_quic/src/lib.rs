@@ -46,7 +46,7 @@ pub use transport::{Connection, Endpoint, EndpointConfig};
 /// Crate version embedded for diagnostics.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Initialize the rustls / aws-lc-rs crypto provider once at process
+/// Initialize the rustls crypto provider (ring) once at process
 /// start. Safe to call multiple times. Most callers should use
 /// [`Endpoint::server_for_identity`] / [`Endpoint::client_for_identity`]
 /// which call this internally.

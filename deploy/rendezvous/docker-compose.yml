@@ -36,6 +36,7 @@ services:
       ONE_LINK_RDZ_RATE_NEW_PUBKEY_PER_IP_PER_MIN: "10"
       ONE_LINK_RDZ_RATE_LISTENER_REPLACE_PER_PUBKEY_PER_MIN: "2"
       ONE_LINK_RDZ_MAX_CONCURRENT_CONNECTIONS: "64"
+      ONE_LINK_RDZ_MAX_CONCURRENT_PER_SOURCE: "16"
       # Must equal the effective hard memory limit below. The server refuses
       # to start when configured state/connection/relay ceilings exceed it.
       ONE_LINK_RDZ_MEMORY_BUDGET_BYTES: "536870912"

@@ -769,3 +769,45 @@ def test_both_send_loops_are_the_loop_that_was_searched():
     assert flat.count("refusal = ack_batching.refusal_of_unanswered_chunk(m, unanswered_chunks)") == 1
     assert flat.count("unanswered_chunks.append(pending_cdc_sizes)") == 1
     assert flat.count("unanswered_chunks.append(pending_sizes)") == 1
+
+def test_ack_receipt_window_binds_and_preserves_first_observation():
+    receipts = ack_batching.AckReceiptWindow()
+    pending = deque([("a", 1, 0.1), ("b", 1, 0.2)])
+    msg = {"blob": "blob", "ofs": ["a", "b", "not-outstanding"], "count": 3}
+    receipts.record_batch(msg, [pending], blob="blob", observed_at=1.25, max_count=32)
+    assert len(receipts) == 2
+    receipts.record_batch(msg, [pending], blob="blob", observed_at=5.0, max_count=32)
+    assert receipts.consume("a") == 1.25
+    assert receipts.consume("b") == 1.25
+    assert receipts.consume("not-outstanding") is None
+    assert len(receipts) == 0
+
+
+@pytest.mark.parametrize("mutation", [
+    {"blob": "wrong"}, {"count": True}, {"count": 2}, {"ofs": ["a", "a"]},
+    {"ofs": "a"}, {"ofs": [None]}, {"ofs": ["a"] * 33},
+    {"ofs": ["a" * 129]}, {"ok": False}, {"rejected": "disk"},
+])
+def test_ack_receipt_window_rejects_malformed_or_crossed_batch(mutation):
+    receipts = ack_batching.AckReceiptWindow()
+    msg = {"blob": "blob", "ofs": ["a"], "count": 1, **mutation}
+    with pytest.raises(ValueError):
+        receipts.record_batch(msg, [[("a",)]], blob="blob", observed_at=1.0, max_count=32)
+    assert len(receipts) == 0
+
+
+def test_ack_receipt_window_legacy_and_bounded_stale_flood():
+    receipts = ack_batching.AckReceiptWindow()
+    pending = deque([("a",), ("b",)])
+    for i in range(1000):
+        receipts.record_batch({"acks": [f"unknown-{i}"]}, [pending], blob="blob",
+                              observed_at=float(i), max_count=32)
+    assert len(receipts) == 0
+    receipts.record_batch({"acks": ["a", "b"]}, [pending], blob="blob",
+                          observed_at=2.0, max_count=32)
+    pending.popleft()
+    receipts.record_batch({"acks": ["b"]}, [pending], blob="blob",
+                          observed_at=3.0, max_count=32)
+    assert len(receipts) == 1
+    assert receipts.consume("a") is None
+    assert receipts.consume("b") == 2.0

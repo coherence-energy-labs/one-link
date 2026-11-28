@@ -71,7 +71,7 @@ from collections import OrderedDict, deque
 from one_link.env_bounds import env_float, env_int
 from one_link._coerce import to_int
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import (
     IO,
     BinaryIO,
@@ -289,7 +289,14 @@ from one_link.transfer_safety import (
     known_bytes_from_chunks,
     same_storage_volume,
 )
-from one_link import ack_batching, connection_shutdown, held_offers
+from one_link import (
+    ack_batching,
+    connection_shutdown,
+    held_offers,
+    peer_admission,
+    task_refs,
+    transfer_names,
+)
 from one_link.wire import decode_msg, encode_msg, make_msg
 
 log = logging.getLogger("one_link.daemon")
@@ -3640,12 +3647,12 @@ class Daemon:
         self._relay_listener_clients: list = []
         # v0.5.6: per-peer connection regime, last-seen.
         # peer_fp -> {"outbound": str, "inbound": str, "ts": float}
-        self._inbound_regime: dict[str, str] = {}
+        self._inbound_regime: dict[str, str] = peer_admission.BoundedDict(peer_admission.PEER_BOOKKEEPING_MAX)
         # v0.10.4 peer presence cache. peer_fp -> 'online' | 'away'
         # | 'dnd' | 'offline'. 'invisible' is never observed on the
         # wire — invisible peers report 'offline'. NOT persisted —
         # presence is transient (resets when the peer disconnects).
-        self._peer_presence: dict[str, str] = {}
+        self._peer_presence: dict[str, str] = peer_admission.BoundedDict(peer_admission.PEER_BOOKKEEPING_MAX)
         # v0.7.0: per-pairing health metrics. Updated on every
         # successful send / receive. Surfaced in /api/peers so the
         # UI can show real "last alive" + latency instead of guessing
@@ -3672,7 +3679,7 @@ class Daemon:
         self._fabric_snapshots = _build_fabric_snapshot_cache(self)
         # v0.7.1: dedup table for capability_request WS events.
         # (peer_fp, cap) -> monotonic ts of last UI prompt fired.
-        self._capability_request_seen: dict[tuple[str, str], float] = {}
+        self._capability_request_seen: dict[tuple[str, str], float] = peer_admission.BoundedDict(peer_admission.PEER_BOOKKEEPING_MAX)
         # v0.7.1: outbox flush concurrency. One in-flight flush per
         # peer at a time — multiple session-up events shouldn't fire
         # parallel deliveries that ACK out of order.
@@ -7156,6 +7163,17 @@ class Daemon:
                     incoming = self._incoming_files.get(blob) if blob else None
                     if t.status == "paused" and incoming is None:
                         continue
+                    # The blob is content, not a delivery identity. A stale
+                    # ledger row for the same peer/blob must not park a newer
+                    # writer, including one currently awaiting owner consent.
+                    if incoming is not None and (
+                        (incoming.transfer_id or f"in:{blob}") != t.id
+                        or not self._inbound_file_owned_by(incoming, t.peer_fp)
+                    ):
+                        continue
+                    pending = self._pending_file_offers.get(t.id)
+                    if pending is not None and pending.get("accept_reply_in_flight"):
+                        continue
                     # Whole-file hash/fsync runs in a worker thread. Never
                     # close or park its handle merely because a very large
                     # finalization exceeded the ordinary progress deadline.
@@ -7538,6 +7556,7 @@ class Daemon:
         # sessions are stamped separately on OutboundSession.
         inbound_regime = regime if regime is not None else _classify_address_regime(peer_ip)
         self._inbound_regime[peer_fp] = inbound_regime
+        frame_admitted = self.admission.bind_channel(channel, peer_fp)
         if self._inbound_is_rejected(peer_fp):
             log.warning("rejected peer attempted inbound connection: %s", peer_fp[:8])
             await channel.close()
@@ -7597,6 +7616,7 @@ class Daemon:
                 # open tab raises the red banner without waiting for
                 # the next /api/peers poll.
                 self._broadcast_key_change_if_present(rec)
+                self.admission.after_handshake(rec)
             except Exception as e:
                 log.warning("upsert_peer failed: %s", e)
 
@@ -7630,6 +7650,8 @@ class Daemon:
                         channel.peer_short_id, read_deadline_s,
                     )
                     break
+                if not frame_admitted(len(plaintext)):
+                    raise RuntimeError("peer without standing exceeded its frame allowance")
                 if plaintext.startswith(BINARY_FRAME_MAGIC):
                     msg = _decode_binary_frame(plaintext)
                 else:
@@ -7680,11 +7702,14 @@ class Daemon:
                 if not live:
                     self._inbound_live_channels.pop(peer_fp, None)
 
+    #: Decisions about peers without standing live in peer_admission.py.
+    admission = peer_admission.PerDaemon()
+
     def _admit_inbound_chat_rate(self, peer_fp: str) -> bool:
         """Consume one bounded per-peer chat/control admission token."""
 
         if not hasattr(self, "_text_rate_per_peer"):
-            self._text_rate_per_peer: dict[str, deque[float]] = {}
+            self._text_rate_per_peer: dict[str, deque[float]] = peer_admission.BoundedDict(peer_admission.PEER_BOOKKEEPING_MAX)
         rate_window = self._text_rate_per_peer.setdefault(peer_fp, deque())
         rate_now = time.monotonic()
         rate_cutoff = rate_now - TEXT_RATE_WINDOW_S
@@ -7698,20 +7723,20 @@ class Daemon:
     async def _on_peer_message(self, channel: ch.Channel, msg: dict) -> None:
         peer_fp = fingerprint_of(channel.peer_ed_pub)
         peer_sid = channel.peer_short_id
-        # v0.7.0: any frame received from a paired peer = they're alive.
-        self._stamp_pair_health(peer_fp)
         t = msg.get("t")
-        # H2: rejected peers cannot drive any state mutation, including the
-        # sqlite write that CAPS would have caused. They get an ACK with the
-        # rejection reason so they can fail loudly instead of silently
-        # retrying a write-amplification primitive against our DB.
+        # Revocation precedes every peer-driven mutation. A rejected CAPS
+        # cannot be acknowledged: the reader would wait for the very CAPS
+        # negotiation it must refuse. Raise so its owner closes the channel.
         if self._inbound_is_rejected(peer_fp):
-            with contextlib.suppress(Exception):
-                await channel.send(encode_msg(make_msg(
-                    "ACK", self.me.short_id,
-                    of=msg.get("id"), rejected="peer_rejected",
-                )))
+            if t != "CAPS":
+                with contextlib.suppress(Exception):
+                    await channel.send(encode_msg(make_msg(
+                        "ACK", self.me.short_id,
+                        of=msg.get("id"), rejected="peer_rejected",
+                    )))
             raise RuntimeError(f"rejected peer attempted message: {peer_fp[:8]}")
+        # v0.7.0: an admitted frame from a paired peer proves liveness.
+        self._stamp_pair_health(peer_fp)
         if getattr(self, "_update_handoff_draining", False) and t not in {
             "ACK",
             "CAPS",
@@ -8617,6 +8642,34 @@ class Daemon:
             if _retry_tid in self._pending_file_offers:
                 _ctx = self._pending_file_offers[_retry_tid]
                 if _ctx.get("peer_fp") == peer_fp:
+                    _active_retry = held_offers.pending_file_offer_owner(self, _retry_tid, _ctx)
+                    if (
+                        _active_retry is None
+                        or _active_retry.blob_hex != blob
+                        or _active_retry.size != size
+                        or not _incoming_delivery_contract_matches(
+                            _active_retry, peer_fp=peer_fp,
+                            delivery_id=delivery_id,
+                            delivery_name=delivery_name,
+                            delivery_rel_path=delivery_rel_path,
+                            delivery_kind=delivery_kind,
+                        )
+                    ):
+                        # Do not write a rejection over the original ledger row.
+                        await channel.send(encode_msg(make_msg(
+                            "ACK", self.me.short_id, of=msg["id"],
+                            rejected="delivery_contract_mismatch",
+                        )))
+                        return
+                    if _ctx.get("accept_reply_in_flight"):
+                        # The current reply owns its channel and correlation ID.
+                        # A concurrent retry must not mutate them underneath it.
+                        await channel.send(encode_msg(make_msg(
+                            "FILE_OFFER_HELD", self.me.short_id,
+                            of=msg["id"], blob=blob,
+                            reason="acceptance_reply_in_flight",
+                        )))
+                        return
                     # Use THIS retry's channel — the prior session is
                     # gone (the sender timed out + reconnected). Protocol
                     # replies must correlate to THIS retry's message id;
@@ -8624,32 +8677,24 @@ class Daemon:
                     _ctx["channel"] = channel
                     _ctx["msg_id"] = msg["id"]
                     _ctx["msg"] = msg
-                    _active_retry = self._incoming_files.get(blob)
-                    if _active_retry is not None:
-                        _active_retry.offer_id = str(msg["id"])
-                        if commit_receipt_required:
-                            self._register_file_commit_waiter(
-                                _active_retry,
-                                offer_id=str(msg["id"]),
-                                channel=channel,
-                            )
-                    if _ctx.get("accepted"):
-                        try:
-                            await self._reply_to_accepted_file_offer(_ctx)
-                        except Exception as e:
-                            log.info(
-                                "accepted file retry reply failed for %s: %s",
-                                blob[:8],
-                                e,
-                            )
-                            return
-                        self._pending_file_offers.pop(_retry_tid, None)
-                        self._mark_file_offer_accepted(_retry_tid)
-                        log.info(
-                            "file offer resumed after prior acceptance: %s from %s",
-                            _ctx.get("name") or name,
-                            peer_sid,
+                    _active_retry.offer_id = str(msg["id"])
+                    if commit_receipt_required:
+                        self._register_file_commit_waiter(
+                            _active_retry,
+                            offer_id=str(msg["id"]),
+                            channel=channel,
                         )
+                    if _ctx.get("accepted"):
+                        # Failed-reply inheritance must be disabled while this
+                        # newly correlated reply is in flight as well.
+                        _ctx["accept_reply_in_flight"] = True
+                        _ctx["accept_reply_failed"] = False
+                        try:
+                            await held_offers.complete_pending_accept_reply(
+                                self, _retry_tid, _ctx, _active_retry,
+                            )
+                        finally:
+                            _ctx["accept_reply_in_flight"] = False
                         return
                     await channel.send(
                         encode_msg(
@@ -8684,6 +8729,14 @@ class Daemon:
                         "One Link blocked a file fingerprint already active for another sender."
                     ),
                 )
+                return
+            if existing_owner is not None and (
+                existing_owner.size != size or existing_owner.blob_hex != blob
+            ) and existing_owner.delivery_id == delivery_id:
+                await channel.send(encode_msg(make_msg(
+                    "ACK", self.me.short_id, of=msg["id"],
+                    rejected="delivery_contract_mismatch",
+                )))
                 return
             # Owner consent carried over from an accepted offer whose sender left.
             inherited_acceptance = False
@@ -8795,6 +8848,10 @@ class Daemon:
                 peer_fp,
                 blob,
                 delivery_id=delivery_id,
+                size=size,
+                delivery_name=delivery_name,
+                delivery_rel_path=delivery_rel_path,
+                delivery_kind=delivery_kind,
             ):
                 await self._reject_file_offer(
                     channel,
@@ -10576,6 +10633,9 @@ class Daemon:
                         of=msg.get("id"),
                     )))
         elif t == "PAIR_REQUEST":
+            if not self.admission.prompt_admitted(peer_fp):
+                await self.admission.refuse(channel, msg, "pair_request_rate_limited")
+                return
             # Peer wants to pair with us. Compute the SAS bound to the
             # channel's transcript_hash (audit fix H11) and store as
             # incoming, surface to UI for the user to verify.
@@ -10693,6 +10753,9 @@ class Daemon:
                 })
             await channel.send(encode_msg(make_msg("ACK", self.me.short_id, of=msg["id"])))
         elif t == "PAIR_REJECT":
+            if not self.admission.pair_reject_allowed(peer_fp):
+                await self.admission.refuse(channel, msg, "no_live_pair_context")
+                return
             self.pairing.reject(peer_fp)
             if self.state is not None:
                 # Rejection must be durable; otherwise the same identity can
@@ -10912,6 +10975,8 @@ class Daemon:
             sender_pub_bytes = channel.peer_ed_pub
         except Exception:
             return
+        if not self.admission.has_standing(peer_fp, sender_pub_bytes):
+            return  # only a peer with standing can have sent the file frame
         try:
             parsed, verified = handle_inbound_provenance(
                 msg=msg,
@@ -11672,61 +11737,11 @@ class Daemon:
         return rel
 
     def _safe_transfer_name(self, value) -> str:
-        # Take the basename against BOTH separators regardless of host.
-        # ``Path(...).name`` only understands the local one, so on POSIX a
-        # peer-supplied "C:\\Windows\\System32\\evil.dll" survived whole and
-        # was stored with its backslashes intact. That is harmless where it
-        # lands -- backslash is an ordinary character on POSIX -- but this is
-        # a FILE TRANSFER product: that artifact travels, and the same name on
-        # a Windows machine is a traversal path. A received name must never
-        # carry another platform's separators.
-        raw = str(value or "").replace("\\", "/")
-        name = PurePosixPath(raw).name
-        if not name or name in (".", ".."):
-            return "unnamed.bin"
-        # v0.20.7 (security audit H16):
-        #   - Reject NUL + control chars (0x00-0x1f, 0x7f).
-        #   - Reject trailing dots and spaces (Windows silently strips
-        #     them, so "report.pdf." collides with "report.pdf").
-        #   - Reject Windows reserved device names (CON, NUL, COM1-9,
-        #     LPT1-9, AUX, PRN). Match by stem so "CON.txt" is also
-        #     rejected — Windows treats the device-name stem as the
-        #     reserved meaning even with an extension.
-        # 2026-05-21 audit T3-R: also strip the ``:`` separator. On
-        # NTFS, ``report.pdf:hidden.exe`` is a valid filename where
-        # ``:hidden.exe`` is an Alternate Data Stream — invisible to
-        # Explorer but executable. A paired peer could ship an
-        # executable hidden as a document attachment.
-        clean = name.replace("\x00", "").replace(":", "_").rstrip(". ")
-        if not clean:
-            return "unnamed.bin"
-        if any(0 <= ord(c) <= 0x1F or ord(c) == 0x7F for c in clean):
-            clean = "".join(
-                c for c in clean
-                if not (0 <= ord(c) <= 0x1F or ord(c) == 0x7F)
-            )
-            if not clean:
-                return "unnamed.bin"
-        stem = Path(clean).stem
-        if stem.upper() in self._WINDOWS_RESERVED_BASENAMES:
-            clean = "_" + clean
-        encoded = clean.encode("utf-8", errors="ignore")
-        if len(encoded) <= MAX_TRANSFER_FILE_NAME_BYTES:
-            return clean
-        # Preserve the extension when clipping by total byte length so
-        # a long-prefix attacker can't collide on the trimmed name.
-        suffix = Path(clean).suffix.encode("utf-8", errors="ignore")
-        if 0 < len(suffix) < MAX_TRANSFER_FILE_NAME_BYTES // 2:
-            stem_budget = MAX_TRANSFER_FILE_NAME_BYTES - len(suffix)
-            stem_bytes = encoded[:stem_budget]
-            clipped = stem_bytes.decode("utf-8", errors="ignore").rstrip() + suffix.decode(
-                "utf-8", errors="ignore"
-            )
-        else:
-            clipped = (
-                encoded[:MAX_TRANSFER_FILE_NAME_BYTES].decode("utf-8", errors="ignore").strip()
-            )
-        return clipped or "unnamed.bin"
+        return transfer_names.safe_transfer_name(
+            value,
+            reserved=self._WINDOWS_RESERVED_BASENAMES,
+            max_bytes=MAX_TRANSFER_FILE_NAME_BYTES,
+        )
 
     def _unique_inbox_path(
         self, blob: str, name: str, *, rel_path: str | None = None,
@@ -17699,8 +17714,8 @@ class Daemon:
         # Live re-config so we register with the inherited rendezvous
         # immediately; no daemon restart.
         try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self.update_rendezvous_urls(urls))
+            asyncio.get_running_loop()
+            self._track(self.update_rendezvous_urls(urls))
         except RuntimeError:
             pass
         if self.ui_server is not None:
@@ -17872,8 +17887,8 @@ class Daemon:
         # the inbound peer-message handler — and so we don't try to
         # `await` from this sync helper.
         try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self.update_rendezvous_urls(sorted(clean)))
+            asyncio.get_running_loop()
+            self._track(self.update_rendezvous_urls(sorted(clean)))
         except RuntimeError:
             # Not in an event loop (shouldn't happen here, but be safe).
             pass
@@ -20231,64 +20246,6 @@ class Daemon:
             metadata_root=self._resume_metadata_root,
         )
 
-    async def _reply_to_accepted_file_offer(self, ctx: dict) -> None:
-        """Send the accept response correlated to the latest retry offer."""
-        ch = ctx["channel"]
-        f = self._incoming_files.get(ctx["blob"])
-        missing = (
-            sorted(f.cdc_missing or [])
-            if f is not None and f.cdc_chunks is not None
-            else list(ctx.get("missing") or [])
-        )
-        ctx["missing"] = missing
-        if ctx["mode"] == "cdc":
-            use_bloom_only = self._bloom_only_for_peer(
-                ctx["peer_fp"],
-                ctx["blob"],
-            )
-            bloom_sent = False
-            if use_bloom_only:
-                bloom_sent = await self._maybe_send_bloom_init_advisory(
-                    ch,
-                    msg_id=ctx["msg_id"],
-                    blob=ctx["blob"],
-                    peer_fp=ctx["peer_fp"],
-                )
-            if not bloom_sent:
-                await ch.send(
-                    encode_msg(
-                        make_msg(
-                            "FILE_WANTS",
-                            self.me.short_id,
-                            of=ctx["msg_id"],
-                            blob=ctx["blob"],
-                            wants=missing,
-                        )
-                    )
-                )
-                await self._maybe_send_bloom_init_advisory(
-                    ch, msg_id=ctx["msg_id"], blob=ctx["blob"],
-                    peer_fp=ctx["peer_fp"],
-                )
-            if not missing:
-                self._schedule_finish_cdc_file(
-                    ctx["blob"],
-                    ctx["peer_fp"],
-                    ctx["peer_sid"],
-                    ctx["msg"],
-                    channel=ch,
-                )
-        else:
-            await ch.send(
-                encode_msg(
-                    make_msg(
-                        "ACK",
-                        self.me.short_id,
-                        of=ctx["msg_id"],
-                    )
-                )
-            )
-
     def _broadcast_file_offer_resolved(self, transfer_id: str) -> None:
         if self.ui_server is not None:
             with contextlib.suppress(Exception):
@@ -20300,144 +20257,13 @@ class Daemon:
                     }
                 )
 
-    def _mark_file_offer_accepted(self, transfer_id: str) -> None:
-        self._update_transfer(
-            transfer_id,
-            status="active",
-            metadata=self._merge_transfer_metadata(
-                transfer_id,
-                {
-                    "needs_accept": False,
-                    "delivery_state": "receiving",
-                    "user_message": "",
-                },
-            ),
-        )
-        self._broadcast_file_offer_resolved(transfer_id)
+    async def accept_file_offer(self, transfer_id: str, *, accept_all: bool = False) -> dict:
+        """Grant the current held delivery through the consent service."""
+        return await held_offers.accept_file_offer(self, transfer_id, accept_all=accept_all)
 
-    async def accept_file_offer(
-        self,
-        transfer_id: str,
-        *,
-        accept_all: bool = False,
-    ) -> dict:
-        """User accepted a HELD incoming file. Resume the pull by
-        sending the deferred FILE_WANTS (CDC) / ACK (stream) on the
-        original peer channel. ``accept_all`` also auto-accepts the rest
-        of this peer's offers for the session so a multi-file send
-        prompts once."""
-        ctx = self._pending_file_offers.get(transfer_id)
-        if ctx is None:
-            return {"ok": False, "error": "no pending offer for this transfer"}
-        # Record consent before touching the connection. If the sender's
-        # original channel already timed out, the next retry must inherit the
-        # user's decision instead of prompting again.
-        ctx["accepted"] = True
-        if accept_all:
-            self._file_accept_allow.add(ctx["peer_fp"])
-        f = self._incoming_files.get(ctx["blob"])
-        if f is not None:
-            f.acceptance_granted = True
-            with contextlib.suppress(Exception):
-                self._persist_incoming_acceptance(ctx["peer_fp"], f)
-            if f.cdc_chunks is not None and f.cdc_missing:
-                try:
-                    remaining, swarm_assist = await self._swarm_assist_file_offer(
-                        sender_fp=ctx["peer_fp"],
-                        name=f.name,
-                        size=f.size,
-                        blob=f.blob_hex,
-                        cdc_chunks=f.cdc_chunks,
-                        missing=set(f.cdc_missing),
-                    )
-                    f.cdc_missing = remaining
-                    ctx["missing"] = sorted(remaining)
-                    self._update_transfer(
-                        transfer_id,
-                        metadata=self._merge_transfer_metadata(
-                            transfer_id,
-                            {"swarm_assist": swarm_assist},
-                        ),
-                    )
-                except Exception as e:
-                    log.debug(
-                        "post-consent swarm assist skipped for %s: %s",
-                        f.blob_hex[:8],
-                        e,
-                    )
-        try:
-            await self._reply_to_accepted_file_offer(ctx)
-        except Exception as e:
-            # Channel almost certainly closed (sender timed out + went
-            # away). Keep the partial; the sender retries + re-offers.
-            log.info("accept_file_offer %s: send failed: %s", transfer_id, e)
-            self._update_transfer(
-                transfer_id, status="paused",
-                metadata=self._merge_transfer_metadata(transfer_id, {
-                    "needs_accept": False,
-                    "delivery_state": "waiting_for_sender",
-                    "transient": True,
-                    "user_message": (
-                        "The sender went offline before you accepted. "
-                        "It will resend automatically."
-                    ),
-                },
-                ),
-            )
-            self._broadcast_file_offer_resolved(transfer_id)
-            return {"ok": False, "error": "sender offline; it will resend"}
-        if self._pending_file_offers.get(transfer_id) is ctx:
-            self._pending_file_offers.pop(transfer_id, None)
-        self._mark_file_offer_accepted(transfer_id)
-        if accept_all:
-            for tid in [
-                t for t, c in list(self._pending_file_offers.items())
-                if c["peer_fp"] == ctx["peer_fp"]
-            ]:
-                with contextlib.suppress(Exception):
-                    await self.accept_file_offer(tid)
-        return {"ok": True}
-
-    async def decline_file_offer(
-        self, transfer_id: str, *, decline_all: bool = False,
-    ) -> dict:
-        """User declined a HELD incoming file. Tell the sender, abort
-        the partial, and mark the transfer declined."""
-        ctx = self._pending_file_offers.pop(transfer_id, None)
-        if ctx is None:
-            return {"ok": False, "error": "no pending offer for this transfer"}
-        with contextlib.suppress(Exception):
-            await ctx["channel"].send(encode_msg(make_msg(
-                "FILE_DECLINED", self.me.short_id,
-                of=ctx["msg_id"], blob=ctx["blob"],
-            )))
-        f = self._incoming_files.get(ctx["blob"])
-        if f is not None:
-            self._abort_incoming_file(ctx["blob"], f)
-        self._update_transfer(
-            transfer_id, status="failed",
-            metadata=self._merge_transfer_metadata(transfer_id, {
-                "needs_accept": False,
-                "delivery_state": "declined",
-                "transient": False,
-                "user_message": "You declined this file.",
-            },
-            ),
-        )
-        if self.ui_server is not None:
-            with contextlib.suppress(Exception):
-                self.ui_server.broadcast({
-                    "type": "file_offer_resolved",
-                    "transfer_id": transfer_id, "action": "declined",
-                })
-        if decline_all:
-            for tid in [
-                t for t, c in list(self._pending_file_offers.items())
-                if c["peer_fp"] == ctx["peer_fp"]
-            ]:
-                with contextlib.suppress(Exception):
-                    await self.decline_file_offer(tid)
-        return {"ok": True}
+    async def decline_file_offer(self, transfer_id: str, *, decline_all: bool = False) -> dict:
+        """Revoke the current held delivery through the consent service."""
+        return await held_offers.decline_file_offer(self, transfer_id, decline_all=decline_all)
 
     def list_pending_file_offers(self) -> list[dict]:
         """Snapshot of held incoming-file offers for the UI."""
@@ -21975,12 +21801,12 @@ class Daemon:
                     "peer identity mismatch: expected full fingerprint "
                     f"{expected_fp}, got {actual_fp}"
                 )
-            return actual_fp
-        if channel.peer_short_id != peer.short_id:
+        elif channel.peer_short_id != peer.short_id:
             raise RuntimeError(
                 f"peer fingerprint mismatch: expected short id {peer.short_id}, "
                 f"got {channel.peer_short_id}"
             )
+        self.admission.bind_channel(channel, actual_fp)
         return actual_fp
 
     def _check_outbound_trust(self, peer: Peer) -> str | None:
@@ -24813,14 +24639,11 @@ class Daemon:
         last = self._capability_request_seen.get(key, 0.0)
         if now - last < CAPABILITY_REQUEST_DEDUP_S:
             return
-        # Per-peer prompt budget. Maintained on the daemon under a
-        # bounded deque keyed by peer_fp.
-        from collections import deque as _deque
+        # Per-peer prompt budget: a bounded map of deques keyed by peer_fp.
         if not hasattr(self, "_capability_request_per_peer"):
-            self._capability_request_per_peer: dict[str, _deque] = {}
-        window = self._capability_request_per_peer.setdefault(peer_fp, _deque())
-        cutoff = now - 60.0
-        while window and window[0] < cutoff:
+            self._capability_request_per_peer: dict[str, deque] = peer_admission.BoundedDict(peer_admission.PEER_BOOKKEEPING_MAX)
+        window = self._capability_request_per_peer.get(peer_fp) or deque()
+        while window and window[0] < now - 60.0:
             window.popleft()
         if len(window) >= 5:
             log.info(
@@ -24828,6 +24651,9 @@ class Daemon:
                 peer_fp[:8], cap,
             )
             return
+        if not self.admission.prompt_admitted(peer_fp):
+            return
+        self._capability_request_per_peer[peer_fp] = window
         window.append(now)
         self._capability_request_seen[key] = now
         with contextlib.suppress(Exception):
@@ -26640,8 +26466,8 @@ class Daemon:
             )
             return
         try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self._send_batched_endpoint(peer_fp, outer))
+            asyncio.get_running_loop()
+            self._track(self._send_batched_endpoint(peer_fp, outer))
         except RuntimeError:
             # No running loop (test environment) — skip.
             pass
@@ -31569,7 +31395,7 @@ class Daemon:
                 bloom_response_capable = bool(bloom_init.HAS_NATIVE)
             except ImportError:
                 bloom_response_capable = False
-        batched_acks: set[str] = set()
+        batched_acks = ack_batching.AckReceiptWindow()
         unanswered_chunks: list[Any] = []  # the pending queue of whichever send loop runs
         commit_verification_count = 0
         commit_verification_seq = -1
@@ -31592,14 +31418,13 @@ class Daemon:
             deadline_at = asyncio.get_running_loop().time() + max(0.0, deadline)
             expected = expected_types or {"ACK"}
             while True:
-                if request_id is not None and request_id in batched_acks:
-                    batched_acks.remove(request_id)
-                    return {
-                        "t": "ACK",
-                        "from": peer.short_id,
-                        "of": request_id,
-                        "batched": True,
-                    }
+                if request_id is not None and "ACK" in expected:
+                    observed_at = batched_acks.consume(request_id)
+                    if observed_at is not None:
+                        return {
+                            "t": "ACK", "from": peer.short_id, "of": request_id,
+                            "batched": True, "_local_ack_observed_at": observed_at,
+                        }
                 try:
                     remaining = deadline_at - asyncio.get_running_loop().time()
                     if remaining <= 0:
@@ -31612,6 +31437,7 @@ class Daemon:
                         f"file send to {peer.short_id}: peer did not "
                         f"ACK within {deadline}s — transfer aborted"
                     ) from e
+                observed_at = time.perf_counter()
                 m = decode_msg(plaintext)
                 t = str(m.get("t") or "")
                 if t == "CAPS":
@@ -31638,21 +31464,10 @@ class Daemon:
                         return m
                     continue
                 if t == "FILE_ACK_BATCH":
-                    acked = {
-                        str(v) for v in (m.get("ofs") or m.get("acks") or [])
-                        if v is not None and str(v)
-                    }
-                    if request_id is not None and request_id in acked:
-                        acked.remove(request_id)
-                        batched_acks.update(acked)
-                        return {
-                            "t": "ACK",
-                            "from": m.get("from", peer.short_id),
-                            "of": request_id,
-                            "batched": True,
-                            "batch_count": int(m.get("count") or (len(acked) + 1)),
-                        }
-                    batched_acks.update(acked)
+                    batched_acks.record_batch(
+                        m, unanswered_chunks, blob=blob_hex,
+                        observed_at=observed_at, max_count=FILE_ACK_BATCH_MAX,
+                    )
                     continue
                 if t != "ACK" and not t.startswith("FILE_"):
                     await self._on_peer_message(ch_, m)
@@ -31730,6 +31545,8 @@ class Daemon:
                         f"request {request_id or '<uncorrelated>'}: {reason}"
                     )
                 if t in expected:
+                    if t == "ACK":
+                        m["_local_ack_observed_at"] = observed_at
                     return m
                 log.debug(
                     "ignored out-of-band file-transfer frame %s while waiting for %s",
@@ -32244,12 +32061,12 @@ class Daemon:
                             window_bytes = sum(
                                 int(entry[2] or 0) for entry in pending_cdc_sizes
                             )
-                            await _await_ack(
+                            ack = await _await_ack(
                                 channel,
                                 request_id=msg_id,
                                 deadline=_inter_chunk_ack_deadline(window_bytes),
                             )
-                            ack_done = time.perf_counter()
+                            ack_done = float(ack["_local_ack_observed_at"])
                             pending_cdc_sizes.popleft()
                             cdc_scheduler.observe_ack(
                                 ack_ms=(ack_done - sent_at) * 1000.0,
@@ -32722,12 +32539,12 @@ class Daemon:
                                     int(entry[1] or 0) for entry in pending_sizes
                                 )
                                 deadline = _inter_chunk_ack_deadline(window_bytes)
-                            await _await_ack(
+                            ack = await _await_ack(
                                 channel,
                                 request_id=msg_id,
                                 deadline=deadline,
                             )
-                            ack_done = time.perf_counter()
+                            ack_done = float(ack["_local_ack_observed_at"])
                             pending_sizes.popleft()
                             stream_scheduler.observe_ack(
                                 ack_ms=(ack_done - sent_at) * 1000.0,
@@ -33529,7 +33346,7 @@ class Daemon:
                     )
             elif cmd == "shutdown":
                 await self._reply(writer, {"ok": True, "stopping": True})
-                asyncio.create_task(self._control_shutdown())
+                task_refs.spawn(self._control_shutdown())
             elif cmd == "peers":
                 peer_rows = [
                     {
@@ -34265,7 +34082,7 @@ class Daemon:
                 # whose sender will never come back without waiting
                 # 30 days for the TTL prune.
                 blob = str(req.get("blob") or "").strip().lower()
-                if not blob or len(blob) != 64:
+                if not self._valid_blob_hex(blob):
                     await self._reply(writer, {
                         "ok": False,
                         "error": "blob must be a 64-character hex string",
@@ -34290,22 +34107,25 @@ class Daemon:
                     #    Pop it (so a later FILE_OFFER doesn't
                     #    auto-resume), then delete the partial and
                     #    the sidecar.
-                    keys_to_remove = [
-                        (pfp, bb) for (pfp, bb) in list(self._resume_registry.keys())
-                        if bb == blob
-                    ]
-                    for pfp, bb in keys_to_remove:
-                        sc = self._resume_registry.pop_match(pfp, bb)
-                        if sc is not None:
-                            try:
-                                Path(sc.out_path).unlink()
-                                cancelled_partial = True
-                            except OSError:
-                                pass
-                    _delete_resume_sidecar(inbox_dir(), blob,
-                        metadata_root=self._resume_metadata_root,
+                    for sc in self._resume_registry.discard_blob(blob):
+                        try:
+                            Path(sc.out_path).unlink()
+                            cancelled_partial = True
+                        except OSError:
+                            pass
+                    cancelled_sidecar = _delete_resume_sidecar(
+                        inbox_dir(), blob, metadata_root=self._resume_metadata_root,
                     )
-                    cancelled_sidecar = True
+                    if not cancelled_sidecar:
+                        await self._reply(writer, {
+                            "ok": False,
+                            "error": "could not remove persisted resume state",
+                            "blob": blob,
+                            "cancelled_in_session": False,
+                            "cancelled_partial": cancelled_partial,
+                            "cancelled_sidecar": False,
+                        })
+                        return
                 await self._reply(writer, {
                     "ok": True,
                     "blob": blob,
@@ -34558,20 +34378,9 @@ class Daemon:
         rec = self.state.get_peer_by_short_id(needle)
         if rec is not None and rec.trust == "pinned":
             return rec.fingerprint
-        for rec in self.state.list_peers():
-            values = (
-                rec.fingerprint,
-                rec.short_id,
-                rec.hostname or "",
-                rec.local_alias or "",
-                rec.display_name,
-            )
-            if rec.trust == "pinned" and any(
-                v and (v.lower() == lowered or lowered in v.lower())
-                for v in values
-            ):
-                return rec.fingerprint
-        return None
+        return peer_admission.unique_pinned_match(
+            needle, (rec for rec in self.state.list_peers() if rec.trust == "pinned")
+        )
 
     async def resolve_for_send(self, needle: str) -> Peer | None:
         """v0.5.1: send-path peer resolution. mDNS first, rendezvous
@@ -35537,6 +35346,7 @@ class Daemon:
             ed_pub_hex=self.me.public_bytes.hex(),
             rendezvous_urls=rdz_to_advertise,
             device_kind=kind_tag,
+            announce_details=_sov.mdns_announce_details_for(self.state),
         )
         if _mdns_active:
             await self.discovery.start()
@@ -35796,26 +35606,19 @@ class Daemon:
         # page reload. Errors swallowed silently — the loop never
         # raises in a way that takes down the daemon.
         #
-        # May 15 2026 — SOVEREIGNTY DEFAULT: the update-check poll
-        # is the ONLY external network call this daemon makes
-        # (GitHub is Microsoft-owned). One Link's promise is "no
-        # corp dependencies, no calls home." So the poll is now
-        # opt-IN, not opt-out.
+        # The poll is ON by default: a fresh install uses the "just_works"
+        # preset, which permits it. It is one of the outside contacts a
+        # default install makes (the others are the community STUN servers);
+        # docs/NETWORK_CONTACTS.md lists them all for users.
         #
-        # Enable via either:
-        #   - Env var:  ONE_LINK_UPDATE_CHECK=1
-        #   - Setting:  state.set_setting("update_check_enabled", "1")
-        #               (Settings panel surfaces this checkbox)
+        # The decision is read through the sovereignty preset layer. The
+        # strict presets ("quiet", "off_grid") keep it off; an explicit
+        # setting or ONE_LINK_UPDATE_CHECK may disable a permitted check but
+        # cannot loosen a strict preset.
         #
-        # When disabled, the daemon never reaches api.github.com.
-        # The /api/update/check HTTP endpoint also short-circuits
-        # to status=disabled so a UI tab refresh doesn't quietly
-        # poke GitHub anyway.
-        # May 15 2026 — read through the sovereignty preset layer so a
-        # fresh install (preset="just_works") gets update notifications
-        # by default while strict modes ("quiet", "off_grid") stay
-        # silent. Explicit settings may disable a permitted check but cannot
-        # loosen a strict preset.
+        # When disabled, the daemon never reaches api.github.com. The
+        # /api/update/check HTTP endpoint also short-circuits to
+        # status=disabled so a UI tab refresh doesn't poke GitHub anyway.
         from one_link import sovereignty as _sov
         update_check_setting: str | None = None
         preset_name: str | None = None

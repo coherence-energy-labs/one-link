@@ -946,3 +946,62 @@ def test_index_html_has_paused_status_renderer():
         "label so the user knows the transfer isn't dead"
     )
     assert ".badge.paused" in text  # CSS pill style
+
+@pytest.mark.asyncio
+async def test_authenticated_cancel_removes_modern_parked_delivery(tmp_path, monkeypatch):
+    import blake3
+    from one_link.paths import inbox_dir
+    from one_link.resume import ResumeSidecar, persist_sidecar, load_sidecar
+
+    monkeypatch.setenv("ONE_LINK_HOME", str(tmp_path / "home"))
+    daemon = Daemon(_new_identity())
+    peer = _new_identity()
+    content = b"accepted resumable file"
+    blob = blake3.blake3(content).hexdigest()
+    partial = inbox_dir() / ".incoming" / "modern.part"
+    partial.parent.mkdir(parents=True, exist_ok=True)
+    partial.write_bytes(content[:4])
+    sc = ResumeSidecar(
+        blob_hex=blob, peer_fp=peer.fingerprint,
+        name="modern.bin", size=len(content), out_path=str(partial),
+        cdc_chunks=[{"index": 0, "start": 0, "end": len(content),
+                     "size": len(content), "hash": blob}],
+        acceptance_granted=True, delivery_id="aa" * 16,
+        delivery_name="modern.bin", final_path=str(inbox_dir() / "modern.bin"),
+    )
+    persist_sidecar(inbox_dir(), sc, metadata_root=daemon._resume_metadata_root)
+    daemon._resume_registry.register(sc)
+    response = await _invoke_authenticated_control(
+        daemon, {"cmd": "cancel_resumable_transfer", "blob": blob}, monkeypatch,
+    )
+    assert response["ok"] is True
+    assert response["cancelled_partial"] is True
+    assert len(daemon._resume_registry) == 0
+    assert not partial.exists()
+    assert load_sidecar(
+        inbox_dir(), blob, metadata_root=daemon._resume_metadata_root,
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_authenticated_cancel_rejects_nonhex_blob(tmp_path, monkeypatch):
+    monkeypatch.setenv("ONE_LINK_HOME", str(tmp_path / "home"))
+    daemon = Daemon(_new_identity())
+    response = await _invoke_authenticated_control(
+        daemon, {"cmd": "cancel_resumable_transfer", "blob": "z" * 64}, monkeypatch,
+    )
+    assert response["ok"] is False
+
+@pytest.mark.asyncio
+async def test_authenticated_cancel_reports_failed_sidecar_removal(tmp_path, monkeypatch):
+    from one_link import daemon as daemon_module
+
+    monkeypatch.setenv("ONE_LINK_HOME", str(tmp_path / "home"))
+    daemon = Daemon(_new_identity())
+    monkeypatch.setattr(daemon_module, "_delete_resume_sidecar", lambda *a, **kw: False)
+    response = await _invoke_authenticated_control(
+        daemon, {"cmd": "cancel_resumable_transfer", "blob": "ab" * 32}, monkeypatch,
+    )
+    assert response["ok"] is False
+    assert response["cancelled_sidecar"] is False
+    assert "persisted resume state" in response["error"]

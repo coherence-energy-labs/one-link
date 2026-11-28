@@ -24,6 +24,7 @@ tests/test_held_offers_two_daemon_e2e.py.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -101,6 +102,7 @@ def _hold(
         reservation_id=f"res:{transfer_id}",
     )
     f.finalizing = finalizing
+    f.acceptance_granted = accepted
     d._incoming_files[blob] = f
     reserved = d._transfer_reservation_ledger().reserve(
         reservation_id=f.reservation_id,
@@ -120,6 +122,7 @@ def _hold(
         "channel": _Channel(), "peer_fp": peer_fp, "peer_sid": peer_fp[:8], "blob": blob,
         "msg_id": "first", "msg": {"id": "first"}, "mode": "stream", "missing": None,
         "name": name, "size": 10, "created_ms": 1, "accepted": accepted,
+        "accept_reply_failed": accepted,
     }
     return f
 
@@ -458,3 +461,215 @@ def test_the_quota_reasons_named_here_are_the_ones_admission_produces():
     assert produced == set(held_offers.QUOTA_REASONS_PER_PEER | held_offers.QUOTA_REASONS_GLOBAL), (
         "admission has a quota reason the waiting rule does not know about"
     )
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("progress", [
+    {"received": 1}, {"next_seq": 1}, {"cdc_streamed": {0}},
+    {"cdc_parts": {0: b""}}, {"cdc_pending_state": [{"chunk_hash": "a" * 64}]},
+])
+async def test_a_failed_accept_reply_cannot_displace_partial_progress(daemon, tmp_path, progress):
+    """FILE_WANTS may have reached the sender before a later reply step failed."""
+    holder = _hold(daemon, tmp_path, accepted=True)
+    for key, value in progress.items():
+        setattr(holder, key, value)
+    assert await _settle(daemon, holder, _Channel()) == "refuse"
+    assert daemon._incoming_files[BLOB] is holder
+    assert daemon._pending_file_offers[HOLDER_ID]["accept_reply_failed"] is True
+    assert _reservations(daemon) == [f"res:{HOLDER_ID}"]
+    assert not holder.handle.closed
+    assert holder.out_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_accepted_context_without_failed_reply_evidence_is_not_superseded(daemon, tmp_path):
+    holder = _hold(daemon, tmp_path, accepted=True)
+    daemon._pending_file_offers[HOLDER_ID].pop("accept_reply_failed")
+    assert await _settle(daemon, holder, _Channel()) == "refuse"
+    assert daemon._incoming_files[BLOB] is holder
+    assert not holder.handle.closed
+
+
+@pytest.mark.asyncio
+async def test_accept_reply_in_flight_cannot_be_superseded(daemon, tmp_path):
+    holder = _hold(daemon, tmp_path)
+    entered, proceed = asyncio.Event(), asyncio.Event()
+
+    class SlowChannel:
+        async def send(self, payload):
+            entered.set()
+            await proceed.wait()
+
+    ctx = daemon._pending_file_offers[HOLDER_ID]
+    ctx["channel"] = SlowChannel()
+    accept = asyncio.create_task(daemon.accept_file_offer(HOLDER_ID))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert ctx["accepted"] is True
+        assert ctx["accept_reply_failed"] is False
+        assert await _settle(daemon, holder, _Channel()) == "refuse"
+        assert daemon._incoming_files[BLOB] is holder
+        assert not holder.handle.closed
+    finally:
+        proceed.set()
+        result = await asyncio.wait_for(accept, timeout=5)
+    assert result == {"ok": True}
+    assert HOLDER_ID not in daemon._pending_file_offers
+    assert daemon._incoming_files[BLOB] is holder
+
+
+@pytest.mark.asyncio
+async def test_real_failed_accept_reply_records_inheritance_eligibility(daemon, tmp_path):
+    holder = _hold(daemon, tmp_path)
+
+    class DeadChannel:
+        async def send(self, payload):
+            raise ConnectionError("synthetic lost reply")
+
+    ctx = daemon._pending_file_offers[HOLDER_ID]
+    ctx["channel"] = DeadChannel()
+    assert await daemon.accept_file_offer(HOLDER_ID) == {
+        "ok": False, "error": "sender offline; it will resend",
+    }
+    assert ctx["accepted"] is True and ctx["accept_reply_failed"] is True
+    assert holder.acceptance_granted is True
+    assert await _settle(daemon, holder, _Channel()) == "superseded"
+    assert BLOB not in daemon._incoming_files
+
+
+@pytest.mark.asyncio
+async def test_decline_revokes_the_writer_before_waiting_on_the_wire(daemon, tmp_path):
+    holder = _hold(daemon, tmp_path, accepted=True)
+    entered, proceed = asyncio.Event(), asyncio.Event()
+
+    class SlowDecline:
+        async def send(self, payload):
+            assert decode_msg(payload)["t"] == "FILE_DECLINED"
+            entered.set()
+            await proceed.wait()
+
+    daemon._pending_file_offers[HOLDER_ID]["channel"] = SlowDecline()
+    task = asyncio.create_task(daemon.decline_file_offer(HOLDER_ID))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert BLOB not in daemon._incoming_files
+        assert holder.handle.closed
+        assert _reservations(daemon) == []
+        assert daemon.state.get_transfer(HOLDER_ID).metadata["delivery_state"] == "declined"
+    finally:
+        proceed.set()
+        assert await asyncio.wait_for(task, timeout=5) == {"ok": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reply_fails", [False, True])
+async def test_inflight_accept_cannot_overwrite_a_concurrent_decline(daemon, tmp_path, reply_fails):
+    holder = _hold(daemon, tmp_path)
+    entered, proceed = asyncio.Event(), asyncio.Event()
+
+    class OverlappingChannel:
+        async def send(self, payload):
+            kind = decode_msg(payload)["t"]
+            if kind == "ACK":
+                entered.set()
+                await proceed.wait()
+                if reply_fails:
+                    raise ConnectionResetError("reply lost")
+            else:
+                assert kind == "FILE_DECLINED"
+
+    daemon._pending_file_offers[HOLDER_ID]["channel"] = OverlappingChannel()
+    accept = asyncio.create_task(daemon.accept_file_offer(HOLDER_ID))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert await daemon.decline_file_offer(HOLDER_ID) == {"ok": True}
+        assert holder.handle.closed and BLOB not in daemon._incoming_files
+    finally:
+        proceed.set()
+        result = await asyncio.wait_for(accept, timeout=5)
+    assert result["ok"] is False
+    row = daemon.state.get_transfer(HOLDER_ID)
+    assert row.status == "failed"
+    assert row.metadata["delivery_state"] == "declined"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_owner_accept_does_not_send_another_reply(daemon, tmp_path):
+    _hold(daemon, tmp_path)
+    entered, proceed = asyncio.Event(), asyncio.Event()
+    sent = []
+
+    class SlowAccept:
+        async def send(self, payload):
+            sent.append(decode_msg(payload)["t"])
+            entered.set()
+            await proceed.wait()
+
+    daemon._pending_file_offers[HOLDER_ID]["channel"] = SlowAccept()
+    task = asyncio.create_task(daemon.accept_file_offer(HOLDER_ID))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        # Launch a duplicate without deadlocking the original implementation.
+        duplicate = asyncio.create_task(daemon.accept_file_offer(HOLDER_ID))
+        await asyncio.sleep(0)
+        assert duplicate.done()
+        assert len(sent) == 1
+        assert (await duplicate)["ok"] is False
+    finally:
+        proceed.set()
+        await asyncio.wait_for(task, timeout=5)
+        if "duplicate" in locals():
+            await asyncio.wait_for(duplicate, timeout=5)
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_pending_context_cannot_accept_or_abort_another_writer(daemon, tmp_path):
+    holder = _hold(daemon, tmp_path)
+    holder.transfer_id = "in:newer-delivery"
+    channel = daemon._pending_file_offers[HOLDER_ID]["channel"]
+    assert (await daemon.accept_file_offer(HOLDER_ID))["ok"] is False
+    assert (await daemon.decline_file_offer(HOLDER_ID))["ok"] is False
+    assert daemon._incoming_files[BLOB] is holder
+    assert not holder.handle.closed
+    assert not holder.acceptance_granted
+    assert channel.sent == []
+
+
+def test_reaper_cannot_park_new_writer_using_a_stale_delivery_row(daemon, tmp_path, monkeypatch):
+    holder = _hold(daemon, tmp_path)
+    daemon.state.upsert_transfer(
+        id="in:old-delivery", direction="in", peer_fp=PEER, kind="file",
+        name=holder.name, size=holder.size, blob_hash=BLOB, status="paused",
+        progress_bytes=0, total_bytes=holder.size, chunks_done=0, chunks_total=0,
+        metadata={"needs_accept": False, "delivery_state": "waiting_for_sender"},
+    )
+    monkeypatch.setattr(daemon, "STUCK_TRANSFER_DEADLINE_MS", 0)
+    assert daemon._reap_stuck_transfers() == 0
+    assert daemon._incoming_files[BLOB] is holder
+    assert not holder.handle.closed
+    assert HOLDER_ID in daemon._pending_file_offers
+    assert _reservations(daemon) == [f"res:{HOLDER_ID}"]
+
+@pytest.mark.asyncio
+async def test_acceptance_persistence_failure_requests_no_bytes_and_keeps_prompt(
+    daemon, tmp_path, monkeypatch,
+):
+    holder = _hold(daemon, tmp_path)
+    ctx = daemon._pending_file_offers[HOLDER_ID]
+    channel = ctx["channel"]
+
+    def fail_persist(*args, **kwargs):
+        raise OSError("injected durable consent failure")
+
+    monkeypatch.setattr(daemon, "_persist_incoming_acceptance", fail_persist)
+    result = await daemon.accept_file_offer(HOLDER_ID, accept_all=True)
+    assert result["ok"] is False
+    assert "persist" in result["error"]
+    assert daemon._pending_file_offers[HOLDER_ID] is ctx
+    assert not holder.acceptance_granted
+    assert not ctx.get("accepted")
+    assert not ctx.get("accept_reply_in_flight")
+    assert PEER not in daemon._file_accept_allow
+    assert channel.sent == []
+    assert not holder.handle.closed
+    assert _reservations(daemon) == [f"res:{HOLDER_ID}"]

@@ -134,7 +134,11 @@ rand              = "0.9"
 bloomfilter       = "3.0"
 # Phase A2: QUIC transport (per ADR-0009, ADR-0010). Pin a stable quinn,
 # matching rustls + rcgen versions for self-signed identity-bound TLS.
-quinn             = { version = "0.11.9", default-features = false, features = ["rustls-aws-lc-rs", "runtime-tokio"] }
+# One TLS crypto backend for the whole tree. rustls, rcgen and ol_aead use
+# ring, and ol_quic installs ring as the rustls provider, so quinn is built
+# against ring too. Selecting quinn's aws-lc-rs feature here compiled a second,
+# C-language crypto library into every build for no code path that used it.
+quinn             = { version = "0.11.9", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
 rustls            = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen             = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 ring              = "0.17"
@@ -185,7 +189,14 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
-panic = "abort"
+# Unwind, do not abort. This library is loaded into the daemon's Python
+# process and parses bytes that arrive from the network. With "abort", any
+# panic on any thread (an out-of-range index, a failed assertion, a bug in a
+# dependency) kills the whole daemon: every transfer, every chat, the UI.
+# With "unwind", PyO3 turns a panic in a called function into a Python
+# exception and tokio turns a panic in a task into a JoinError, so the fault
+# costs one request or one connection instead of the process.
+panic = "unwind"
 debug = 0
 
 [profile.ct-audit]

@@ -57,6 +57,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
 
+from one_link import task_refs
 from one_link.bounded_resolver import resolve_bounded
 from one_link.process_security import (
     hidden_creationflags,
@@ -467,7 +468,7 @@ async def scan_mdns_browse_all(
             return
         if zc is None or st is None or name is None:
             return
-        asyncio.ensure_future(_on_service(zc, st, name, state_change))
+        task_refs.spawn(_on_service(zc, st, name, state_change))
 
     browsers = []
     for st in _INTERESTING_MDNS_SERVICES:

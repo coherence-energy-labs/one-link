@@ -182,3 +182,22 @@ def test_service_type_rejects_malformed_override(monkeypatch):
     ):
         monkeypatch.setenv("ONE_LINK_MDNS_SERVICE_TYPE", bad)
         assert d._resolve_service_type() == "_onelink._tcp.local.", bad
+
+
+def test_find_refuses_an_ambiguous_short_id_prefix():
+    r = Registry()
+    first = _peer("abc11111")
+    second = _peer("abc22222")
+    r.upsert(first)
+    r.upsert(second)
+    assert r.find("abc") is None
+    assert r.find("abc1") is first
+    assert r.find("abc22222") is second
+    assert {p.short_id for p in r.candidates("abc")} == {"abc11111", "abc22222"}
+
+
+def test_empty_needle_matches_nothing():
+    r = Registry()
+    r.upsert(_peer("abc11111"))
+    assert r.candidates("") == []
+    assert r.find("") is None

@@ -11,3 +11,6 @@ native/ol_shell/patches/** text eol=lf
 # A unified diff's blank context lines and the original license retain their
 # upstream whitespace; changing either would invalidate the reviewed bytes.
 native/ol_shell/patches/*.patch -whitespace
+
+# Canonical JSON bytes are part of the JavaScript ownership gate.
+tests/js/ownership_baseline.json text eol=lf

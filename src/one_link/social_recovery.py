@@ -76,13 +76,20 @@ y-coordinate transformed via (1+y)/(1-y) mod p.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import secrets
 import struct
 import time
 from dataclasses import dataclass
 from typing import Optional
 
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey, X25519PublicKey,
 )
@@ -105,7 +112,27 @@ except ImportError:
 
 
 SHARE_MAGIC = b"OLSR1"
-SHARE_VERSION = 1
+# Version 2 changes two things, both so that a recovery can tell when it has
+# gone wrong:
+#
+#   * The Shamir secret is ``seed || check`` instead of the bare seed, where
+#     ``check`` is a 16-byte digest of the seed. Shamir reconstruction always
+#     returns *some* bytes: too few shares, shares from two different setups
+#     or one damaged share used to produce a wrong seed that looked exactly
+#     like a right one. Now the digest fails to match.
+#   * Each wrapped share ends with the Ed25519 public key that created it and
+#     that key's signature, so a guardian can see whose share it is holding
+#     and a forged or altered share is refused before it is stored.
+#
+# Version 1 shares are still read. They reconstruct a bare seed that cannot
+# be checked, and callers are told so.
+SHARE_VERSION = 2
+LEGACY_SHARE_VERSION = 1
+SUPPORTED_SHARE_VERSIONS = (LEGACY_SHARE_VERSION, SHARE_VERSION)
+CHECK_LEN = 16
+CHECK_DOMAIN = b"OL/social-recovery/secret-check|v2"
+SIGNATURE_DOMAIN = b"OL/social-recovery/share-signature|v2"
+SIGNER_TRAILER_LEN = 32 + 64  # creator public key + signature
 HEADER_LEN = 5 + 1 + 1 + 1 + 1 + 8 + 32 + 12  # 61 bytes
 NONCE_LEN = 12
 HKDF_INFO = b"OL/social-recovery/share-wrap|v1"
@@ -125,28 +152,70 @@ class WrappedShare:
     total: int
     setup_ms: int
     encoded: bytes
+    #: Ed25519 public key that created and signed the share. ``None`` for a
+    #: version 1 share, which carries no signature.
+    creator_ed_pub: Optional[bytes] = None
+
+    @property
+    def version(self) -> int:
+        return self.encoded[5]
 
     @classmethod
     def parse(cls, blob: bytes) -> "WrappedShare":
+        """Parse a wrapped share and, for version 2, verify its signature.
+
+        The AEAD tag is not checked here; that needs the guardian's private
+        key and happens in :func:`unwrap_share`.
+        """
         if len(blob) < HEADER_LEN:
             raise ValueError(
                 f"share too short: {len(blob)} < {HEADER_LEN}"
             )
         if blob[:5] != SHARE_MAGIC:
             raise ValueError("not a One Link social-recovery share (bad magic)")
-        if blob[5] != SHARE_VERSION:
+        if blob[5] not in SUPPORTED_SHARE_VERSIONS:
             raise ValueError(f"unsupported share version {blob[5]}")
         share_index = blob[6]
         threshold_k = blob[7]
         total_n = blob[8]
         setup_ms = struct.unpack(">Q", blob[9:17])[0]
+        creator = None
+        if blob[5] == SHARE_VERSION:
+            _body, creator = _verify_share_signature(blob)
         return cls(
             share_index=share_index,
             threshold=threshold_k,
             total=total_n,
             setup_ms=setup_ms,
             encoded=blob,
+            creator_ed_pub=creator,
         )
+
+
+def _secret_check(seed: bytes) -> bytes:
+    return hashlib.sha256(CHECK_DOMAIN + seed).digest()[:CHECK_LEN]
+
+
+def _verify_share_signature(blob: bytes) -> tuple[bytes, bytes]:
+    """Split a version 2 share into ``(header + ciphertext, creator_pub)``.
+
+    Raises ``ValueError`` unless the trailer's signature verifies under the
+    trailer's own public key. That proves the share was not altered after
+    its creator signed it; whether that creator is who the guardian thinks
+    it is, the guardian decides by comparing the key with the owner's.
+    """
+    if len(blob) < HEADER_LEN + 16 + SIGNER_TRAILER_LEN:
+        raise ValueError("signed share too short")
+    body = blob[:-SIGNER_TRAILER_LEN]
+    creator = blob[-SIGNER_TRAILER_LEN:-64]
+    signature = blob[-64:]
+    try:
+        Ed25519PublicKey.from_public_bytes(creator).verify(
+            signature, SIGNATURE_DOMAIN + creator + body
+        )
+    except (InvalidSignature, ValueError) as exc:
+        raise ValueError("share signature is invalid; the share was altered or forged") from exc
+    return body, creator
 
 
 # ── Ed25519 → X25519 conversion ──────────────────────────────────────
@@ -227,6 +296,7 @@ def split_and_wrap(
     threshold_k: int = DEFAULT_THRESHOLD,
     total_n: int = DEFAULT_TOTAL,
     setup_ms: Optional[int] = None,
+    signing_key: Optional[Ed25519PrivateKey] = None,
 ) -> list[WrappedShare]:
     """Split ``seed`` into Shamir shares + encrypt each share to one
     contact's Ed25519 identity. Returns ``total_n`` WrappedShare
@@ -234,6 +304,10 @@ def split_and_wrap(
 
     ``contact_ed_pubs`` MUST have length ``total_n``. The share at
     index i is wrapped for contact_ed_pubs[i].
+
+    Every share is signed. ``signing_key`` defaults to the identity key the
+    seed itself derives, so the same key that a successful recovery restores
+    is the one guardians see as the creator.
     """
     if len(seed) != SEED_LEN:
         raise ValueError(f"seed must be {SEED_LEN} bytes")
@@ -249,22 +323,34 @@ def split_and_wrap(
     for i, p in enumerate(contact_ed_pubs):
         if not isinstance(p, (bytes, bytearray)) or len(p) != 32:
             raise ValueError(f"contact_ed_pubs[{i}] must be 32 bytes")
+    if len({bytes(p) for p in contact_ed_pubs}) != total_n:
+        # Two shares for one guardian would let fewer than k people recover.
+        raise ValueError("contact_ed_pubs must not repeat a guardian")
     if setup_ms is None:
         setup_ms = int(time.time() * 1000)
+    if signing_key is None:
+        from one_link import master_seed
+
+        signing_key = master_seed.derive_identity_priv(bytes(seed))
+    creator_pub = signing_key.public_key().public_bytes_raw()
+
+    # What is split is the seed followed by a digest of the seed, so that a
+    # reconstruction can be recognised as right or wrong.
+    secret = bytes(seed) + _secret_check(bytes(seed))
 
     # Row 9 wiring: prefer the native Rust Shamir impl when available
     # (45-84x faster reconstruct). Both paths produce the same share
     # bytes for the same secret + the same set of x-values.
     if _NATIVE_AVAILABLE:
         native_shares = _native_tr.split_compat(
-            bytes(seed), threshold=threshold_k, num_shares=total_n
+            secret, threshold=threshold_k, num_shares=total_n
         )
         raw_shares = [
             threshold.Share(x=x, y=y) for x, y in native_shares
         ]
     else:
         raw_shares = threshold.split(
-            secret=bytes(seed), threshold=threshold_k, num_shares=total_n,
+            secret=secret, threshold=threshold_k, num_shares=total_n,
         )
     out: list[WrappedShare] = []
     for i, share in enumerate(raw_shares):
@@ -301,14 +387,20 @@ def split_and_wrap(
         # We re-include the index inside the AEAD so a guardian can't
         # be tricked into shipping a renumbered share.
         plaintext = bytes([share_idx]) + share_bytes
-        ct = AESGCM(key).encrypt(nonce, plaintext, header)
-        encoded = header + ct
+        # The creator's key is part of the associated data, so the trailer
+        # cannot be replaced with another key's signature over the same
+        # ciphertext: the share would no longer decrypt.
+        ct = AESGCM(key).encrypt(nonce, plaintext, header + creator_pub)
+        body = header + ct
+        signature = signing_key.sign(SIGNATURE_DOMAIN + creator_pub + body)
+        encoded = body + creator_pub + signature
         out.append(WrappedShare(
             share_index=share_idx,
             threshold=threshold_k,
             total=total_n,
             setup_ms=setup_ms,
             encoded=encoded,
+            creator_ed_pub=creator_pub,
         ))
     return out
 
@@ -329,8 +421,11 @@ def unwrap_share(
         raise ValueError("wrapped share too short")
     if wrapped[:5] != SHARE_MAGIC:
         raise ValueError("not a One Link social-recovery share")
-    if wrapped[5] != SHARE_VERSION:
+    if wrapped[5] not in SUPPORTED_SHARE_VERSIONS:
         raise ValueError(f"unsupported version {wrapped[5]}")
+    aad_suffix = b""
+    if wrapped[5] == SHARE_VERSION:
+        wrapped, aad_suffix = _verify_share_signature(wrapped)
     share_idx = wrapped[6]
     threshold_k = wrapped[7]
     total_n = wrapped[8]
@@ -352,7 +447,7 @@ def unwrap_share(
         raise ValueError("ECDH yielded zero shared secret")
     key = _derive_aead_key(shared)
     try:
-        plaintext = AESGCM(key).decrypt(nonce, ct, header)
+        plaintext = AESGCM(key).decrypt(nonce, ct, header + aad_suffix)
     except Exception as e:
         raise ValueError(
             f"share decrypt failed (wrong key or tamper): {e}"
@@ -369,35 +464,74 @@ def unwrap_share(
     return inner_idx, share_bytes
 
 
-def combine_shares(shares: list[tuple[int, bytes]]) -> bytes:
-    """Reconstruct the original seed from K shares. Each tuple is
-    ``(share_index, share_bytes)`` — the same shape that
-    ``unwrap_share`` returns. Wraps ``threshold.combine`` with a
-    length check + a clearer error.
+class UnverifiableSharesError(ValueError):
+    """Version 1 shares reconstructed a seed that cannot be checked."""
 
-    Row 9 wiring: uses the native Rust Shamir reconstruct when
-    available (45-84x faster than pure-Python per F1.1 benches).
+
+def combine_shares_checked(shares: list[tuple[int, bytes]]) -> tuple[bytes, bool]:
+    """Reconstruct the seed and say whether the result is proven correct.
+
+    Each tuple is ``(share_index, share_bytes)``, the shape
+    :func:`unwrap_share` returns. Returns ``(seed, verified)``.
+
+    ``verified`` is ``True`` for version 2 shares, whose secret carries a
+    digest of the seed: a wrong reconstruction (too few shares, shares from
+    different setups, a damaged share) raises ``ValueError`` instead of
+    returning. It is ``False`` for version 1 shares, which reconstruct a
+    bare seed with nothing to check it against; the caller must confirm the
+    result some other way before relying on it.
     """
     if not shares:
         raise ValueError("need at least one share")
-    # Use native reconstruct when available.
+    indexes = [int(idx) for idx, _payload in shares]
+    if len(set(indexes)) != len(indexes):
+        raise ValueError("the same share was supplied more than once")
+    lengths = {len(payload) for _idx, payload in shares}
+    if len(lengths) != 1:
+        raise ValueError("shares have different lengths; they are from different setups")
+    # Row 9 wiring: uses the native Rust Shamir reconstruct when
+    # available (45-84x faster than pure-Python per F1.1 benches).
     if _NATIVE_AVAILABLE:
-        # Native expects exactly `k` shares; infer k from supplied count.
-        # If caller provided extras, split_compat-style we use first len(shares).
-        k = len(shares)
         share_tuples = [(int(idx), bytes(payload)) for idx, payload in shares]
-        seed = _native_tr.combine_compat(share_tuples, threshold=k)
+        secret = _native_tr.combine_compat(share_tuples, threshold=len(shares))
     else:
         threshold_shares = [
             threshold.Share(x=int(idx), y=bytes(payload))
             for idx, payload in shares
         ]
-        seed = threshold.combine(threshold_shares)
-    if len(seed) != SEED_LEN:
-        raise ValueError(
-            f"reconstructed secret has wrong length {len(seed)}; "
-            f"expected {SEED_LEN}. Did you mix shares from different "
-            "setups?"
+        secret = threshold.combine(threshold_shares)
+    if len(secret) == SEED_LEN + CHECK_LEN:
+        seed, check = secret[:SEED_LEN], secret[SEED_LEN:]
+        if not hmac.compare_digest(check, _secret_check(seed)):
+            raise ValueError(
+                "these shares do not reconstruct the original seed: there are "
+                "fewer of them than the threshold, they come from different "
+                "setups, or one of them is damaged"
+            )
+        return seed, True
+    if len(secret) == SEED_LEN:
+        return secret, False
+    raise ValueError(
+        f"reconstructed secret has wrong length {len(secret)}; "
+        f"expected {SEED_LEN}. Did you mix shares from different "
+        "setups?"
+    )
+
+
+def combine_shares(
+    shares: list[tuple[int, bytes]], *, allow_unverified: bool = False
+) -> bytes:
+    """Reconstruct the original seed from K shares.
+
+    Raises :class:`UnverifiableSharesError` for version 1 shares unless
+    ``allow_unverified`` is set, because their result cannot be told apart
+    from a wrong one. See :func:`combine_shares_checked`.
+    """
+    seed, verified = combine_shares_checked(shares)
+    if not verified and not allow_unverified:
+        raise UnverifiableSharesError(
+            "these shares were created by an older version and carry no "
+            "integrity check, so a wrong result cannot be detected"
         )
     return seed
 
@@ -410,6 +544,7 @@ def setup_social_recovery(
     seed: bytes,
     guardians: list[tuple[str, bytes]],
     threshold_k: int = DEFAULT_THRESHOLD,
+    signing_key: Optional[Ed25519PrivateKey] = None,
 ) -> list[tuple[str, WrappedShare]]:
     """Convenience: pair guardians (display_name, ed_pub) with their
     respective wrapped shares. Returns ``[(display_name, WrappedShare),
@@ -423,6 +558,7 @@ def setup_social_recovery(
         contact_ed_pubs=pubs,
         threshold_k=threshold_k,
         total_n=total_n,
+        signing_key=signing_key,
     )
     return [(name, share) for (name, _pub), share in zip(guardians, shares)]
 

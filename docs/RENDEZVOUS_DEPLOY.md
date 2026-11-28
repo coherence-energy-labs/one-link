@@ -135,6 +135,7 @@ services:
       ONE_LINK_RDZ_MAX_REGISTRATIONS: "20000"
       ONE_LINK_RDZ_MAX_ATTACKER_STATE_KEYS: "20000"
       ONE_LINK_RDZ_MAX_CONCURRENT_CONNECTIONS: "64"
+      ONE_LINK_RDZ_MAX_CONCURRENT_PER_SOURCE: "16"
       ONE_LINK_RDZ_MEMORY_BUDGET_BYTES: "536870912"
 ```
 
@@ -368,6 +369,17 @@ for the configured relay payload budget, WebSocket/parser buffers, Python
 baseline, and transient cryptographic work. The startup estimator is a
 fail-closed floor derived from the measured hostile state with allocator
 headroom, not a throughput guarantee or substitute for workload testing.
+
+`--max-concurrent-connections` is a memory bound, and every relay listener
+holds one slot for as long as its WebSocket is open, so it is also the number
+of devices one process can serve at a time. `--max-concurrent-per-source`
+(default 16) keeps one source address, or one IPv6 /64, from holding more than
+its share; a request over that share is answered 429 while the server still
+has room for everyone else. A household or office behind one NAT address
+counts as one source: raise the per-source value if you expect more than 16
+devices behind a single address. Behind a reverse proxy, pass
+`--trust-proxy-headers`, otherwise every client appears to come from the
+proxy and they all share one source's limits.
 
 Do not place independent in-memory rendezvous processes behind an ordinary
 load balancer: a registration and a later lookup can land on different state.

@@ -61,40 +61,36 @@ fn parse_manifest_kind(s: &str) -> PyResult<ManifestRecordKind> {
     }
 }
 
+/// The error for an id of the wrong length. Out of line, so that the checks
+/// below are a length test and a copy that the compiler folds into each
+/// caller.
+#[cold]
+#[inline(never)]
+fn wrong_length(what: &str, want: usize, got: usize) -> PyErr {
+    PyValueError::new_err(format!("{what} must be {want} bytes, got {got}"))
+}
+
+// The three checks run on every call that names a chunk. Inlined, they cost a
+// compare; as calls of their own (which is how the optimizer left them once
+// unwinding made each one carry a cleanup path for its error) the id was
+// written to memory by the callee and read straight back by the caller, and
+// a lookup took about a tenth longer.
+#[inline]
 fn check_chunk_id(b: &[u8]) -> PyResult<[u8; 32]> {
-    if b.len() != 32 {
-        return Err(PyValueError::new_err(format!(
-            "chunk_id must be 32 bytes, got {}",
-            b.len(),
-        )));
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(b);
-    Ok(out)
+    b.try_into()
+        .map_err(|_| wrong_length("chunk_id", 32, b.len()))
 }
 
+#[inline]
 fn check_ratchet_id(b: &[u8]) -> PyResult<[u8; 16]> {
-    if b.len() != 16 {
-        return Err(PyValueError::new_err(format!(
-            "ratchet_key_id must be 16 bytes, got {}",
-            b.len(),
-        )));
-    }
-    let mut out = [0u8; 16];
-    out.copy_from_slice(b);
-    Ok(out)
+    b.try_into()
+        .map_err(|_| wrong_length("ratchet_key_id", 16, b.len()))
 }
 
+#[inline]
 fn check_actor_id(b: &[u8]) -> PyResult<[u8; 32]> {
-    if b.len() != 32 {
-        return Err(PyValueError::new_err(format!(
-            "actor_id must be 32 bytes, got {}",
-            b.len(),
-        )));
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(b);
-    Ok(out)
+    b.try_into()
+        .map_err(|_| wrong_length("actor_id", 32, b.len()))
 }
 
 /// Python view of a chunk record (everything the daemon needs).
@@ -106,12 +102,14 @@ fn check_actor_id(b: &[u8]) -> PyResult<[u8; 32]> {
 )]
 #[derive(Debug, Clone)]
 pub struct PyReadChunk {
+    // One of a fixed set of names: borrowed, so that building this view
+    // allocates nothing for them.
     #[pyo3(get)]
-    kind: String,
+    kind: &'static str,
     #[pyo3(get)]
-    address_kind: String,
+    address_kind: &'static str,
     #[pyo3(get)]
-    aead_kind: String,
+    aead_kind: &'static str,
     #[pyo3(get)]
     compressed: bool,
     #[pyo3(get)]
@@ -160,9 +158,9 @@ impl PyReadChunk {
             ChunkAeadKind::ChaCha20Poly1305 => "chacha",
         };
         Self {
-            kind: kind.to_string(),
-            address_kind: address_kind.to_string(),
-            aead_kind: aead_kind.to_string(),
+            kind,
+            address_kind,
+            aead_kind,
             compressed: r.compressed,
             format_aware: r.format_aware,
             length_plaintext: r.length_plaintext,
@@ -185,8 +183,10 @@ impl PyReadChunk {
 pub struct PyStripe {
     #[pyo3(get)]
     stripe_id_lo64: u64,
+    // "data", "parity" or "not_striped": borrowed, so that a chunk lookup,
+    // which returns one of these per call, does not allocate for it.
     #[pyo3(get)]
-    role: String,
+    role: &'static str,
     #[pyo3(get)]
     stripe_index: u8,
     #[pyo3(get)]
@@ -209,20 +209,25 @@ impl PyStripe {
         stripe_m: u8,
         cohort_id_lo64: u64,
     ) -> PyResult<Self> {
-        // Validate role string.
-        match role {
-            "data" | "parity" | "not_striped" => Ok(Self {
-                stripe_id_lo64,
-                role: role.to_string(),
-                stripe_index,
-                stripe_k,
-                stripe_m,
-                cohort_id_lo64,
-            }),
-            other => Err(PyValueError::new_err(format!(
-                "unknown stripe role '{other}'; expected 'data', 'parity', or 'not_striped'"
-            ))),
-        }
+        // Validate the role and keep the name this module owns.
+        let role = match role {
+            "data" => "data",
+            "parity" => "parity",
+            "not_striped" => "not_striped",
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown stripe role '{other}'; expected 'data', 'parity', or 'not_striped'"
+                )))
+            }
+        };
+        Ok(Self {
+            stripe_id_lo64,
+            role,
+            stripe_index,
+            stripe_k,
+            stripe_m,
+            cohort_id_lo64,
+        })
     }
 }
 
@@ -235,7 +240,7 @@ impl PyStripe {
         };
         Self {
             stripe_id_lo64: s.stripe_id_lo64,
-            role: role.to_string(),
+            role,
             stripe_index: s.stripe_index,
             stripe_k: s.stripe_k,
             stripe_m: s.stripe_m,
@@ -244,7 +249,7 @@ impl PyStripe {
     }
 
     fn to_rust(&self) -> PyResult<StripeDescriptor> {
-        let role = match self.role.as_str() {
+        let role = match self.role {
             "data" => StripeRole::Data,
             "parity" => StripeRole::Parity,
             "not_striped" => StripeRole::NotStriped,

@@ -8,12 +8,13 @@ the two-daemon e2e).
 """
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from one_link.daemon import Daemon
+from one_link.daemon import Daemon, IncomingFile
 from one_link.identity import Identity, fingerprint_of
 from one_link.state import State
 from one_link.wire import decode_msg
@@ -49,12 +50,22 @@ def _daemon(tmp_path: Path) -> Daemon:
     return d
 
 
-def _held_transfer(d: Daemon, tid: str, peer_fp: str) -> None:
+def _held_transfer(
+    d: Daemon, tid: str, peer_fp: str, tmp_path: Path, *, blob: str = "ab" * 32,
+    size: int = 10, name: str = "photo.png",
+) -> None:
     d.state.upsert_transfer(
         id=tid, direction="in", peer_fp=peer_fp, kind="file",
-        name="photo.png", size=10, blob_hash="ab" * 32, status="offered",
-        progress_bytes=0, total_bytes=10, chunks_done=0, chunks_total=0,
+        name=name, size=size, blob_hash=blob, status="offered",
+        progress_bytes=0, total_bytes=size, chunks_done=0, chunks_total=0,
         metadata={"needs_accept": True, "delivery_state": "awaiting_acceptance"},
+    )
+    # These narrow response-correlation tests now include the current
+    # writer. The real CDC path is exercised separately by daemon tests.
+    d._incoming_files[blob] = IncomingFile(
+        name=name, size=size, blob_hex=blob, peer_fp=peer_fp,
+        transfer_id=tid, out_path=tmp_path / (blob + ".part"),
+        handle=BytesIO(), hasher=None,
     )
 
 
@@ -106,7 +117,7 @@ async def test_accept_sends_ack_and_marks_active(tmp_path):
     d = _daemon(tmp_path)
     try:
         peer = "aa" * 32
-        _held_transfer(d, "in:abc", peer)
+        _held_transfer(d, "in:abc", peer, tmp_path)
         ch = _FakeChannel()
         d._pending_file_offers["in:abc"] = {
             "channel": ch, "peer_fp": peer, "peer_sid": "aaaa",
@@ -132,7 +143,7 @@ async def test_accept_cdc_sends_file_wants(tmp_path):
     d = _daemon(tmp_path)
     try:
         peer = "bb" * 32
-        _held_transfer(d, "in:cdc", peer)
+        _held_transfer(d, "in:cdc", peer, tmp_path, blob="cd" * 32)
         ch = _FakeChannel()
         d._pending_file_offers["in:cdc"] = {
             "channel": ch, "peer_fp": peer, "peer_sid": "bbbb",
@@ -154,7 +165,7 @@ async def test_accept_survives_closed_channel_and_hides_reprompt(tmp_path):
     d = _daemon(tmp_path)
     try:
         peer = "dd" * 32
-        _held_transfer(d, "in:retry", peer)
+        _held_transfer(d, "in:retry", peer, tmp_path, blob="de" * 32, size=100, name="ACE.zip")
         d._pending_file_offers["in:retry"] = {
             "channel": _ClosedChannel(), "peer_fp": peer, "peer_sid": "dddd",
             "blob": "de" * 32, "msg_id": "old", "msg": {"id": "old"},
@@ -207,7 +218,7 @@ async def test_decline_sends_file_declined_and_fails_transfer(tmp_path):
     d = _daemon(tmp_path)
     try:
         peer = "cc" * 32
-        _held_transfer(d, "in:dec", peer)
+        _held_transfer(d, "in:dec", peer, tmp_path, blob="ef" * 32)
         ch = _FakeChannel()
         d._pending_file_offers["in:dec"] = {
             "channel": ch, "peer_fp": peer, "peer_sid": "cccc",

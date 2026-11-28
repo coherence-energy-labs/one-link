@@ -197,6 +197,81 @@ def _wait_for_payload(home: Path, payload: bytes, timeout: float, *, exclude: se
     return None, time.perf_counter()
 
 
+def _payload_counts(record: dict) -> tuple[dict, dict] | None:
+    """Validate a labelled accounting window before using its route claim."""
+    bytes_by_route = record.get("payload_bytes_by_transport")
+    chunks_by_route = record.get("payload_chunks_by_transport")
+    routes = {"tcp", "relay", "webrtc", "quic", "unknown"}
+    if not isinstance(bytes_by_route, dict) or not isinstance(chunks_by_route, dict):
+        return None
+    if set(bytes_by_route) != set(chunks_by_route) or not set(bytes_by_route) <= routes:
+        return None
+    if any(type(v) is not int or v < 0 for v in bytes_by_route.values()):
+        return None
+    if any(type(v) is not int or v <= 0 for v in chunks_by_route.values()):
+        return None
+    label = next(iter(chunks_by_route)) if len(chunks_by_route) == 1 else (
+        "mixed" if chunks_by_route else "none")
+    if record.get("payload_transport") != label:
+        return None
+    if type(record.get("payload_fallbacks")) is not int or record["payload_fallbacks"] < 0:
+        return None
+    return bytes_by_route, chunks_by_route
+
+
+def _nonnegative_counter(value: Any) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _verified_payload_accounting(result: dict) -> bool:
+    """Validate units, counter identities and attempt/whole-transfer linkage.
+
+    This is application acknowledgement accounting, not a packet capture.
+    A route label cannot override contradictory counters or missing evidence.
+    """
+    if (result.get("payload_accounting_scope") != "acknowledged_application_payload"
+            or result.get("payload_bytes_unit") != "encoded_payload_bytes"
+            or result.get("payload_accounting_window") != "attempt"):
+        return False
+    current = _payload_counts(result)
+    totals = result.get("payload_transfer_totals")
+    if current is None or not isinstance(totals, dict):
+        return False
+    overall = _payload_counts(totals)
+    if overall is None:
+        return False
+    byte_counts, chunk_counts = current
+    total_bytes, total_chunks = overall
+    if not all(_nonnegative_counter(v) for v in (
+        result.get("wire_bytes_sent"), result.get("raw_bytes_sent"),
+        totals.get("wire_bytes"), totals.get("raw_bytes"), totals.get("chunks"),
+    )):
+        return False
+    return (
+        result["wire_bytes_sent"] == sum(byte_counts.values())
+        and totals["wire_bytes"] == sum(total_bytes.values())
+        and totals["chunks"] == sum(total_chunks.values())
+        and totals["raw_bytes"] >= result["raw_bytes_sent"]
+        and totals["payload_fallbacks"] >= result["payload_fallbacks"]
+        and all(total_bytes.get(k, -1) >= v for k, v in byte_counts.items())
+        and all(total_chunks.get(k, -1) >= v for k, v in chunk_counts.items())
+    )
+
+
+def _forced_route_verified(result: dict, requested: str, size: int) -> bool:
+    if not _verified_payload_accounting(result):
+        return False
+    totals = result["payload_transfer_totals"]
+    return (
+        result.get("transport_requested") == requested
+        and result["payload_transport"] == requested
+        and result["payload_fallbacks"] == 0
+        and totals["payload_fallbacks"] == 0
+        and totals["payload_transport"] == requested
+        and (size == 0 or result["payload_bytes_by_transport"].get(requested, 0) > 0)
+    )
+
+
 def _transfer_attempt(pair: Any, src: Path, payload: bytes, *, transport: str = "auto", timeout: float = 300.0) -> dict:
     """One request-to-verified-receiver observation; no failed attempt disappears."""
     expected_sha256 = hashlib.sha256(payload).hexdigest()
@@ -237,15 +312,9 @@ def _transfer_attempt(pair: Any, src: Path, payload: bytes, *, transport: str = 
         # payload bytes; keep the receipt's own unit, window and whole-transfer
         # totals beside them so a stored row cannot be read in another unit.
         for key in ("payload_transport", "payload_bytes_by_transport", "payload_chunks_by_transport", "payload_fallbacks",
-                    "payload_bytes_unit", "payload_accounting_window", "payload_transfer_totals"):
+                    "payload_accounting_scope", "payload_bytes_unit", "payload_accounting_window", "payload_transfer_totals"):
             row[key] = result.get(key)
-        byte_counts = result.get("payload_bytes_by_transport")
-        chunk_counts = result.get("payload_chunks_by_transport")
-        row["payload_transport_verified"] = (
-            isinstance(byte_counts, dict) and isinstance(chunk_counts, dict)
-            and bool(result.get("payload_transport"))
-            and all(type(v) is int and v >= 0 for v in [*byte_counts.values(), *chunk_counts.values()])
-        )
+        row["payload_transport_verified"] = _verified_payload_accounting(result)
         remaining = max(0.0, timeout - (time.perf_counter() - started))
         landed, _ = _wait_for_payload(pair.b.home, payload, remaining, exclude=previous)
         row["receiver_verified"] = landed is not None
@@ -254,11 +323,7 @@ def _transfer_attempt(pair: Any, src: Path, payload: bytes, *, transport: str = 
             row["error"] = "verified receiver file did not arrive before the deadline"
         elif not all(row[key] for key in ("application_confirmed", "application_size_matches", "application_hash_matches")):
             row["error"] = "receiver bytes arrived but application commit/hash/size receipt was not confirmed"
-        elif transport != "auto" and (
-            not row["payload_transport_verified"] or row["payload_transport"] != transport
-            or result.get("payload_fallbacks", 0) != 0
-            or (len(payload) > 0 and (not byte_counts or int(byte_counts.get(transport, 0)) <= 0))
-        ):
+        elif transport != "auto" and not _forced_route_verified(result, transport, len(payload)):
             row.update(status="inconclusive", error="forced transport was not verified by payload accounting")
         else:
             row["status"] = "passed"
@@ -284,44 +349,129 @@ def _attempt_summary(attempts: list[dict]) -> dict:
     }
 
 
-class _RssTracker:
-    """Sample RSS of a target process every ``interval`` seconds in
-    a background thread. Returns peak RSS in bytes when stopped."""
+def _authenticated_benchmark_process(handle: Any) -> tuple[psutil.Process, tuple]:
+    """Bind measurements to the serving daemon, not its Python launcher.
 
-    def __init__(self, pid: int, interval: float = 0.05) -> None:
-        self.pid = pid
+    A Windows virtualenv launcher can be a different process. Only the
+    authenticated test daemon may name the PID, and it must belong to the
+    disposable process tree we started for that exact profile. Do not attach
+    the sampler to an arbitrary local process or a reused PID.
+    """
+    status = request(handle.control_port, cmd="status", timeout=10.0)
+    pid = status.get("pid")
+    instance = status.get("daemon_instance_id")
+    source = status.get("source_fingerprint")
+    home = status.get("home")
+    me = status.get("me")
+    if (
+        status.get("ok") is not True
+        or type(pid) is not int or pid <= 0
+        or not isinstance(instance, str) or not instance
+        or not isinstance(source, str) or not source
+        or not isinstance(home, str) or not home
+        or Path(home).resolve() != (handle.home / "data").resolve()
+        or not isinstance(me, dict) or me.get("fingerprint") != handle.fingerprint
+        or handle.proc.poll() is not None
+    ):
+        raise RuntimeError("benchmark daemon identity could not be authenticated")
+    proc = psutil.Process(pid)
+    if pid != handle.proc.pid and not any(
+        parent.pid == handle.proc.pid for parent in proc.parents()
+    ):
+        raise RuntimeError("authenticated benchmark PID is outside the spawned process tree")
+    created = proc.create_time()
+    if not proc.is_running():
+        raise RuntimeError("authenticated benchmark process is no longer running")
+    return proc, (pid, created, instance, source)
+
+
+class _RssTracker:
+    """Bounded sampled RSS, with process identity and coverage failure evidence.
+
+    This is NOT the OS high-water counter or a whole-process-tree measurement.
+    A missing sample, lost process or sampler that fails to terminate cannot
+    produce a qualified memory observation. The baseline and final sample
+    bracket the transfer; intermediate values are aggregated in O(1) space.
+    """
+
+    def __init__(self, proc: psutil.Process, interval: float = 0.05) -> None:
+        if not 0 < interval <= 1:
+            raise ValueError("RSS sample interval must be in (0, 1] seconds")
+        self.proc = proc
+        self.pid = proc.pid
         self.interval = interval
         self._stop = threading.Event()
-        self._peak: int = 0
-        self._samples: list[int] = []
+        self._peak = 0
+        self._sum = 0
+        self._count = 0
+        self._first: float | None = None
+        self._last: float | None = None
+        self._max_gap = 0.0
+        self._error: str | None = None
         self._thread: threading.Thread | None = None
+        self.baseline_bytes: int | None = None
+
+    def _sample(self) -> int:
+        if not self.proc.is_running():
+            raise RuntimeError("benchmark process exited or PID was reused")
+        rss = self.proc.memory_info().rss
+        if type(rss) is not int or rss <= 0:
+            raise RuntimeError("invalid RSS observation")
+        if not self.proc.is_running():
+            raise RuntimeError("benchmark process identity changed during sample")
+        observed = time.perf_counter()
+        if self._last is not None:
+            self._max_gap = max(self._max_gap, observed - self._last)
+        if self._first is None:
+            self._first = observed
+        self._last = observed
+        self._peak = max(self._peak, rss)
+        self._sum += rss
+        self._count += 1
+        return rss
 
     def start(self) -> None:
+        if self._thread is not None or self._stop.is_set():
+            raise RuntimeError("RSS sampler cannot be restarted")
+        self.baseline_bytes = self._sample()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def _run(self) -> None:
-        try:
-            proc = psutil.Process(self.pid)
-        except psutil.NoSuchProcess:
-            return
-        while not self._stop.is_set():
+        while not self._stop.wait(self.interval):
             try:
-                rss = proc.memory_info().rss
-                self._peak = max(self._peak, rss)
-                self._samples.append(rss)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                break
-            time.sleep(self.interval)
+                self._sample()
+            except (psutil.Error, OSError, RuntimeError) as exc:
+                self._error = type(exc).__name__
+                return
 
     def stop(self) -> dict:
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
+        if self._thread is None:
+            raise RuntimeError("RSS sampler was not started")
+        self._thread.join(timeout=2.0)
+        if self._thread.is_alive():
+            # Do not race the still-running collector to read its counters.
+            return {
+                "valid": False, "error": "RSS sampler did not stop",
+                "peak_bytes": None, "mean_bytes": None, "samples": None,
+                "sample_duration_sec": None, "max_sample_gap_sec": None,
+            }
+        if self._error is None:
+            try:
+                self._sample()
+            except (psutil.Error, OSError, RuntimeError) as exc:
+                self._error = type(exc).__name__
+        duration = (self._last - self._first
+                    if self._first is not None and self._last is not None else None)
+        valid = self._error is None and self._count >= 2
         return {
-            "peak_bytes": self._peak,
-            "mean_bytes": int(statistics.mean(self._samples)) if self._samples else 0,
-            "samples": len(self._samples),
+            "valid": valid, "error": self._error,
+            "peak_bytes": self._peak if valid else None,
+            "mean_bytes": self._sum // self._count if valid else None,
+            "samples": self._count,
+            "sample_duration_sec": duration,
+            "max_sample_gap_sec": self._max_gap,
         }
 
 
@@ -391,24 +541,40 @@ def _bench_memory(size: int, *, sender: bool) -> dict:
         src = Path(td) / "memory.bin"
         src.write_bytes(payload)
         with daemon_pair() as pair:
-            pid = pair.a.proc.pid if sender else pair.b.proc.pid
-            baseline_rss = psutil.Process(pid).memory_info().rss
-            tracker = _RssTracker(pid)
+            target = pair.a if sender else pair.b
+            proc, identity = _authenticated_benchmark_process(target)
+            tracker = _RssTracker(proc)
             tracker.start()
             try:
                 attempt = _transfer_attempt(pair, src, payload)
             finally:
                 memory = tracker.stop()
+            try:
+                _, after = _authenticated_benchmark_process(target)
+                same_instance = identity == after
+            except (psutil.Error, OSError, RuntimeError, ValueError):
+                same_instance = False
     summary = _attempt_summary([attempt])
-    if memory["samples"] == 0 and summary["status"] == "passed":
-        summary.update(status="inconclusive", error="RSS sampler collected no observations")
+    valid = memory["valid"] and same_instance
+    if not valid and summary["status"] == "passed":
+        summary.update(status="inconclusive",
+                       error=memory["error"] or "RSS process identity/coverage changed")
+    baseline_rss = tracker.baseline_bytes
+    peak = memory["peak_bytes"] if valid else None
     return {
         "scenario": "sender_memory" if sender else "receiver_memory", "size_bytes": size,
-        **summary, "rss_baseline_bytes": baseline_rss,
-        "rss_peak_bytes": memory["peak_bytes"], "rss_mean_bytes": memory["mean_bytes"],
-        "rss_growth_bytes": max(0, memory["peak_bytes"] - baseline_rss), "rss_samples": memory["samples"],
+        **summary, "rss_baseline_bytes": baseline_rss if valid else None,
+        "rss_peak_bytes": peak, "rss_mean_bytes": memory["mean_bytes"] if valid else None,
+        "rss_growth_bytes": max(0, peak - baseline_rss) if peak is not None and baseline_rss is not None else None,
+        "rss_samples": memory["samples"],
         "rss_sample_interval_sec": tracker.interval,
-        "qualification": "One process at one file size; not a proof of asymptotic memory bounds.",
+        "rss_sample_duration_sec": memory["sample_duration_sec"],
+        "rss_max_sample_gap_sec": memory["max_sample_gap_sec"],
+        "rss_measurement_valid": valid,
+        "rss_process_identity_verified": same_instance,
+        "rss_process_scope": "authenticated serving daemon only",
+        "rss_peak_kind": "sampled_lower_bound",
+        "qualification": "Sampled RSS of one serving process at one file size, not its OS high-water mark, process tree, or proof of asymptotic bounds.",
     }
 
 
@@ -589,6 +755,30 @@ def bench_related_file(size: int = 16 * 1024 * 1024) -> dict:
     return _bench_related_pair(size, edited=True)
 
 
+def _kill_benchmark_serving_process(handle: Any) -> tuple:
+    """Abruptly stop only the authenticated disposable daemon we spawned."""
+    proc, identity = _authenticated_benchmark_process(handle)
+    if proc.pid == handle.proc.pid:
+        handle.proc.kill()
+    else:
+        # On Windows a virtualenv launcher can survive its serving child or
+        # vice versa. Never infer a daemon crash from killing just the wrapper.
+        proc.kill()
+        proc.wait(timeout=10)
+    handle.proc.wait(timeout=10)
+    if proc.is_running() or handle.proc.poll() is None:
+        raise RuntimeError("benchmark daemon or launcher remained alive after termination")
+    return identity
+
+
+def _already_delivered_payload(home: Path, payload: bytes) -> bool:
+    expected = hashlib.sha256(payload).hexdigest()
+    for path in inbox_files(home):
+        if path.stat().st_size == len(payload) and file_sha256(path) == expected:
+            return True
+    return False
+
+
 def bench_resume_effectiveness(size: int = 32 * 1024 * 1024) -> dict:
     """Interrupt an owned receiver, retain its private discovery scope, verify restart delivery."""
     payload = _build_payload(size, seed=3)
@@ -618,14 +808,19 @@ def bench_resume_effectiveness(size: int = 32 * 1024 * 1024) -> dict:
                 return {"scenario": "resume_effectiveness", "status": "inconclusive",
                         "error": "could not observe an in-progress transfer at the requested cache checkpoint",
                         "size_bytes": size, "cache_files_observed": cached, "initial_sender_outcomes": sender_outcomes}
-            pair.b.proc.kill()
-            pair.b.proc.wait(timeout=5)
+            killed_identity = _kill_benchmark_serving_process(pair.b)
             if pair.b.log_fh is not None:
                 pair.b.log_fh.close()
             sender.join(timeout=125)
             if sender.is_alive():
                 return {"scenario": "resume_effectiveness", "status": "failed", "error": "sender request did not terminate after receiver stop"}
-            for name in ("control.port", "peer.port", "instance.lock"):
+            # A completion that raced the kill is not evidence of recovery.
+            # No receiver is running now, so this check cannot race its writes.
+            if _already_delivered_payload(pair.b.home, payload):
+                return {"scenario": "resume_effectiveness", "status": "inconclusive",
+                        "error": "receiver completed before verified abrupt termination",
+                        "size_bytes": size, "initial_sender_outcomes": sender_outcomes}
+            for name in ("control.port", "peer.port", "server.port", "ui.token", "instance.lock"):
                 try:
                     (pair.b.home / "data" / name).unlink()
                 except FileNotFoundError:
@@ -634,6 +829,10 @@ def bench_resume_effectiveness(size: int = 32 * 1024 * 1024) -> dict:
             replacement = None
             try:
                 replacement = _bring_up(pair.b.home, pair.b.log, "B-resume", mdns_type=pair.benchmark_mdns_type)
+                _, new_identity = _authenticated_benchmark_process(replacement)
+                if replacement.fingerprint != pair.b.fingerprint or new_identity[2] == killed_identity[2]:
+                    return {"scenario": "resume_effectiveness", "status": "failed",
+                            "error": "replacement daemon did not preserve peer identity and create a fresh instance"}
                 landed, _ = _wait_for_payload(replacement.home, payload, 120.0)
                 elapsed = time.perf_counter() - started
                 return {
@@ -643,6 +842,8 @@ def bench_resume_effectiveness(size: int = 32 * 1024 * 1024) -> dict:
                     "elapsed_after_restart_sec": elapsed, "source_sha256": hashlib.sha256(payload).hexdigest(),
                     "initial_sender_outcomes": sender_outcomes,
                     "resume_wire_bytes": None,
+                    "abrupt_serving_process_termination_verified": True,
+                    "fresh_instance_and_peer_continuity_verified": True,
                     "qualification": "Restart plus independently verified delivery; cache-file count is not an acknowledged-byte or re-fetch count.",
                 }
             finally:
@@ -852,8 +1053,9 @@ def main() -> int:
             rows = [{"status": "inconclusive", "error": "scenario returned no observations"}]
             result = rows
         for row in rows:
-            if "status" not in row:
-                row["status"] = "failed" if row.get("error") or row.get("landed") is False or row.get("completed") is False else "passed"
+            if row.get("status") not in {"passed", "failed", "inconclusive"}:
+                row["status"] = "inconclusive"
+                row.setdefault("error", "scenario omitted an explicit supported verdict")
             section_outcomes.append(row["status"])
         results[name] = result
 

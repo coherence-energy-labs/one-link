@@ -12,6 +12,7 @@
 
   let _rdzRefreshTimer = null;
   let _rdzRefreshState = null;
+  let _rdzPagePaused = false;
 
   function _cancelRdzRefresh() {
     if (_rdzRefreshTimer !== null) clearTimeout(_rdzRefreshTimer);
@@ -20,12 +21,13 @@
   }
 
   function _pauseRdzRefresh() {
+    _rdzPagePaused = true;
     if (_rdzRefreshTimer !== null) clearTimeout(_rdzRefreshTimer);
     _rdzRefreshTimer = null;
   }
 
   function _scheduleRdzRefresh() {
-    if (!_rdzRefreshState) return;
+    if (!_rdzRefreshState || _rdzPagePaused || _rdzRefreshState.inFlight) return;
     if (_rdzRefreshTimer !== null) clearTimeout(_rdzRefreshTimer);
     const current = _rdzRefreshState;
     const remainingMs = Math.max(0, current.localExpiresAtMs - Date.now());
@@ -34,9 +36,11 @@
     const delay = current.retryAttempt === 0
       ? refreshDelay
       : Math.max(1_000, Math.min(retryDelay, remainingMs > 1_000 ? remainingMs - 1_000 : retryDelay));
-    _rdzRefreshTimer = setTimeout(async () => {
-      if (_rdzRefreshState !== current) return;
+    const timer = setTimeout(async () => {
+      if (_rdzRefreshState !== current || _rdzRefreshTimer !== timer ||
+          _rdzPagePaused || current.inFlight) return;
       _rdzRefreshTimer = null;
+      current.inFlight = true;
       try {
         const ack = await registerWith(current.url);
         if (_rdzRefreshState !== current) return;
@@ -49,9 +53,12 @@
         current.retryAttempt = Math.min(current.retryAttempt + 1, 10);
         text($("#rdz-status"),
           `Presence refresh failed; retrying: ${e && e.message ? e.message : e}`);
+      } finally {
+        current.inFlight = false;
+        if (_rdzRefreshState === current) _scheduleRdzRefresh();
       }
-      _scheduleRdzRefresh();
     }, delay);
+    _rdzRefreshTimer = timer;
   }
 
   function _startRdzRefresh(ack, rdzUrl) {
@@ -61,6 +68,7 @@
       url: _normalizeRdzUrl(rdzUrl),
       localExpiresAtMs: Date.now() + lifetimeMs,
       retryAttempt: 0,
+      inFlight: false,
     };
     _scheduleRdzRefresh();
   }
@@ -70,7 +78,10 @@
     else _cancelRdzRefresh();
   });
   window.addEventListener("pageshow", (event) => {
-    if (event.persisted && _rdzRefreshState) _scheduleRdzRefresh();
+    if (event.persisted) {
+      _rdzPagePaused = false;
+      _scheduleRdzRefresh();
+    }
   });
 
   $("#btn-rdz-register")?.addEventListener("click", async () => {

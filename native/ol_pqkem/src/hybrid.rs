@@ -15,7 +15,7 @@ type MlKem768CtSize = <MlKem768 as KemCore>::CiphertextSize;
 use rand_core::CryptoRng;
 use rand_core::RngCore;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::PqKemError;
 
@@ -39,6 +39,28 @@ pub const SHARED_SECRET_LEN: usize = 32;
 
 /// BLAKE3 `derive_key` context for the hybrid KEM combiner (ADR-0006 registry).
 const COMBINER_CONTEXT: &str = "ol-pqkem-hybrid-v1";
+
+/// The ML-KEM modulus q (FIPS 203 section 2.4).
+const ML_KEM_Q: u16 = 3329;
+/// Bytes of an ML-KEM-768 encapsulation key that encode the vector t-hat:
+/// 3 polynomials of 256 coefficients at 12 bits each. The remaining 32
+/// bytes are the matrix seed rho, which may hold any value.
+const ML_KEM_EK_T_HAT_LEN: usize = 3 * 256 * 12 / 8;
+
+/// FIPS 203 section 7.2 "modulus check" for an encapsulation key.
+///
+/// Every 12-bit coefficient of t-hat must already be reduced modulo q. The
+/// `ml-kem` 0.2 decoder accepts unreduced coefficients and reduces them
+/// silently, so two different byte strings would act as the same key and a
+/// peer could send a key no honest key generation produces. The key is
+/// public, so this check does not need to be constant-time.
+fn encapsulation_key_is_reduced(ek: &[u8; ML_KEM_EK_LEN]) -> bool {
+    ek[..ML_KEM_EK_T_HAT_LEN].chunks_exact(3).all(|triple| {
+        let low = u16::from(triple[0]) | (u16::from(triple[1] & 0x0F) << 8);
+        let high = u16::from(triple[1] >> 4) | (u16::from(triple[2]) << 4);
+        low < ML_KEM_Q && high < ML_KEM_Q
+    })
+}
 
 /// A hybrid 32-byte shared secret derived from the BLAKE3 combiner.
 /// Zeroized on drop.
@@ -77,6 +99,9 @@ impl HybridPublicKey {
     /// # Errors
     ///
     /// [`PqKemError::InvalidWireLength`] if `bytes.len() != HYBRID_PUBLIC_KEY_LEN`.
+    /// [`PqKemError::InvalidEncapsulationKey`] if the ML-KEM half fails the
+    /// FIPS 203 modulus check. A `HybridPublicKey` can only be obtained from
+    /// here or from [`keypair`], so every key [`encapsulate`] sees is checked.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PqKemError> {
         if bytes.len() != HYBRID_PUBLIC_KEY_LEN {
             return Err(PqKemError::InvalidWireLength {
@@ -86,6 +111,9 @@ impl HybridPublicKey {
         }
         let mut ml_kem_ek_bytes = [0u8; ML_KEM_EK_LEN];
         ml_kem_ek_bytes.copy_from_slice(&bytes[..ML_KEM_EK_LEN]);
+        if !encapsulation_key_is_reduced(&ml_kem_ek_bytes) {
+            return Err(PqKemError::InvalidEncapsulationKey);
+        }
         let mut x25519_bytes = [0u8; X25519_LEN];
         x25519_bytes.copy_from_slice(&bytes[ML_KEM_EK_LEN..]);
         Ok(Self {
@@ -120,10 +148,13 @@ impl HybridSecretKey {
     /// the in-memory copy).
     #[must_use]
     pub fn to_bytes(&self) -> Zeroizing<[u8; HYBRID_SECRET_KEY_LEN]> {
-        let mut out = [0u8; HYBRID_SECRET_KEY_LEN];
+        // Filled in place inside the wiping wrapper, so no unwiped copy of
+        // the key is left behind on this stack frame.
+        let mut out = Zeroizing::new([0u8; HYBRID_SECRET_KEY_LEN]);
         out[..ML_KEM_DK_LEN].copy_from_slice(&self.ml_kem_dk_bytes[..]);
-        out[ML_KEM_DK_LEN..].copy_from_slice(&self.x25519_sk.to_bytes());
-        Zeroizing::new(out)
+        let x25519_bytes = Zeroizing::new(self.x25519_sk.to_bytes());
+        out[ML_KEM_DK_LEN..].copy_from_slice(&x25519_bytes[..]);
+        out
     }
 
     /// Parse from wire bytes.
@@ -140,9 +171,9 @@ impl HybridSecretKey {
         }
         let mut ml_kem_dk_bytes = Zeroizing::new([0u8; ML_KEM_DK_LEN]);
         ml_kem_dk_bytes[..].copy_from_slice(&bytes[..ML_KEM_DK_LEN]);
-        let mut x25519_bytes = [0u8; X25519_LEN];
+        let mut x25519_bytes = Zeroizing::new([0u8; X25519_LEN]);
         x25519_bytes.copy_from_slice(&bytes[ML_KEM_DK_LEN..]);
-        let x25519_sk = X25519StaticSecret::from(x25519_bytes);
+        let x25519_sk = X25519StaticSecret::from(*x25519_bytes);
         Ok(Self {
             ml_kem_dk_bytes,
             x25519_sk,
@@ -201,9 +232,13 @@ pub fn keypair<R: RngCore + CryptoRng>(rng: &mut R) -> (HybridPublicKey, HybridS
     let mut public_key_bytes = [0u8; ML_KEM_EK_LEN];
     public_key_bytes.copy_from_slice(&encoded_public);
 
-    let encoded_secret = dk.as_bytes();
+    // `dk` wipes itself on drop (ml-kem's `zeroize` feature). Its encoded
+    // form is a separate copy and is wiped here once it has been moved into
+    // the wiping wrapper.
+    let mut encoded_secret = dk.as_bytes();
     let mut secret_key_bytes = Zeroizing::new([0u8; ML_KEM_DK_LEN]);
     secret_key_bytes[..].copy_from_slice(&encoded_secret);
+    encoded_secret.zeroize();
 
     // X25519.
     let responder_dh_secret = X25519StaticSecret::random_from_rng(&mut *rng);
@@ -234,13 +269,14 @@ pub fn encapsulate<R: RngCore + CryptoRng>(
     let ek_bytes_arr: hybrid_array::Array<u8, MlKem768EkEncoded> =
         hybrid_array::Array::from(pk.ml_kem_ek_bytes);
     let ek = <ml_kem::MlKem768 as KemCore>::EncapsulationKey::from_bytes(&ek_bytes_arr);
-    let (ct, mlkem_ss) = ek.encapsulate(rng).map_err(|()| PqKemError::MlKemFailed {
+    let (ct, mut mlkem_ss) = ek.encapsulate(rng).map_err(|()| PqKemError::MlKemFailed {
         reason: "encapsulate",
     })?;
     let mut ml_kem_ct_bytes = [0u8; ML_KEM_CT_LEN];
     ml_kem_ct_bytes.copy_from_slice(&ct);
     let mut mlkem_ss_bytes = Zeroizing::new([0u8; X25519_LEN]);
     mlkem_ss_bytes[..].copy_from_slice(&mlkem_ss);
+    mlkem_ss.zeroize();
 
     // X25519 side: ephemeral keypair, DH against the responder's static pk.
     let sender_ephemeral_secret = X25519StaticSecret::random_from_rng(&mut *rng);
@@ -267,20 +303,23 @@ pub fn decapsulate(
     sk: &HybridSecretKey,
     ct: &HybridCiphertext,
 ) -> Result<SharedSecret, PqKemError> {
-    // ML-KEM side.
-    let dk_bytes_copy: [u8; ML_KEM_DK_LEN] = *sk.ml_kem_dk_bytes;
-    let dk_bytes_arr: hybrid_array::Array<u8, MlKem768DkEncoded> =
-        hybrid_array::Array::from(dk_bytes_copy);
+    // ML-KEM side. The typed copy of the encoded key is wiped as soon as the
+    // key object has been built from it; the key object wipes itself on drop.
+    let mut dk_bytes_arr: hybrid_array::Array<u8, MlKem768DkEncoded> =
+        hybrid_array::Array::default();
+    dk_bytes_arr.copy_from_slice(&sk.ml_kem_dk_bytes[..]);
     let dk = <ml_kem::MlKem768 as KemCore>::DecapsulationKey::from_bytes(&dk_bytes_arr);
+    dk_bytes_arr.zeroize();
     let ct_bytes_arr: hybrid_array::Array<u8, MlKem768CtSize> =
         hybrid_array::Array::from(ct.ml_kem_ct_bytes);
-    let mlkem_ss = dk
+    let mut mlkem_ss = dk
         .decapsulate(&ct_bytes_arr)
         .map_err(|()| PqKemError::MlKemFailed {
             reason: "decapsulate",
         })?;
     let mut mlkem_ss_bytes = Zeroizing::new([0u8; X25519_LEN]);
     mlkem_ss_bytes[..].copy_from_slice(&mlkem_ss);
+    mlkem_ss.zeroize();
 
     // X25519 side.
     let x25519_ss = sk.x25519_sk.diffie_hellman(&ct.x25519_eph_pk);
@@ -297,19 +336,37 @@ pub fn decapsulate(
 /// BLAKE3-based hybrid combiner. Input layout per ADR-0017:
 ///
 /// `derive_key(COMBINER_CONTEXT, mlkem_ct || mlkem_ss || x25519_eph_pk || x25519_ss)`
+///
+/// The inputs are streamed into the hasher. Concatenating them first put
+/// both shared secrets into a heap buffer that was freed without being
+/// wiped; streaming produces the identical key and leaves no such copy.
+///
+/// # What this combiner does not bind
+///
+/// The recipient's public key is not an input. ML-KEM binds its own half
+/// (the encapsulation key is hashed into the ML-KEM shared secret), but the
+/// X25519 half is bound only to the ephemeral key. Used alone, this is not
+/// a key-binding KEM. One Link never uses it alone: the channel handshake
+/// feeds this output into HKDF together with a transcript hash that covers
+/// both identities, the full hybrid public key and the ciphertext
+/// (`channel.py`, and `tests/test_channel_pq_handshake.py` proves a changed
+/// key changes the session). Adding the recipient key here would change
+/// every derived key, so it has to arrive as a new negotiated suite, not
+/// as an edit to "v1".
 fn combine(
     ml_kem_ct: &[u8; ML_KEM_CT_LEN],
     ml_kem_ss: &[u8; X25519_LEN],
     x25519_eph_pk: &[u8; X25519_LEN],
     x25519_ss: &[u8; X25519_LEN],
 ) -> SharedSecret {
-    let mut input = Vec::with_capacity(ML_KEM_CT_LEN + 3 * X25519_LEN);
-    input.extend_from_slice(ml_kem_ct);
-    input.extend_from_slice(ml_kem_ss);
-    input.extend_from_slice(x25519_eph_pk);
-    input.extend_from_slice(x25519_ss);
-    let key = blake3::derive_key(COMBINER_CONTEXT, &input);
-    Zeroizing::new(key)
+    let mut hasher = blake3::Hasher::new_derive_key(COMBINER_CONTEXT);
+    hasher.update(ml_kem_ct);
+    hasher.update(ml_kem_ss);
+    hasher.update(x25519_eph_pk);
+    hasher.update(x25519_ss);
+    let key = Zeroizing::new(*hasher.finalize().as_bytes());
+    hasher.zeroize();
+    key
 }
 
 #[cfg(test)]
@@ -358,6 +415,75 @@ mod tests {
         let (_, ss_a) = encapsulate(&pk_a, &mut rng).unwrap();
         let (_, ss_b) = encapsulate(&pk_b, &mut rng).unwrap();
         assert_ne!(*ss_a, *ss_b);
+    }
+
+    /// The combiner must keep producing exactly what it produced when its
+    /// inputs were concatenated, or peers on different builds stop agreeing.
+    #[test]
+    fn streamed_combiner_matches_the_concatenated_definition() {
+        let ct = [0x11u8; ML_KEM_CT_LEN];
+        let mlkem_ss = [0x22u8; X25519_LEN];
+        let eph = [0x33u8; X25519_LEN];
+        let dh = [0x44u8; X25519_LEN];
+        let mut concatenated = Vec::new();
+        concatenated.extend_from_slice(&ct);
+        concatenated.extend_from_slice(&mlkem_ss);
+        concatenated.extend_from_slice(&eph);
+        concatenated.extend_from_slice(&dh);
+        let expected = blake3::derive_key(COMBINER_CONTEXT, &concatenated);
+        assert_eq!(*combine(&ct, &mlkem_ss, &eph, &dh), expected);
+    }
+
+    #[test]
+    fn honest_keys_pass_the_modulus_check() {
+        let mut rng = StdRng::seed_from_u64(0x0A11);
+        for _ in 0..16 {
+            let (pk, _) = keypair(&mut rng);
+            assert!(HybridPublicKey::from_bytes(&pk.to_bytes()).is_ok());
+        }
+    }
+
+    #[test]
+    fn unreduced_coefficient_is_rejected() {
+        let mut rng = StdRng::seed_from_u64(0x0BAD);
+        let (pk, _) = keypair(&mut rng);
+        let honest = pk.to_bytes();
+
+        // First coefficient = 0xFFF (4095 >= q).
+        let mut low = honest;
+        low[0] = 0xFF;
+        low[1] |= 0x0F;
+        assert!(matches!(
+            HybridPublicKey::from_bytes(&low),
+            Err(PqKemError::InvalidEncapsulationKey)
+        ));
+
+        // Second coefficient of the last triple = q exactly (0xD01).
+        let mut high = honest;
+        let last = ML_KEM_EK_T_HAT_LEN - 3;
+        high[last + 1] = (high[last + 1] & 0x0F) | 0x10;
+        high[last + 2] = 0xD0;
+        assert!(matches!(
+            HybridPublicKey::from_bytes(&high),
+            Err(PqKemError::InvalidEncapsulationKey)
+        ));
+
+        // q - 1 is the largest legal value and must still be accepted.
+        let mut edge = honest;
+        edge[0] = 0x00;
+        edge[1] = (edge[1] & 0xF0) | 0x0D;
+        assert!(HybridPublicKey::from_bytes(&edge).is_ok());
+    }
+
+    #[test]
+    fn the_seed_bytes_of_a_key_are_not_range_checked() {
+        let mut rng = StdRng::seed_from_u64(0x5EED);
+        let (pk, _) = keypair(&mut rng);
+        let mut bytes = pk.to_bytes();
+        for b in &mut bytes[ML_KEM_EK_T_HAT_LEN..ML_KEM_EK_LEN] {
+            *b = 0xFF;
+        }
+        assert!(HybridPublicKey::from_bytes(&bytes).is_ok());
     }
 
     #[test]

@@ -253,8 +253,20 @@ class Registry:
             self.on_change()
 
     def find(self, needle: str) -> Peer | None:
+        """Resolve ``needle`` to one peer, or ``None``.
+
+        A short-ID prefix that fits more than one device is refused rather
+        than resolved to whichever device was registered first. Use
+        :meth:`candidates` to see every match.
+        """
         matches = self.candidates(needle)
-        return matches[0] if matches else None
+        if not matches:
+            return None
+        if needle not in self.peers:
+            by_prefix = sum(1 for p in matches if p.short_id.startswith(needle))
+            if by_prefix > 1:
+                return None
+        return matches[0]
 
     def candidates(self, needle: str) -> list[Peer]:
         """Return peer matches in safest order.
@@ -263,6 +275,8 @@ class Registry:
         beat hostname matches. Hostnames are human-friendly but many devices on
         one test machine share the same name, and stale mDNS records can linger.
         """
+        if not needle:
+            return []
         if needle in self.peers:
             return [self.peers[needle]]
 
@@ -482,9 +496,14 @@ class Discovery:
         ed_pub_hex: str,
         rendezvous_urls: list[str] | None = None,
         device_kind: str = "",
+        announce_details: bool = True,
     ):
         self.short_id = short_id
         self.hostname = hostname
+        # When False the announcement carries only the short ID and public
+        # key, which a peer needs to authenticate its dial: no display name,
+        # no device kind, no rendezvous URLs.
+        self.announce_details = bool(announce_details)
         self.port = port
         self.ed_pub_hex = ed_pub_hex
         # v0.5.4: rendezvous URLs we advertise in our mDNS TXT record
@@ -537,20 +556,7 @@ class Discovery:
                 "::1",
                 "localhost",
             }
-        # mDNS TXT properties. Cap rdz length: an oversized record can
-        # be silently dropped by routers, defeating the whole point.
-        # 8 URLs × ~64 chars = 512 bytes, well under typical limits.
-        rdz_value = ",".join(self.rendezvous_urls[:8])
-        properties: dict[str, str] = {
-            "sid": self.short_id,
-            "host": self.hostname,
-            "pub": self.ed_pub_hex,
-            "v": "0.0.1",
-        }
-        if rdz_value:
-            properties["rdz"] = rdz_value
-        if self.device_kind:
-            properties["kind"] = self.device_kind
+        properties = self._txt_properties()
         self._info = AsyncServiceInfo(
             type_=SERVICE_TYPE,
             name=f"{self.short_id}.{SERVICE_TYPE}",
@@ -569,6 +575,28 @@ class Discovery:
             listener=self._listener,
         )
 
+    def _txt_properties(self) -> dict[str, str]:
+        """The TXT record this device announces.
+
+        Always the short ID and the public key. The display name, device
+        kind and rendezvous URLs are included only when ``announce_details``
+        is set. The rendezvous list is capped: an oversized record can be
+        dropped by routers (8 URLs of about 64 characters is 512 bytes).
+        """
+        properties: dict[str, str] = {
+            "sid": self.short_id,
+            "host": self.hostname if self.announce_details else self.short_id,
+            "pub": self.ed_pub_hex,
+            "v": "0.0.1",
+        }
+        if self.announce_details:
+            rdz_value = ",".join(self.rendezvous_urls[:8])
+            if rdz_value:
+                properties["rdz"] = rdz_value
+            if self.device_kind:
+                properties["kind"] = self.device_kind
+        return properties
+
     async def update_rendezvous_urls(self, urls: list[str]) -> None:
         """v0.5.4: live-update the advertised rendezvous URLs in the
         mDNS TXT record without re-registering the service. Called
@@ -576,19 +604,9 @@ class Discovery:
         self.rendezvous_urls = list(urls or [])
         if self._zc is None or self._info is None:
             return
-        rdz_value = ",".join(self.rendezvous_urls[:8])
         # AsyncServiceInfo.properties is a dict; building a new one
         # and re-registering is the supported path.
-        new_props: dict[str, str] = {
-            "sid": self.short_id,
-            "host": self.hostname,
-            "pub": self.ed_pub_hex,
-            "v": "0.0.1",
-        }
-        if rdz_value:
-            new_props["rdz"] = rdz_value
-        if self.device_kind:
-            new_props["kind"] = self.device_kind
+        new_props = self._txt_properties()
         # `update_service` re-broadcasts the TXT record without
         # cycling the service registration (which would briefly remove
         # us from peers' registries and surface as a flap).

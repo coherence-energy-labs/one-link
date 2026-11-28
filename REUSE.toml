@@ -1,0 +1,31 @@
+# Licensing and copyright for every file in this repository, in the REUSE
+# format (https://reuse.software). `reuse lint` checks that no file is left
+# without a license and a copyright holder.
+#
+# The project's own files are declared here in one place rather than with a
+# header in each of several thousand files. A file that carries its own
+# SPDX header keeps it; the entries below apply to the rest.
+
+version = 1
+
+[[annotations]]
+path = "**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 One Link contributors <weareone@oneunity.earth>"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+# Third-party source vendored with a reviewed patch. See native/Cargo.toml
+# and native/ol_shell/Cargo.toml for why each is vendored, and
+# THIRD_PARTY_NOTICES.md for every other dependency.
+
+[[annotations]]
+path = "native/vendor/ml-kem-0.2.3/**"
+precedence = "override"
+SPDX-FileCopyrightText = "RustCrypto Developers"
+SPDX-License-Identifier = "Apache-2.0 OR MIT"
+
+[[annotations]]
+path = "native/ol_shell/vendor/glib-0.18.5/**"
+precedence = "override"
+SPDX-FileCopyrightText = "The gtk-rs Project Developers"
+SPDX-License-Identifier = "MIT"

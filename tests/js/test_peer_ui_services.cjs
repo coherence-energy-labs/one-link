@@ -124,3 +124,108 @@ test("disabled local assistance does not contribute candidate addresses", async 
   }) }));
   assert.deepEqual(plain(await client.loadPublicIceConfig()), { iceServers: [], localCandidateAddresses: [] });
 });
+
+// Execute the real canonical UI module, with deterministic clock, deferred
+// network results and lifecycle events. No browser clock/event-loop timing
+// assumptions are needed to reach the races.
+function rendezvousLifecycleFixture() {
+  const handlers = new Map();
+  const timers = new Map();
+  const requests = [];
+  const statuses = [];
+  let nextId = 1;
+  let now = 100000;
+  class ClockDate extends Date {
+    constructor(...args) { super(...(args.length ? args : [now])); }
+    static now() { return now; }
+  }
+  const context = vm.createContext({
+    Date: ClockDate,
+    RDZ_REFRESH_MARGIN_MS: 30000,
+    window: { addEventListener: (name, fn) => handlers.set(name, fn) },
+    $: () => null,
+    text: (_node, status) => statuses.push(status),
+    _normalizeRdzUrl: (url) => url,
+    setTimeout: (fn, delay) => {
+      const id = nextId++;
+      timers.set(id, { fn, delay });
+      return id;
+    },
+    clearTimeout: (id) => timers.delete(id),
+    registerWith: (url) => new Promise((resolve, reject) => {
+      requests.push({ url, resolve, reject });
+    }),
+  });
+  const sourceText = fs.readFileSync(path.join(source, "ui/rendezvous.js"), "utf8");
+  new vm.Script(sourceText + "\n;globalThis.fixture = { start: _startRdzRefresh, cancel: _cancelRdzRefresh };").runInContext(context);
+  const ack = { expires_at_ms: 60000, server_time_ms: 0 };
+  const start = (url = "https://fixture.invalid") => context.fixture.start(ack, url);
+  const event = (name, persisted = true) => handlers.get(name)({ persisted });
+  const fire = () => {
+    assert.equal(timers.size, 1);
+    const [id, timer] = timers.entries().next().value;
+    timers.delete(id);
+    now += timer.delay;
+    return timer.fn();
+  };
+  return { timers, requests, statuses, ack, start, event, fire, cancel: context.fixture.cancel };
+}
+
+test("rendezvous: in-flight completion cannot re-arm a hidden page", async () => {
+  const f = rendezvousLifecycleFixture();
+  f.start();
+  const pending = f.fire();
+  assert.equal(f.requests.length, 1);
+  f.event("pagehide");
+  f.requests[0].resolve(f.ack);
+  await pending;
+  assert.equal(f.timers.size, 0);
+  f.event("pageshow");
+  f.event("pageshow");
+  assert.equal(f.timers.size, 1);
+});
+
+test("rendezvous: restored page cannot schedule overlapping refreshes", async () => {
+  const f = rendezvousLifecycleFixture();
+  f.start();
+  const pending = f.fire();
+  f.event("pagehide");
+  f.event("pageshow");
+  f.event("pageshow");
+  assert.equal(f.timers.size, 0);
+  f.requests[0].reject(new Error("offline"));
+  await pending;
+  assert.equal(f.timers.size, 1);
+  assert.equal([...f.timers.values()][0].delay, 4000);
+});
+
+test("rendezvous: stale completion cannot modify replacement registration", async () => {
+  const f = rendezvousLifecycleFixture();
+  f.start("https://old.invalid");
+  const pending = f.fire();
+  f.start("https://new.invalid");
+  const newTimer = [...f.timers.keys()][0];
+  f.requests[0].resolve(f.ack);
+  await pending;
+  assert.deepEqual([...f.timers.keys()], [newTimer]);
+  assert.deepEqual(f.statuses, []);
+});
+
+test("rendezvous: registration finishing during a hidden page stays paused", () => {
+  const f = rendezvousLifecycleFixture();
+  f.event("pagehide");
+  f.start();
+  assert.equal(f.timers.size, 0);
+  f.event("pageshow");
+  assert.equal(f.timers.size, 1);
+});
+
+test("rendezvous: queued obsolete timer cannot initiate a request", async () => {
+  const f = rendezvousLifecycleFixture();
+  f.start();
+  const obsolete = [...f.timers.values()][0];
+  f.event("pageshow");
+  await obsolete.fn();
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.timers.size, 1);
+});

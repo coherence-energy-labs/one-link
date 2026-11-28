@@ -544,6 +544,9 @@ def _local_key_source_label() -> str:
 
 def get_passphrase() -> str | None:
     """Return authority, or ``None`` only when every store proves absence."""
+    from one_link.passphrase_source import adopt_passphrase_file
+
+    adopt_passphrase_file()
     env = os.environ.get(ENV_VAR, "").strip()
     if env:
         _record_key_source(f"{ENV_VAR} environment override")

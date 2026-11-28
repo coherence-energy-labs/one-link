@@ -1,0 +1,642 @@
+{
+  "schema": "one-link-phase-zero-overhaul-coverage/v1",
+  "scope": "Reconciliation of the exact inherited audit ledger, not a release certificate or 100% closure claim",
+  "audit_source_revision": "ae5c81b02aaad0ef7382c94494c21fe3893b6a45",
+  "audit_source_normalized_sha256": "c8b5d4a6307f6f79df719ec669cf036de2c729d35737cd299db7a70d319dbdc3",
+  "root_cause_clusters": {
+    "dependency_and_supply_chain": {
+      "cause": "Unqualified dependency/artifact identity and incomplete vulnerability evidence",
+      "finding_ids": [
+        "RLS-01",
+        "RLS-04"
+      ]
+    },
+    "release_authority": {
+      "cause": "Release governance, artifact identity and build qualification are distinct boundaries",
+      "finding_ids": [
+        "RLS-02",
+        "RLS-03",
+        "RLS-06",
+        "RLS-07",
+        "RLS-08",
+        "REV-S1",
+        "REV-S2"
+      ]
+    },
+    "measurement_integrity": {
+      "cause": "Unbound workloads, observations, comparisons and claim scope",
+      "finding_ids": [
+        "PERF-01",
+        "PERF-02",
+        "PERF-03",
+        "PERF-04",
+        "PERF-05",
+        "PERF-06",
+        "PERF-07",
+        "PERF-08",
+        "BRANCH-03",
+        "REV-P1",
+        "REV-D1"
+      ]
+    },
+    "native_memory_and_algorithms": {
+      "cause": "Incomplete input/length/boundary contracts and retained intermediate state",
+      "finding_ids": [
+        "BRANCH-01",
+        "BRANCH-02",
+        "BRANCH-04",
+        "BRANCH-05",
+        "REV-N1",
+        "REV-N2"
+      ]
+    },
+    "cryptographic_qualification": {
+      "cause": "Secret-dependent behavior and insufficient evidence of constant-time properties",
+      "finding_ids": [
+        "RLS-05",
+        "REV-CT1",
+        "REV-CT2"
+      ]
+    },
+    "storage_authority": {
+      "cause": "Boot and key transitions must preserve the existing data authority",
+      "finding_ids": [
+        "RUN-02",
+        "REV-R1"
+      ]
+    },
+    "browser_state_authority": {
+      "cause": "Shared state and asynchronous lifecycle transitions can overwrite newer state or leave stale timers",
+      "finding_ids": [
+        "RUN-01",
+        "MNT-03",
+        "REV-U1",
+        "FLD-01",
+        "FLD-02"
+      ]
+    },
+    "service_boundaries": {
+      "cause": "Orchestrator monolith and untracked protocol or ownership changes",
+      "finding_ids": [
+        "MNT-01",
+        "MNT-04"
+      ]
+    },
+    "qualification_coverage": {
+      "cause": "Environment-dependent test execution, platform coverage and release evidence",
+      "finding_ids": [
+        "MNT-02"
+      ]
+    },
+    "transfer_ownership_and_receipts": {
+      "cause": "Content identity, delivery authority, admission, ACK ownership and observation time conflated",
+      "finding_ids": [
+        "REV-R2",
+        "FLD-03",
+        "FLD-05"
+      ]
+    },
+    "peer_lifecycle": {
+      "cause": "The reader can wait for a send whose readiness depends on that same reader",
+      "finding_ids": [
+        "FLD-04",
+        "FLD-06"
+      ]
+    }
+  },
+  "findings": [
+    {
+      "id": "RLS-01",
+      "title": "Current dependency checks fail against the committed locks",
+      "root_cause_cluster": "dependency_and_supply_chain",
+      "inherited_status": "implemented_pending_qualification",
+      "inherited_remaining": [
+        "No release artifact was built from this branch, so the dependency inventory of the intended release artifacts is not verified.",
+        "The glib and ml-kem fixes are project-maintained backports; the registry versions stay in the advisories' affected ranges and the ancestor checks must keep running.",
+        "RUSTSEC-2024-0370 (proc-macro-error, unmaintained) remains, exempted by exact id."
+      ],
+      "current_reconciliation": "Prior lock reconciliation covered 88 default-branch alerts; current candidate artifact SBOM and fresh dependency qualification are still required.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "RLS-02",
+      "title": "Release publication does not wait for reproducibility verification",
+      "root_cause_cluster": "release_authority",
+      "inherited_status": "implemented_pending_qualification",
+      "inherited_remaining": [
+        "No release was cut: the two-builder comparison and the refusal to publish on a mismatch have not been observed on a real candidate.",
+        "Windows and macOS wheels, the standalone archives and the SBOM have no independent rebuild."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "RLS-03",
+      "title": "The observed ruleset does not require approving review or named status checks",
+      "root_cause_cluster": "release_authority",
+      "inherited_status": "partially_remediated",
+      "inherited_remaining": [
+        "No tag ruleset exists and the 'release' environment does not exist; both payloads are prepared in docs/RELEASE_PROTECTION.md and neither is applied (see REV-S1).",
+        "One approving review is required and there are no bypass actors, so this pull request needs an approver other than its author."
+      ],
+      "current_reconciliation": "Read-back on this pass confirms active master branch ruleset, no branch bypass, active version-tag protection and protected release environment. Independent approvals and release artifact checks remain open.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "RLS-04",
+      "title": "A failed Python dependency gate prevents later analysis and report upload",
+      "root_cause_cluster": "dependency_and_supply_chain",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "Two historical type-only and comment fingerprints stay documented; neither is a detector-wide or path-wide suppression."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "RLS-05",
+      "title": "A green native workflow includes an incomplete optional strict test pass",
+      "root_cause_cluster": "cryptographic_qualification",
+      "inherited_status": "implemented_pending_qualification",
+      "inherited_remaining": [
+        "The dedicated timing runner is not provisioned, so the controlled-machine run the acceptance names has not happened. It is one manual dispatch of native_timing.yml on a runner labelled one-link-timing.",
+        "Memcheck does not model variable-latency instructions, and the statistical runs were made on a loaded shared workstation. Neither is a proof of constant-time execution."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "RLS-06",
+      "title": "The documented source quickstart omits the required secure-channel native backend",
+      "root_cause_cluster": "release_authority",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "Packaged-device qualification is separate from a source bootstrap.",
+        "macOS runs the native workspace tests and the picker smoke, not the full Python suite."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "RLS-07",
+      "title": "The release-status narrative is stale",
+      "root_cause_cluster": "release_authority",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "Finalize this remediation ledger with exact candidate SHA and hosted outcomes.",
+        "Downloaded final release bytes/signatures/attestations and fresh-device verification remain incomplete."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "RLS-08",
+      "title": "The installed Windows native package identity differs from the checked-out source version",
+      "root_cause_cluster": "release_authority",
+      "inherited_status": "implemented_pending_qualification",
+      "inherited_remaining": [
+        "Linux and Windows only; released artifacts on other devices are not covered by a source run.",
+        "Not every live shard passed on this revision (see MNT-02); the live half of the acceptance is therefore not complete."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "RUN-01",
+      "title": "Firefox required-identity browser-to-daemon pairing did not complete in the live test",
+      "root_cause_cluster": "browser_state_authority",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "Released artifacts, other browsers and networks, and long-duration runs remain separate.",
+        "macOS Firefox was not checked for the cache setting (Linux and Windows were)."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "RUN-02",
+      "title": "Fresh passphrase-mode startup checks for a recovery envelope before creating it",
+      "root_cause_cluster": "storage_authority",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "Linux live discovery is environment-blocked by EPERM; it is not a pass or a passphrase regression.",
+        "Final packaged-install/platform/long-duration qualification remains separate from this verified initialization-order fix."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "PERF-01",
+      "title": "File-engine benchmark corpus is highly compressible and repetitive",
+      "root_cause_cluster": "measurement_integrity",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "Run a controlled representative corpus matrix on target storage/network/hardware before publishing general transfer rates."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "PERF-02",
+      "title": "QUIC-versus-WebRTC scenario does not isolate the two transports",
+      "root_cause_cluster": "measurement_integrity",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "An actual isolated end-to-end QUIC-versus-WebRTC file comparison remains unavailable/unqualified.",
+        "Payload/framing counters are not link-layer packet captures or complete network overhead measurements."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "PERF-03",
+      "title": "Cold-transfer benchmark silently drops missing deliveries",
+      "root_cause_cluster": "measurement_integrity",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "Completion rates and successful latency must remain separate in future product reports."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "PERF-04",
+      "title": "Primitive benchmarks bypass meaningful current daemon costs",
+      "root_cause_cluster": "measurement_integrity",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "These are preparation measurements, not full-transfer speedups.",
+        "Cold first-call allocation sensitivity remains recorded; no speculative warm-up or redundant-read fix was justified."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "PERF-05",
+      "title": "Overlap rule can pass a large median throughput loss",
+      "root_cause_cluster": "measurement_integrity",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "A sufficiently precise comparable final-candidate and baseline timing result remains required.",
+        "The same-binary harness smoke validates measurement plumbing and supplies no implementation speedup evidence."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "PERF-06",
+      "title": "Legacy Python CDC comparison may actually use native C",
+      "root_cause_cluster": "measurement_integrity",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "Do not label format-aware Rust CDC and legacy Gear CDC as identical algorithms or infer transport speed from either primitive."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "PERF-07",
+      "title": "Provenance, repetitions and latency statistics need consistent contracts",
+      "root_cause_cluster": "measurement_integrity",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "Small local samples do not establish tail latency, network variability, hardware coverage or user-facing SLOs."
+      ],
+      "current_reconciliation": "ACK application-read observation retained separately from subsequent accounting. Timing is not packet arrival time.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "PERF-08",
+      "title": "Benchmark workflow path filters and acceptance descriptions are incomplete",
+      "root_cause_cluster": "measurement_integrity",
+      "inherited_status": "implemented_pending_qualification",
+      "inherited_remaining": [
+        "QUIC round trips are 1 to 4% slower than the default branch. No QUIC code of this project changed; the arms differ by the tokio and quinn-proto updates, and quinn-proto 0.11.19 is the security update RLS-01 requires. Which of the two costs the time has not been measured. The owner decides whether to accept that cost and re-baseline after merge.",
+        "The same candidate code measured 0.981 to 0.986 in one study and 0.959 to 0.973 in the next: the between-run spread is larger than each study's own interval, so a 5% limit will sometimes be reached by a difference this size.",
+        "The two chunk-store write metrics are disk-bound and bimodal on hosted runners (about 221 MB/s or about 1.1 GB/s in either arm, a runner disk cap); the study at 64495c4 was inconclusive on them for that reason alone. They should be measured against memory-backed storage or left out of the hosted gate.",
+        "A relative benchmark result does not establish any absolute network throughput target."
+      ],
+      "current_reconciliation": "Earlier 28-metric paired native gate replay passed; local 16-stage diagnostic was 15 successful, one inconclusive QUIC arm. No physical-network superiority inferred; controlled timing and optimization remain.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "MNT-01",
+      "title": "Core runtime is concentrated into exceptionally large classes and stateful handlers",
+      "root_cause_cluster": "service_boundaries",
+      "inherited_status": "partially_remediated",
+      "inherited_remaining": [
+        "Still in Daemon: the transfer domain (about 9,900 lines), the peer dispatcher (4,400), the rest of folder sync (3,200), groups and mesh. Still in UIServer: peer, folder and recovery routes.",
+        "Courier imports remain serialized on the event loop; concurrent workers need a synchronization design first."
+      ],
+      "current_reconciliation": "Consent transitions moved to a typed service port; Daemon 497 methods versus failing combined 501; ratchet tightened, not waived. Remaining transfer, peer and other service decomposition is open.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "MNT-02",
+      "title": "Many existing live-daemon tests are omitted from normal push/PR execution",
+      "root_cause_cluster": "qualification_coverage",
+      "inherited_status": "implemented_pending_qualification",
+      "inherited_remaining": [
+        "Linux and Windows only.",
+        "On hosted Windows runners single live cases fail intermittently: across the last runs on this branch, a daemon that took more than 20 to 30 s to start (a class the repository has carried diagnostics for since July), a folder send that did not land within 30 s, and two folder-sync tests whose expected counts depended on which delivery path won. The count race is fixed in the tests; the slow start and the folder send are not explained. Each now arrives with the daemons' logs and the startup step that was slow. The same cases passed 8 of 8 and 9 of 9 on a workstation."
+      ],
+      "current_reconciliation": "Earlier combined hosted candidate had all 8 live daemon shards pass, but both full suites failed the class census and Windows Chromium failed the stale rendezvous assertion. Local corrections and regression runs are documented separately; require exact-revision hosted rerun.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "MNT-03",
+      "title": "Browser application logic remains concentrated in huge inline scripts",
+      "root_cause_cluster": "browser_state_authority",
+      "inherited_status": "partially_remediated",
+      "inherited_remaining": [
+        "336 cross-module writes remain outside the six named features, each listed with a rationale and held by the ratchet.",
+        "Screenshots are captured for review; there is no pixel-level layout gate."
+      ],
+      "current_reconciliation": "Rendezvous lifecycle now owns one pending timer and one in-flight request; stale completions cannot rearm hidden pages. Generated HTML is current. 336 existing cross-module writes remain under the ownership ratchet.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "MNT-04",
+      "title": "Protocol catalogue omits current completion states and historical test audit is not current evidence",
+      "root_cause_cluster": "service_boundaries",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "Append exact-final-source hosted skip/xfail/execution results; do not add overlapping suite counts."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "BRANCH-01",
+      "title": "ZIP/H264 whole-buffer path accepts a short read as a successful complete scan",
+      "root_cause_cluster": "native_memory_and_algorithms",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "Supported-platform/final-artifact matrix results remain to be attached; no claim covers arbitrary concurrent filesystem mutation beyond the documented contract."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "BRANCH-02",
+      "title": "Bounded payload buffering does not bound dense-record metadata memory",
+      "root_cause_cluster": "native_memory_and_algorithms",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "Hosted sizes stop at 1 GiB; larger logs were measured on one Windows workstation only.",
+        "The smaller buffers cost speed: about 15 to 30% on dense logs and up to a third on sparse ones (hosted runners and a 14-round workstation sweep agree on the direction; the workstation is too noisy to pick an optimum). A larger hashing batch with a small read-ahead should keep the memory limit and restore parallel hashing; that needs a quiet machine.",
+        "Returned output remains O(chunks), and the explicit offset-list APIs keep their O(records) result by design."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "BRANCH-03",
+      "title": "New file APIs have no binding-level tests or in-repository runtime integration evidence",
+      "root_cause_cluster": "measurement_integrity",
+      "inherited_status": "implemented_pending_qualification",
+      "inherited_remaining": [
+        "No end-to-end benchmark with the real caller is recorded.",
+        "One Link's own transfer path stays on plain content-defined chunking on purpose: a deduplication experiment on its corpus did not favour format-aware cuts."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "BRANCH-04",
+      "title": "cdc_file documentation still describes a 512 KiB buffer despite a 32 MiB window",
+      "root_cause_cluster": "native_memory_and_algorithms",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "No constant-total-memory claim; output size and explicit all-offset APIs remain proportional to their result counts."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "BRANCH-05",
+      "title": "Cross-platform determinism fixture does not yet pin exact boundary outputs",
+      "root_cause_cluster": "native_memory_and_algorithms",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "Format-aware boundaries changed definition (version 2); stores that mix versions deduplicate only where the definitions agree."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "REV-CT1",
+      "title": "Shamir sharing forbade a zero top coefficient, which broke perfect secrecy",
+      "root_cause_cluster": "cryptographic_qualification",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "REV-CT2",
+      "title": "Secret-dependent branches and table lookups in onion, key-encapsulation and duress code",
+      "root_cause_cluster": "cryptographic_qualification",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "See RLS-05 for what a Valgrind audit and a noisy-host statistical test do not prove."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "REV-N1",
+      "title": "Chunk profiles FastCDC refuses aborted the process or looped without bound",
+      "root_cause_cluster": "native_memory_and_algorithms",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "REV-N2",
+      "title": "Format-aware chunking did not resynchronise on dense records",
+      "root_cause_cluster": "native_memory_and_algorithms",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "Peers on different boundary versions deduplicate each other only on sparse containers; FORMAT_AWARE_CHUNKING_VERSION is exported so a store can record which definition made a manifest."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "REV-R1",
+      "title": "Setting or unsetting the passphrase variable replaced the key that protected an install's data",
+      "root_cause_cluster": "storage_authority",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "An install already split across two data keys now refuses to start with an explicit message; before, it kept writing under a key that did not protect its data.",
+        "After set-passphrase the old stored database key stays in the keychain; it opens nothing.",
+        "Four test daemons in a row on a hosted Windows runner stalled 26 to 30 s where the data key is acquired. The cause was not found. Two real lock defects on that path are fixed (366c047), the event-loop wait is capped at 2 s, and a slow step now logs where it is stuck."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "REV-R2",
+      "title": "A resumed or retried transfer dropped the requested transport and undercounted itself",
+      "root_cause_cluster": "transfer_ownership_and_receipts",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "The planner's estimate can show a few percent 'already known' on a send with no savings; not fixed here."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "REV-S1",
+      "title": "No tag ruleset and no protected release environment",
+      "root_cause_cluster": "release_authority",
+      "inherited_status": "prepared_not_applied",
+      "inherited_remaining": [
+        "Applying either is a repository-owner decision; this review changed no repository setting."
+      ],
+      "current_reconciliation": "The previously prepared settings were applied in the earlier Phase Zero increment. This pass read them back; tag restriction and review environment are active. Admin tag bypass is retained as documented, not an unrestricted release approval.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "REV-S2",
+      "title": "Required native gates could pass without running",
+      "root_cause_cluster": "release_authority",
+      "inherited_status": "implemented_pending_qualification",
+      "inherited_remaining": [
+        "This pull request is the bootstrap case: the base revision has no policy yet, so the base-copy protection takes effect once it merges.",
+        "A pull request can still edit the workflow file itself; the settings that close that are in docs/RELEASE_PROTECTION.md."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "REV-U1",
+      "title": "Ending an inbound call threw, skipping media teardown",
+      "root_cause_cluster": "browser_state_authority",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "REV-P1",
+      "title": "A QUIC throughput regression was read as a pass",
+      "root_cause_cluster": "measurement_integrity",
+      "inherited_status": "implemented_pending_qualification",
+      "inherited_remaining": [
+        "The first-traffic explanation survived the elimination and the probe points the same way, but the interval includes no difference: it is not established at twenty pairs. In the median the effect is under a fifth of a millisecond, once per process."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "REV-D1",
+      "title": "Evidence and gates that could mislead",
+      "root_cause_cluster": "measurement_integrity",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "Older tracked audit files in this public repository contain a local user-profile path; removing them from history is an owner decision."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "FLD-01",
+      "title": "Every daemon restart invalidated every saved window sign-in",
+      "root_cause_cluster": "browser_state_authority",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "Not covered: a binary older than step 28 writing into a database already past it leaves a row the step will not convert. That row cannot authenticate, so the browser signs in once more. Making the step idempotent needs a stored form that tells a record key from a bearer.",
+        "Rolled onto the install where it was found. The owner's second device still runs older code. Sign-ins invalidated before the roll cannot be restored."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "FLD-02",
+      "title": "An owner window showed two status banners over each other and never recovered by itself",
+      "root_cause_cluster": "browser_state_authority",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "What first answered 401 to the window on 2026-11-25 was not recorded anywhere; FLD-01 explains a 401 after the restart, and the daemon now records the next one.",
+        "The call backfill poll is not suspended during recovery, and the update, key-rotation and install banners are still fixed overlays at the top of the window.",
+        "The browser restart test failed once on hosted Linux for a reason in the test (a probe count over a fixed window). It was corrected to count from the injected 401; with recovery capped at two attempts it still fails."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "FLD-03",
+      "title": "A file waiting for the owner's acceptance made the sender's later files fail",
+      "root_cause_cluster": "transfer_ownership_and_receipts",
+      "inherited_status": "implemented_pending_qualification",
+      "inherited_remaining": [
+        "What keeps this pending: inheriting an undeliverable acceptance is unit-tested but not exercised between two real daemons, and the independent read of this change was by reading, not execution.",
+        "Read from the code, not measured: once the stall deadline parks an accepted offer whose sender never returned, a different delivery of the same file is refused as resume_owned_by_another_delivery, even when the parked copy holds no bytes. The inheritance above covers only the time before that.",
+        "A waiting sender is not told when the wait ends; it finds out on its next retry.",
+        "'Accept all from this device' is remembered only until the daemon restarts; whether it should persist is an owner decision.",
+        "If an inheriting delivery is then refused for another reason (disk space, say), the acceptance is not kept and the owner is asked again. Read from the code; not exercised."
+      ],
+      "current_reconciliation": "Earlier Phase Zero fixed 15 consent/recovery regressions. This pass extracted the authority lifecycle without changing public API; cross-delivery parked supersession and admission-failure grant retention remain open.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "FLD-04",
+      "title": "A daemon asked to stop kept running while any connection stayed open",
+      "root_cause_cluster": "peer_lifecycle",
+      "inherited_status": "implemented_and_verified",
+      "inherited_remaining": [
+        "An explicit stop now interrupts a transfer or a control command in progress instead of waiting for it, which is what it did before Python 3.12. The updater's own drain still refuses to begin while transfers are active.",
+        "The interrupt path (Ctrl-C, Ctrl-Break) is covered against real asyncio servers but not by a real-daemon test.",
+        "On Python 3.11 a closed server does not wait, so only the 3.12 lanes can fail these tests.",
+        "Not examined, by the author or the reviewer: what a stop does to a handler caught in the middle of a durable change. The stores are closed one loop turn after the connections are ended, as before.",
+        "The real-socket test of a closing connection skips on Windows, where the platform accepted all 64 MiB at once; the scripted-writer tests run everywhere.",
+        "Hosted CI on the revision with these corrections."
+      ],
+      "current_reconciliation": "Inherited remediation and evidence retained; no new item-specific closure claimed in this increment.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "FLD-05",
+      "title": "A file sender and its receiver could each wait for the other until the send was reported as paused",
+      "root_cause_cluster": "transfer_ownership_and_receipts",
+      "inherited_status": "implemented_pending_qualification",
+      "inherited_remaining": [
+        "Hosted CI on these revisions.",
+        "No test with real daemons fails deterministically without the first change: the stall needs a slow acknowledgement at one point in the transfer, and nothing in the product lets a test place it. The evidence with real daemons is the before-and-after count.",
+        "A sender that predates the second change still waits out its deadline when a chunk behind a held answer is refused, whatever the receiver runs. Answering what is held before every refusal would fix that for old senders and means touching about forty refusal sites; not done.",
+        "The reply wait's handling of a refusal is tested through the function it calls and a check of the source text, not by driving the daemon's send path; an independent review confirmed it by reading.",
+        "The window controller is told an acknowledgement's age when the send loop next needs room, not when the acknowledgement arrived, so chunks answered together look progressively slower and the window shrinks more often than the link warrants. Recorded, not changed: it affects speed, not completion.",
+        "The disabled QUIC chunk path derives its transfer session from the most recent inbound connection from the peer, which can be a route-verification probe. Read in the source, not tested; the path is off."
+      ],
+      "current_reconciliation": "Bounded ACK receipt window, correlated outstanding IDs, first local read timestamp shared by batch members, malformed/crossed-batch rejection. This eliminates stale cached ID growth and per-settlement timestamp inflation. Wire-arrival latency, disabled QUIC chunk mode and old-sender compatibility remain separately qualified.",
+      "release_qualification": "not_closed_by_this_increment"
+    },
+    {
+      "id": "FLD-06",
+      "title": "A daemon that had rotated its identity froze the connection of a peer that called it",
+      "root_cause_cluster": "peer_lifecycle",
+      "inherited_status": "implemented_pending_qualification",
+      "inherited_remaining": [
+        "Hosted CI on these revisions.",
+        "Found by reading and confirmed with the handler in isolation. It has not been exercised between two real daemons, where it needs one that has rotated and a peer that calls before the certificate is acknowledged.",
+        "It was found while looking for the cause of one hosted failure of the key-rotation live test and is not that cause: there the rotated daemon had made the call.",
+        "One more place has the same shape and was named by the reviewer without being run: a peer that becomes rejected between the accept-time check and its first frame is answered from the read task before CAPS has been received, and nothing wakes that send. It needs the owner to reject the peer in that instant, or the state store to be unavailable."
+      ],
+      "current_reconciliation": "Integrated newer rotation drain ordering; pre-CAPS rejection reproduced on a real socket and corrected to close without a send that waits on its own reader. Real multi-device rotation qualification remains open.",
+      "release_qualification": "not_closed_by_this_increment"
+    }
+  ],
+  "global_requirements": [
+    "Complete final-source hosted correctness, security, browser, native and packaging gates. Preserve failing and inconclusive attempts with their actual source and artifact identities.",
+    "Preserve the original secret-scan finding and successful exact-exception revalidation, then retain final combined-candidate hosted security conclusions.",
+    "Apply and read back the reviewed repository ruleset. RLS-03 is prepared only; enforcement is not established.",
+    "Complete full hosted shell/window qualification and intended released-artifact checks for the verified official-source GLib backport. Maintain the exact patch and live original-version advisory gate; the separate proc-macro-error maintenance warning and eventual upstream toolkit migration remain responsibilities.",
+    "Obtain sufficiently precise comparable benchmark results and supported-platform executions of frozen boundary vectors. Windows UI execution at d2de862 and Python distribution validation at f5fb842 are complete; exact-final-source hosted acceptance remains pending.",
+    "Qualify representative LAN, WAN, storage and multi-gigabyte workloads on physical devices, including long-duration and recovery behavior. Current Windows transfer durations establish correctness observations only.",
+    "Run dedicated controlled timing and fresh formal or released-artifact signature and provenance verification where claimed. Functional tests do not certify side-channel resistance or universal safety.",
+    "Continue incremental Daemon and UIServer service decomposition and browser feature-state separation. Production use of the distinct Rust format-aware pathname API remains unqualified."
+  ]
+}

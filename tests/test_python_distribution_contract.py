@@ -51,6 +51,7 @@ def _stage_distribution_source(destination: Path) -> None:
         "LICENSE",
         "LICENSE-NOTICE",
         "NOTICE",
+        "THIRD_PARTY_NOTICES.md",
         "README.md",
         "pyproject.toml",
         "setup.py",
@@ -91,7 +92,14 @@ def test_stable_distribution_contract_exactly_matches_source_tree() -> None:
     # daemon ends its open connections.
     # 226: ack_batching (imported by daemon), 2026-11-26: when a file sender may
     # wait for an acknowledgement and when a receiver answers a short batch.
-    assert len(build_identity.EXPECTED_STABLE_RUNTIME_MODULES) == 226
+    # 229: passphrase_source (imported by identity, keychain and cli),
+    # peer_admission and transfer_names (imported by daemon), 2026-11-26: the
+    # passphrase-file source, the decisions about peers without standing, and
+    # the received-file-name sanitiser. The last two hold logic moved out of
+    # Daemon.
+    # 230: task_refs (imported by daemon, server and lan_discovery),
+    # 2026-11-26: holds fire-and-forget tasks so they cannot be collected.
+    assert len(build_identity.EXPECTED_STABLE_RUNTIME_MODULES) == 230
     assert build_identity.EXPECTED_STABLE_RUNTIME_MODULES == tuple(
         sorted(set(build_identity.EXPECTED_STABLE_RUNTIME_MODULES))
     )
@@ -171,9 +179,11 @@ def test_distribution_source_contract_hashes_every_packaged_python_file() -> Non
     # (239 / 262 before them.) Two more the same day: held_offers, owner_auth_note.
     # (241 / 264 before it.) connection_shutdown, 2026-11-26.
     # (242 / 265 before it.) ack_batching, 2026-11-26.
-    assert len(source_python) == 243
+    # (243 / 266 before them.) passphrase_source, peer_admission,
+    # transfer_names, 2026-11-26. (246 / 269 before it.) task_refs, same day.
+    assert len(source_python) == 247
     assert packaged_python == source_python
-    assert len(contract.payload_hashes) == 266
+    assert len(contract.payload_hashes) == 270
 
 
 def test_developer_only_modules_are_not_stable_distribution_requirements() -> None:
@@ -318,6 +328,7 @@ def test_core_wheel_configuration_is_genuinely_universal() -> None:
         "LICENSE",
         "LICENSE-NOTICE",
         "NOTICE",
+        "THIRD_PARTY_NOTICES.md",
     ]
     assert project["build-system"]["requires"] == [
         "setuptools>=84.1,<85",

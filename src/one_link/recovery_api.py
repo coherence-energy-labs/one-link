@@ -1042,6 +1042,8 @@ def test_shares_against_current_seed(
     import secrets as _secrets
     out: dict[str, Any] = {
         "valid_recovery": False,
+        "integrity_verified": False,
+        "unverifiable_legacy_shares": False,
         "matches_current_seed": False,
         "matches_current_identity": False,
         "matches_current_data_root": False,
@@ -1058,7 +1060,7 @@ def test_shares_against_current_seed(
         out["error"] = "need at least 2 shares to verify"
         return out
     try:
-        candidate = social_recovery.combine_shares(shares)
+        candidate, verified = social_recovery.combine_shares_checked(shares)
     except (ValueError, TypeError) as e:
         out["error"] = str(e)
         return out
@@ -1068,7 +1070,18 @@ def test_shares_against_current_seed(
             f"expected {master_seed.SEED_LEN_BYTES}"
         )
         return out
-    out["valid_recovery"] = True
+    # Reconstruction always returns bytes. Only shares that carry the seed's
+    # digest can prove those bytes are the seed; for older shares the answer
+    # stays "unknown" unless it matches the seed already on this install.
+    out["integrity_verified"] = verified
+    out["unverifiable_legacy_shares"] = not verified
+    out["valid_recovery"] = verified
+    if not verified:
+        out["error"] = (
+            "these shares were created by an older version and carry no "
+            "integrity check; they can only be confirmed against a seed that "
+            "is already on this device. Re-issue shares to get checked ones."
+        )
     try:
         current = master_seed.load_seed(Path(data_dir))
     except Exception as exc:
@@ -2344,6 +2357,7 @@ def restore_from_shares(
     data_dir: Path,
     shares: list[tuple[int, bytes]],
     delete_identity_files: bool,
+    allow_unverified_legacy_shares: bool = False,
 ) -> bytes:
     """Combine K unwrapped Shamir shares and stage recovered authority.
 
@@ -2353,17 +2367,24 @@ def restore_from_shares(
     Each share is (share_index, share_bytes) as produced by the
     guardian's unwrap_share call (or the unwrap HTTP endpoint).
     Must supply at least K of N where K is the threshold the
-    original split used; the combine step infers K from the
-    supplied count.
+    original split used.
 
     Raises ValueError on malformed shares OR on combine failure
-    (e.g., shares from different splits, fewer than threshold).
+    (e.g., shares from different splits, fewer than threshold). Current
+    shares carry a digest of the seed, so a wrong reconstruction is detected
+    and nothing is staged. Shares made by older versions carry no such
+    digest: too few of them, or a mix from two setups, reconstruct a wrong
+    seed that cannot be told from the right one. Those are refused unless
+    ``allow_unverified_legacy_shares`` is set, which the caller should do
+    only after the owner confirmed they supplied the full threshold.
     Returns the 32-byte reconstructed seed for immediate verification.
     """
     from one_link import master_seed, social_recovery
     if not shares or len(shares) < 2:
         raise ValueError("need at least 2 shares to recover")
-    seed = social_recovery.combine_shares(shares)
+    seed = social_recovery.combine_shares(
+        shares, allow_unverified=allow_unverified_legacy_shares
+    )
     if len(seed) != master_seed.SEED_LEN_BYTES:
         raise ValueError(
             f"reconstructed seed has wrong length {len(seed)}; "
@@ -2404,6 +2425,20 @@ def parse_held_share_blob(blob: bytes) -> dict[str, Any]:
         "setup_ms": wrapped.setup_ms,
         "wrapped_blob": wrapped.encoded,
     }
+
+
+def held_share_creator_fingerprint(blob: bytes) -> str | None:
+    """Fingerprint of the identity that signed a wrapped share.
+
+    ``None`` for a share from an older version, which is unsigned. A guardian
+    compares this with the fingerprint of the person who asked them to hold
+    the share; a signed share that fails verification does not parse at all.
+    """
+    from one_link import social_recovery
+    from one_link.identity import fingerprint_of
+
+    creator = social_recovery.WrappedShare.parse(blob).creator_ed_pub
+    return fingerprint_of(creator) if creator else None
 
 
 def reset_all_recovery_state(state) -> None:

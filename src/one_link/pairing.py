@@ -317,12 +317,31 @@ class PairingTracker:
         # order so the new entry is youngest.
         self._by_peer.pop(peer_fp, None)
         self._by_peer[peer_fp] = ctx
-        # v0.20.7 (security audit M19): hard cap. On overflow drop the
-        # oldest entry. begin() being the only insertion point means
-        # we can enforce here without scanning.
+        # v0.20.7 (security audit M19): hard cap. begin() is the only
+        # insertion point, so the cap is enforced here.
         while len(self._by_peer) > MAX_PAIR_CONTEXTS:
-            self._by_peer.popitem(last=False)
+            self._by_peer.pop(self._eviction_victim(keep=peer_fp), None)
         return ctx
+
+    def _eviction_victim(self, *, keep: str) -> str:
+        """Pick the context to drop when the table is full.
+
+        Finished, expired and unsolicited inbound contexts go first, oldest
+        first. A pairing the owner started or confirmed is dropped only when
+        nothing else is left, so a flood of inbound requests cannot cancel it.
+        """
+        fallback: Optional[str] = None
+        for fp, existing in self._by_peer.items():
+            if fp == keep:
+                continue
+            if existing.is_expired() or existing.state not in (
+                PairState.REQUESTED,
+                PairState.CONFIRMED,
+            ):
+                return fp
+            if fallback is None:
+                fallback = fp
+        return fallback if fallback is not None else keep
 
     def we_confirm(self, peer_fp: str) -> Optional[PairContext]:
         self._maybe_evict_expired(peer_fp)

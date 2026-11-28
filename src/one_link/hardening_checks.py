@@ -217,6 +217,40 @@ def check_at_rest_encryption(is_encrypted: bool) -> list[Finding]:
     return findings
 
 
+def check_identity_key_protection(key_file: Path) -> list[Finding]:
+    """Report how the long-term identity key is protected at rest."""
+    from one_link import identity
+
+    try:
+        with open(key_file, "rb") as fh:
+            head = fh.read(256)
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        return [Finding("warn", "identity", f"identity key could not be inspected: {exc}")]
+    protection = identity.key_file_protection(head)
+    if protection == identity.PROTECTION_SEALED:
+        return [Finding(
+            "info", "identity",
+            "identity key: sealed with a passphrase (scrypt + ChaCha20-Poly1305).",
+        )]
+    if protection == identity.PROTECTION_LEGACY_PEM:
+        return [Finding(
+            "warn", "identity",
+            "identity key: encrypted with the old PBKDF2 wrapping (2,048 "
+            "rounds). Start One Link once with the passphrase available and "
+            "it is re-sealed with scrypt automatically.",
+        )]
+    return [Finding(
+        "warn", "identity",
+        "identity key: stored unencrypted, protected only by file "
+        "permissions. Anyone who copies this file (a backup, a synced "
+        "folder, a stolen disk) can impersonate this device. Set "
+        "ONE_LINK_PASSPHRASE_FILE to a file holding a passphrase, or "
+        "ONE_LINK_PASSPHRASE, to seal it.",
+    )]
+
+
 def run_all_checks(
     *,
     data_dir: Path,
@@ -230,6 +264,9 @@ def run_all_checks(
     operator to audit interactively."""
     all_findings: list[Finding] = []
     all_findings.extend(check_at_rest_encryption(is_encrypted))
+    from one_link.paths import key_path
+
+    all_findings.extend(check_identity_key_protection(key_path()))
     all_findings.extend(check_file_permissions(data_dir))
     all_findings.extend(check_cloud_sync_colocation(data_dir))
     all_findings.extend(check_network_bind(bind_host, lan_explicit))

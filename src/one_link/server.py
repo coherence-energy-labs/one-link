@@ -56,7 +56,7 @@ install_windows_platform_fastpath()
 
 from aiohttp import WSMsgType, web
 
-from one_link import certified_surface, control_ipc
+from one_link import certified_surface, control_ipc, task_refs
 from one_link.build_identity import runtime_build_identity
 from one_link.call_routes import CallRouter
 from one_link.owner_auth_note import note_refused_owner_request
@@ -151,9 +151,32 @@ def _atomic_settings_update(handler):
         transaction = getattr(state, "durable_write_transaction", None)
         if state is None or not callable(transaction):
             return await handler(self, request)
+        # Everything the handler waits for has to arrive before the
+        # transaction opens. The request body is the only such thing: read it
+        # now, so a client that sends it one byte a minute holds nothing.
+        read_body = getattr(request, "read", None)
+        if callable(read_body):
+            arriving = read_body()
+            if hasattr(arriving, "__await__"):
+                await arriving
         try:
             with transaction():
-                response = await handler(self, request)
+                # Run the handler to completion without ever yielding to the
+                # event loop. While this transaction is open it holds the
+                # state write lock; any other coroutine that ran in the gap
+                # would have its own writes folded into this commit, and
+                # rolled back with it if this request were refused.
+                step = handler(self, request)
+                try:
+                    step.send(None)
+                except StopIteration as finished:
+                    response = finished.value
+                else:
+                    step.close()
+                    raise RuntimeError(
+                        f"{handler.__name__} waited on something inside its "
+                        "settings transaction; do the waiting before it opens"
+                    )
                 if response.status >= 400:
                     raise _SettingsResponseRollback(response)
             return response
@@ -1421,7 +1444,95 @@ SESSION_LABELS_SETTING = "ui_session_labels_enabled"
 SESSION_AUTOPRUNE_REVOKED_AFTER_DAYS = 7
 MAX_JSON_REQUEST_BYTES = 256 * 1024
 MAX_REQUEST_TARGET_BYTES = 8 * 1024
+_CSP_HOST_SOURCE_RE = re.compile(
+    r"(?:[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?|\[[0-9A-Fa-f:.]{2,45}\])(?::[0-9]{1,5})?"
+)
+
+
+DEV_PAGES_ENV = "ONE_LINK_SERVE_DEV_PAGES"
+
+
+def _dev_pages_enabled() -> bool:
+    """Developer-only pages are served only when asked for by name.
+
+    A self-test harness is a developer tool. Release bundles leave the file
+    out; a source or pip install has it on disk, so its route also needs an
+    explicit opt-in before it serves anything to whoever can reach the port.
+    """
+    return os.environ.get(DEV_PAGES_ENV) == "1"
+
+
+def _owner_connect_src(host: str | None) -> str:
+    """``connect-src`` for the owner page.
+
+    The owner page talks to this daemon and nothing else: same-origin API
+    calls and one WebSocket back to the same host. The policy used to allow
+    every ``https:`` and ``wss:`` origin, which is the easiest way for an
+    injected script to carry the owner's bearer off the machine. ``'self'``
+    covers the API calls; the WebSocket origins are spelled out because not
+    every browser lets ``'self'`` match ``ws:``. A Host header that is not a
+    plain host[:port] is ignored rather than copied into a response header.
+    """
+    if host and _CSP_HOST_SOURCE_RE.fullmatch(host):
+        return f"connect-src 'self' ws://{host} wss://{host}; "
+    return "connect-src 'self'; "
+
+
 RATE_LIMIT_WINDOW_SECONDS = 60.0
+# Rate-limit buckets are keyed by remote address. The map is swept of idle
+# buckets once it reaches SWEEP_MIN entries and never holds more than MAX.
+RATE_BUCKETS_SWEEP_MIN = 1_024
+RATE_BUCKETS_MAX = 65_536
+
+
+class RateBuckets(dict):
+    """The rate limiter's ``(bucket, key) -> timestamps`` map, plus the two
+    numbers its sweep needs. A plain ``dict`` works in its place and simply
+    starts each sweep decision from the defaults."""
+
+    sweep_at = RATE_BUCKETS_SWEEP_MIN
+    longest_window = RATE_LIMIT_WINDOW_SECONDS
+
+
+def rate_limited(
+    buckets: dict,
+    bucket_name: str,
+    key: str,
+    *,
+    limit: int,
+    window_seconds: float = RATE_LIMIT_WINDOW_SECONDS,
+) -> bool:
+    """Record one event for ``(bucket_name, key)``; ``True`` if over ``limit``.
+
+    Keys come from remote addresses, so the map is swept as it grows: a
+    bucket with nothing inside its window carries no information and is
+    dropped. The sweep threshold doubles with the live population, which
+    keeps the cost amortised constant. When every bucket is live and the map
+    is full, a new key is refused; evicting one would reset somebody's limit.
+    """
+    now = time.monotonic()
+    bucket_key = (bucket_name, key)
+    bucket = buckets.get(bucket_key)
+    if bucket is None:
+        longest = max(getattr(buckets, "longest_window", RATE_LIMIT_WINDOW_SECONDS), window_seconds)
+        if len(buckets) >= getattr(buckets, "sweep_at", RATE_BUCKETS_SWEEP_MIN):
+            horizon = now - longest
+            for stale in [k for k, b in buckets.items() if not b or b[-1] <= horizon]:
+                del buckets[stale]
+            if isinstance(buckets, RateBuckets):
+                buckets.sweep_at = max(RATE_BUCKETS_SWEEP_MIN, 2 * len(buckets))
+        if isinstance(buckets, RateBuckets):
+            buckets.longest_window = longest
+        if len(buckets) >= RATE_BUCKETS_MAX:
+            return True
+        bucket = buckets[bucket_key] = deque()
+    cutoff = now - window_seconds
+    while bucket and bucket[0] <= cutoff:
+        bucket.popleft()
+    if len(bucket) >= limit:
+        return True
+    bucket.append(now)
+    return False
 MAX_FAILED_AUTH_ATTEMPTS = 32
 MAX_DISCOVER_INVITES = 256
 MAX_PUBLIC_INVITE_PREVIEWS = 24
@@ -2853,7 +2964,7 @@ class UIServer:
         # window so silent sockets cannot consume the listener indefinitely.
         self._pending_signaling_total = 0
         self._pending_signaling_by_client: dict[str, int] = {}
-        self._rate_buckets: dict[tuple[str, str], deque[float]] = {}
+        self._rate_buckets: dict[tuple[str, str], deque[float]] = RateBuckets()
         self._update_install_lock = asyncio.Lock()
         self._update_capability_lock = asyncio.Lock()
         self._update_handoff_committed = False
@@ -4775,16 +4886,9 @@ class UIServer:
         limit: int,
         window_seconds: float = RATE_LIMIT_WINDOW_SECONDS,
     ) -> bool:
-        now = time.monotonic()
-        bucket_key = (bucket_name, key)
-        bucket = self._rate_buckets.setdefault(bucket_key, deque())
-        cutoff = now - window_seconds
-        while bucket and bucket[0] <= cutoff:
-            bucket.popleft()
-        if len(bucket) >= limit:
-            return True
-        bucket.append(now)
-        return False
+        return rate_limited(
+            self._rate_buckets, bucket_name, key, limit=limit, window_seconds=window_seconds
+        )
 
     # 2026-05-21 audit T2-O: HTTP methods that mutate state must
     # pass an Origin / Referer check on top of the token. Otherwise
@@ -4972,6 +5076,8 @@ class UIServer:
         rejection, OOO delivery, small-order rejection, header
         encode/decode, kdf advance. Useful for verifying browser
         compatibility (X25519 in WebCrypto requires a recent build)."""
+        if not _dev_pages_enabled():
+            return web.Response(status=404, text="not found")
         p = WEB_DIR / "dr_test.html"
         if not p.is_file():
             return web.Response(status=404, text="dr_test.html not bundled")
@@ -5230,7 +5336,7 @@ class UIServer:
             f"script-src 'self' {_script_hashes}; "
             "style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data: blob:; "
-            "connect-src 'self' ws: wss: https:; "
+            f"{_owner_connect_src(request.host)}"
             "media-src 'self' blob:; "
             "worker-src 'self' blob:; "
             "frame-src 'none'; "
@@ -13327,8 +13433,8 @@ class UIServer:
         try:
             recovery_api.restore_from_shares(
                 data_dir=data_dir(),
-                shares=share_tuples,
-                delete_identity_files=destructive,
+                shares=share_tuples, delete_identity_files=destructive,
+                allow_unverified_legacy_shares=bool(data.get("allow_unverified_legacy_shares")),
             )
         except ValueError as e:
             return web.json_response({"error": str(e)}, status=400)
@@ -19229,7 +19335,7 @@ class UIServer:
                     "error": str(e),
                 })
 
-        loop.create_task(_bg_scan())
+        task_refs.spawn(_bg_scan())
 
         return web.json_response({
             "ok": True, "folder": f, "scan_status": "in_progress",
@@ -21180,7 +21286,7 @@ class UIServer:
                 })
             except Exception as e:
                 log.warning("relocate rescan for %s failed: %s", name, e)
-        loop.create_task(_bg_scan())
+        task_refs.spawn(_bg_scan())
         return web.json_response({"ok": True, "folder": row})
 
     async def api_folder_audit(self, request: web.Request) -> web.Response:
@@ -22458,8 +22564,6 @@ class UIServer:
         mat = self._materialize_group(bytes.fromhex(gid_hex))
         title = (mat.get("name") if mat else None) or f"Group {gid_hex[:8]}"
         # recent_group_messages already exists; pull a generous batch.
-        with contextlib.suppress(Exception):
-            self.daemon.state.recent_group_messages
         msgs = self.daemon.state.recent_group_messages(
             group_id=bytes.fromhex(gid_hex), limit=100_000,
         )
@@ -28228,7 +28332,7 @@ class UIServer:
             async def _shutdown_for_update() -> None:
                 await self.daemon.request_shutdown(delay_s=0.75)
 
-            asyncio.create_task(_shutdown_for_update())
+            task_refs.spawn(_shutdown_for_update())
             return web.json_response(
                 {
                     "status": "handoff_started",
@@ -28299,7 +28403,7 @@ class UIServer:
         async def _shutdown_soon():
             log.info("daemon shutdown: requesting clean shutdown")
             await self.daemon.request_shutdown(delay_s=0.5)
-        asyncio.create_task(_shutdown_soon())
+        task_refs.spawn(_shutdown_soon())
 
         return resp
 

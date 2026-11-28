@@ -229,10 +229,16 @@ lock.
   defense. As of v0.20.7 (audit fix H22) `PRAGMA secure_delete=ON`
   makes the disappearing-messages reaper actually scrub plaintext
   from freed pages + WAL.
-- The Ed25519 identity key is unencrypted PEM by default. Setting
-  `ONE_LINK_PASSPHRASE` before launch wraps it with PBKDF2-derived
-  PKCS#8 encryption (transparent migration from unencrypted on
-  next successful load).
+- The Ed25519 identity key is unencrypted PEM by default, protected
+  only by file permissions; the startup security report and the Privacy
+  panel say so. Supplying a passphrase seals it with ChaCha20-Poly1305
+  under a scrypt-derived key (N=2^17, r=8, p=1, about 128 MiB per
+  guess), the same cost as the lockbox. Supply the passphrase with
+  `ONE_LINK_PASSPHRASE_FILE` (a file only the service can read: a
+  systemd credential, a Docker or Kubernetes secret) or with
+  `ONE_LINK_PASSPHRASE`. An unencrypted key, and a key written by an
+  older release with PKCS#8 PBKDF2 encryption (2,048 rounds), is
+  re-sealed on the next successful load with a passphrase.
 - File-mode 0600 on POSIX (audit fix H19 makes the write atomic).
   On Windows, `os.chmod` is a partial story; the inherited
   `%APPDATA%` ACL is the practical defense until the explicit

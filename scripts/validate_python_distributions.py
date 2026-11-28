@@ -46,6 +46,7 @@ REQUIRED_SDIST_BUILD_INPUTS = (
     "LICENSE",
     "LICENSE-NOTICE",
     "NOTICE",
+    "THIRD_PARTY_NOTICES.md",
     "README.md",
     "pyproject.toml",
     "setup.py",

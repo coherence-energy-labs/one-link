@@ -80,7 +80,7 @@ def test_the_self_test_page_is_declared_unpackaged() -> None:
 
 
 def test_both_separators_reach_the_spec_filter() -> None:
-    """Asserted against the PARSED list the filter consults, not the generator's source text.
+    r"""Asserted against the PARSED list the filter consults, not the generator's source text.
 
     The filter matches raw PyInstaller paths, which use `/` on POSIX and `\` on Windows, so a
     single spelling silently ships the page on the other platform. Parsing the emitted
@@ -126,6 +126,8 @@ async def test_the_route_answers_404_when_the_page_is_absent(tmp_path, monkeypat
     from one_link import server as server_mod
 
     monkeypatch.setattr(server_mod, "WEB_DIR", tmp_path)
+    # Opted in, so the 404 is about the missing file and not the opt-in.
+    monkeypatch.setenv(server_mod.DEV_PAGES_ENV, "1")
     ui = server_mod.UIServer.__new__(server_mod.UIServer)
     response = await ui._dr_test_page(None)  # type: ignore[arg-type]
     assert response.status == 404
@@ -140,6 +142,12 @@ async def test_the_route_still_serves_when_the_page_IS_present(tmp_path, monkeyp
     (tmp_path / "dr_test.html").write_text("<h1>self test</h1>", encoding="utf-8")
     monkeypatch.setattr(server_mod, "WEB_DIR", tmp_path)
     ui = server_mod.UIServer.__new__(server_mod.UIServer)
+    # A source or pip install has the page on disk. It is still not served
+    # until the operator asks for developer pages by name.
+    monkeypatch.delenv(server_mod.DEV_PAGES_ENV, raising=False)
+    hidden = await ui._dr_test_page(None)  # type: ignore[arg-type]
+    assert hidden.status == 404 and "self test" not in hidden.text
+    monkeypatch.setenv(server_mod.DEV_PAGES_ENV, "1")
     response = await ui._dr_test_page(None)  # type: ignore[arg-type]
     assert response.status == 200
     assert "self test" in response.text

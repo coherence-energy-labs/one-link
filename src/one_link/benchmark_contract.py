@@ -86,7 +86,7 @@ def cpu_model() -> str:
                     if line.lower().startswith(("model name", "hardware", "cpu model")):
                         return line.split(":", 1)[1].strip()
         if platform.system() == "Darwin":
-            out = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True, timeout=5)
+            out = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True, timeout=5, check=False)
             if out.returncode == 0 and out.stdout.strip():
                 return out.stdout.strip()
     except (OSError, ValueError, subprocess.SubprocessError):

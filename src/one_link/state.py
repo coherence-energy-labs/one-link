@@ -763,6 +763,28 @@ CREATE INDEX IF NOT EXISTS idx_reactions_target ON message_reactions(target_msg_
 """
 
 
+def _sync_directory_entry(path: Path) -> None:
+    """Make a just-renamed file's name durable where the OS allows it.
+
+    Best effort: the file's contents are already synced, and a filesystem
+    that cannot sync a directory must not stop an upgrade. Windows exposes no
+    directory sync through Python.
+    """
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0))
+    with contextlib.suppress(OSError):
+        fd = os.open(str(path.parent), flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+class StateSchemaTooNewError(RuntimeError):
+    """The database was written by a newer release than this one."""
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -1499,6 +1521,22 @@ class State:
         with self._write_lock:
             c = self._conn.cursor()
             try:
+                stored = self._stored_schema_version(c)
+                if stored is not None and stored > self.LATEST_SCHEMA_VERSION:
+                    # Written by a newer release. Running this build's
+                    # CREATE-IF-NOT-EXISTS script and backfills over a layout
+                    # it has never seen would damage it quietly; refusing is
+                    # the only safe answer, and it leaves the file untouched.
+                    raise StateSchemaTooNewError(
+                        f"{self.db_path} has schema version {stored}, but this "
+                        f"version of One Link only understands up to "
+                        f"{self.LATEST_SCHEMA_VERSION}. It was last opened by a "
+                        "newer release. Install that release again, or restore "
+                        "the snapshot it saved next to the database before it "
+                        "upgraded."
+                    )
+                if stored is not None and stored < self.LATEST_SCHEMA_VERSION:
+                    self._snapshot_before_migration(c, stored)
                 # Bootstrap v1. SCHEMA_V1 is composed entirely of
                 # ``CREATE ... IF NOT EXISTS`` statements (tables,
                 # virtual tables, triggers, indexes), so a crash mid-
@@ -1551,16 +1589,116 @@ class State:
                     (29, self._migrate_v29_file_index_identity),
                     (30, self._migrate_v30_folder_pending_applies),
                 ]
+                if steps[-1][0] != self.LATEST_SCHEMA_VERSION:
+                    raise RuntimeError(
+                        "LATEST_SCHEMA_VERSION does not match the last migration step"
+                    )
                 for target_version, apply_fn in steps:
                     self._run_atomic_migration(
                         c,
                         target_version=target_version,
                         current_version=current,
                         apply=apply_fn,
-                        exactly_once=target_version in self._EXACTLY_ONCE_MIGRATIONS,
+                        exactly_once=target_version not in self._REAPPLIED_EVERY_BOOT,
                     )
+                if stored is not None and stored < self.LATEST_SCHEMA_VERSION:
+                    self._prune_migration_snapshots(keep_version=stored)
             finally:
                 c.close()
+
+    #: Highest schema version this build writes. A database stamped higher
+    #: was written by a newer release and is refused.
+    LATEST_SCHEMA_VERSION = 30
+
+    @staticmethod
+    def _stored_schema_version(c: sqlite3.Cursor) -> Optional[int]:
+        """Schema version of an existing database, ``None`` for a new file."""
+        has_table = c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'"
+        ).fetchone()
+        if not has_table:
+            return None
+        row = c.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+
+    def _migration_snapshot_path(self, version: int) -> Path:
+        db = Path(self.db_path)
+        return db.with_name(f"{db.name}.pre-migration-v{version}.bak")
+
+    def _snapshot_before_migration(self, c: sqlite3.Cursor, stored: int) -> None:
+        """Keep a copy of the database as it was before this upgrade.
+
+        Migrations rewrite the only copy of the user's messages, peers and
+        keys in place. If a step is wrong, or the new release has to be
+        rolled back, the snapshot is the way home: stop One Link, move the
+        snapshot over the database file, start the previous release.
+
+        A snapshot that already exists for this version is kept as is; it
+        was taken before an earlier attempt at the same upgrade and is the
+        more pristine of the two.
+        """
+        db = Path(self.db_path)
+        if not db.is_file():
+            return  # in-memory database
+        target = self._migration_snapshot_path(stored)
+        if target.exists():
+            return
+        partial = target.with_name(target.name + ".partial")
+        try:
+            with contextlib.suppress(FileNotFoundError):
+                partial.unlink()
+            try:
+                # A transactionally consistent copy. Under SQLCipher the copy
+                # is encrypted with the same key as the original.
+                c.execute("VACUUM INTO ?", (str(partial),))
+            except sqlite3.Error:
+                # Builds without VACUUM INTO: fold the WAL into the main file
+                # and copy it. The write lock is held and nothing has been
+                # written on this connection yet, so the file is quiescent.
+                with contextlib.suppress(FileNotFoundError):
+                    partial.unlink()
+                c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                import shutil
+
+                shutil.copyfile(db, partial)
+            with contextlib.suppress(OSError):
+                os.chmod(partial, 0o600)
+            # Windows flushes through FlushFileBuffers, which needs a handle
+            # opened for writing; a read-only handle fails with EBADF there.
+            with open(partial, "r+b") as fh:
+                os.fsync(fh.fileno())
+            os.replace(partial, target)
+            _sync_directory_entry(target)
+        except Exception as exc:
+            with contextlib.suppress(OSError):
+                partial.unlink()
+            if os.environ.get("ONE_LINK_ALLOW_UNSNAPSHOTTED_MIGRATION") == "1":
+                log.warning(
+                    "state.db schema upgrade v%s -> v%s is proceeding WITHOUT a "
+                    "snapshot (%s); ONE_LINK_ALLOW_UNSNAPSHOTTED_MIGRATION is set",
+                    stored, self.LATEST_SCHEMA_VERSION, exc,
+                )
+                return
+            raise RuntimeError(
+                f"could not save a snapshot of {db} before upgrading its schema "
+                f"from v{stored} to v{self.LATEST_SCHEMA_VERSION}: {exc}. Free "
+                "disk space and start again; the database has not been changed. "
+                "To upgrade without a snapshot, set "
+                "ONE_LINK_ALLOW_UNSNAPSHOTTED_MIGRATION=1."
+            ) from exc
+        log.info(
+            "state.db: saved pre-upgrade snapshot %s (schema v%s -> v%s)",
+            target.name, stored, self.LATEST_SCHEMA_VERSION,
+        )
+
+    def _prune_migration_snapshots(self, *, keep_version: int) -> None:
+        """After a successful upgrade keep only the snapshot it started from."""
+        db = Path(self.db_path)
+        keep = self._migration_snapshot_path(keep_version)
+        for old in db.parent.glob(f"{db.name}.pre-migration-v*.bak"):
+            if old != keep:
+                with contextlib.suppress(OSError):
+                    old.unlink()
 
     # Migrations that transform stored values one way. The runner re-applies
     # every other step on every boot (they are idempotent backfills); these
@@ -1585,6 +1723,16 @@ class State:
     # Making the step idempotent would need a stored form that tells a record
     # key from a bearer; the two are indistinguishable today.
     _EXACTLY_ONCE_MIGRATIONS = frozenset({28})
+
+    # The steps that existed when "re-apply everything on every boot" was the
+    # rule, minus the one known to be one-way. They keep that behaviour,
+    # because some of them double as boot-time backfills.
+    #
+    # Every step added after them runs exactly once. Re-running is the unsafe
+    # default: step 28 showed that a one-way step nobody remembered to list
+    # corrupts data on every start. A new step that really is an idempotent
+    # backfill opts in by being added here, where the choice is visible.
+    _REAPPLIED_EVERY_BOOT = frozenset(range(2, 31)) - _EXACTLY_ONCE_MIGRATIONS
 
     def _run_atomic_migration(
         self,
@@ -2786,6 +2934,125 @@ class State:
         # sites; applied_default_ttl is for tests + a future caller
         # that wants the signal.
 
+    # Rows about a peer in these tables are route and hostname caches. They
+    # are dropped together with a pruned pending peer. Every other table that
+    # names a peer is history, and a peer with history is never pruned.
+    _PENDING_PRUNE_CACHE_DELETES = {
+        "route_memory": "DELETE FROM route_memory WHERE peer_fp = ?",
+        "route_candidates": "DELETE FROM route_candidates WHERE peer_fp = ?",
+        "hostname_keys": "DELETE FROM hostname_keys WHERE fingerprint = ?",
+    }
+
+    def _peer_history_tables_locked(self, c: sqlite3.Cursor) -> list[tuple[str, str]]:
+        """Every ``(table, column)`` that ties stored history to a peer.
+
+        Read from the live schema rather than a hand-kept list, so a table
+        added later protects its peers from pruning without anyone having to
+        remember this function exists.
+        """
+        cache_tables = set(self._PENDING_PRUNE_CACHE_DELETES)
+        out: list[tuple[str, str]] = []
+        names = [
+            row[0]
+            for row in c.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        ]
+        for name in names:
+            if name == "peers" or name in cache_tables or name.startswith("sqlite_"):
+                continue
+            quoted = name.replace('"', '""')
+            columns = {
+                row[1] for row in c.execute(f'PRAGMA table_info("{quoted}")').fetchall()
+            }
+            for column in ("peer_fp", "fingerprint"):
+                if column in columns:
+                    out.append((quoted, column))
+        return out
+
+    def prune_pending_peers(self, *, keep: int, protect: Iterable[str] = ()) -> int:
+        """Delete surplus pending peers that never became anything.
+
+        Anyone who completes a handshake gets a ``pending`` row, and a fresh
+        identity costs the remote party nothing, so the count has to be
+        bounded here. When more than ``keep`` pending rows exist, the least
+        recently seen ones are deleted until the count fits, skipping any row
+        the owner touched (alias, verification, mute), any fingerprint in
+        ``protect`` (peers connected right now), and any peer that a history
+        table still refers to. Pinned and rejected peers are never considered.
+
+        Returns the number of peers deleted.
+        """
+        if keep < 0:
+            raise ValueError("keep must not be negative")
+        protected = set(protect)
+        with self._write_lock:
+            c = self._conn.cursor()
+            try:
+                total = c.execute(
+                    "SELECT COUNT(*) FROM peers WHERE trust = 'pending'"
+                ).fetchone()[0]
+                surplus = int(total) - keep
+                if surplus <= 0:
+                    return 0
+                history = self._peer_history_tables_locked(c)
+                candidates = c.execute(
+                    "SELECT fingerprint FROM peers"
+                    " WHERE trust = 'pending'"
+                    " AND local_alias IS NULL"
+                    " AND verified_at_ms IS NULL"
+                    " AND COALESCE(muted, 0) = 0"
+                    " ORDER BY last_seen_ms ASC, first_seen_ms ASC"
+                ).fetchall()
+                victims: list[str] = []
+                for row in candidates:
+                    fp = row[0]
+                    if fp in protected:
+                        continue
+                    # Table and column names come from this database's own
+                    # schema (sqlite_master), quoted; the value is bound.
+                    if any(
+                        c.execute(
+                            f'SELECT 1 FROM "{table}" WHERE "{column}" = ? LIMIT 1',  # nosec B608
+                            (fp,),
+                        ).fetchone()
+                        for table, column in history
+                    ):
+                        continue
+                    victims.append(fp)
+                    if len(victims) >= surplus:
+                        break
+                if not victims:
+                    return 0
+                c.execute("BEGIN IMMEDIATE")
+                try:
+                    for fp in victims:
+                        for delete_cached in self._PENDING_PRUNE_CACHE_DELETES.values():
+                            with contextlib.suppress(*DB_OPERATIONAL_ERRORS):
+                                c.execute(delete_cached, (fp,))
+                        # A key-change alert that involved a pinned peer is
+                        # 'high' and stays. The rest only ever compared two
+                        # unpinned keys, one of which is now forgotten.
+                        with contextlib.suppress(*DB_OPERATIONAL_ERRORS):
+                            c.execute(
+                                "DELETE FROM key_change_events"
+                                " WHERE severity != 'high'"
+                                " AND (old_fingerprint = ? OR new_fingerprint = ?)",
+                                (fp, fp),
+                            )
+                        c.execute(
+                            "DELETE FROM peers"
+                            " WHERE fingerprint = ? AND trust = 'pending'",
+                            (fp,),
+                        )
+                    c.execute("COMMIT")
+                except BaseException:
+                    c.execute("ROLLBACK")
+                    raise
+                return len(victims)
+            finally:
+                c.close()
+
     def get_peer(self, fingerprint: str) -> Optional[PeerRecord]:
         row = self._conn.execute(
             "SELECT * FROM peers WHERE fingerprint = ?", (fingerprint,)
@@ -2793,10 +3060,27 @@ class State:
         return self._row_to_peer(row) if row else None
 
     def get_peer_by_short_id(self, short_id: str) -> Optional[PeerRecord]:
-        row = self._conn.execute(
-            "SELECT * FROM peers WHERE short_id = ?", (short_id,)
-        ).fetchone()
-        return self._row_to_peer(row) if row else None
+        """Resolve a short ID, or ``None`` when it does not name one peer.
+
+        A short ID is 32 bits of the fingerprint, few enough that a second
+        key with the same short ID can be ground out on purpose. A pinned
+        peer therefore always wins over unpinned ones, and when the choice is
+        still not unique the answer is ``None``: the caller has to use the
+        full fingerprint rather than be handed whichever row came back first.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM peers WHERE short_id = ?"
+            " ORDER BY (trust = 'pinned') DESC, last_seen_ms DESC LIMIT 3",
+            (short_id,),
+        ).fetchall()
+        if not rows:
+            return None
+        pinned = [r for r in rows if r["trust"] == "pinned"]
+        if len(pinned) == 1:
+            return self._row_to_peer(pinned[0])
+        if pinned or len(rows) > 1:
+            return None
+        return self._row_to_peer(rows[0])
 
     def list_peers(self) -> list[PeerRecord]:
         rows = self._conn.execute(
@@ -3671,6 +3955,8 @@ class State:
 
     # ─── key-change tracking (v0.7.8) ─────────────────────────────────
 
+    _MAX_UNPINNED_KEY_CHANGE_ALERTS = 4
+
     def _record_hostname_key_seen_locked(
         self,
         *,
@@ -3721,6 +4007,7 @@ class State:
         if not prior_rows:
             return None
         new_event_id: Optional[int] = None
+        unpinned_alerts = 0
         for old in prior_rows:
             old_fp = old["fingerprint"]
             old_pub_hex = old["ed_pub_hex"]
@@ -3751,6 +4038,15 @@ class State:
                 severity = "medium"
             else:
                 severity = "low"
+            if severity != "high":
+                # A hostname is whatever a device on the LAN says it is. One
+                # that cycles through keys would otherwise log an alert
+                # against every key it ever used, each time: quadratic rows
+                # that say nothing new. A change away from a PINNED key is
+                # always recorded; of the rest, only the most recent few.
+                unpinned_alerts += 1
+                if unpinned_alerts > self._MAX_UNPINNED_KEY_CHANGE_ALERTS:
+                    continue
             cur = c.execute(
                 """
                 INSERT INTO key_change_events(

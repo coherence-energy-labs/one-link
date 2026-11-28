@@ -26,9 +26,24 @@ import json
 import math
 import time
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 MAX_FRAME = 16 * 1024 * 1024  # 16 MiB hard cap per frame; chunked above this
+
+# Frame ceilings by trust stage. A peer earns the full ceiling only after the
+# owner has pinned it; before that every byte it sends is attacker-chosen.
+#
+# HANDSHAKE_MAX_FRAME bounds the unauthenticated first flights. The largest
+# legitimate one is the post-quantum REPLY (about 1.3 KiB); 16 KiB leaves room
+# for a sealed envelope and future fields while keeping a pre-authentication
+# connection from buffering megabytes.
+HANDSHAKE_MAX_FRAME = 16 * 1024
+
+# UNPINNED_MAX_FRAME bounds an authenticated-but-unpinned peer. Such a peer
+# may only exchange CAPS, keepalives and the pairing ceremony, all of which
+# are a few kilobytes.
+UNPINNED_MAX_FRAME = 256 * 1024
 
 # v0.20.7 (security audit M7): cap JSON nesting on encrypted-frame
 # plaintexts. Without this, a malicious peer can ship `{"a":{"a":...}}`
@@ -42,47 +57,94 @@ MAX_FRAME = 16 * 1024 * 1024  # 16 MiB hard cap per frame; chunked above this
 MAX_JSON_DEPTH = 64
 
 
-def _check_json_depth(data: bytes, max_depth: int = MAX_JSON_DEPTH) -> None:
-    """Pre-scan the JSON byte string for max nesting depth. Raise
-    ValueError if the max-nesting peak exceeds ``max_depth``. Honors
-    string boundaries so `{` inside a string literal does not count.
+# A frame may not materialise more than this many JSON containers. json.loads
+# allocates one Python object per container, so an unbounded count turns a
+# 16 MiB frame of ``[],[],[]...`` into hundreds of megabytes of lists.
+MAX_JSON_CONTAINERS = 1_000_000
 
-    Doing this BEFORE json.loads avoids the cost of full parsing for
-    obviously-malicious inputs and avoids tripping CPython's
-    recursion limit on the critical decode path."""
-    depth = 0
+_NON_BRACKET_BYTES = bytes(b for b in range(256) if b not in b"{}[]")
+_OPENERS = frozenset(b"{[")
+# String literals are removed window by window so that a frame made of
+# millions of tiny literals never has more than one window's worth of split
+# parts alive at once.
+_STRIP_WINDOW = 1 << 20
+
+
+def _json_brackets(data: bytes) -> bytes:
+    """Return only the structural brackets of ``data``, in order.
+
+    Brackets inside string literals are dropped. Every step is a C-level
+    ``bytes`` primitive, so the cost is a few passes over the frame however
+    the content is arranged.
+    """
+    if b"\\" in data:
+        # Drop escaped backslashes, then escaped quotes. What remains has no
+        # escaped quote, so quotes alternate strictly between open and close.
+        data = data.replace(b"\\\\", b"").replace(b'\\"', b"")
+    out: list[bytes] = []
     in_string = False
-    escape = False
-    for c in data:
-        if escape:
-            escape = False
-            continue
-        if in_string:
-            if c == 0x5c:  # backslash
-                escape = True
-                continue
-            if c == 0x22:  # closing quote
-                in_string = False
-            continue
-        if c == 0x22:  # opening quote
-            in_string = True
-            continue
-        if c == 0x7b or c == 0x5b:  # { or [
+    view = memoryview(data)
+    for offset in range(0, len(data), _STRIP_WINDOW):
+        parts = bytes(view[offset : offset + _STRIP_WINDOW]).split(b'"')
+        outside = parts[1::2] if in_string else parts[0::2]
+        out.append(b"".join(outside).translate(None, _NON_BRACKET_BYTES))
+        if (len(parts) - 1) & 1:
+            in_string = not in_string
+    return b"".join(out)
+
+
+def _check_json_depth(data: bytes, max_depth: int = MAX_JSON_DEPTH) -> None:
+    """Reject a JSON byte string whose nesting exceeds ``max_depth`` or whose
+    container count exceeds ``MAX_JSON_CONTAINERS``. Raises ValueError.
+
+    Runs before json.loads so a hostile frame is refused before any object is
+    built. Brackets inside string literals do not count.
+
+    Nesting can never be deeper than the number of opening brackets, so a
+    frame with few brackets (every chunk and chat frame) is cleared by two
+    ``bytes.count`` calls. Only frames with many brackets take the exact path,
+    and that path walks brackets alone.
+    """
+    if data.count(b"{") + data.count(b"[") <= max_depth:
+        return
+    brackets = _json_brackets(data)
+    if len(brackets) > 2 * MAX_JSON_CONTAINERS:
+        raise ValueError(
+            f"JSON too complex (>{MAX_JSON_CONTAINERS} containers) — frame rejected"
+        )
+    depth = 0
+    for c in brackets:
+        if c in _OPENERS:
             depth += 1
             if depth > max_depth:
                 raise ValueError(
                     f"JSON nesting too deep (>{max_depth}) — frame rejected"
                 )
-        elif c == 0x7d or c == 0x5d:  # } or ]
-            if depth > 0:
-                depth -= 1
+        elif depth > 0:
+            depth -= 1
 
 
-async def read_frame(reader: asyncio.StreamReader) -> bytes:
+async def read_frame(
+    reader: asyncio.StreamReader,
+    max_frame: int | Callable[[], int] = MAX_FRAME,
+) -> bytes:
+    """Read one length-prefixed frame, refusing any length above ``max_frame``.
+
+    The length is checked before a single payload byte is buffered, so the
+    caller's ceiling is also the most memory one frame can pin. ``max_frame``
+    is clamped to ``MAX_FRAME``; a caller cannot raise the protocol ceiling.
+
+    ``max_frame`` may be a callable. It is evaluated after the length prefix
+    arrives, so a ceiling that depends on the sender's current trust reflects
+    the moment the frame was sent, not the moment the read began waiting.
+    """
     header = await reader.readexactly(4)
     n = int.from_bytes(header, "big")
-    if n > MAX_FRAME:
-        raise ValueError(f"frame too large: {n} > {MAX_FRAME}")
+    limit = max_frame() if callable(max_frame) else max_frame
+    if limit > MAX_FRAME:
+        limit = MAX_FRAME
+    if n > limit:
+        raise ValueError(f"frame too large: {n} > {limit}")
     return await reader.readexactly(n)
 
 

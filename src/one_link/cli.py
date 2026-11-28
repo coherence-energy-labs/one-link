@@ -213,6 +213,14 @@ def _resolve_running_daemon_for_url(*, timeout: float = 5.0) -> tuple[int, str]:
 @click.version_option(__version__, prog_name="one-link")
 def cli() -> None:
     """One Link — peer-to-peer LAN chat + file sync."""
+    from one_link.passphrase_source import PassphraseSourceError, adopt_passphrase_file
+
+    # Every command reads ONE_LINK_PASSPHRASE from the environment. Resolve a
+    # configured passphrase file once, before any of them runs.
+    try:
+        adopt_passphrase_file()
+    except PassphraseSourceError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 @cli.command()
@@ -1189,15 +1197,13 @@ def recovery_unwrap(share_path):
         # var as the daemon's normal identity-load path so an
         # operator with a passphrase-protected key on disk can
         # decrypt for recovery without supplying it twice.
-        from cryptography.hazmat.primitives import serialization
-        from one_link.identity import PASSPHRASE_ENV
+        from one_link.identity import PASSPHRASE_ENV, decode_private_key_file
 
         pw_env = os.environ.get(PASSPHRASE_ENV)
         pw = pw_env.encode("utf-8") if pw_env else None
         try:
-            priv_obj = serialization.load_pem_private_key(
-                key_path().read_bytes(),
-                password=pw,
+            priv_obj, _protection = decode_private_key_file(
+                key_path().read_bytes(), pw
             )
         except Exception as e:
             raise click.ClickException(f"identity key load failed: {e}")
@@ -1246,7 +1252,21 @@ def recovery_unwrap(share_path):
     is_flag=True,
     help="Overwrite an existing master seed on this device.",
 )
-def recovery_restore(portable_shares: tuple[str, ...], force: bool) -> None:
+@click.option(
+    "--allow-unverified-legacy-shares",
+    is_flag=True,
+    help=(
+        "Accept shares made by an older version, which carry no integrity "
+        "check. Only use this when you are certain you supplied at least the "
+        "threshold number of shares from one setup; fewer reconstruct a wrong "
+        "seed that cannot be detected."
+    ),
+)
+def recovery_restore(
+    portable_shares: tuple[str, ...],
+    force: bool,
+    allow_unverified_legacy_shares: bool = False,
+) -> None:
     """Reconstruct the master seed from K guardian shares.
 
     PORTABLE_SHARES is the list of base64 strings collected from the
@@ -1297,6 +1317,7 @@ def recovery_restore(portable_shares: tuple[str, ...], force: bool) -> None:
             data_dir=root,
             shares=decrypted,
             delete_identity_files=force,
+            allow_unverified_legacy_shares=allow_unverified_legacy_shares,
         )
     except ValueError as exc:
         raise click.ClickException(f"reconstruct failed: {exc}") from exc

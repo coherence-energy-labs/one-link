@@ -15,6 +15,12 @@ pub enum PqKemError {
         got: usize,
     },
 
+    /// The ML-KEM encapsulation key is not a valid key: one of its
+    /// coefficients is not reduced modulo q. FIPS 203 section 7.2 requires
+    /// this check before a key received from another party is used.
+    #[error("invalid ML-KEM encapsulation key: coefficient not reduced modulo q")]
+    InvalidEncapsulationKey,
+
     /// ML-KEM internal failure during keygen / encapsulate / decapsulate.
     /// The `ml-kem` crate generally surfaces these only on malformed
     /// inputs; we forward as a generic error.

@@ -11,7 +11,12 @@ A report is *declassified* only when that innermost line is a repository
 source line marked ``ct-audit: declassify`` (the one branch on a verdict the
 function exists to publish): the marker sits in a comment on that line, or on
 a comment-only line directly above it (the rustfmt-stable form). A marker any
-further away does not count. Any other report is a
+further away does not count. A verdict branch the compiler attributes to a
+third-party crate cannot carry a marker; it is declassified only by an entry
+in ``external_declassifications.json`` that pins the exact package version,
+file, line and source text, and only in the audit cases that entry names. An
+entry that no longer declassifies anything in a case it names fails the run,
+so the list stays exactly what the audit observes. Any other report is a
 *violation*. Any other Memcheck error kind (invalid reads, leaks of
 definedness into syscalls, ...) is always a violation.
 
@@ -66,6 +71,7 @@ class Report:
     count: int = 1
     classification: str = "violation"
     reason: str = ""
+    external: ExternalDeclassification | None = None
 
     def innermost(self) -> Frame | None:
         return self.frames[0] if self.frames else None
@@ -200,6 +206,11 @@ class ExternalDeclassification:
     line: int
     source_text: str
     reason: str
+    cases: tuple[str, ...] = ()
+
+    @property
+    def label(self) -> str:
+        return f"{self.package}@{self.version} {self.file}:{self.line}"
 
     def matches(self, frame: Frame) -> bool:
         if frame.path is None or frame.line != self.line:
@@ -216,6 +227,12 @@ def load_external(path: pathlib.Path | None) -> list[ExternalDeclassification]:
         raise SystemExit(f"unsupported external declassification schema in {path}")
     entries = []
     for raw in data.get("entries", []):
+        cases = raw.get("cases")
+        if not isinstance(cases, list) or not cases or not all(isinstance(c, str) and c for c in cases):
+            raise SystemExit(
+                f"external declassification {raw.get('package')}@{raw.get('version')} "
+                f"{raw.get('file')}:{raw.get('line')} in {path} must name the audit cases it was reviewed for"
+            )
         entries.append(
             ExternalDeclassification(
                 package=raw["package"],
@@ -224,9 +241,29 @@ def load_external(path: pathlib.Path | None) -> list[ExternalDeclassification]:
                 line=int(raw["line"]),
                 source_text=raw["source_text"].strip(),
                 reason=raw["reason"],
+                cases=tuple(cases),
             )
         )
     return entries
+
+
+def stale_external(results: list[CaseResult], external: list[ExternalDeclassification]) -> list[str]:
+    """Entries that declassified nothing in a case they name and that ran.
+
+    A reviewed line the audit no longer reaches is a standing allowance for
+    code nobody is looking at; it has to be removed, or re-reviewed at the
+    line the compiler now attributes the verdict to.
+    """
+    ran = {r.name: r for r in results}
+    stale = []
+    for entry in external:
+        for name in entry.cases:
+            result = ran.get(name)
+            if result is None or result.problems or not result.completed:
+                continue  # not run, or failing for its own reason already
+            if not any(report.external is entry for report in result.declassified):
+                stale.append(f"{entry.label} declassifies nothing in {name}")
+    return stale
 
 
 def external_line(frame: Frame) -> str | None:
@@ -241,7 +278,10 @@ def external_line(frame: Frame) -> str | None:
 
 
 def classify(
-    report: Report, index: SourceIndex, external: list[ExternalDeclassification] | None = None
+    report: Report,
+    index: SourceIndex,
+    external: list[ExternalDeclassification] | None = None,
+    case: str | None = None,
 ) -> None:
     if report.kind not in SECRET_KINDS:
         report.classification = "violation"
@@ -254,23 +294,31 @@ def classify(
         return
     resolved = index.resolve(frame.path)
     if resolved is None:
-        for entry in external or []:
-            if entry.matches(frame):
-                actual = external_line(frame)
-                if actual == entry.source_text:
-                    report.classification = "declassified"
-                    report.reason = (
-                        f"external {entry.package}@{entry.version} {entry.file}:{entry.line}: {entry.reason}"
-                    )
-                else:
-                    report.classification = "violation"
-                    report.reason = (
-                        f"external declassification for {entry.package}@{entry.version} {entry.file}:"
-                        f"{entry.line} no longer matches the reviewed source text (found {actual!r})"
-                    )
-                return
-        report.classification = "violation"
-        report.reason = f"innermost frame is outside the repository: {frame.path}:{frame.line}"
+        at_line = [entry for entry in external or [] if entry.matches(frame)]
+        if not at_line:
+            report.classification = "violation"
+            report.reason = f"innermost frame is outside the repository: {frame.path}:{frame.line}"
+            return
+        entry = next((e for e in at_line if case is not None and case in e.cases), None)
+        if entry is None:
+            reviewed = sorted({name for e in at_line for name in e.cases})
+            report.classification = "violation"
+            report.reason = (
+                f"external declassification for {at_line[0].label} was reviewed for {reviewed}, "
+                f"not for case {case!r}"
+            )
+            return
+        actual = external_line(frame)
+        if actual == entry.source_text:
+            report.classification = "declassified"
+            report.reason = f"external {entry.label}: {entry.reason}"
+            report.external = entry
+        else:
+            report.classification = "violation"
+            report.reason = (
+                f"external declassification for {entry.label} no longer matches the "
+                f"reviewed source text (found {actual!r})"
+            )
         return
     text = index.line(resolved, frame.line)
     above = index.line(resolved, frame.line - 1) if frame.line > 1 else None
@@ -368,7 +416,7 @@ def run_case(
     if status != "FINISHED":
         result.problems.append(f"Memcheck status {status!r}, expected 'FINISHED'")
     for report in reports:
-        classify(report, index, external)
+        classify(report, index, external, case["name"])
     result.reports = reports
     return result
 
@@ -436,6 +484,11 @@ def main(argv: list[str] | None = None) -> int:
     work = args.report.resolve().parent / "memcheck"
     work.mkdir(parents=True, exist_ok=True)
     cases = list_cases(binary)
+    known = {c["name"] for c in cases}
+    for entry in external:
+        missing = sorted(set(entry.cases) - known)
+        if missing:
+            raise SystemExit(f"external declassification {entry.label} names unknown cases: {missing}")
     if args.case:
         unknown = sorted(set(args.case) - {c["name"] for c in cases})
         if unknown:
@@ -448,6 +501,8 @@ def main(argv: list[str] | None = None) -> int:
     failed = [r.name for r in results if not r.passed]
     if not args.case and not controls:
         failed.append("<no negative control: the instrument's sensitivity is unproven>")
+    stale = stale_external(results, external)
+    failed.extend(f"<stale external declassification: {item}>" for item in stale)
     summary = {
         "schema": "one-link/ct-audit-report/v1",
         "binary": str(binary),
@@ -457,9 +512,8 @@ def main(argv: list[str] | None = None) -> int:
         "failed": failed,
         "negative_controls": len(controls),
         "negative_controls_detected": sum(r.passed for r in controls),
-        "external_declassifications": [
-            f"{e.package}@{e.version} {e.file}:{e.line}" for e in external
-        ],
+        "external_declassifications": [e.label for e in external],
+        "stale_external_declassifications": stale,
         "results": [result_json(r, index) for r in results],
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
@@ -479,6 +533,8 @@ def main(argv: list[str] | None = None) -> int:
                 if args.explain:
                     for fr in rep.frames[1:4]:
                         print(f"        from {fr.fn} @ {fr.path}:{fr.line}")
+    for item in stale:
+        print(f"FAIL stale external declassification: {item}")
     print(f"ct-audit: {summary['passed']}/{summary['cases']} cases passed; report {args.report}")
     return 0 if not summary["failed"] else 1
 

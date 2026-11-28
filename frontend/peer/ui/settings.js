@@ -59,9 +59,16 @@
       }
     } catch (e) {
       if (daemonStatusEl) {
-        daemonStatusEl.innerHTML =
-          '<span style="color:#a44;">● Not connected</span> ' +
-          `<span style="color:var(--text-dim);">— ${e && e.message ? e.message : e}</span>`;
+        // The reason comes from the remote daemon's reply. It is placed as
+        // text, never as markup: this page runs with 'unsafe-inline', so
+        // markup built from it would execute.
+        const dot = document.createElement("span");
+        dot.style.color = "#a44";
+        dot.textContent = "● Not connected";
+        const reason = document.createElement("span");
+        reason.style.color = "var(--text-dim)";
+        reason.textContent = `— ${e && e.message ? e.message : e}`;
+        daemonStatusEl.replaceChildren(dot, " ", reason);
       }
       if (cert && cert.root_pub_b64 && daemonFpEl) {
         daemonFpEl.textContent = `root: ${cert.root_pub_b64}`;

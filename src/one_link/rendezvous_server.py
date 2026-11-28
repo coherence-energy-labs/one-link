@@ -84,6 +84,9 @@ log = logging.getLogger("one_link.rendezvous_server")
 _DEFAULT_MAX_REGISTRATIONS = 20_000
 _DEFAULT_MAX_ATTACKER_STATE_KEYS = 20_000
 _DEFAULT_MAX_CONCURRENT_CONNECTIONS = 64
+# One source address (an IPv4 address or an IPv6 /64) may hold at most this
+# many of those slots, so a single host cannot occupy the whole server.
+_DEFAULT_MAX_CONCURRENT_PER_SOURCE = 16
 _DEFAULT_PROCESS_MEMORY_BUDGET_BYTES = 512 * 1024 * 1024
 _DEFAULT_RELAY_ROUTE_KEYS = 4_096
 _MEASURED_HOSTILE_STATE_KEYS = 50_000
@@ -223,6 +226,11 @@ class ServerConfig:
     # fan-out attack from many source IPs. This must remain finite so the
     # declared process memory envelope has a meaningful upper bound.
     max_concurrent_connections: int = _DEFAULT_MAX_CONCURRENT_CONNECTIONS
+    # Share of those slots one source address may hold at a time. Without it
+    # the global cap is a denial-of-service lever: whoever opens the most
+    # WebSockets owns the server. Behind a reverse proxy this needs
+    # trust_proxy_headers, or every client shares the proxy's address.
+    max_concurrent_per_source: int = _DEFAULT_MAX_CONCURRENT_PER_SOURCE
     # Fail closed when operator-provided state/concurrency/relay ceilings no
     # longer fit the declared process/container memory envelope. The estimator
     # deliberately scales from a hostile distinct-key RSS measurement and adds
@@ -1082,11 +1090,16 @@ def _validate_server_config(config: ServerConfig) -> None:
             config.rate_listener_replace_per_pubkey_per_min
         ),
         "max_concurrent_connections": config.max_concurrent_connections,
+        "max_concurrent_per_source": config.max_concurrent_per_source,
         "memory_budget_bytes": config.memory_budget_bytes,
     }
     for name, value in positive_ints.items():
         if type(value) is not int or value <= 0:
             raise ValueError(f"{name} must be a positive integer")
+    if config.max_concurrent_per_source > config.max_concurrent_connections:
+        raise ValueError(
+            "max_concurrent_per_source must not exceed max_concurrent_connections"
+        )
     for name in (
         "rate_per_ip_per_min",
         "rate_register_per_pubkey_per_min",
@@ -1234,6 +1247,10 @@ class RendezvousApp:
         # positive ceiling so this counter participates in the memory envelope.
         self._max_concurrent: int = config.max_concurrent_connections
         self._concurrent: int = 0
+        # In-flight handlers per source address. Entries exist only while a
+        # handler is running, so the map never exceeds the global cap.
+        self._max_concurrent_per_source: int = config.max_concurrent_per_source
+        self._concurrent_by_source: dict[str, int] = {}
         # v0.20.7 (security audit M35): HMAC key for IP-in-logs. The
         # raw IP shows up at DEBUG; INFO and above use the HMAC tag so
         # log-pipeline operators don't hold raw client IPs by accident.
@@ -1249,13 +1266,25 @@ class RendezvousApp:
         handlers count toward the cap for the lifetime of the WS,
         which is exactly the period that holds the resources we care
         about."""
+        source = self._rate_identity(request)
+        held = self._concurrent_by_source.get(source, 0)
+        if held >= self._max_concurrent_per_source:
+            return web.json_response(
+                {"error": "too many connections from this address"}, status=429
+            )
         if self._concurrent >= self._max_concurrent:
             return web.json_response({"error": "server at capacity"}, status=503)
         self._concurrent += 1
+        self._concurrent_by_source[source] = held + 1
         try:
             return await handler(request)
         finally:
             self._concurrent -= 1
+            remaining = self._concurrent_by_source.get(source, 1) - 1
+            if remaining > 0:
+                self._concurrent_by_source[source] = remaining
+            else:
+                self._concurrent_by_source.pop(source, None)
 
     @staticmethod
     def _browser_cors_contract(path: str) -> tuple[str, ...] | None:
@@ -3132,6 +3161,12 @@ def _parse_args(argv: Optional[list[str]] = None) -> ServerConfig:
         help="finite global cap on in-flight HTTP and WebSocket handlers",
     )
     p.add_argument(
+        "--max-concurrent-per-source",
+        type=int,
+        default=_DEFAULT_MAX_CONCURRENT_PER_SOURCE,
+        help="how many of those handlers one source address may hold at a time",
+    )
+    p.add_argument(
         "--memory-budget-bytes",
         type=int,
         default=_DEFAULT_PROCESS_MEMORY_BUDGET_BYTES,
@@ -3187,6 +3222,7 @@ def _parse_args(argv: Optional[list[str]] = None) -> ServerConfig:
         rate_new_pubkey_register_per_ip_per_min=args.rate_new_pubkey_register_per_ip_per_min,
         rate_listener_replace_per_pubkey_per_min=args.rate_listener_replace_per_pubkey_per_min,
         max_concurrent_connections=args.max_concurrent_connections,
+        max_concurrent_per_source=args.max_concurrent_per_source,
         memory_budget_bytes=args.memory_budget_bytes,
         metrics_token=metrics_token,
     )

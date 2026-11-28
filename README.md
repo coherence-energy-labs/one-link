@@ -273,6 +273,12 @@ Coherence / OneField ecosystem hooks:
 
 ## Security notes
 
+**What a default install contacts.** No accounts and no telemetry, but not
+nothing: the update check asks GitHub for the latest release every 6 hours,
+calls use three community STUN servers, and the device announces itself on
+the local network. [docs/NETWORK_CONTACTS.md](docs/NETWORK_CONTACTS.md) lists
+every contact, what it learns and how to turn it off.
+
 - **Default-loopback owner UI.** The owner HTTP/WebSocket listener binds to
   127.0.0.1 by default. Explicit LAN pairing mode adds network listeners, but
   remote plaintext requests cannot use owner credentials. Neither mode makes
@@ -409,7 +415,8 @@ What's queued:
 - Exact-commit release qualification of Double Ratchet activation, downgrade,
   legacy-peer, revocation, and crash-recovery behavior
 - Service Worker pinned-pubkey signature verification (closes the update channel)
-- Argon2id-wrapped identity key + OS-keyring passphrase (replaces PBKDF2 + env var)
+- OS-keyring-held passphrase so the identity key is sealed by default
+  (it is scrypt-sealed today when a passphrase or passphrase file is supplied)
 - `server.py` modularization (12K → many smaller files for review)
 - CSP nonce migration + TrustedTypes
 - Group calls (3+ participants)

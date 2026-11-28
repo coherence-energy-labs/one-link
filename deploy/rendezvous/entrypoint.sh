@@ -50,6 +50,7 @@ exec /opt/rendezvous-venv/bin/python -m one_link.rendezvous_server \
     --rate-new-pubkey-register-per-ip-per-min "${ONE_LINK_RDZ_RATE_NEW_PUBKEY_PER_IP_PER_MIN:-10}" \
     --rate-listener-replace-per-pubkey-per-min "${ONE_LINK_RDZ_RATE_LISTENER_REPLACE_PER_PUBKEY_PER_MIN:-2}" \
     --max-concurrent-connections "${ONE_LINK_RDZ_MAX_CONCURRENT_CONNECTIONS:-64}" \
+    --max-concurrent-per-source "${ONE_LINK_RDZ_MAX_CONCURRENT_PER_SOURCE:-16}" \
     --memory-budget-bytes "${ONE_LINK_RDZ_MEMORY_BUDGET_BYTES:-536870912}" \
     --relay-connect-per-ip-per-min "${ONE_LINK_RDZ_RELAY_CONNECT_PER_IP_PER_MIN:-60}" \
     --relay-max-sessions-per-listener "${ONE_LINK_RDZ_RELAY_MAX_SESSIONS_PER_LISTENER:-32}" \
